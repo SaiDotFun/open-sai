@@ -644,23 +644,33 @@ def test_confirmed_close_rechecks_position_height(
     ("scenario", "reopened"),
     [("quote-cache-reopened", True), ("quote-cache-closed", False)],
 )
+@pytest.mark.parametrize("implementation", ["python", "rust"])
 def test_open_submission_uses_fresh_market_state(
-    tmp_path: Path, scenario: str, reopened: bool
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    scenario: str,
+    reopened: bool,
+    implementation: str,
 ) -> None:
-    cli = (str(Path(sys.executable).with_name("sai")),)
+    python = implementation == "python"
+    cli = (
+        (str(Path(sys.executable).with_name("sai")),)
+        if python
+        else request.getfixturevalue("cli_pair")[1]
+    )
     replay = TradeReplay("OPEN_TRADE", "")
     home = tmp_path / "home"
     with loopback(scenario, trade_replay=replay, market_price=100) as endpoints:
         seed_home(home, endpoints, "session")
         code, preview, stderr = run(
-            cli, home, endpoints, (*OPEN, "--dry-run"), python=True
+            cli, home, endpoints, (*OPEN, "--dry-run"), python=python
         )
         assert (code, stderr) == (0, "")
         assert ("previewDigest" in preview) == (not reopened)
         assert not replay.attempts()
         assert not rows(home)
 
-        code, result, stderr = run(cli, home, endpoints, OPEN[:-2], python=True)
+        code, result, stderr = run(cli, home, endpoints, OPEN[:-2], python=python)
         assert not endpoints.errors
         assert [entry.label for entry in endpoints.wire].count("get_market") == 2
         if reopened:

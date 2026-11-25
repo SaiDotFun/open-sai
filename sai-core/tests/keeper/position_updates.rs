@@ -685,6 +685,30 @@ async fn confirmed_core_open_checks_market_state_before_reserving() {
         error.details.unwrap()["preview"]["estimates"]["execution"]["code"],
         "MarketClosed"
     );
+    server.state.lock().unwrap().price = "110";
+    let moved = trading
+        .submit(
+            &session,
+            &preview,
+            SubmitOptions {
+                confirmation: Some(
+                    Confirmation::new(issued["previewDigest"].as_str().unwrap(), Some("100"))
+                        .unwrap(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(moved.code, Code::PriceMoved);
+    let details = moved.details.unwrap();
+    let replacement = &details["preview"];
+    assert_eq!(
+        replacement["estimates"]["execution"]["code"],
+        "MarketClosed"
+    );
+    assert!(replacement.get("previewDigest").is_none());
     assert!(!server.requests().iter().any(|label| label == "admission"));
     assert!(!home.path().join("trader/intents.sqlite3").exists());
 }
@@ -730,25 +754,7 @@ async fn confirmed_core_close_checks_oracle_age_before_reserving() {
         .err()
         .unwrap();
     assert_eq!(error.code, Code::PreviewMismatch);
-    assert_eq!(
-        error.details.unwrap()["preview"]["estimates"]["execution"]["code"],
-        "OraclePriceStale"
-    );
-
-    let mismatch = trading
-        .submit(
-            &session,
-            &preview,
-            SubmitOptions {
-                confirmation: Some(Confirmation::new(&"0".repeat(64), None).unwrap()),
-                ..Default::default()
-            },
-        )
-        .await
-        .err()
-        .unwrap();
-    assert_eq!(mismatch.code, Code::PreviewMismatch);
-    let details = mismatch.details.unwrap();
+    let details = error.details.unwrap();
     let replacement = &details["preview"];
     assert_eq!(
         replacement["estimates"]["execution"]["code"],
