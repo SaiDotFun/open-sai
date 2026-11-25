@@ -37,6 +37,8 @@ SIDECARS = ("-wal", "-shm", "-journal")
 DURATION = re.compile(r"(?<= in )\d+(?= ms\b)")
 DOCTOR_GENERATED_AT = re.compile(r'("generatedAt":)"([^"\\]+)"')
 DOCTOR_DURATION_MS = re.compile(r'(?<="durationMs":)(?:0|[1-9]\d*)(?=[,}])')
+DOCTOR_BUILD_VERSION = re.compile(rf'("(?:version|installed)":"){VERSION.pattern}(?=")')
+DOCTOR_DISPLAY_VERSION = re.compile(rf"(?<=sai ){VERSION.pattern}(?=[ ;]|$)")
 INTENT_ID = re.compile(r"\b\d{8}T\d{9}Z_[0-9A-HJKMNP-TV-Z]{16}\b")
 TOML_TABLE = re.compile(r"\s*\[([^\[\]]+)\]\s*(?:#.*)?")
 SQLITE_TRIVIA = r"[ \t\n\f\r]+|--[^\n]*|/\*[\s\S]*?(?:\*/|$)"
@@ -356,12 +358,14 @@ def doctor_report(value: dict[str, Any]) -> None:
 
 
 def mask_doctor_stream(raw: str) -> str:
-    """Mask clock values without changing the CLI's serialization or layout."""
+    """Mask clock and build values without changing serialization or layout."""
     raw = DOCTOR_GENERATED_AT.sub(
         lambda match: f'{match[1]}"<generatedAt>"' if timestamp(match[2]) else match[0],
         raw,
     )
     raw = DOCTOR_DURATION_MS.sub('"<durationMs>"', raw)
+    raw = DOCTOR_BUILD_VERSION.sub(r"\g<1><version>", raw)
+    raw = DOCTOR_DISPLAY_VERSION.sub("<version>", raw)
     return DURATION.sub("<durationMs>", raw)
 
 

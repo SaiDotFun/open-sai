@@ -32,7 +32,7 @@ def test_case_command_skips_global_options() -> None:
     assert case.command == "config list"
 
 
-def test_doctor_stream_masks_clock_values_and_keeps_other_bytes() -> None:
+def test_doctor_stream_masks_clock_and_build_values_and_keeps_other_bytes() -> None:
     text = "warn    lcd        http://127.0.0.1:9090 answered in 14 ms; another chain\n"
     assert mask_doctor_stream(text) == text.replace("14 ms", "<durationMs> ms")
     raw = (
@@ -45,6 +45,11 @@ def test_doctor_stream_masks_clock_values_and_keeps_other_bytes() -> None:
     assert mask_doctor_stream(raw) == expected
     malformed = '{"generatedAt":"invalid","durationMs":14.5}\n'
     assert mask_doctor_stream(malformed) == malformed
+    build = '{"version":"0.1.2","summary":"sai 0.1.2 installed"}\n'
+    assert (
+        mask_doctor_stream(build)
+        == '{"version":"<version>","summary":"sai <version> installed"}\n'
+    )
 
 
 def test_start_log_compares_command_and_argv_shape(tmp_path: Path) -> None:

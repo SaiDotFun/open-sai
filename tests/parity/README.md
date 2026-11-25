@@ -285,8 +285,8 @@ The LCD comparison contract comes from Python main at
 `--case doctor-network --case 'doctor-lcd-*'`. These cases cover matching
 chains, a missing Keeper chain ID, a reflected LCD path, an unreachable
 LCD, and malformed chain IDs. The driver compares the CLI streams byte
-for byte after masking the temporary home path, report timestamp, and
-probe and check durations.
+for byte after masking the temporary home path, report timestamp, probe
+and check durations, and each implementation's package version.
 
 The invalid-chain cases pin exit 1 in both modes when `node_info` returns
 a nonempty malformed chain ID. Earlier Rust reported a warning and exited
