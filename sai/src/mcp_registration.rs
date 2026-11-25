@@ -1251,6 +1251,10 @@ impl Clients {
         dry: bool,
         result: &mut RegistrationResult,
     ) -> ClientResult<()> {
+        let launcher = &target.argv[0];
+        if target.explicit && Path::new(launcher).is_absolute() && which(launcher).is_none() {
+            return Err("The requested server launcher is missing or not executable".into());
+        }
         if client == Client::Codex {
             if scope != Scope::User {
                 return Err("Codex registers MCP servers per user only".into());

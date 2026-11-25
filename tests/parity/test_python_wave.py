@@ -385,3 +385,39 @@ def test_repl_omits_rejected_auth_and_imports_from_history(
         assert "synthetic-" not in history
         assert "auth import" not in history
         assert "+auth list\n" in history
+
+
+@pytest.mark.parametrize("exists", [False, True], ids=["missing", "non-executable"])
+def test_mcp_install_rejects_unusable_absolute_launcher(
+    wave_clis: tuple[str, str], tmp_path: Path, exists: bool
+) -> None:
+    for index, binary in enumerate(wave_clis):
+        home = tmp_path / str(index)
+        home.mkdir()
+        overrides = {"PATH": os.defpath}
+        original = seed_clients(home, overrides, "current")
+        launcher = home / "unusable-launcher"
+        if exists:
+            launcher.touch(mode=0o600)
+        result = run_cli(
+            binary,
+            home,
+            "--json",
+            "mcp",
+            "install",
+            "cursor",
+            "--",
+            str(launcher),
+            "mcp",
+            "serve",
+            overrides=overrides,
+        )
+        assert result.returncode == 1
+        details = json.loads(result.stdout)["error"]["details"]
+        [cursor] = details["results"]
+        assert (
+            cursor["error"]
+            == "The requested server launcher is missing or not executable"
+        )
+        assert cursor["changed"] is False
+        assert (home / ".cursor/mcp.json").read_bytes() == original[".cursor/mcp.json"]
