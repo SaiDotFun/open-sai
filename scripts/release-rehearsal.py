@@ -1697,10 +1697,28 @@ class CutoverMcp:
         path.write_text(source, encoding="utf-8")
         path.chmod(0o600)
 
-    def verify(self, client: str) -> None:
+    def add_stale_cursor_alias(self) -> None:
+        data = self.read("cursor")
+        data["mcpServers"]["sai-mcp"] = self.expected("cursor", stale=True)[
+            "mcpServers"
+        ]["sai"]
+        self.paths["cursor"].write_text(json.dumps(data), encoding="utf-8")
+
+    def verify_cursor_alias(self) -> None:
+        data = self.read("cursor")
+        expected = self.expected("cursor", stale=False)["mcpServers"]["sai"]
+        actual = data.get("mcpServers", {}).get("sai-mcp")
+        require(
+            actual == expected,
+            "The native updater did not repoint the existing Cursor alias",
+        )
+
+    def verify(self, client: str, *, cursor_alias: bool = False) -> None:
         expected = self.expected(client, stale=False)
         data = self.read(client)
         key = next(iter(expected))
+        if cursor_alias:
+            data[key].pop("sai-mcp", None)
         entry = data.get(key, {}).get("sai", {})
         if isinstance(entry.get("command"), str):
             # uv can spell the registered bin path with a parent component.
@@ -2049,10 +2067,11 @@ def rehearse_native_staged(tool: Install, assets: NativeAssets) -> int:
                 lambda client=client: mcp.verify(client),
             )
 
-        # Test a good registration and a stale registration during the native
-        # updater's rollback. Replace only fixtures used by the doctor probe.
+        # Restore the good entries from before the doctor probe. Add a stale
+        # Cursor alias to check repair and startup independently on rollback.
         mcp.seed("codex")
-        mcp.seed("cursor", stale=True)
+        mcp.seed("cursor")
+        mcp.add_stale_cursor_alias()
         cutover_update(tool, base, baseline)
         tool.verify_version(baseline)
         require(
@@ -2080,6 +2099,9 @@ def rehearse_native_staged(tool: Install, assets: NativeAssets) -> int:
                 f"Rollback update MCP {client}",
                 lambda client=client: mcp.verify(client),
             )
+        check(
+            "Rollback update repoints the stale Cursor alias", mcp.verify_cursor_alias
+        )
     print(
         f"Native cutover rehearsal finished with {failures} failed checks.",
         flush=True,
