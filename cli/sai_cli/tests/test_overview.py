@@ -620,6 +620,53 @@ def test_a_failed_read_preserves_other_sections(replay, failure):
     assert result["queuedMarketOrders"]["data"][0]["sequence"] == 400
 
 
+@pytest.mark.parametrize("paginated", [False, True])
+def test_queued_orders_keep_valid_actions_beside_invalid_rows(replay, paginated):
+    populate_trades(replay)
+    order = replay["http"][keeper.PENDING_MARKET_ORDERS]["data"]["perp"][
+        "marketOrders"
+    ][0]
+    actions = ["open", "close", "increase", "decrease", "update_leverage"]
+    valid = [
+        {
+            **order,
+            "sequence": index,
+            "side": action,
+            "collateralAmount": order["collateralAmount"]
+            if action in {"open", "increase"}
+            else None,
+        }
+        for index, action in enumerate(actions)
+    ]
+    rows = [*valid[:2], {"sequence": "invalid"}, *valid[2:]]
+    if paginated:
+        rows = rows[:3] + [None] * 97 + rows[3:]
+
+    def orders(variables):
+        offset = variables["offset"]
+        return {
+            "data": {
+                "perp": {"marketOrders": rows[offset : offset + variables["limit"]]}
+            }
+        }
+
+    replay["http"][keeper.PENDING_MARKET_ORDERS] = orders
+    queued = mcp(replay, addr=ADDR)["queuedMarketOrders"]
+
+    assert [row["action"] for row in queued["data"]] == actions
+    assert [row["collateralBaseUnits"] for row in queued["data"]] == [
+        row["collateralAmount"] for row in valid
+    ]
+    assert queued["error"]["code"] == "INCOMPLETE_DATA"
+    assert "Invalid rows were omitted" in queued["error"]["message"]
+    assert "paginated list could not be confirmed" not in queued["error"]["message"]
+    assert [
+        variables["offset"]
+        for query, variables in replay["calls"]
+        if query == keeper.PENDING_MARKET_ORDERS
+    ] == ([0, 100, 0, 100] if paginated else [0])
+
+
 def test_no_default_account_gives_an_address_hint(replay):
     result = cli(replay, "account", "overview")
     assert result.exit_code != 0 and "--as ADDR" in result.output

@@ -309,16 +309,20 @@ def _scan_pages(
             page = response["perp"][field]
             if not isinstance(page, list):
                 raise TypeError("Expected a list")
-            entries = [(_uint(row[id_field]), row) for row in page]
+            if query == keeper.PENDING_MARKET_ORDERS:
+                entries = [_queued_entry(row) for row in page]
+            else:
+                entries = [(_uint(row[id_field]), row) for row in page]
         except (keeper.KeeperError, KeyError, TypeError):
             if not rows:
                 raise
             return Pages(rows, False, True, read_failed=True)
         fetched = datetime.now(UTC).isoformat()
         for item_id, row in entries:
-            if item_id in seen:
-                return Pages(rows, False, True)
-            seen.add(item_id)
+            if item_id is not None:
+                if item_id in seen:
+                    return Pages(rows, False, True)
+                seen.add(item_id)
             rows.append({**row, "fetchedAt": fetched})
         if len(page) < PAGE_SIZE:
             return Pages(rows, True, page_num > 0)
@@ -346,8 +350,8 @@ def _pages(endpoint: str, query: str, field: str, id_field: str, addr: str) -> P
         if (
             snapshot.complete
             and current.complete
-            and [row[id_field] for row in snapshot.rows]
-            == [row[id_field] for row in current.rows]
+            and [row.get(id_field) for row in snapshot.rows]
+            == [row.get(id_field) for row in current.rows]
         ):
             return current
         snapshot = current
@@ -995,52 +999,60 @@ def _skipped_prices(reason: str) -> dict[str, Any]:
     return {"fetchedAt": None, "data": [], "status": "skipped", "skipReason": reason}
 
 
-def _queued_rows(endpoint: str, addr: str) -> Pages:
-    snapshot = _pages(
-        endpoint, keeper.PENDING_MARKET_ORDERS, "marketOrders", "sequence", addr
-    )
-    rows = []
-    for row in snapshot.rows:
-        trade_id = row["tradeId"]
-        if trade_id is not None:
-            _uint(trade_id)
-        _base_units(row["collateralAmount"])
+def _queued_entry(row: Any) -> tuple[int | None, dict[str, Any]]:
+    try:
+        sequence = _uint(row["sequence"])
+        collateral = row["collateralAmount"]
+        if collateral is not None:
+            _base_units(collateral)
         if (
-            row["side"] not in ("open", "close")
+            row["side"]
+            not in ("open", "close", "increase", "decrease", "update_leverage")
             or row["status"] != "pending_exec"
             or keeper.request_hash(row["orderReqTxHash"])[1]
             or keeper.request_hash(row["orderReqEvmTxHash"])[1]
+            or _instant(row["orderReqBlockTs"]) is None
         ):
             raise ValueError("Invalid queued market order")
-        mapped = {
-            "sequence": row["sequence"],
-            "tradeId": trade_id,
+        return sequence, {
+            "sequence": sequence,
+            "tradeId": _uint(row["tradeId"]),
             "action": row["side"],
             "marketId": _uint(row["perpMarketId"]),
             "status": row["status"],
-            "collateralBaseUnits": row["collateralAmount"],
+            "collateralBaseUnits": collateral,
             "requestTxHash": row["orderReqTxHash"],
             "requestEvmTxHash": row["orderReqEvmTxHash"],
-            "block": row["orderReqBlock"],
+            "block": _uint(row["orderReqBlock"]),
             "block_ts": row["orderReqBlockTs"],
-            "fetchedAt": row["fetchedAt"],
         }
-        _check_block(mapped)
-        rows.append(mapped)
-    snapshot.rows = rows
-    return snapshot
+    except (KeyError, TypeError, ValueError):
+        # An invalid row still occupies an offset in Keeper's response.
+        return None, {}
 
 
 def _queued_orders(
     endpoint: str, addr: str, lookup: Callable[[int], datetime | None]
 ) -> dict[str, Any]:
-    section = _read(lambda: _queued_rows(endpoint, addr))
+    section = _read(
+        lambda: _pages(
+            endpoint, keeper.PENDING_MARKET_ORDERS, "marketOrders", "sequence", addr
+        )
+    )
     if "data" in section:
         snapshot = section["data"]
-        section["data"] = snapshot.rows
-        if not snapshot.complete:
+        rows = [row for row in snapshot.rows if "sequence" in row]
+        section["data"] = rows
+        if len(rows) != len(snapshot.rows):
+            message = (
+                "Keeper returned invalid queued orders. Invalid rows were omitted."
+            )
+            if not snapshot.complete:
+                message += f" {PAGINATION_ERROR}."
+            section["error"] = _failure(Code.INCOMPLETE_DATA, message)
+        elif not snapshot.complete:
             _mark_incomplete(section)
-        for row in section["data"]:
+        for row in rows:
             row.update(_block_source(row, row["fetchedAt"], lookup))
             del row["block"], row["block_ts"]
     return section
