@@ -84,7 +84,7 @@ impl<'a> EventContext<'a> {
 
 
 def prepare_rust(source: Path, version: str) -> None:
-    for directory in ("sai", "sai-core", ".cargo"):
+    for directory in ("sai", "sai-core", "skills/sai", ".cargo"):
         if (ROOT / directory).is_dir():
             shutil.copytree(ROOT / directory, source / directory)
     for file in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml"):
