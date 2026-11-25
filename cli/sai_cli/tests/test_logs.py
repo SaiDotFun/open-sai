@@ -3664,6 +3664,67 @@ def test_intent_cursor_rejects_changed_unread_files(home, change):
     assert "events" not in json.loads(output)
 
 
+@pytest.mark.parametrize("before_read", [True, False])
+def test_intent_cursor_rejects_truncation_during_terminal_page(
+    home, monkeypatch, before_read
+):
+    root = home / "logs"
+    root.mkdir()
+    older = date(2026, 11, 24)
+    newer = older + timedelta(days=1)
+    row = {
+        "event": "intent.keeper",
+        "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": "h1_" + "a" * 64,
+    }
+    older_rows = [
+        log.encode({**row, "ts": f"{older}T00:00:00.000Z", "seq": seq})
+        for seq in range(74)
+    ]
+    path = log.file_path("cli", older, root)
+    path.write_bytes(b"".join(older_rows))
+    log.file_path("cli", newer, root).write_bytes(
+        b"".join(
+            log.encode({**row, "ts": f"{newer}T00:00:00.000Z", "seq": seq})
+            for seq in range(log_queries.MAX_REPORT_ROWS)
+        )
+    )
+    args = ("--json", "logs", "intent", "KEY", "--offline")
+    code, output = run_cli(*args)
+    assert code == 0
+    continuation = ("--before", json.loads(output)["nextBefore"])
+    code, output = run_cli(*args, *continuation)
+    assert code == 0 and len(json.loads(output)["events"]) == 74
+    assert "nextBefore" not in json.loads(output)
+
+    read = os.read
+    expected = path.stat()
+    truncated = False
+
+    def truncate_during_read(fd, size):
+        nonlocal truncated
+        info = os.fstat(fd)
+        if (
+            truncated
+            or size <= 1
+            or (info.st_dev, info.st_ino) != (expected.st_dev, expected.st_ino)
+        ):
+            return read(fd, size)
+        if not before_read:
+            data = read(fd, size)
+        with path.open("r+b") as stream:
+            stream.truncate(sum(map(len, older_rows[:44])))
+        truncated = True
+        return read(fd, size) if before_read else data
+
+    monkeypatch.setattr(os, "read", truncate_during_read)
+    code, output = run_cli(*args, *continuation)
+    assert truncated
+    assert code == 2 and "Start a new intent log query" in output
+    assert "events" not in json.loads(output)
+
+
 def test_intent_cursor_cache_evicts_old_states_and_refuses_oversize_reads(home):
     root = home / "logs"
     root.mkdir()
