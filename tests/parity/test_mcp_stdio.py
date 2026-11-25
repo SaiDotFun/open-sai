@@ -347,6 +347,12 @@ def test_trade_accepts_nonnegative_integers_and_ascii_digit_strings(
         assert not endpoints.wire
 
 
+TRADE_INTEGER_ERROR = (
+    "Value error, Expected a nonnegative integer or a string of ASCII digits",
+    "value_error",
+)
+
+
 def validation_text(tool: str, *issues: tuple[str | None, str, str]) -> str:
     label = "validation error" if len(issues) == 1 else "validation errors"
     lines = [f"Error executing tool {tool}: {len(issues)} {label} for {tool}Arguments"]
@@ -389,11 +395,7 @@ def test_trade_integer_rejections(
                 "type": "text",
                 "text": validation_text(
                     "trade_open",
-                    (
-                        "market_id",
-                        "Value error, Expected a nonnegative integer or a string of ASCII digits",
-                        "value_error",
-                    ),
+                    ("market_id", *TRADE_INTEGER_ERROR),
                 ),
             }
         ]
@@ -474,13 +476,7 @@ INVALID_ADDRESS = ("addr", "Input should be a valid string", "string_type")
         (
             "preview_close",
             {"trade_id": f"{REJECTED_MARKER}-" + "z" * 1024},
-            (
-                (
-                    "trade_id",
-                    "Input should be a valid integer, unable to parse string as an integer",
-                    "int_parsing",
-                ),
-            ),
+            (("trade_id", *TRADE_INTEGER_ERROR),),
         ),
     ],
     ids=[
