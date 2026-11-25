@@ -341,6 +341,40 @@ def test_mcp_open_checks_confirmation_before_building_an_intent(
             assert not rows(home)
 
 
+def test_mcp_confirmation_explains_locked_ledger(
+    mcp_pair: tuple[Path, Path], tmp_path: Path
+) -> None:
+    for i, executable in enumerate(mcp_pair):
+        home = tmp_path / str(i)
+        with (
+            loopback("quote-market") as endpoints,
+            server(
+                executable,
+                home,
+                endpoints,
+                seed="doctor-ledger-session",
+                call_timeout=15,
+            ) as stdio,
+            closing(sqlite3.connect(home / "sai/trader/intents.sqlite3")) as ledger,
+        ):
+            ledger.execute("DELETE FROM intents")
+            ledger.commit()
+            preview = result(stdio.call(2, "preview_open", **OPEN))
+            confirmed = trade_args(preview, OPEN)
+            ledger.execute("BEGIN IMMEDIATE")
+            try:
+                refused = result(stdio.call(3, "trade_open", **confirmed))
+            finally:
+                ledger.rollback()
+            assert not any(item.label == "recordUserIntent" for item in endpoints.wire)
+            assert not rows(home)
+            assert not endpoints.errors
+            assert refused == {
+                "code": "INTERNAL_ERROR",
+                "error": "Could not reserve the trade intent. database is locked. Nothing was sent.",
+            }
+
+
 @pytest.mark.parametrize("lose_reply", [False, True], ids=["accepted", "unknown"])
 def test_mcp_open_confirmation_reserves_once_until_overridden(
     mcp_pair: tuple[Path, Path], tmp_path: Path, lose_reply: bool

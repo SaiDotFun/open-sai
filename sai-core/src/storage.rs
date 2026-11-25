@@ -20,6 +20,10 @@ mod sessions;
 pub use ledger::{IntentRow, IntentStatus, StatusUpdateOptions};
 pub use sessions::{Accounts, RemovedSession, Session, SessionSummary};
 
+/// Safe to disclose when opening or reserving the ledger failed before dispatch.
+pub const TRADE_LEDGER_LOCKED: &str =
+    "Could not reserve the trade intent. database is locked. Nothing was sent.";
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error(transparent)]
@@ -52,6 +56,14 @@ pub struct SessionError(pub SaiError);
 
 impl StorageError {
     pub(crate) fn mcp_trade_error(self) -> SaiError {
+        if let Self::Sqlite(rusqlite::Error::SqliteFailure(error, _)) = &self
+            && matches!(
+                error.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+        {
+            return SaiError::new(Code::InternalError, TRADE_LEDGER_LOCKED);
+        }
         let keys = match &self {
             Self::RecentOpenPending { keys, .. } => Some(serde_json::json!(keys)),
             _ => None,
