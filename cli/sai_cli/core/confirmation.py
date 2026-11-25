@@ -50,6 +50,9 @@ def digest_material(preview: dict[str, Any]) -> dict[str, Any]:
             }
             quote["closedNotionalUsdAvailable"] = usd_available
         material["quote"] = quote
+    if "collateralBaseUnits" in preview:
+        # The CLI leverage quote binds quantities. USD conversions are display data.
+        material["collateralBaseUnits"] = preview["collateralBaseUnits"]
     if "positionRoute" in preview:
         material["positionRoute"] = preview["positionRoute"]
     return material

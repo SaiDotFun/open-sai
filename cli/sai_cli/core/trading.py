@@ -492,8 +492,8 @@ def _position_intent(
     if verified is not None:
         preview["positionRoute"] = verified.route
 
-    def estimate(_preview: dict[str, Any]) -> dict[str, Any]:
-        return _estimate_position(
+    def estimate(quoted_preview: dict[str, Any]) -> dict[str, Any]:
+        values = _estimate_position(
             endpoint,
             lcd,
             addr,
@@ -503,7 +503,11 @@ def _position_intent(
             target,
             updates_triggers,
             show_collateral=show_collateral and dry_run,
+            bind_collateral=show_collateral and (dry_run or before_submit is not None),
         )
+        if collateral := values.pop("collateralBaseUnits", None):
+            quoted_preview["collateralBaseUnits"] = collateral
+        return values
 
     if dry_run:
         if verified is None:
@@ -531,6 +535,7 @@ def _estimate_position(
     updates_triggers: bool,
     *,
     show_collateral: bool = False,
+    bind_collateral: bool = False,
 ) -> dict[str, Any]:
     state = None
     if lcd is not None and verified is not None:
@@ -554,6 +559,7 @@ def _estimate_position(
         trade_id,
         target=target,
         show_collateral=show_collateral,
+        bind_collateral=bind_collateral,
     )
 
 

@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import pytest
 from compare import INTENT_ID, timestamp
 from keeper_wire import WireRequest, graphql_request, same_variables
+from sai_cli.core.confirmation import preview_digest
 from sai_cli.tests.loopback import http_server
 from scenarios import (
     ADDRESS,
@@ -584,6 +585,13 @@ def test_position_update_dry_run(
                     "beforeUsd": "20.2",
                     "afterUsd": "10.1",
                 }
+                assert document["collateralBaseUnits"] == {
+                    "before": "20000000",
+                    "after": "10000000",
+                }
+                assert document.pop("previewDigest") == preview_digest(document)
+                document.pop("collateralBaseUnits")
+                document["previewDigest"] = preview_digest(document)
                 expected_wire += ["get_collateral_price"]
                 output = (json.dumps(document, sort_keys=True) + "\n").encode()
             outputs.append(output)

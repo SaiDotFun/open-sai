@@ -3621,3 +3621,44 @@ def test_cli_cancel_reuses_close_confirmation_and_pending_order_check(position_s
     assert accepted.exit_code == 0, accepted.output
     (submitted,) = position.submitted
     assert {key: submitted[key] for key in preview["intent"]} == preview["intent"]
+
+
+@pytest.mark.parametrize(
+    "changes_position", [False, True], ids=["oracle-tick", "position"]
+)
+def test_cli_leverage_confirmation_binds_only_collateral_quantities(
+    position_service, changes_position
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.fill_at_next_oracle_price = True
+    save_session(f"{base_url}/query")
+    args = position_cli_args(base_url, ["leverage", "7", "--leverage", "1.6"])
+    cli = CliRunner()
+    dry_run = cli.invoke(main, [*args, "--dry-run"])
+    assert dry_run.exit_code == 0, dry_run.output
+    original = json.loads(dry_run.stdout)
+    assert original["collateralBaseUnits"] == {"before": "4000000", "after": "5000000"}
+
+    if changes_position:
+        position.collateral = 8_000_000
+    position.collateral_price = "1.01"
+    dry_run = cli.invoke(main, [*args, "--dry-run"])
+    assert dry_run.exit_code == 0, dry_run.output
+    fresh = json.loads(dry_run.stdout)
+    assert fresh["collateral"]["afterUsd"] != original["collateral"]["afterUsd"]
+    result = cli.invoke(main, [*args, "--preview-digest", original["previewDigest"]])
+
+    if changes_position:
+        assert fresh["collateralBaseUnits"] == {
+            "before": "8000000",
+            "after": "10000000",
+        }
+        assert fresh["previewDigest"] != original["previewDigest"]
+        assert result.exit_code == ExitCode.REJECTED, result.output
+        assert json.loads(result.stdout)["error"]["code"] == "PREVIEW_MISMATCH"
+        assert not position.submitted
+    else:
+        assert fresh["previewDigest"] == original["previewDigest"]
+        assert result.exit_code == 0, result.output
+        assert len(position.submitted) == 1

@@ -567,6 +567,7 @@ def position_estimates(
     quoted_effective: Decimal | None = None,
     require_unchanged: bool = False,
     show_collateral: bool = False,
+    bind_collateral: bool = False,
 ) -> dict[str, Any]:
     """Quote leverage or TP/SL changes after checking the after-hours guard."""
     unknown = unavailable(
@@ -580,7 +581,14 @@ def position_estimates(
         raw = state.raw
         if target is not None:
             return _leverage_estimates(
-                lcd, state, trade_id, height, target, quoted_effective, show_collateral
+                lcd,
+                state,
+                trade_id,
+                height,
+                target,
+                quoted_effective,
+                show_collateral,
+                bind_collateral,
             )
         effective, _ = margin.leverage_inputs(lcd, state, trade_id, height=height)
         if effective is None:
@@ -624,6 +632,7 @@ def _leverage_estimates(
     target: Decimal,
     quoted_effective: Decimal | None,
     show_collateral: bool,
+    bind_collateral: bool,
 ) -> dict[str, Any]:
     raw, contract = state.raw, state.contract
     pair = contract_market(lcd, contract, raw["market_index"], height=height)
@@ -746,6 +755,11 @@ def _leverage_estimates(
             if not queued:
                 return rejected("InsufficientDepositBalance", funding)
             result["execution"]["warning"] = f"{funding} Perp checks funding at fill."
+    if bind_collateral:
+        result["collateralBaseUnits"] = {
+            "before": str(before),
+            "after": str(collateral),
+        }
     if show_collateral:
         collateral_price = margin.optional_collateral_price(lcd, state, height=height)
         result["collateral"] = margin.collateral_amounts(
