@@ -792,20 +792,23 @@ def _same_margin(raw: dict[str, Any], position: dict[str, Any]) -> bool:
     ) and float(str(raw.get("leverage"))) == float(position["leverage"])
 
 
+def margin_amount_usdc(amount: str) -> int:
+    requested = intents.positive(amount, "Margin amount")
+    scaled_amount = requested * 1_000_000
+    if scaled_amount != scaled_amount.to_integral_value():
+        raise ValueError("Margin amount must have at most six decimal places")
+    return int(scaled_amount)
+
+
 def margin_quote(
     raw: dict[str, Any],
     funds: dict[str, Any] | None,
     market: dict[str, Any],
     direction: str,
-    amount: str,
+    delta: int,
     *,
     effective_leverage: Decimal,
 ) -> dict[str, str]:
-    requested = intents.positive(amount, "Margin amount")
-    scaled_amount = requested * 1_000_000
-    if scaled_amount != scaled_amount.to_integral_value():
-        raise ValueError("Margin amount must have at most six decimal places")
-    delta = int(scaled_amount)
     collateral = int(raw["collateral_amount"])
     leverage_before = intents.positive(str(raw["leverage"]), "Current leverage")
     if effective_leverage <= 0:
