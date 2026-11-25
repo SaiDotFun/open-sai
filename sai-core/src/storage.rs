@@ -33,7 +33,11 @@ pub enum StorageError {
     #[error(
         "Earlier open intent {key} may still execute. Check its status with `{hint}` before retrying."
     )]
-    RecentOpenPending { key: String, hint: String },
+    RecentOpenPending {
+        key: String,
+        hint: String,
+        keys: Vec<String>,
+    },
     #[error("{0}")]
     Session(#[from] SessionError),
     #[error("{0}")]
@@ -45,6 +49,23 @@ pub enum StorageError {
 #[derive(Debug, Error)]
 #[error("{0}")]
 pub struct SessionError(pub SaiError);
+
+impl StorageError {
+    pub(crate) fn mcp_trade_error(self) -> SaiError {
+        let keys = match &self {
+            Self::RecentOpenPending { keys, .. } => Some(serde_json::json!(keys)),
+            _ => None,
+        };
+        let mut error = SaiError::from(self);
+        if let Some(keys) = keys {
+            error.details = Some(Box::new(serde_json::Map::from_iter([(
+                "intentKeys".into(),
+                keys,
+            )])));
+        }
+        error
+    }
+}
 
 impl SessionError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
@@ -65,7 +86,9 @@ impl From<StorageError> for SaiError {
             StorageError::InvalidSessionExpiry => {
                 Self::new(Code::SessionUnavailable, crate::session::INVALID_EXPIRY)
             }
-            StorageError::RecentOpenPending { ref key, ref hint } => SaiError {
+            StorageError::RecentOpenPending {
+                ref key, ref hint, ..
+            } => SaiError {
                 intent_key: Some(key.clone()),
                 hint: Some(hint.clone()),
                 ..Self::new(Code::RecentOpenPending, error.to_string())

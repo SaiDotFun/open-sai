@@ -32,8 +32,9 @@ def native() -> Path:
 
 
 class Stdio:
-    def __init__(self, proc: subprocess.Popen[bytes]):
+    def __init__(self, proc: subprocess.Popen[bytes], call_timeout: float = 3):
         self.proc = proc
+        self.call_timeout = call_timeout
         self.pending = bytearray()
 
     def write(self, raw: bytes) -> None:
@@ -68,7 +69,7 @@ class Stdio:
 
     def call(self, id_: int, name: str, **arguments: Any) -> dict[str, Any]:
         self.send("tools/call", id_=id_, name=name, arguments=arguments)
-        response = self.receive()
+        response = self.receive(self.call_timeout)
         assert response["id"] == id_
         return response["result"]
 
@@ -81,6 +82,7 @@ def server(
     *,
     seed: str = "empty",
     logs: bool = False,
+    call_timeout: float = 3,
 ) -> Iterator[Stdio]:
     seed_home(home, endpoints, seed)
     env = {**child_env(home, endpoints), "SAI_LOG": "1" if logs else "0"}
@@ -93,7 +95,7 @@ def server(
         stderr=subprocess.PIPE,
     ) as child:
         try:
-            stdio = Stdio(child)
+            stdio = Stdio(child, call_timeout)
             stdio.send(
                 "initialize",
                 id_=1,
@@ -101,7 +103,7 @@ def server(
                 capabilities={},
                 clientInfo={"name": "sai-regression", "version": "1"},
             )
-            assert stdio.receive()["id"] == 1
+            assert stdio.receive(call_timeout)["id"] == 1
             stdio.send("notifications/initialized")
             yield stdio
         finally:
@@ -319,8 +321,8 @@ def test_invalid_request_frames(native: Path, tmp_path: Path, use_python: bool) 
         assert stdio.receive() == {"jsonrpc": "2.0", "id": 4, "result": {}}
 
 
-@pytest.mark.parametrize("market_id", ["  -3.00 ", "01_1", "+02", 3.0, True])
-def test_trade_integer_coercion(
+@pytest.mark.parametrize("market_id", ["003", "0", 3])
+def test_trade_accepts_nonnegative_integers_and_ascii_digit_strings(
     native: Path, tmp_path: Path, market_id: object
 ) -> None:
     with (
@@ -339,7 +341,9 @@ def test_trade_integer_coercion(
             preview_digest="fixture",
         )
         assert result["isError"] is False
-        assert json.loads(result["content"][0]["text"])["code"] == "NOT_IMPLEMENTED"
+        body = json.loads(result["content"][0]["text"])
+        assert body["code"] == "INVALID_REQUEST"
+        assert body["error"].startswith("reference_price is required")
         assert not endpoints.wire
 
 
@@ -359,23 +363,10 @@ def validation_text(tool: str, *issues: tuple[str | None, str, str]) -> str:
 
 
 @pytest.mark.parametrize(
-    ("market_id", "detail", "code"),
-    [
-        (
-            1.5,
-            "Input should be a valid integer, got a number with a fractional part",
-            "int_from_float",
-        ),
-        (
-            "3e0",
-            "Input should be a valid integer, unable to parse string as an integer",
-            "int_parsing",
-        ),
-        ([], "Input should be a valid integer", "int_type"),
-    ],
+    "market_id", [-3, " 3", "3e0", "01_1", "+02", "٣", 3.0, True, []]
 )
 def test_trade_integer_rejections(
-    native: Path, tmp_path: Path, market_id: object, detail: str, code: str
+    native: Path, tmp_path: Path, market_id: object
 ) -> None:
     with (
         loopback("normal") as endpoints,
@@ -396,7 +387,14 @@ def test_trade_integer_rejections(
         assert result["content"] == [
             {
                 "type": "text",
-                "text": validation_text("trade_open", ("market_id", detail, code)),
+                "text": validation_text(
+                    "trade_open",
+                    (
+                        "market_id",
+                        "Value error, Expected a nonnegative integer or a string of ASCII digits",
+                        "value_error",
+                    ),
+                ),
             }
         ]
         assert "structuredContent" not in result

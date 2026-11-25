@@ -1378,12 +1378,24 @@ def loopback(
                             self.reject(f"Wrong LCD variables for {name}")
                             return
                         if scenario.startswith("quote-"):
+                            # Each MCP call can start another unpinned position
+                            # read before it pins its estimates to a block.
+                            last_position = next(
+                                (
+                                    index
+                                    for index in range(len(wire) - 1, -1, -1)
+                                    if wire[index].label == "trade"
+                                ),
+                                -1,
+                            )
+                            quote_reads = wire[last_position + 1 :]
                             pinned = name == "get_perp_prices" or any(
-                                request.label == "get_perp_prices" for request in wire
+                                request.label == "get_perp_prices"
+                                for request in quote_reads
                             )
                             anchor = name == "get_trade_raw" and any(
                                 request.label == "get_exchange_balance"
-                                for request in wire
+                                for request in quote_reads
                             )
                             if (
                                 pinned

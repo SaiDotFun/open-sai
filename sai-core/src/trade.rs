@@ -122,6 +122,25 @@ impl TradePreview {
         output
     }
 
+    /// Format the live terms a client can confirm over MCP.
+    pub fn mcp_preview_output(&self, account: Option<&str>) -> Value {
+        let mut output = self.cli_preview_output(account);
+        if self.intent.kind == "OPEN_TRADE" && account.is_none() {
+            output
+                .as_object_mut()
+                .expect("preview object")
+                .shift_remove("previewDigest");
+            output["confirmationStatus"] = json!("informational");
+            if output["estimates"]["execution"]["status"] != "would_be_rejected" {
+                output["recovery"] = json!({
+                    "action": "connect_and_preview",
+                    "message": "Connect a Sai account, then call preview_open again for that account.",
+                });
+            }
+        }
+        output
+    }
+
     /// Include only confirmations that the CLI can use to submit.
     pub fn cli_preview_output(&self, account: Option<&str>) -> Value {
         let mut output = self.output(account);
@@ -349,31 +368,40 @@ impl<'a> Trading<'a> {
         let account = session.addr();
         self.storage.check_active_trade(session, endpoint)?;
         let confirming = options.confirmation.is_some();
-        let cli_confirmation = options.confirmation.as_ref().filter(|confirmation| {
-            confirmation.is_cli()
+        let mcp_confirmation = options
+            .confirmation
+            .as_ref()
+            .is_some_and(Confirmation::is_mcp);
+        let live_confirmation = options.confirmation.as_ref().filter(|confirmation| {
+            (confirmation.is_cli() || confirmation.is_mcp())
                 && (matches!(
                     preview.intent.kind,
                     "OPEN_TRADE" | "CLOSE_POSITION" | "CANCEL_PENDING_TRADE"
                 ) || preview.is_standalone_position_update())
         });
-        let cli_preview = if let Some(confirmation) = cli_confirmation {
+        let confirmed_preview = if let Some(confirmation) = live_confirmation {
             Some(
-                self.prepare_cli_confirmation(session, preview, confirmation)
-                    .await?,
+                self.prepare_confirmation(
+                    session,
+                    preview,
+                    confirmation,
+                    options.allow_concurrent_open,
+                )
+                .await?,
             )
         } else {
             None
         };
-        let route = if cli_preview.is_none() {
+        let route = if confirmed_preview.is_none() {
             self.basic_trade_route(session, preview, confirming, options.confirmation.as_ref())
                 .await?
         } else {
             None
         };
-        let checked_route = route.is_some() || cli_preview.is_some();
+        let checked_route = route.is_some() || confirmed_preview.is_some();
         let market = preview.requires_market_price_refresh();
         let mut market_row = None;
-        let update = if cli_preview.is_none() && preview.is_standalone_position_update() {
+        let update = if confirmed_preview.is_none() && preview.is_standalone_position_update() {
             Some(
                 self.preflight_position_update(account, preview, options.confirmation.is_some())
                     .await?,
@@ -382,7 +410,7 @@ impl<'a> Trading<'a> {
             None
         };
         let mut prepared;
-        let preview = if let Some(preview) = &cli_preview {
+        let preview = if let Some(preview) = &confirmed_preview {
             preview
         } else if market || confirming && checked_route {
             prepared = preview.clone();
@@ -421,10 +449,13 @@ impl<'a> Trading<'a> {
             if let Some(update) = update {
                 return Err(self.update_refusal(account, update, error).await);
             }
-            if let Some(fresh) = error
-                .details
-                .as_deref_mut()
-                .and_then(|details| details.get_mut("preview"))
+            if confirmed_preview.is_none()
+                && let Some(fresh) = error
+                    .details
+                    .as_deref_mut()
+                    .and_then(|details| details.get_mut("preview"))
+                && !preview.margin_change
+                && preview.intent.kind != "DECREASE_POSITION_SIZE"
             {
                 let mut replacement = preview.clone();
                 self.estimate_preview(
@@ -438,7 +469,7 @@ impl<'a> Trading<'a> {
             }
             return Err(error);
         }
-        if cli_preview.is_some()
+        if confirmed_preview.is_some()
             || preview.margin_change
             || preview.intent.kind == "DECREASE_POSITION_SIZE"
         {
@@ -466,6 +497,8 @@ impl<'a> Trading<'a> {
                         hint: Some(status_hint(blocked)),
                         ..SaiError::from(error)
                     }
+                } else if mcp_confirmation {
+                    error.mcp_trade_error()
                 } else {
                     error.into()
                 }

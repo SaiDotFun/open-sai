@@ -1,6 +1,7 @@
 mod install;
 mod session;
 mod stdio;
+mod trade;
 mod validation;
 
 use std::{
@@ -168,6 +169,9 @@ impl SaiMcp {
         let storage = Storage::new(&self.env.home);
         let endpoint = self.settings.endpoint();
         let events = self.events().with_tool(name, call_id);
+        if let Some(action) = trade::Action::named(name) {
+            return self.trade(action, args, call_id).await;
+        }
         let keeper = Keeper::new(endpoint, events);
         let query = match name {
             "market_list" => keeper::MARKETS,
@@ -338,7 +342,9 @@ impl SaiMcp {
             match tokio::time::timeout(remaining, self.wait_slots.clone().acquire_owned()).await {
                 Ok(slot) => slot.map_err(|_| SaiError::internal())?,
                 // Admission expired before the worker could resolve an account.
-                Err(_) => return Ok(wait_result(Map::new(), wait::unknown_result(&key))),
+                Err(_) => {
+                    return Ok(wait_result(Map::new(), wait::unknown_result(&key)));
+                }
             };
         let home = self.env.home.clone();
         let endpoint = self.settings.endpoint().to_owned();
@@ -454,7 +460,10 @@ impl SaiMcp {
         };
         // FastMCP checks the session even for missing or malformed trade arguments.
         if name.starts_with("trade_") {
-            let addr = args.get("addr").and_then(Value::as_str);
+            let addr = args
+                .get("addr")
+                .and_then(Value::as_str)
+                .filter(|addr| !addr.is_empty());
             let state = session::StoredSession::load(
                 &Storage::new(&self.env.home),
                 self.settings.endpoint(),
@@ -476,7 +485,13 @@ impl SaiMcp {
         Ok(self
             .run_tool(name, &args, call_id)
             .await
-            .unwrap_or_else(|error| self.error(error)))
+            .unwrap_or_else(|error| {
+                if trade::Action::named(name).is_some() {
+                    trade::failure(&self.env.home, error)
+                } else {
+                    self.error(error)
+                }
+            }))
     }
 }
 
