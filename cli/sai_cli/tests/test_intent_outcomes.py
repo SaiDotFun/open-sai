@@ -17,6 +17,7 @@ from contextlib import closing, suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from multiprocessing.queues import Queue
 from pathlib import Path
 from typing import Any
@@ -1330,6 +1331,77 @@ def test_wait_times_out_with_unknown_and_keeps_pending_ledger(keeper_replay):
     assert clock.delays == [0.25, 0.5]
     assert status(endpoint) == "pending"
     assert log.tail(1, name="intent.wait.end")[0]["status"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("report_at", "exit_code"), [(33, 0), (60, 5)], ids=["late-success", "timeout"]
+)
+def test_trade_wait_budget(
+    connected_replay: tuple[str, deque[Reply]],
+    submitted_keys: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    report_at: int,
+    exit_code: int,
+) -> None:
+    endpoint, replies = connected_replay
+    clock = FakeClock()
+    monkeypatch.setattr(
+        wait,
+        "for_intent",
+        partial(wait.for_intent, clock=wait.Clock(clock.now, clock.sleep)),
+    )
+    pending = deepcopy(RESPONSES["pending_exec"])
+    completed = deepcopy(RESPONSES["filled"])
+    for reply in (pending, completed):
+        reply["data"]["userIntents"][0].update(
+            kind="UPDATE_TRADE", body={"requestedLeverage": "2"}
+        )
+    history = fill_history()
+    history["data"]["perp"]["tradeHistory"][0]["tradeChangeType"] = "leverage_updated"
+
+    def poll() -> dict[str, Any]:
+        if clock.now() >= report_at:
+            replies.append(history)
+            return completed
+        replies.append(poll)
+        return pending
+
+    replies.extend(("ack", poll))
+    result = CliRunner().invoke(
+        main,
+        [
+            "--endpoint",
+            endpoint,
+            "--json",
+            "trade",
+            "leverage",
+            "7",
+            "--leverage",
+            "2",
+            "--wait",
+        ],
+    )
+    remaining_replies = list(replies)
+    replies.clear()
+    assert result.exit_code == exit_code, result.output
+    document = json.loads(result.stdout)
+    assert submitted_keys == [document["intentKey"]]
+    assert document["receipt"]["requestBlock"] == 50109595
+    if exit_code == 0:
+        assert not remaining_replies
+        assert report_at <= clock.now() < 60
+        assert document["outcome"] == document["status"] == "succeeded"
+        execution = document["receipt"]["execution"]
+        assert execution["block"] == 50109596
+        assert execution["tradeChangeType"] == "leverage_updated"
+        assert status(endpoint) == "terminal"
+    else:
+        assert remaining_replies == [poll]
+        assert clock.now() == 60
+        assert document["outcome"] == document["status"] == "unknown"
+        assert document["code"] == document["error"]["code"] == "OUTCOME_UNKNOWN"
+        assert document["receipt"]["execution"] is None
+        assert status(endpoint) == "pending"
 
 
 def test_intent_wait_cli_returns_confirmed_failure(keeper_replay):

@@ -9,7 +9,6 @@ import select
 import signal
 import sqlite3
 import subprocess
-import sys
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -887,81 +886,6 @@ def test_trade_wait_interrupt_retains_reservation(
             assert not replies
             documents.append(normalized(document, key))
     assert documents[0] == documents[1]
-
-
-def test_python_trade_wait_reports_late_keeper_execution(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home = tmp_path / "sai"
-    kind = "UPDATE_TRADE"
-    keys: list[str] = []
-
-    def lcd(request: Request) -> Reply:
-        if request.path == "/":
-            return Reply(status=404)
-        return target_lcd(request)
-
-    with replay(get=lcd) as (endpoint, replies, requests):
-        connect(home, endpoint, monkeypatch)
-        report_at = 0.0
-
-        def admit(request: Request) -> Reply:
-            nonlocal report_at
-            key = submitted_key(request, kind)
-            keys.append(key)
-            report_at = time.monotonic() + 33
-            return accepted(key, kind)
-
-        def poll(request: Request) -> Reply:
-            assert json.loads(request.body) == {
-                "query": keeper.WAIT_INTENTS,
-                "variables": {"user": ADDR, "key": keys[0], "includeAction": True},
-            }
-            if time.monotonic() < report_at:
-                replies.append(poll)
-                step = "pending_exec"
-            else:
-                replies.append(
-                    response(
-                        history(indexed_update("leverage_updated", keys[0], LEVERAGE))
-                    )
-                )
-                step = "filled"
-            return response(
-                intent(step, intentKey=keys[0], kind=kind, body=UPDATES[LEVERAGE])
-            )
-
-        queue_update_preflight(replies)
-        replies.extend((admit, poll))
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "sai_cli.sai_cli",
-                *trade_wait_args(endpoint, LEVERAGE),
-            ],
-            env=cli_environment(home),
-            cwd=tmp_path,
-            capture_output=True,
-            check=False,
-            timeout=50,
-        )
-        assert (result.returncode, result.stderr) == (0, b""), result.stdout
-        document = json.loads(result.stdout)
-        key = document["intentKey"]
-        assert keys == [key]
-        assert document["outcome"] == document["status"] == "succeeded"
-        assert document["receipt"]["requestBlock"] == REQUEST_BLOCK
-        assert document["receipt"]["execution"]["block"] == FILL_BLOCK
-        assert document["receipt"]["execution"]["tradeChangeType"] == "leverage_updated"
-        assert ledger_state(home) == [(key, "terminal", "terminal")]
-        assert not replies
-        mutations = [
-            request
-            for request in requests
-            if request.body and json.loads(request.body)["query"].startswith("mutation")
-        ]
-        assert len(mutations) == 1
 
 
 def test_position_trade_wait_times_out(
