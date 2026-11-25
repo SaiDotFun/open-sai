@@ -71,7 +71,9 @@ def test_bare_leaf_prints_full_help_and_json_usage(
         if args == ("trade", "margin"):
             # The new option widens the option column and wraps other help text.
             without_cap = re.sub(
-                rb"(?m)^  --max-collateral-usd [^\n]*\n +[^\n]*\n", b"", help_text
+                rb"(?m)^  --max-collateral-usd [^\n]*\n(?: {4,}[^\n]*\n)*",
+                b"",
+                help_text,
             )
             return b" ".join(without_cap.split())
         return help_text

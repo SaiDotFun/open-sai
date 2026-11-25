@@ -1729,7 +1729,7 @@ def lcd_trade_settings(
 @click.option(
     "--max-collateral-usd",
     type=TRADE_DECIMAL,
-    help="Reduce a margin add to fit this estimated total collateral in USD.",
+    help="Cap the margin quote only. Actual collateral in USD can exceed this cap.",
 )
 @click.option(
     "--lcd-endpoint",
