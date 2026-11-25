@@ -149,6 +149,8 @@ fn main() -> process::ExitCode {
         .collect();
     let (command, operands) = command_path(&argv);
     let command = command.as_str();
+    let auth_attempt = command.split(' ').next() == Some("auth")
+        || (command.is_empty() && argv.iter().any(|arg| arg == "auth"));
     let environment = Environment::from_process();
     let home = environment.as_ref().ok().map(|env| env.home.as_path());
     let requested_json = json_requested(&argv);
@@ -214,20 +216,16 @@ fn main() -> process::ExitCode {
         if let Some(writer) = &writer
             && !log_started.replace(true)
         {
-            // A stray argument to import can contain a token.
-            let logged_argv = if command == "auth import" {
-                &argv[..argv.len() - operands.len()]
+            let logged_argv = if auth_attempt {
+                Field::argv(command.split_whitespace().map(str::to_owned))
             } else {
-                &argv
+                Field::argv(argv.iter().take(64).cloned())
             };
             writer.event(
                 surface,
                 "command.start",
                 Level::Info,
-                [
-                    ("command", command_field()),
-                    ("argv", Field::argv(logged_argv.iter().take(64).cloned())),
-                ],
+                [("command", command_field()), ("argv", logged_argv)],
             );
         }
     };
@@ -252,7 +250,14 @@ fn main() -> process::ExitCode {
                 ),
             }
         }
-        Err(error) => print_parse_error(&error, command, operands, requested_json, home),
+        Err(error) => print_parse_error(
+            &error,
+            command,
+            operands,
+            requested_json,
+            home,
+            auth_attempt,
+        ),
     };
     start_log();
     finish(
@@ -326,6 +331,7 @@ fn complete(
         eprintln!("Aborted!");
     } else {
         if error.exit_code == ExitCode::Usage
+            && error.show_usage
             && let Some(command) = usage_command
         {
             eprintln!(
@@ -470,15 +476,30 @@ fn context_text(error: &clap::Error, kind: ContextKind) -> Option<&str> {
     }
 }
 
+// Return a diagnostic that is safe for both terminal output and the log.
+fn auth_usage_error(error: &clap::Error, command: &str) -> SaiError {
+    let option = (error.kind() == ErrorKind::UnknownArgument)
+        .then(|| context_text(error, ContextKind::InvalidArg))
+        .flatten()
+        .filter(|arg| arg.starts_with('-'));
+    let message = if option == Some("--json") {
+        "No such option: --json"
+    } else if command == "auth import" {
+        "Unexpected arguments to auth import."
+    } else if option.is_some() {
+        "No such option for auth."
+    } else if error.kind() == ErrorKind::MissingRequiredArgument
+        && let Some(missing) = usage_error(error, command, &[])
+    {
+        return missing;
+    } else {
+        "Invalid arguments to auth."
+    };
+    SaiError::usage(message)
+}
+
 fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Option<SaiError> {
     let arg = context_text(error, ContextKind::InvalidArg);
-    if command == "auth import"
-        && !(error.kind() == ErrorKind::UnknownArgument
-            && arg == Some("--json")
-            && operands.first().is_some_and(|arg| arg == "--json"))
-    {
-        return Some(SaiError::usage("Unexpected arguments to auth import."));
-    }
     let message = match error.kind() {
         ErrorKind::InvalidSubcommand => {
             let command = context_text(error, ContextKind::InvalidSubcommand)?;
@@ -570,6 +591,7 @@ fn print_parse_error(
     operands: &[String],
     json: bool,
     home: Option<&Path>,
+    auth_attempt: bool,
 ) -> (ExitCode, Option<SaiError>) {
     let help = || {
         config::help(command)
@@ -674,6 +696,14 @@ fn print_parse_error(
         }
         _ => command,
     };
+    if auth_attempt {
+        return complete(
+            Err(auth_usage_error(error, command)),
+            Some(usage_command),
+            json,
+            home,
+        );
+    }
     if let Some(usage) = usage_error(error, usage_command, operands) {
         if !json && error.kind() == ErrorKind::InvalidValue && usage_command.is_empty() {
             eprintln!("Error: {}", usage.message);

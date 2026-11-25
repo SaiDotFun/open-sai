@@ -137,23 +137,23 @@ and follow the same recovery rules for `NOT_SENT`, `ADMISSION_REJECTED`,
 
 ## Digest Confirmation in MCP
 
-A preview for a connected account returns `previewDigest`. If a signed-out
-`preview_open` returns `addr: null`, preview again for the connected account
-after sign-in, then ask for confirmation. A `trade_*` call must send the
-confirmed preview's digest as
-input `preview_digest`, and a market `trade_open` must also send the
+For confirmation, use an account-bound preview with a `previewDigest`.
+If `preview_open` returns `recovery.action` set to `connect_and_preview`,
+connect an account and preview again. A `trade_*` call must pass the preview
+digest as input `preview_digest`, and a market `trade_open` must also pass the
 preview's `referencePrice` as `reference_price`. The server rebuilds the
 trade and refuses with `PREVIEW_MISMATCH` or `PRICE_MOVED` when the account,
 intent, position quote, or quoted price fails the confirmation check.
-Nothing is submitted on a refusal. Use the replacement `preview` only if
-Sai can verify the quote. For a partial close, check that
-`quote.collateralPriceUsd` has a value. A USDC estimate can still have a
-digest when that field is `null`.
+The server refuses submission. Show the replacement preview and ask for
+confirmation if it has a `previewDigest`. If the quote is unavailable,
+follow the result's recovery instructions.
 
-If the replacement is missing or lacks a verifiable quote, wait until Sai
-can verify the quote and call the matching `preview_*` tool again. Ask for
-confirmation only when the preview shows a verifiable quote, including the
-collateral price for a partial close. Discard the old digest.
+For a partial close, ask for confirmation when the preview has a digest
+and both `quote.effectiveLeverage` and `quote.collateralPriceUsd` have
+values. When effective leverage is unreadable, the preview gives a fallback
+estimate and omits the digest. An estimate may still carry a digest while
+the collateral price is `null`. If either value is missing, wait until it
+is readable and request a fresh preview.
 
 `PRICE_MOVED` is the quote check from rule 3. Passing it does not cap the
 fill at the confirmed price plus the slippage.
