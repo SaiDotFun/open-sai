@@ -291,15 +291,20 @@ if __name__ == "__main__":
 
 
 @pytest.mark.parametrize("selector", ["--reference", "SAI_PARITY_PYTHON"])
-def test_current_reference_selects_cancel_and_margin_fixtures(selector: str) -> None:
-    launcher = str(Path(sys.executable).with_name("sai"))
+def test_current_reference_selects_cancel_and_margin_fixtures(
+    selector: str, tmp_path: Path
+) -> None:
+    launcher = tmp_path / "sai-launcher"
+    installed_cli = shlex.quote(str(Path(sys.executable).with_name("sai")))
+    launcher.write_text(f'#!/bin/sh\nexec {installed_cli} "$@"\n', encoding="utf-8")
+    launcher.chmod(0o700)
     environment = {**os.environ}
     environment.pop("SAI_PARITY_BIN", None)
     options = ["--case", "trade-margin"]
     if selector == "--reference":
-        options.extend(("--reference", launcher))
+        options.extend(("--reference", str(launcher)))
     else:
-        environment[selector] = launcher
+        environment[selector] = str(launcher)
     run = run_driver("bare-help-trade-cancel", environment, *options)
     assert run.returncode == 0, run.stdout + run.stderr
     assert "(bare-help-trade-cancel) | PASS |" in run.stdout

@@ -1311,6 +1311,23 @@ def release_commands(reference: list[str]) -> set[str]:
     return set(names)
 
 
+def supports_current_trade_ux(reference: list[str]) -> bool:
+    """Probe the executable so installed launchers and wrappers both work."""
+    with (
+        tempfile.TemporaryDirectory(prefix="sai-reference-help-") as temp,
+        loopback("normal") as endpoints,
+    ):
+        home = Path(temp)
+        result = invoke(
+            reference, ["trade", "cancel", "--help"], home, child_env(home, endpoints)
+        )
+    return (
+        result.returncode == 0
+        and result.stdout.startswith("Usage: sai trade cancel")
+        and "--preview-digest" in result.stdout
+    )
+
+
 def project_position_estimates(value: Any) -> None:
     """Compare position quotes independently of Python's newer read-only estimates."""
     if isinstance(value, list):
@@ -1415,20 +1432,17 @@ def main() -> int:
     deferred: dict[str, str] = configured.get("deferred", {})
     commands = cli_commands(python_cli)
     try:
-        reference_commands = (
-            release_commands(reference)
-            if configured_reference is not None
-            else commands
-        )
         if args.cutover:
             require_manifest_case_ids(
                 (case.name for case in cases), HERE / "release-case-ids.txt"
             )
-            commands = commands | reference_commands
+            commands |= release_commands(reference)
+        # The cancel command and the current margin preview shipped together.
+        python_main = not comparing_release and (
+            configured_reference is None or supports_current_trade_ux(reference)
+        )
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         parser.error(str(exc))
-    # The new cancel command and the current margin preview shipped together.
-    python_main = not comparing_release and "trade cancel" in reference_commands
     missing = commands - ({case.command for case in cases} | deferred.keys())
     if missing:
         parser.error(
