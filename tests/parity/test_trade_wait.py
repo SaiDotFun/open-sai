@@ -42,6 +42,7 @@ from test_intent_wait import (
     indexed,
     intent,
     ledger_state,
+    with_timeout_warning,
 )
 from test_trade import rows
 from test_trade import run as run_trade
@@ -1127,6 +1128,10 @@ def test_position_trade_wait_deadlines(
             assert elapsed >= deadline_seconds - 1.5, elapsed
             assert document["outcome"] == document["status"] == "unknown"
             assert document["code"] == document["error"]["code"] == "OUTCOME_UNKNOWN"
+            if native:
+                hint = document["hint"]
+                assert hint == document["error"]["hint"]
+                assert hint.endswith(f"intent wait {key} --addr {ADDR}")
             assert document["receipt"]["execution"] is None
             assert ledger_state(home) == [(key, "unknown", "pending")]
         waits = [
@@ -1184,7 +1189,7 @@ def test_position_trade_wait_deadlines(
         for args, (reference, native) in zip(POSITION_ACTIONS, pairs, strict=True):
             reference_result, native_result = reference.result(), native.result()
             if args == TPSL:
-                assert reference_result == native_result
+                assert with_timeout_warning(reference_result) == native_result
 
 
 def test_trade_wait_recovers_when_stdout_closes(
