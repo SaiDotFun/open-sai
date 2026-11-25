@@ -12,6 +12,7 @@ aes = { version = "0.8", features = ["zeroize"] }
 aes-gcm = { workspace = true, features = ["zeroize"] }
 base64.workspace = true
 bech32.workspace = true
+bigdecimal = "0.4"
 chrono.workspace = true
 num-bigint.workspace = true
 openssl-probe.workspace = true

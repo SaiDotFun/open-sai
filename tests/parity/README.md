@@ -212,6 +212,21 @@ intent key can therefore differ even when both IDs have valid shapes.
 `LOG_VOLATILE_FIELDS` in `compare.py` assigns normalization rules to the
 volatile fields listed in `docs/log-events.json` and to generated intent keys.
 
+## Account Overview Reference
+
+The `account-overview-*` and `account-bare` cases use Python main at
+`20493c984e3398756365ea1a2b8786a7a0115a11`.
+The reference includes the cancellable LCD reads from PR #119 and the
+address-pinned renewal guidance from PRs #135 and #156. Rust CI installs
+it on Python 3.13.
+The three-position case compares gross PnL against the compensated
+`sum()` in Python 3.12 and later. Both implementations use the same
+summation on Python 3.11, the package's minimum supported interpreter.
+Set `SAI_PARITY_OVERVIEW_PYTHON` to its `sai` executable for local runs.
+The cases validate height-pinned requests and compare section errors,
+source timestamps, risk values, and persisted state. Fetch timestamps and
+ages are checked against the invocation and then normalized.
+
 ## Shared-Home Trade Replays
 
 The shared-state cases pin Python to commit
