@@ -891,7 +891,18 @@ def test_trade_confirmation_binds_verified_route(
             cli_preview = cli.invoke(main, [*cli_args, "--dry-run"])
             assert cli_preview.exit_code == 0, cli_preview.output
             digest = preview["previewDigest"]
-            assert json.loads(cli_preview.stdout)["previewDigest"] == digest
+            cli_document = json.loads(cli_preview.stdout)
+            cli_digest = cli_document["previewDigest"]
+            assert cli_document["positionRoute"] == preview["positionRoute"]
+            if tool == "leverage":
+                assert "collateralBaseUnits" not in preview
+                assert cli_document["collateralBaseUnits"] == {
+                    "before": "4000000",
+                    "after": "2666666",
+                }
+                assert cli_digest != digest
+            else:
+                assert cli_digest == digest
             assert preview["positionRoute"] == {
                 "chainId": CHAIN_ID,
                 "contractAddress": "nibi1contract",
@@ -904,7 +915,7 @@ def test_trade_confirmation_binds_verified_route(
 
             setattr(position, field, value)
             cli_refusal = cli.invoke(
-                main, [*cli_submit_args, "--preview-digest", digest]
+                main, [*cli_submit_args, "--preview-digest", cli_digest]
             )
             assert cli_refusal.exit_code == ExitCode.REJECTED, cli_refusal.output
             cli_error = json.loads(cli_refusal.stdout)["error"]
@@ -915,7 +926,9 @@ def test_trade_confirmation_binds_verified_route(
 
             if field == "contract_address" and tool != "open":
                 position.contract_position_unavailable = True
-                cli_refusal = cli.invoke(main, [*cli_args, "--preview-digest", digest])
+                cli_refusal = cli.invoke(
+                    main, [*cli_args, "--preview-digest", cli_digest]
+                )
                 assert cli_refusal.exit_code == ExitCode.REJECTED, cli_refusal.output
                 assert (
                     json.loads(cli_refusal.stdout)["error"]["code"]
@@ -943,8 +956,16 @@ def test_trade_confirmation_binds_verified_route(
                     "chainId": position.chain_id,
                     "contractAddress": position.contract_address,
                 }
+                fresh_cli_digest = fresh["previewDigest"]
+                if tool == "leverage":
+                    fresh_cli = cli.invoke(main, [*cli_args, "--dry-run"])
+                    assert fresh_cli.exit_code == 0, fresh_cli.output
+                    fresh_cli_document = json.loads(fresh_cli.stdout)
+                    assert fresh_cli_document["positionRoute"] == fresh["positionRoute"]
+                    fresh_cli_digest = fresh_cli_document["previewDigest"]
+                    assert fresh_cli_digest != cli_digest
                 accepted = cli.invoke(
-                    main, [*cli_submit_args, "--preview-digest", fresh["previewDigest"]]
+                    main, [*cli_submit_args, "--preview-digest", fresh_cli_digest]
                 )
                 assert accepted.exit_code == 0, accepted.output
                 assert json.loads(accepted.stdout)["status"] == "accepted"

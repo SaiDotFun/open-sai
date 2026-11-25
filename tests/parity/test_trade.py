@@ -139,6 +139,16 @@ def test_cli_dry_run_digest_matches_python_main(
                 assert digest == preview_digest(preview)
             else:
                 assert digest is None
+            if args[:2] == ("trade", "leverage"):
+                if index == 0:
+                    # Issue 231 tracks the extra digest terms against current Python.
+                    assert preview.pop("collateralBaseUnits") == {
+                        "before": "10000000",
+                        "after": "10999999",
+                    }
+                    digest = preview_digest(preview)
+                else:
+                    assert "collateralBaseUnits" not in preview
             confirmations.append((preview["positionRoute"], digest))
             assert not endpoints.errors
             assert not rows(home)

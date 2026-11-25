@@ -510,6 +510,9 @@ def _position_intent(
         )
         if collateral := values.pop("collateralBaseUnits", None):
             quoted_preview["collateralBaseUnits"] = collateral
+        elif show_collateral and not dry_run and before_submit is not None:
+            # A definitive rejection may arrive before Perp can quote collateral.
+            _reject_execution(quoted_preview, values, addr)
         return values
 
     if dry_run:
