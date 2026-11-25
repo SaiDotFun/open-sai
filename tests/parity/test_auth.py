@@ -186,7 +186,8 @@ def test_auth_logs_omit_argument_values(
     parse_error: str | None,
 ) -> None:
     marker = "synthetic-auth-argument-value"
-    for env in homes(tmp_path, auth_privacy_pair):
+    python, rust = homes(tmp_path, auth_privacy_pair)
+    for env in (python, rust):
         env.extra_env["SAI_LOG"] = "1"
         result = env.run(*(arg.replace("{private}", marker) for arg in args))
         assert_unexposed(env, result.stdout + result.stderr, marker)
@@ -203,7 +204,7 @@ def test_auth_logs_omit_argument_values(
         assert start["argv"] == command_words
         if parse_error is not None:
             [end] = [event for event in events if event["event"] == "command.end"]
-            assert end["error"] == parse_error
+            assert end["error"] == (parse_error if env is python else "[redacted]")
 
 
 @pytest.mark.parametrize(
