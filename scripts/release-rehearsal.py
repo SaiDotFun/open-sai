@@ -1595,17 +1595,17 @@ def rehearse_native(root: Path, assets: NativeAssets, diagnostics: Path | None) 
         raise RehearsalError(
             "Native cutover requires a loopback-only network namespace"
         )
-    tool.env.update(UV_PYTHON=sys.executable, UV_PYTHON_DOWNLOADS="never")
-    for wheel in (assets.baseline, assets.bridge):
-        tool.run(
-            f"Cache dependencies for {wheel.name}",
-            tool.uv,
-            "pip",
-            "install",
-            "--target",
-            root / "dependency-cache",
-            wheel,
-        )
+    host_cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    cache = Path(os.environ.get("UV_CACHE_DIR") or host_cache / "uv").resolve()
+    require(
+        cache.is_dir(), "Prepare the offline uv cache using the README instructions"
+    )
+    tool.env.update(
+        UV_CACHE_DIR=str(cache),
+        UV_OFFLINE="1",
+        UV_PYTHON=sys.executable,
+        UV_PYTHON_DOWNLOADS="never",
+    )
     print(
         f"Native candidate {assets.archive.name}, SHA-256 "
         f"{release_install.file_digest(assets.archive)}.",

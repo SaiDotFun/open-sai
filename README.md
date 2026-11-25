@@ -438,11 +438,27 @@ sha256sum "$cutover/native/sai-0.2.4-$target.tar.gz"
 The loopback shim must match the archive's version. Record the source
 revision and archive digest with the rehearsal output. Download the baseline
 wheel and build the full Python bridge from the checkout under review.
+Prepare uv's dependency cache as a separate step with network access.
+Use the same Python interpreter and cache for the rehearsal.
 
 ```bash
 gh release download sai-cli/v0.1.3 --repo SaiDotFun/open-sai \
   --pattern '*.whl' --pattern SHA256SUMS --dir "$cutover/published"
 python3 scripts/build-bridge.py --version 0.1.4 --out-dir "$cutover/bridge"
+export UV_CACHE_DIR="$cutover/uv-cache"
+for wheel in "$cutover/published/"*.whl "$cutover/bridge/"*.whl; do
+  uv --no-config pip install --python "$(command -v python3)" \
+    --default-index https://pypi.org/simple --only-binary :all: \
+    --target "$cutover/prefetch" "$wheel"
+done
+```
+
+Run the rehearsal with that cache. All installs, CLI commands, and MCP
+checks run in the loopback-only namespace with uv offline. The rehearsal
+exits if the namespace is unavailable or the offline install fails.
+When `UV_CACHE_DIR` is unset, it uses the host's default uv cache.
+
+```bash
 python3 scripts/release-rehearsal.py --verbose \
   --published-assets "$cutover/published" \
   --bridge-wheel "$cutover/bridge/sai_cli-0.1.4-py3-none-any.whl" \
@@ -450,8 +466,6 @@ python3 scripts/release-rehearsal.py --verbose \
   "$cutover/native/sai_cli-0.2.4-py3-none-any.whl"
 ```
 
-The script prefetches Python dependencies before entering the required
-loopback-only namespace. CLI installs and MCP checks run inside it.
 The script installs the published wheel with uv, updates to the bridge
 and then to the native shim, and rolls back using the native updater.
 The same uv launcher and temporary profile are used throughout.
