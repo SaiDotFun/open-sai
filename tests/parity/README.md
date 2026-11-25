@@ -91,9 +91,14 @@ expiry in text and JSON against the native auth implementation from
 disable logging. The auth regression tests check output and log redaction
 directly, including Python MCP stdio responses.
 
-The `auth-use-missing` case checks the fixed diagnostic for an
-unregistered account. The auth privacy comparison checks that command logs
-contain only the command words.
+The `auth-use-missing` case keeps its release exception because Rust uses
+the fixed diagnostic from Python main. Python v0.1.2 echoed the unregistered
+account operand in the error.
+
+For `auth use` and `auth logout`, the focused log tests compare each command
+start, session event, and command end against the release. Rust records only
+the command words in `argv`, following Python main's auth privacy behavior.
+Python v0.1.2 records the address operand and flags.
 
 ## Native Distribution
 

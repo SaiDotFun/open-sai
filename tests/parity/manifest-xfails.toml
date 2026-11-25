@@ -91,6 +91,7 @@ signature = "5219af5b19ddc2160975b3fdcad6f0369df5e397ce7c2b0d57bf68c5bb2e0264"
 
 [gap."case:auth-use-missing"]
 owner = "#213"
+# Keep the fixed diagnostic from Python main. The release echoes the operand.
 signature = "a5a3b63e5e796da8b5dea0a7978511ab96dcc1925e743e83475668032cf065cf"
 
 [gap."case:config-invalid-value"]
