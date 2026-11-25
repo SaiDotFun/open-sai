@@ -85,6 +85,24 @@ The `auth-use-missing` case checks the fixed diagnostic for an
 unregistered account. The auth privacy comparison checks that command logs
 contain only the command words.
 
+## Native Distribution
+
+The Native Distribution workflow installs the built shim wheel with uv on
+each native target and serves the matching archive over loopback. Build the
+loopback-only wheel with `python scripts/native-dist.py rehearsal-wheel DIR`.
+Set `SAI_NATIVE_WHEEL` and `SAI_NATIVE_ARCHIVE` to the rehearsal wheel and archive paths to run
+`uv run --locked pytest tests/parity/test_native_distribution.py`. If uv
+is exposed through a version manager, set `UV` to the uv executable itself.
+Set `SAI_NATIVE_RELEASE_WHEEL` to the official-source wheel to check that it
+ignores the loopback override. The CI bundle contains the official-source wheel.
+
+The Linux x86_64 job also tests upgrade and offline rollback against the
+published Python release `sai-cli/v0.1.1` at commit
+`9ee5a356fd41a22697483e467652d367035909bd`. To run that case locally, set
+`SAI_NATIVE_BASELINE` to a directory with the published wheel and
+`SHA256SUMS`, `scripts/install.py` from the pinned commit as `install.py`,
+and the commit SHA in a file named `commit`.
+
 ## Compare MCP Stdio
 
 Check out Python commit `ea09f0d417a53a71079bb8c5e426005fa29051a4` in a
@@ -348,6 +366,25 @@ The C9a cases compare against Python main at
 `SAI_PARITY_BIN` to the Rust binary. With `SAI_C9A_PYTHON` unset, the
 driver uses the Python entry point from its own environment.
 
+Doctor cases that query `node_info` use the checkout's Python entry point.
+The LCD comparison contract comes from Python main at
+`59a694fc3bebcf18954de864d9aa8e009a8ac558`. The native CI gate runs
+`--case doctor-network --case 'doctor-lcd-*'`. These cases cover matching
+chains, a missing Keeper chain ID, a reflected LCD path, an unreachable
+LCD, and malformed chain IDs. The driver compares the CLI streams byte
+for byte after masking the temporary home path, report timestamp, probe
+and check durations, and each implementation's package version.
+
+The invalid-chain cases pin exit 1 in both modes when `node_info` returns
+a nonempty malformed chain ID. Earlier Rust reported a warning and exited
+0 in this fixture. Current Rust treats it as a failed LCD check, matching
+Python.
+
+The logging-enabled mismatch case checks the LCD warning event and scans
+the raw logs for the fixture path. It allows the existing difference in
+the Keeper probe event, where Python includes `command` and `commandId`
+and Rust omits both fields.
+
 The `client_seed` key supplies private Claude Code, Codex, and Cursor
 configs. The runner uses fixture programs for client subprocesses and
 compares their arguments, file modes, config values, Codex comments, and
@@ -360,8 +397,8 @@ original bytes and mode. The pinned Python reference leaves the replacement
 on disk.
 
 The `lcd-origin-only` cases project the LCD endpoint in Python's report to
-its origin before comparing it with Rust. They cover successful probes and
-an unavailable LCD with a private path. Rust output is compared as emitted.
+its origin before comparing it with Rust. The byte-comparison cases use
+Python's origin-only report directly.
 
 ## TP/SL and Leverage
 

@@ -36,6 +36,7 @@ from compare import (
     config_text,
     first_difference,
     ledger,
+    mask_doctor_stream,
     mask_overview_stdout,
     rewrite_mcp_fields,
     snapshot,
@@ -512,6 +513,8 @@ def observe(
     display = result.stdout
     if case.command == "account overview" and case.mode == "text":
         display = mask_overview_stdout(display, case.mode)
+    if case.command == "doctor" and case.exact_output and case.mode == "text":
+        display = mask_doctor_stream(display)
     try:
         output = stdout(display, case.mode, case.command, normalize)
         if contender:
@@ -563,12 +566,18 @@ def observe(
         # the two source times allocated by the overview fixture.
         output = clocks.paths(output)
         display = clocks.text(display)
+    diagnostic = result.stderr
+    if case.command == "doctor" and case.exact_output:
+        if case.mode == "json":
+            display = mask_doctor_stream(display)
+        display = normalize.text(display)
+        diagnostic = normalize.text(mask_doctor_stream(diagnostic))
     raw = None
     if exact:
         raw = (
-            (normalize.text(display).encode(), normalize.text(result.stderr).encode())
+            (normalize.text(display).encode(), normalize.text(diagnostic).encode())
             if cutover
-            else (display.encode(), result.stderr.encode())
+            else (display.encode(), diagnostic.encode())
         )
     return Observation(result.returncode, output, stderr, files, raw, tuple(checks))
 
@@ -817,6 +826,24 @@ def project_reference_lcd_origin(output: dict[str, Any]) -> None:
         )
 
 
+def project_reference_doctor_keeper_log(left: Observation, right: Observation) -> None:
+    """Allow the existing omission of command context on Rust's Keeper probe."""
+    name = "logs/cli.jsonl"
+    if (reference := left.files.get(name)) is None or (
+        native := right.files.get(name)
+    ) is None:
+        return
+    for expected, actual in zip(reference.data, native.data, strict=False):
+        if (
+            expected.get("event") == actual.get("event") == "keeper.request"
+            and expected.get("command") == "doctor"
+            and "command" not in actual
+            and "commandId" not in actual
+        ):
+            del expected["command"]
+            expected.pop("commandId", None)
+
+
 def run_case(
     case: Case,
     reference: list[str],
@@ -877,6 +904,11 @@ def run_case(
         )
     if candidate != reference and case.accepted_divergence == "lcd-origin-only":
         project_reference_lcd_origin(left.output)
+    if (
+        candidate != reference
+        and case.accepted_divergence == "doctor-keeper-log-context"
+    ):
+        project_reference_doctor_keeper_log(left, right)
     expected = None
     if case.mode == "mcp" and reference != candidate and not cutover:
         expected = expect_native_mcp_info(
@@ -1043,9 +1075,8 @@ def main() -> int:
     if not selected:
         parser.error("No parity cases matched")
     candidate = reference
-    c9a_python = os.environ.get("SAI_C9A_PYTHON") or str(
-        Path(sys.executable).with_name("sai")
-    )
+    checkout_python = str(Path(sys.executable).with_name("sai"))
+    c9a_python = os.environ.get("SAI_C9A_PYTHON") or checkout_python
     if "SAI_PARITY_BIN" in os.environ:
         executable = shutil.which(os.environ["SAI_PARITY_BIN"])
         if not executable:
@@ -1090,6 +1121,8 @@ def main() -> int:
             oracle = [str(Path(overview_reference).absolute())]
         elif case.mode == "mcp":
             oracle = mcp_reference
+        elif case.command == "doctor" and "node_info" in (case.wire or []):
+            oracle = [checkout_python]
         elif case.client_seed or case.command in {"doctor", "mcp install", "mcp list"}:
             # Launch directly so uv cannot shadow the fixture launcher on PATH.
             oracle = [c9a_python]

@@ -64,7 +64,13 @@ doctor-fix
 doctor-invalid-endpoint
 doctor-invalid-endpoint-text
 doctor-keeper-error-codes
+doctor-lcd-chain-mismatch
+doctor-lcd-chain-mismatch-text
+doctor-lcd-invalid-chain
+doctor-lcd-invalid-chain-text
+doctor-lcd-unknown-keeper-chain
 doctor-lcd-unreachable
+doctor-lcd-unreachable-text
 doctor-ledger-v0-inspect
 doctor-ledger-v0-migrate
 doctor-malformed-toml
@@ -110,7 +116,7 @@ mcp-info-public-endpoints
 mcp-initialize-legacy
 mcp-initialize-newer
 mcp-install-all
-mcp-install-claude-repair
+mcp-install-claude-repair-legacy
 mcp-install-dry-run
 mcp-install-empty-scope
 mcp-install-invalid-scope

@@ -36,6 +36,10 @@ SQLITE_SCHEMA_REQUIREMENT = (
 )
 SIDECARS = ("-wal", "-shm", "-journal")
 DURATION = re.compile(r"(?<= in )\d+(?= ms\b)")
+DOCTOR_GENERATED_AT = re.compile(r'("generatedAt":)"([^"\\]+)"')
+DOCTOR_DURATION_MS = re.compile(r'(?<="durationMs":)(?:0|[1-9]\d*)(?=[,}])')
+DOCTOR_BUILD_VERSION = re.compile(rf'("(?:version|installed)":"){VERSION.pattern}(?=")')
+DOCTOR_DISPLAY_VERSION = re.compile(rf"(?<=sai ){VERSION.pattern}(?=[ ;]|$)")
 INTENT_ID = re.compile(r"\b\d{8}T\d{9}Z_[0-9A-HJKMNP-TV-Z]{16}\b")
 TOML_TABLE = re.compile(r"\s*\[([^\[\]]+)\]\s*(?:#.*)?")
 SQLITE_TRIVIA = r"[ \t\n\f\r]+|--[^\n]*|/\*[\s\S]*?(?:\*/|$)"
@@ -279,7 +283,16 @@ class Normalize:
         if result.get("event") == "command.end" and isinstance(
             result.get("error"), str
         ):
-            result["error"] = self.intent_refs(result["error"])
+            error = result["error"]
+            # A command hint can be clipped by logging midway through a
+            # fixture path, before the full home can be normalized.
+            message, separator, omitted = error.rpartition("... [")
+            if separator and re.fullmatch(r"[0-9]+ more characters\]", omitted):
+                parent = f"{Path(self.home).parent}/"
+                index = message.rfind(parent)
+                if index >= 0 and self.home.startswith(message[index:]):
+                    error = f"{message[:index]}<HOME>{separator}{omitted}"
+            result["error"] = self.intent_refs(error)
         return result
 
     def log_records(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -363,6 +376,18 @@ def doctor_report(value: dict[str, Any]) -> None:
         replace_if(sai, "version", is_version)
         if isinstance(install := sai.get("install"), dict):
             doctor_provenance(install)
+
+
+def mask_doctor_stream(raw: str) -> str:
+    """Mask clock and build values without changing serialization or layout."""
+    raw = DOCTOR_GENERATED_AT.sub(
+        lambda match: f'{match[1]}"<generatedAt>"' if timestamp(match[2]) else match[0],
+        raw,
+    )
+    raw = DOCTOR_DURATION_MS.sub('"<durationMs>"', raw)
+    raw = DOCTOR_BUILD_VERSION.sub(r"\g<1><version>", raw)
+    raw = DOCTOR_DISPLAY_VERSION.sub("<version>", raw)
+    return DURATION.sub("<durationMs>", raw)
 
 
 def rewrite_mcp_fields(text: str, updates: dict[str, Any]) -> str:

@@ -12,19 +12,21 @@ import socket
 import sqlite3
 import ssl
 import subprocess
+import tempfile
 import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager, suppress
 from dataclasses import asdict, dataclass
+from functools import cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from stat import S_IMODE
 from typing import Any
 
 import pytest
-from compare import Normalize, validate_log_endpoint_key
+from compare import Normalize, is_version, validate_log_endpoint_key
 from release_mismatch import assert_release_equal
 from sai_cli.core import keeper, log, storage
 from sai_cli.tests.loopback import graphql_ws
@@ -451,24 +453,37 @@ def test_c11_first_write_restores_owner_directory_mode(
     assert profiles[0] == profiles[1]
 
 
-def read_events(home: Path) -> list[dict[str, Any]]:
+@cache
+def cli_version(cli: CLI) -> str:
+    with tempfile.TemporaryDirectory(prefix="sai-parity-version-") as directory:
+        result = invoke(cli, Path(directory) / "sai", "--version")
+    assert result.returncode == 0, result.stderr
+    version = result.stdout.decode().split()[-1]
+    assert is_version(version)
+    return version
+
+
+def read_events(home: Path, cli: CLI | None = None) -> list[dict[str, Any]]:
     events = [
         json.loads(line)
         for path in sorted((home / "logs").glob("*.jsonl"))
         for line in path.read_bytes().splitlines()
     ]
     groups: dict[str, list[int]] = {}
+    version = cli_version(cli) if cli is not None else None
     for event in events:
+        if version is not None:
+            assert event["version"] == version
         groups.setdefault(event["runId"], []).append(event["seq"])
     assert all(seq == list(range(1, len(seq) + 1)) for seq in groups.values())
     return events
 
 
-def normalized_events(home: Path) -> list[dict[str, Any]]:
+def normalized_events(home: Path, cli: CLI | None = None) -> list[dict[str, Any]]:
     normalize = Normalize(home)
     # The request and ledger assertions use this fixed fixture key.
     normalize.identity("intentKey", KEY)
-    return normalize.log_records(read_events(home))
+    return normalize.log_records(read_events(home, cli))
 
 
 def test_log_events_detect_wrong_fixture_intent_key(tmp_path: Path) -> None:
@@ -641,7 +656,7 @@ def compare(
                     }
                 )
                 replies.clear()
-            observed.append({"runs": runs, "logs": normalized_events(home)})
+            observed.append({"runs": runs, "logs": normalized_events(home, cli)})
         assert_release_equal(*observed)
 
 
@@ -980,7 +995,8 @@ def test_c11_intent_status_skips_null_records(
             assert intent["lifecycleStep"] == "intent_start"
         else:
             assert document == {"userIntents": []}
-            assert all(event["event"] != "intent.keeper" for event in read_events(home))
+            events = read_events(home, cli)
+            assert all(event["event"] != "intent.keeper" for event in events)
         # Even an expired local reservation stays unknown when Keeper sent
         # a nonempty list with no usable record.
         assert read_state(home)[1:] == ledger
@@ -1038,7 +1054,7 @@ def test_intent_status_logs_only_public_graphql_codes(
                 assert document["outcome"] == "pending"
             [event] = [
                 event
-                for event in normalized_events(home)
+                for event in normalized_events(home, cli)
                 if event["event"] == "keeper.request"
                 and event["operation"] == operation
             ]
@@ -1075,7 +1091,7 @@ def test_connection_refused(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
             assert result.stderr == b""
             assert json.loads(result.stdout)["error"]["code"] == "NOT_SENT"
             assert not (home / "trader").exists()
-            outputs.append((result.stdout, normalized_events(home)))
+            outputs.append((result.stdout, normalized_events(home, cli)))
         assert outputs[0] == outputs[1]
 
 
@@ -1223,7 +1239,7 @@ def test_expired_auth_status(
         assert payload["error"]["code"] == "SESSION_EXPIRED"
         login = origin_login_hint(origin if index == 1 else None)
         assert payload["error"].pop("hint") == f"{login} --addr {ADDR}"
-        observed.append({"stdout": payload, "logs": normalized_events(home)})
+        observed.append({"stdout": payload, "logs": normalized_events(home, cli)})
     assert_release_equal(*observed)
 
 
@@ -1543,7 +1559,7 @@ def assert_watch_disconnect(
     )
     assert [
         (event["level"], event["code"], event["errorType"], event["endpoint"])
-        for event in read_events(home)
+        for event in read_events(home, cli)
         if event["event"] == "watch.disconnected"
     ] == [("warn", "STREAM_ERROR", error_type, ws.removesuffix("/query"))]
 
