@@ -1,15 +1,18 @@
 use std::{
-    fs::{self, DirBuilder, File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io,
     net::Ipv6Addr,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use thiserror::Error;
 
-use crate::errors::{Code, SaiError};
+use crate::{
+    errors::{Code, SaiError},
+    paths,
+};
 
 mod ledger;
 mod sessions;
@@ -243,11 +246,8 @@ impl<'a> Storage<'a> {
     }
 
     fn directory(&self) -> io::Result<&Path> {
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&self.trader)?;
-        fs::set_permissions(&self.trader, fs::Permissions::from_mode(0o700))?;
+        paths::profile(self.trader.parent().expect("trader has a profile parent"))?;
+        paths::managed(&self.trader)?;
         Ok(&self.trader)
     }
 }

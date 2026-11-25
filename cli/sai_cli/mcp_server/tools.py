@@ -120,6 +120,37 @@ def error(message: str, code: str, **extra: Any) -> dict[str, Any]:
     return {"error": message, "code": code, **extra}
 
 
+def preview_mismatch(
+    message: str, preview: dict[str, Any] | None = None, **extra: Any
+) -> dict[str, Any]:
+    if preview is None or "previewDigest" not in preview:
+        return error(
+            message,
+            Code.PREVIEW_MISMATCH,
+            quoteStatus="unavailable",
+            recovery={
+                "action": "request_preview",
+                "message": (
+                    "Check the reported cause. If the trade is still possible, call"
+                    " the matching preview tool and get confirmation before retrying."
+                ),
+            },
+            **({"preview": preview} if preview is not None else {}),
+            **extra,
+        )
+    return error(
+        message,
+        Code.PREVIEW_MISMATCH,
+        preview=preview,
+        quoteStatus="available",
+        recovery={
+            "action": "confirm_preview",
+            "message": "Show the replacement preview and get confirmation before retrying.",
+        },
+        **extra,
+    )
+
+
 def describe(exc: Exception) -> dict[str, Any]:
     """Format the shared classification using the MCP response fields."""
     failure = describe_error(exc)
@@ -142,25 +173,28 @@ def describe(exc: Exception) -> dict[str, Any]:
             intentKeys=exc.keys,
         )
     if isinstance(exc, Refused):
-        extra = {} if exc.preview is None else {"preview": exc.preview}
         reason = estimates.rejection_reason((exc.preview or {}).get("estimates", {}))
+        if failure.code == Code.PREVIEW_MISMATCH:
+            return preview_mismatch(reason or failure.message, exc.preview, **exc.extra)
+        extra = {} if exc.preview is None else {"preview": exc.preview}
         return error(reason or failure.message, failure.code, **extra, **exc.extra)
     if isinstance(exc, trading.ExecutionRejected):
-        return error(failure.message, failure.code, preview=exc.preview)
+        return preview_mismatch(failure.message, exc.preview)
     if isinstance(exc, trading.PositionChanged):
         if exc.preview is None:
-            return error(failure.message, Code.PREVIEW_MISMATCH)
+            return preview_mismatch(failure.message)
         reason = estimates.rejection_reason(exc.preview.get("estimates", {}))
-        return error(
+        return preview_mismatch(
             reason
             or (
                 "The position, quote, or route changed during confirmation, so nothing was"
                 " submitted. Show the user the latest preview, get their confirmation"
                 " again, then retry with its previewDigest."
             ),
-            Code.PREVIEW_MISMATCH,
-            preview=confirmation.with_digest(exc.preview),
+            confirmation.with_digest(exc.preview),
         )
+    if failure.code == Code.PREVIEW_MISMATCH:
+        return preview_mismatch(failure.message)
     if isinstance(exc, storage.IntentReservationError):
         if key := failure.intent_key:
             return error(
@@ -625,7 +659,18 @@ def open_trade(
     )
     if notices:
         result["notices"] = notices
-    return finish(load, dry_run, result)
+    if not dry_run:
+        return finish(load, dry_run, result)
+    preview = {**result, "addr": load.account()}
+    if preview["addr"] is not None:
+        return confirmation.with_digest(preview)
+    preview["confirmationStatus"] = "informational"
+    if estimates.rejection_reason(result.get("estimates", {})) is None:
+        preview["recovery"] = {
+            "action": "connect_and_preview",
+            "message": "Connect a Sai account, then call preview_open again for that account.",
+        }
+    return preview
 
 
 def close_trade(
@@ -748,4 +793,7 @@ def partial_close(
         dry_run=dry_run,
         before_submit=check,
     )
+    quote = result.get("quote")
+    if dry_run and quote is not None and quote.get("effectiveLeverage") is None:
+        return {**result, "addr": load.account()}
     return finish(load, dry_run, result)
