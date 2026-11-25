@@ -480,10 +480,12 @@ def test_doctor_reports_exact_claude_repairs_for_each_scope(env: Env, monkeypatc
     for scope in ("user", "project", "local"):
         assert f"Remove the existing {scope} sai entry" in check["fix"]
         assert "claude mcp remove" not in check["fix"]
-        add = (
-            f"claude mcp add --scope {scope} sai --env=SAI_HOME={home}"
-            f" -- {shlex.quote(str(env.sai))} mcp serve"
-        )
+        add = f"claude mcp add --scope {scope} sai --env=SAI_HOME={home}"
+        if scope != "local":
+            add += " '--env=<NAME>=<value>'"
+        add += f" -- {shlex.quote(str(env.sai))} mcp serve"
+        if scope != "local":
+            add += " --endpoint '<original-argument>'"
         assert any(add in command for command in commands)
     assert (
         f"sai mcp install --client claude --scope local --repair-existing {OLD_COMMAND}"
@@ -1447,6 +1449,7 @@ def test_claude_report_names_the_relative_config_without_changing_directory(
         "--scope",
         "local",
         "sai",
+        "--env=<NAME>=<value>",
         "--",
         *serve(env),
     ]
@@ -1554,6 +1557,120 @@ def test_update_ignores_a_healthy_claude_profile_pin(env: Env, background: bool)
     )
     assert env.claude_json() == original
     assert not any(call[1] in ("add", "remove") for call in env.calls())
+
+
+@pytest.mark.parametrize("background", [False, True])
+@pytest.mark.parametrize("has_env", [False, True])
+def test_update_leaves_a_working_claude_endpoint_override_alone(
+    env: Env, background: bool, has_env: bool
+):
+    config = env.home / ".claude.json"
+    overrides = {"SAI_LCD_ENDPOINT": "http://127.0.0.1:26657"} if has_env else {}
+    entry = claude_entry(
+        [*serve(env), "--endpoint", "http://127.0.0.1:8765/graphql"], overrides
+    )
+    config.write_text(json.dumps({"mcpServers": {"sai": entry}}))
+    before = config.read_bytes()
+
+    outcome = updater.repair_after_update(
+        updater.Outcome(updater.UPDATED, "updated"), env.sai, background
+    )
+
+    assert outcome.mcp_results() == []
+    assert "Claude Code" not in updater.mcp_notice(
+        outcome.mcp_results(), outcome.mcp_notes
+    )
+    assert config.read_bytes() == before
+    assert all(call[:2] == ["mcp", "get"] for call in env.calls())
+
+
+@pytest.mark.parametrize("surface", ["install", "doctor", "background"])
+def test_claude_replacement_advice_preserves_saved_server_options(
+    env: Env, monkeypatch: pytest.MonkeyPatch, surface: str
+):
+    config = env.home / ".claude.json"
+    monkeypatch.setenv("SAI_HOME", str(env.root / "other-profile"))
+    profile = "profiles/paper"
+    endpoint = "http://127.0.0.1:8765/graphql"
+    ws_endpoint = f"wss://private.example/{SECRET}"
+    saved_args = [
+        "mcp",
+        "serve",
+        "--endpoint",
+        endpoint,
+        f"--ws-endpoint={ws_endpoint}",
+    ]
+    private_key = "FIXTURE_CREDENTIAL_AS_ENV_KEY"
+    options = {"SAI_HOME": profile, private_key: SECRET}
+    config.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "sai": claude_entry(["missing-wrapper", *saved_args], options)
+                }
+            }
+        )
+    )
+    before = config.read_bytes()
+
+    if surface == "install":
+        result = invoke("mcp", "install", "claude")
+        failure(result)
+        [row] = payload(result)["error"]["details"]["results"]
+        fix, diagnostic = row["fix"], result.output
+    elif surface == "doctor":
+        result = invoke("doctor", "--offline")
+        fix, diagnostic = mcp_checks(result)["claude"]["fix"], result.output
+    else:
+        outcome = updater.repair_after_update(
+            updater.Outcome(updater.UPDATED, "updated"), env.sai, True
+        )
+        results = outcome.mcp_results()
+        saved_results = json.loads(json.dumps(results))
+        fix = updater.mcp_notice(saved_results, outcome.mcp_notes)
+        diagnostic = fix + json.dumps(results)
+        del saved_results[0]["manualRepairs"][0]["serverArgs"]
+        assert "claude mcp add" not in updater.mcp_notice(
+            saved_results, outcome.mcp_notes
+        )
+    assert all(
+        value not in diagnostic for value in (SECRET, private_key, "private.example")
+    )
+    assert (
+        fix.index("Fill in the placeholders")
+        < fix.index("Continue only if it succeeds")
+        < fix.index("Remove the existing")
+    )
+    assert "claude mcp remove" not in fix
+    assert config.read_bytes() == before
+    assert all(call[:2] == ["mcp", "get"] for call in env.calls())
+
+    command = shlex.split(claude_add_command(fix))
+    assert command == [
+        "claude",
+        "mcp",
+        "add",
+        "--scope",
+        "user",
+        "sai",
+        f"--env=SAI_HOME={profile}",
+        "--env=<NAME>=<value>",
+        "--",
+        *serve(env),
+        "--endpoint",
+        "<original-argument>",
+        "--ws-endpoint=<original-argument>",
+    ]
+    replacements = {
+        "--env=<NAME>=<value>": f"--env={private_key}={SECRET}",
+        "<original-argument>": endpoint,
+        "--ws-endpoint=<original-argument>": f"--ws-endpoint={ws_endpoint}",
+    }
+    config.write_text('{"mcpServers": {}}')
+    subprocess.run([replacements.get(arg, arg) for arg in command], check=True)
+    assert env.claude_json()["mcpServers"]["sai"] == claude_entry(
+        [str(env.sai), *saved_args], options
+    )
 
 
 def test_update_commands_keep_the_profile_of_a_stale_claude_entry(env: Env):
@@ -2478,7 +2595,8 @@ def test_claude_install_reports_scoped_commands_without_credentials(
     assert f"The {scope} sai entry in {config} differs in env." in row["fix"]
     assert (
         f"claude mcp add --scope {scope} sai {shlex.quote(f'--env=SAI_HOME={profile}')}"
-        f" -- {shlex.quote(str(env.sai))} mcp serve"
+        f" '--env=<NAME>=<value>' -- {shlex.quote(str(env.sai))}"
+        " '<original-argument>' '<original-argument>'"
     ) in row["fix"]
     assert "substitute your requested command" in row["fix"]
     assert SECRET not in output and OTHER not in output

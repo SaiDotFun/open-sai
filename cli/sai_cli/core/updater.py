@@ -606,6 +606,16 @@ class Outcome:
                                     if repair.launcher is not None
                                     else {}
                                 ),
+                                **(
+                                    {"serverArgs": list(repair.server_args)}
+                                    if repair.server_args is not None
+                                    else {}
+                                ),
+                                **(
+                                    {"extraEnv": repair.extra_env}
+                                    if repair.extra_env
+                                    else {}
+                                ),
                             }
                             for repair in check.manual_repairs
                         ],
@@ -1200,6 +1210,13 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
                     launcher=repair["launcher"]
                     if isinstance(repair.get("launcher"), str)
                     else None,
+                    server_args=tuple(repair["serverArgs"])
+                    if isinstance(repair.get("serverArgs"), list)
+                    and all(isinstance(arg, str) for arg in repair["serverArgs"])
+                    else None,
+                    extra_env=repair["extraEnv"]
+                    if isinstance(repair.get("extraEnv"), int)
+                    else 0,
                 )
                 for repair in manual
                 if isinstance(repair, dict)

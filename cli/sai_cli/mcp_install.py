@@ -46,6 +46,7 @@ UNINSTALL_SCOPES = ("user", "project", "local")
 SUBPROCESS_TIMEOUT = 60
 INSTALL_URL = "git+https://github.com/SaiDotFun/open-sai"
 ENDPOINT_FLAGS = {spec.flag: spec.key for spec in settings.SETTINGS if spec.flag}
+CLAUDE_ARG_PLACEHOLDER = "<original-argument>"
 
 
 class InstallError(Exception):
@@ -193,6 +194,8 @@ class ClaudeRepair:
     fields: tuple[str, ...] = ()
     launcher: str | None = None
     launcher_args: tuple[str, ...] = ()
+    server_args: tuple[str, ...] | None = None
+    extra_env: int = 0
 
 
 @dataclass(frozen=True)
@@ -216,7 +219,11 @@ def claude_repair_hint(entries: tuple[ClaudeRepair, ...]) -> str:
             source = f" in {entry.config_path}" if entry.config_path is not None else ""
             fields = f" in {', '.join(entry.fields)}" if entry.fields else ""
             hint = f"The {label}{source} differs{fields}."
-            if entry.launcher is None or not os.path.isabs(entry.launcher):
+            if (
+                entry.launcher is None
+                or not os.path.isabs(entry.launcher)
+                or entry.server_args is None
+            ):
                 hints.append(
                     hint + " Run `sai doctor` for current replacement instructions."
                 )
@@ -235,15 +242,22 @@ def claude_repair_hint(entries: tuple[ClaudeRepair, ...]) -> str:
                     entry.scope,
                     entry.name,
                     *profile,
+                    *(["--env=<NAME>=<value>"] * entry.extra_env),
                     "--",
                     entry.launcher,
                     *entry.launcher_args,
-                    "mcp",
-                    "serve",
+                    *entry.server_args,
                 ]
             )
             launcher = shlex.quote(entry.launcher)
             check = f"test -f {launcher} && test -x {launcher}"
+            if entry.extra_env or any(
+                CLAUDE_ARG_PLACEHOLDER in arg for arg in entry.server_args
+            ):
+                hint += (
+                    "\nFill in the placeholders from the existing config before removing the entry."
+                    " You can edit just the launcher in the config to keep those settings in place."
+                )
             hints.append(
                 f"{hint}\nRun `{check}` before removing the entry. Continue only if it succeeds.\n"
                 f"Remove the existing {label} in Claude from the project"
@@ -300,11 +314,15 @@ def report_different_claude_entry(
         scope,
         NAME,
         replace_entry=True,
-        sai_home=target.env.get("SAI_HOME"),
+        sai_home=existing.sai_home
+        if existing.sai_home is not None or existing.invalid_sai_home
+        else target.env.get("SAI_HOME"),
         config_path=path,
         fields=claude_differing_fields(existing, target),
         launcher=launcher,
         launcher_args=launcher_args,
+        server_args=claude_advice_args(existing),
+        extra_env=len(existing.stale_env) + existing.invalid_sai_home,
     )
     hint = claude_repair_hint((entry,))
     if target.explicit_command:
@@ -1231,6 +1249,29 @@ def serves_mcp(args: list[str]) -> bool:
     return command[:1] == ["serve"] and after_server_options(command[1:]) == []
 
 
+def claude_advice_args(reg: Registration) -> tuple[str, ...]:
+    """Keep argument shape while leaving private values in the saved config."""
+    args = reg.argv[1:]
+    prefixed = ["mcp", "serve", *args]
+    if not serves_mcp(args) and serves_mcp(prefixed):
+        args = prefixed
+    rendered = []
+    expects_value = False
+    for arg in args:
+        flag, equals, _ = arg.partition("=")
+        if expects_value:
+            rendered.append(CLAUDE_ARG_PLACEHOLDER)
+            expects_value = False
+        elif flag in ENDPOINT_FLAGS or flag == "--as":
+            rendered.append(f"{flag}={CLAUDE_ARG_PLACEHOLDER}" if equals else flag)
+            expects_value = not equals
+        elif arg in {"mcp", "serve", "--json", "--"}:
+            rendered.append(arg)
+        else:
+            rendered.append(CLAUDE_ARG_PLACEHOLDER)
+    return tuple(rendered)
+
+
 def stale_registration(
     client: Client, name: str, reg: Registration
 ) -> StaleRegistration | None:
@@ -1579,15 +1620,24 @@ def check_claude_differences(
                     {"SAI_HOME": reg.sai_home} if reg.sai_home is not None else {}
                 )
                 expected = replace(expected, env=saved_env)
-            if issue is None and (expected is None or reg.matches(expected)):
+            fields = (
+                claude_differing_fields(reg, expected) if expected is not None else ()
+            )
+            if issue is None and (
+                not fields
+                or (
+                    not compare_profile
+                    and not reg.invalid_sai_home
+                    and set(fields) <= {"args", "env"}
+                    and serves_mcp(reg.argv[1:])
+                )
+            ):
                 continue
             if expected is None:
                 manual.append("Install a stable Sai launcher on PATH.")
             else:
                 home = profile
-                if not compare_profile and (
-                    reg.sai_home is not None or reg.invalid_sai_home
-                ):
+                if reg.sai_home is not None or reg.invalid_sai_home:
                     home = reg.sai_home
                 repairs.append(
                     ClaudeRepair(
@@ -1596,8 +1646,10 @@ def check_claude_differences(
                         replace_entry=True,
                         sai_home=home,
                         config_path=client.registration_path(reg.scope),
-                        fields=claude_differing_fields(reg, expected) or ("command",),
+                        fields=fields or ("command",),
                         launcher=expected.argv[0],
+                        server_args=claude_advice_args(reg),
+                        extra_env=len(reg.stale_env) + reg.invalid_sai_home,
                     )
                 )
         elif issue is None:

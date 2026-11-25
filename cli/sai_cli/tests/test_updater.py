@@ -303,10 +303,18 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
             repair_entry["configPath"] = str(config)
             repair_entry["fields"] = ["command", "args", "env"]
             repair_entry["saiHome"] = str(uv_dirs / "sai-home")
+            repair_entry["serverArgs"] = [
+                "mcp",
+                "serve",
+                "--endpoint",
+                "<original-argument>",
+            ]
+            repair_entry["extraEnv"] = 1
             commands = [
                 (
                     f"claude mcp add --scope {scope} {name}"
-                    f" --env=SAI_HOME={uv_dirs / 'sai-home'} -- {tool.sai} mcp serve"
+                    f" --env=SAI_HOME={uv_dirs / 'sai-home'} '--env=<NAME>=<value>'"
+                    f" -- {tool.sai} mcp serve --endpoint '<original-argument>'"
                 ),
             ]
         assert claude["manualRepairs"] == [repair_entry]
