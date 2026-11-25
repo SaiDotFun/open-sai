@@ -2,6 +2,7 @@
 
 mod edit;
 mod home;
+mod hostname;
 mod toml;
 
 use std::{
@@ -9,7 +10,6 @@ use std::{
     ffi::{OsStr, OsString},
     fmt,
     io::{self, Read},
-    net::Ipv4Addr,
     path::{Path, PathBuf},
 };
 
@@ -190,68 +190,41 @@ impl Key {
         let Kind::Url(schemes) = self.spec().kind else {
             unreachable!()
         };
-        let error = |detail: &str| {
-            SettingsError::endpoint(format!("Invalid value for {}: {detail}", self.spec().name))
+        let invalid = |reason| {
+            SettingsError::endpoint(format!("Invalid value for {}: {reason}", self.spec().name))
         };
-        if self.section_and_name().0 == "keeper" && value.contains('#') {
-            return Err(error("remove the URL fragment"));
+        if self != Self::LcdEndpoint && value.contains('#') {
+            return Err(invalid("remove the URL fragment"));
         }
-        if value
-            .chars()
-            .any(|ch| ch.is_whitespace() || ch.is_control())
-        {
-            return Err(error("URL contains whitespace or control characters"));
+        if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return Err(invalid("URL contains whitespace or control characters"));
         }
         if Endpoint::split(value).is_some_and(|url| {
             let (host, port) = url.host_port();
+            let authority = url.authority.rsplit('@').next().unwrap_or_default();
             schemes.contains(&url.scheme.as_str())
                 && !host.is_empty()
                 && port.is_ok()
                 && !url.authority.contains('\\')
-                && match self {
-                    Self::KeeperWsEndpoint => url
+                && (schemes[0] != "https" || hostname::valid_http_host(authority, &host))
+                && (self != Self::KeeperWsEndpoint
+                    || url
                         .authority
                         .rsplit_once('@')
-                        .is_none_or(|(userinfo, _)| userinfo.contains(':')),
-                    _ => {
-                        let ipv4_style = host.split('.').count() == 4
-                            && host.split('.').all(|part| {
-                                !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())
-                            });
-                        !ipv4_style || host.parse::<Ipv4Addr>().is_ok()
-                    }
-                }
+                        .is_none_or(|(userinfo, _)| userinfo.contains(':')))
         }) {
             return Ok(json!(value));
         }
-        Err(error(&format!(
-            "expected a URL starting with {}:// or {}://",
+        Err(self.expected(&format!(
+            "a URL starting with {}:// or {}://",
             schemes[0], schemes[1]
         )))
     }
 
     /// Validate server endpoints for diagnostics and registration repair.
     pub fn check_diagnostic_url(self, value: &str) -> Result<(), SettingsError> {
-        if !matches!(self.spec().kind, Kind::Url(_)) {
-            return Ok(());
-        }
-        let bad = |reason| {
-            let mut error =
-                SettingsError::invalid(format!("Invalid value for {}: {reason}", self.spec().name));
-            error.invalid_endpoint = true;
-            error
-        };
-        if self != Self::LcdEndpoint && value.contains('#') {
-            return Err(bad("remove the URL fragment"));
-        }
-        if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
-            return Err(bad("URL contains whitespace or control characters"));
-        }
-        self.check_url(value)?;
-        let url = Endpoint::split(value).expect("URL checked");
-        let (host, port) = url.host_port();
-        if host.is_empty() || port.is_err() || url.authority.contains('\\') {
-            return Err(self.invalid_env_value());
+        if matches!(self.spec().kind, Kind::Url(_)) {
+            self.check_url(value)?;
         }
         Ok(())
     }
@@ -542,9 +515,16 @@ impl Settings {
                 Err(error) if key.is_log() => {
                     let already_off = resolved.value(Key::LogsEnabled).as_bool() == Some(false);
                     let source = if already_off { source } else { Source::Invalid };
-                    if source == Source::Invalid && env.is_set(key) {
+                    if source == Source::Invalid
+                        && let Some(raw) = env.raw(key)
+                    {
+                        let detail = if raw.to_str().is_none() {
+                            format!("invalid value for {}", key.spec().name)
+                        } else {
+                            error.to_string()
+                        };
                         resolved.warnings.push(format!(
-                            "{}: {error}; logging is off until it is fixed",
+                            "{}: {detail}; logging is off until it is fixed",
                             key.spec().env
                         ));
                     }
@@ -703,7 +683,7 @@ fn pick(key: Key, flags: &Flags, env: &Environment, file: Option<&Entry>) -> (En
         (key.parse_value(raw), Source::Flag)
     } else if let Some(raw) = env.raw(key) {
         let value = raw.to_str().map_or_else(
-            || Err(SettingsError::invalid(key.invalid_env_value().message)),
+            || Err(key.invalid_env_value()),
             |raw| {
                 key.parse_value(raw).map_err(|error| {
                     if error.invalid_endpoint {

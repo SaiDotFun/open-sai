@@ -8,6 +8,7 @@ use std::{
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 use super::Surface;
+use crate::paths;
 
 const PRUNE_MARKER: &str = ".pruned";
 const ENDPOINT_KEY: &str = ".endpoint-key";
@@ -29,35 +30,29 @@ impl LogDir {
     }
 
     fn open_at(root: &Path, create: bool) -> io::Result<Self> {
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true);
+        let parent = root
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        if create {
+            paths::profile(parent)?;
+        }
         #[cfg(unix)]
         {
             use rustix::{
-                fs::{Mode, OFlags, mkdirat, open, openat},
+                fs::{Mode, OFlags, open, openat},
                 process::{geteuid, getuid},
             };
-            use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+            use std::os::unix::fs::MetadataExt;
 
-            builder.mode(0o700);
-            let parent = root
-                .parent()
-                .filter(|path| !path.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
             let name = root.file_name().ok_or(io::ErrorKind::InvalidInput)?;
             let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-            if create {
-                builder.create(parent)?;
-            }
             let parent = open(parent, flags, Mode::empty())?;
             if rustix::fs::fstat(&parent)?.st_uid != getuid().as_raw() {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
             if create {
-                match mkdirat(&parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
-                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                    Err(error) => return Err(error.into()),
-                }
+                paths::create_managed_at(&parent, Path::new(name))?;
             }
             let fd = openat(parent, name, flags, Mode::empty())?;
             let dir = File::from(fd);
@@ -72,8 +67,8 @@ impl LogDir {
         }
         #[cfg(not(unix))]
         {
-            if create {
-                builder.create(root)?;
+            if create && !root.exists() {
+                paths::managed(root)?;
             }
             let metadata = fs::symlink_metadata(root)?;
             if !metadata.is_dir() || redirected(&metadata) {

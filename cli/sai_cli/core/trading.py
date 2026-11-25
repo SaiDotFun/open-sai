@@ -488,6 +488,20 @@ def _position_preview(
         [margin.PositionSnapshot, dict[str, Any], dict[str, Any]], dict[str, Any]
     ],
 ) -> dict[str, Any]:
+    def verify_replacement(
+        state: margin.PositionSnapshot, inputs: dict[str, Any]
+    ) -> None:
+        try:
+            if margin.position_unchanged(lcd_endpoint, state, trade_id, inputs):
+                return
+        except estimates.READ_ERRORS as exc:
+            raise PositionChanged(
+                f"Could not verify the replacement position quote. {exc}"
+            ) from exc
+        raise PositionChanged(
+            "The position quote changed again during verification. Request a new preview."
+        )
+
     def read_quote() -> PositionPreview:
         try:
             return build()
@@ -506,6 +520,7 @@ def _position_preview(
                     "Could not refresh the position preview after an LCD network mismatch."
                     " Request a new preview before submitting."
                 ) from refresh_error
+            verify_replacement(state, inputs)
             raise PositionChanged(
                 "Keeper trading route and LCD network differed during confirmation."
                 " Review the replacement preview before submitting.",
@@ -535,6 +550,7 @@ def _position_preview(
             raise PositionChanged(
                 f"{changed_message}. Could not quote the latest position. {exc}"
             ) from exc
+        verify_replacement(state, inputs)
     if changed or fresh != preview:
         _attach_estimates(fresh, estimate(state, inputs, fresh))
         raise PositionChanged(changed_message, {**fresh, "addr": addr})

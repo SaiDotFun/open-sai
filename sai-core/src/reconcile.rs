@@ -226,7 +226,7 @@ async fn poll(
     let items = std::mem::take(items);
     let mut matching = Vec::new();
     if let Some(account) = &account {
-        for row in items {
+        for row in items.into_iter().filter(|row| !row.is_null()) {
             if !row.is_object() {
                 if poll.budget.is_none() {
                     return Err(PollError::Data(SaiError::internal()));

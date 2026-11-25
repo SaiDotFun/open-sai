@@ -7,6 +7,7 @@ pub mod keeper;
 mod lcd;
 pub mod log;
 pub mod overview;
+mod paths;
 mod receipt;
 pub mod reconcile;
 pub mod session;
