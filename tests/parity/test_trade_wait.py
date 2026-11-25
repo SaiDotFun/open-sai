@@ -969,7 +969,7 @@ def test_position_trade_wait_times_out(
         assert ledger_state(home) == [(key, "unknown", "pending")]
         waits = [
             (event["event"], event.get("timeoutMs"), event.get("code"))
-            for event in read_events(home)
+            for event in read_events(home, cli)
             if event.get("intentKey") == key
             and event["event"].startswith("intent.wait.")
         ]
