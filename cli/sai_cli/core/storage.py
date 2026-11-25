@@ -556,7 +556,18 @@ def _check_open_pending(
         (endpoint, account.lower(), allow_concurrent_open),
     ).fetchall()
     if opens:
-        raise RecentOpenPending([row[0] for row in opens], endpoint, account)
+        keys = [row[0] for row in opens]
+        for key in keys:
+            log.event(
+                "intent.open_blocked",
+                "warn",
+                intentKey=key,
+                addr=account,
+                endpoint=log.endpoint(endpoint),
+                endpointId=log.endpoint_identity(endpoint),
+                code=Code.RECENT_OPEN_PENDING,
+            )
+        raise RecentOpenPending(keys, endpoint, account)
 
 
 @contextmanager

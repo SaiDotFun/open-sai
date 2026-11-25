@@ -501,6 +501,17 @@ def test_acknowledged_open_blocks_retry(connected_replay, submitted_keys, retry)
     assert error["code"] == "RECENT_OPEN_PENDING"
     assert submitted_keys == [key]
 
+    trail = cli.invoke(main, [*options, "logs", "intent", key, "--offline"])
+    assert trail.exit_code == 0, trail.output
+    [refusal] = [
+        event
+        for event in json.loads(trail.stdout)["events"]
+        if event["event"] == "intent.open_blocked"
+    ]
+    assert refusal["code"] == error["code"]
+    assert refusal["intentKey"] == key and refusal["addr"] == ADDR
+    assert refusal["surface"] == ("mcp" if retry == "mcp" else "cli")
+
     if retry == "same_process":
         failure = RESPONSES["simulation_failed"]["data"]["userIntents"][0]
         replies.append({"data": {"userIntents": [{**failure, "intentKey": key}]}})
@@ -520,6 +531,50 @@ def test_acknowledged_open_blocks_retry(connected_replay, submitted_keys, retry)
     assert allowed["status"] == "accepted"
     assert allowed["intentKey"] != key
     assert submitted_keys == [key, allowed["intentKey"]]
+
+
+def test_mcp_refusal_appears_in_every_blocking_intent_trail(connected_replay):
+    endpoint, replies = connected_replay
+    other_key = "earlier-approved-open"
+    reserve(endpoint)
+    storage.set_status(KEY, endpoint, ADDR, "accepted")
+    storage.pending(
+        other_key, endpoint, ADDR, "OPEN_TRADE", "", allow_concurrent_open=True
+    )
+    storage.set_status(other_key, endpoint, ADDR, "accepted")
+    mcp = open_mcp(endpoint)
+    replies.append(MARKET)
+    preview = call_mcp(mcp, "preview_open", OPEN_ARGS)
+    result = call_mcp(
+        mcp,
+        "trade_open",
+        {
+            **OPEN_ARGS,
+            "preview_digest": preview["previewDigest"],
+            "reference_price": preview["referencePrice"],
+        },
+    )
+    assert result["code"] == "RECENT_OPEN_PENDING"
+    assert result["intentKeys"] == [other_key, KEY]
+
+    call_ids = set()
+    for key in result["intentKeys"]:
+        trail = call_mcp(mcp, "logs_intent", {"key": key, "offline": True})
+        [refusal] = [
+            event
+            for event in trail["events"]
+            if event["event"] == "intent.open_blocked"
+        ]
+        assert refusal["intentKey"] == key
+        assert refusal["code"] == result["code"]
+        call_id = refusal["callId"]
+        assert {"mcp.tool_call", "mcp.tool_result"} <= {
+            event["event"]
+            for event in trail["events"]
+            if event.get("callId") == call_id
+        }
+        call_ids.add(call_id)
+    assert len(call_ids) == 1
 
 
 @pytest.mark.parametrize(
