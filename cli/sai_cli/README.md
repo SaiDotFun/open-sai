@@ -180,9 +180,9 @@ belongs to another install.
 
 The update keeps the path to `~/.local/bin/sai` stable. After verifying the
 install, it checks MCP registrations and can repair stale Codex and Cursor
-launchers. For stale Claude Code registrations, it prints an explicit repair
-command. Background updates include that command in the next update notice
-for any stale user registration they find. A running `sai mcp serve` keeps
+launchers. For differing Claude Code registrations, it prints commands for
+updating them manually. Background updates include the commands in the next
+update notice for any differing user registration they find. A running `sai mcp serve` keeps
 the old code until its client restarts. The `mcp_info` tool reports
 `restartNeeded`.
 
@@ -382,8 +382,13 @@ and `codex mcp add|remove`; Cursor through an atomic edit of
 only the `sai` entry's command, args, `SAI_HOME`, and the names of any other
 environment settings, and never run `claude mcp get`, which starts the
 server. The only environment value output shows is `SAI_HOME`, a path; other
-settings appear by name in `staleEnv`, and an entry with any of them, or a
-disabled Codex entry, is not current and gets replaced. `list` shows every
+settings appear by name in `staleEnv`. For Claude Code, install leaves a
+differing `sai` entry in place and reports its scope, config file, and
+differing fields. Run the printed launcher check before removing the
+existing entry in Claude from the project directory you normally use.
+After the check and removal succeed, run the printed `claude mcp add` command.
+The add includes `SAI_HOME` when the target uses one. Install adds missing
+entries and reports matching ones as unchanged. `list` shows every
 scope's entry under `registrations` and marks the one the client uses as
 `effective` (Claude Code: local, then project, then user; Cursor: project,
 then user). `uninstall` removes every scope's entry unless `--scope` names
@@ -552,13 +557,13 @@ rewrites the session, never writes through a symlink in `$SAI_HOME/trader`,
 and never prints the session token. Without fixes it reads the ledger from a
 temporary copy, so it writes nothing at all.
 
-Doctor can repair stale Codex and Cursor launchers. It prints a repair command
-for each stale Claude Code launcher, such as
-`sai mcp install --client claude --scope user --repair-existing sai`.
-Use the name and scope in the command doctor prints. Run project and local
-repairs from the directory doctor checked. The command preserves the
-registration's environment and compatible server arguments. If the command
-includes `--reset-args`, it uses default server arguments.
+Doctor can repair stale Codex and Cursor launchers. For a differing Claude
+Code `sai` entry, doctor prints a launcher check and a scoped `claude mcp add`
+command. Fill in any placeholders from the saved config before removing the
+entry. Run the check, remove the old entry in Claude, and run the add from
+the project directory where Claude uses the entry. For a stale legacy alias,
+doctor can suggest an explicit `--repair-existing` command that preserves
+compatible arguments.
 
 Each check reports `pass`, `fixed`, `warn`, `fail`, or `skipped` and
 may include a fix. `sai --json doctor` returns `schemaVersion`,
