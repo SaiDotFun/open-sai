@@ -9,6 +9,8 @@ mod reads;
 mod repl;
 mod skill;
 mod trade;
+#[cfg(unix)]
+mod update;
 
 use std::{
     cell::Cell,
@@ -82,6 +84,9 @@ enum Command {
         #[command(subcommand)]
         command: WatchCommand,
     },
+    /// Install the latest sai-cli release over this install.
+    #[cfg(unix)]
+    Update(update::UpdateCommand),
     /// Manage local Sai sessions.
     Auth {
         #[command(subcommand)]
@@ -136,6 +141,8 @@ impl Cli {
             lcd_endpoint: self.lcd_endpoint,
         };
         match self.command {
+            #[cfg(unix)]
+            Some(Command::Update(command)) => command.run(&flags, env, json, events),
             Some(Command::Auth { command }) => {
                 auth::dispatch(command, self.account.as_deref(), &flags, env, json, events)
             }
@@ -208,10 +215,10 @@ fn execute(
         (!command.is_empty()).then_some(command)
     };
     let started = Instant::now();
-    let surface = if command == "mcp serve" {
-        Surface::Mcp
-    } else {
-        Surface::Cli
+    let surface = match command {
+        "mcp serve" => Surface::Mcp,
+        "update" => Surface::Update,
+        _ => Surface::Cli,
     };
     let writer = if command == "logs"
         || command.starts_with("logs ")
@@ -228,7 +235,9 @@ fn execute(
         None
     } else {
         let start = match command {
-            "doctor" | "mcp install" | "mcp list" => LogWriter::start_diagnostic_command,
+            "doctor" | "mcp install" | "mcp list" | "mcp uninstall" => {
+                LogWriter::start_diagnostic_command
+            }
             _ => LogWriter::start_command,
         };
         environment
@@ -269,7 +278,11 @@ fn execute(
             let result = environment
                 .as_ref()
                 .map_err(|error| SaiError::from(error.clone()))
-                .and_then(|env| cli.run(env, json, events, operands, start_log, writer.as_ref()));
+                .and_then(|env| {
+                    #[cfg(unix)]
+                    update::tick(command, json, &env.home, events);
+                    cli.run(env, json, events, operands, start_log, writer.as_ref())
+                });
             match result {
                 Ok(code) => (code, None),
                 Err(error) => complete(
@@ -405,8 +418,9 @@ fn usage(command: &str) -> String {
         "config get" | "config unset" => " KEY",
         "config set" => " KEY VALUE",
         "config list" | "auth status" | "auth list" | "auth import" | "doctor" | "mcp list"
-        | "mcp serve" | "market list" | "market prices" | "trade open" | "account overview" => "",
-        "mcp install" => " [CLIENTS]...",
+        | "mcp serve" | "market list" | "market prices" | "trade open" | "account overview"
+        | "update" => "",
+        "mcp install" | "mcp uninstall" => " [CLIENTS]...",
         "auth login" => " NAME",
         "intent status" | "intent local" | "auth use" | "account positions" | "account history"
         | "account balances" | "watch positions" | "watch balances" => " ADDR",
@@ -415,7 +429,7 @@ fn usage(command: &str) -> String {
         "logs path" | "logs tail" | "logs stats" => "",
         "logs intent" => " KEY",
         "logs run" => " ID",
-        "trade close" | "trade cancel" => " TRADE_ID",
+        "trade close" | "trade cancel" | "trade margin" | "trade partial-close" => " TRADE_ID",
         "intent wait" => " KEY",
         "auth logout" | "auth renew" => " [ADDR]",
         "" => " [COMMAND] [ARGS]...",
@@ -568,6 +582,11 @@ fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Optio
                 return None;
             };
             let first = args.first()?.trim_matches(['<', '>']);
+            if matches!(command, "trade margin" | "trade partial-close")
+                && let Some(error) = trade::missing_position_option(first)
+            {
+                return Some(error);
+            }
             format!("Missing argument {}.", repr(first))
         }
         ErrorKind::InvalidValue if context_text(error, ContextKind::InvalidValue) == Some("") => {
@@ -656,7 +675,7 @@ fn print_parse_error(
         }
         _ => {}
     }
-    if command == "mcp install"
+    if matches!(command, "mcp install" | "mcp uninstall")
         && error.kind() == ErrorKind::InvalidValue
         && context_text(error, ContextKind::InvalidArg)
             .is_some_and(|arg| arg.split(' ').next() == Some("--scope"))

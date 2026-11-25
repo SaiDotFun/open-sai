@@ -7,9 +7,12 @@ use clap::{Args, Subcommand, ValueEnum};
 use sai_core::{
     errors::{Code, ExitCode, SaiError},
     log::EventContext,
-    settings::{Environment, Flags},
+    settings::{Environment, Flags, Key, Settings, repr},
     storage::{Session, Storage, StorageEvent},
-    trade::{self, OpenTrade, PreviewMode, SubmitOptions, TradePreview, Trading, close_preview},
+    trade::{
+        self, MarginDirection, OpenTrade, PositionAction, PositionMode, PreviewMode, SubmitOptions,
+        TradePreview, Trading, close_preview,
+    },
     wait,
 };
 use serde_json::{Map, Value, json};
@@ -55,6 +58,9 @@ pub enum TradeCommand {
         clear_stop_loss: bool,
         #[arg(long)]
         dry_run: bool,
+        /// Wait up to 30 seconds for the intent outcome.
+        #[arg(long)]
+        wait: bool,
     },
     /// Set target leverage without changing TP or SL.
     Leverage {
@@ -65,7 +71,43 @@ pub enum TradeCommand {
         leverage: String,
         #[arg(long)]
         dry_run: bool,
+        /// Wait up to 30 seconds for the intent outcome.
+        #[arg(long)]
+        wait: bool,
     },
+    /// Add or remove margin through a target-leverage intent.
+    Margin {
+        #[command(flatten)]
+        position: Position,
+        /// Direction of the margin change, add or remove.
+        #[arg(long)]
+        direction: String,
+        /// USDC amount for a leverage quote, not an execution cap.
+        #[arg(long, allow_negative_numbers = true)]
+        amount: String,
+    },
+    /// Reduce an open USDC position by a whole percentage.
+    PartialClose {
+        #[command(flatten)]
+        position: Position,
+        /// Whole percentage to close, from 1 to 99.
+        #[arg(long, allow_negative_numbers = true)]
+        percent: String,
+    },
+}
+
+#[derive(Args)]
+pub struct Position {
+    #[arg(allow_negative_numbers = true)]
+    trade_id: String,
+    /// Nibiru REST endpoint for exact contract state. Defaults to lcd.endpoint.
+    #[arg(long)]
+    lcd_endpoint: Option<String>,
+    #[arg(long)]
+    dry_run: bool,
+    /// Confirm the digest printed by --dry-run.
+    #[arg(long)]
+    preview_digest: Option<String>,
 }
 
 #[derive(ValueEnum, Clone, Copy)]
@@ -186,6 +228,43 @@ pub fn run(
             dry_run,
             wait,
         } => (close_preview(&trade_id, true)?, dry_run, wait, false, false),
+        TradeCommand::Margin {
+            position,
+            direction,
+            amount,
+        } => {
+            let direction = match direction.as_str() {
+                "add" => MarginDirection::Add,
+                "remove" => MarginDirection::Remove,
+                _ => {
+                    return Err(SaiError::usage(format!(
+                        "Invalid value for '--direction': {} is not one of 'add', 'remove'.",
+                        repr(&direction),
+                    )));
+                }
+            };
+            return position.run(
+                &trading,
+                &settings,
+                account,
+                PositionAction::Margin {
+                    direction,
+                    amount: &amount,
+                },
+                json,
+            );
+        }
+        TradeCommand::PartialClose { position, percent } => {
+            return position.run(
+                &trading,
+                &settings,
+                account,
+                PositionAction::PartialClose {
+                    percent: trade::parse_partial_close_percent(&percent)?,
+                },
+                json,
+            );
+        }
         TradeCommand::Tpsl {
             trade_id,
             take_profit,
@@ -193,6 +272,7 @@ pub fn run(
             clear_take_profit,
             clear_stop_loss,
             dry_run,
+            wait,
         } => (
             trade::tpsl_preview(
                 &trade_id,
@@ -202,7 +282,7 @@ pub fn run(
                 clear_stop_loss,
             )?,
             dry_run,
-            false,
+            wait,
             false,
             false,
         ),
@@ -210,10 +290,11 @@ pub fn run(
             trade_id,
             leverage,
             dry_run,
+            wait,
         } => (
             trade::leverage_preview(&trade_id, &leverage)?,
             dry_run,
-            false,
+            wait,
             false,
             false,
         ),
@@ -345,11 +426,7 @@ pub fn run(
         &session,
         &preview,
         options,
-        async {
-            if tokio::signal::ctrl_c().await.is_err() {
-                std::future::pending().await
-            }
-        },
+        trade_interrupt(),
     ))?;
     let mut output = json!({
         "addr": session.addr(), "intentKey": result.intent_key, "status": result.status,
@@ -360,6 +437,73 @@ pub fn run(
     }
     local::emit(&output, json)?;
     Ok(ExitCode::Ok)
+}
+
+pub fn missing_position_option(argument: &str) -> Option<SaiError> {
+    let option = argument.split_whitespace().next()?;
+    let message = match option {
+        "--direction" => "Missing option '--direction'. Choose from:\n\tadd,\n\tremove".into(),
+        "--amount" | "--percent" => format!("Missing option {}.", repr(option)),
+        _ => return None,
+    };
+    Some(SaiError::usage(message))
+}
+
+impl Position {
+    fn run(
+        self,
+        trading: &Trading<'_>,
+        settings: &Settings,
+        account: Option<&str>,
+        action: PositionAction<'_>,
+        json: bool,
+    ) -> Result<ExitCode, SaiError> {
+        if let Some(endpoint) = &self.lcd_endpoint {
+            Key::LcdEndpoint.parse_value(endpoint)?;
+        }
+        let lcd_endpoint = self
+            .lcd_endpoint
+            .as_deref()
+            .unwrap_or_else(|| settings.lcd_endpoint());
+        let mode = if self.dry_run {
+            PositionMode::Preview
+        } else {
+            PositionMode::Submit(
+                self.preview_digest
+                    .as_deref()
+                    .map(trade::Confirmation::for_position_cli),
+            )
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| SaiError::internal())?;
+        let result = runtime
+            .block_on(trading.position_trade_with_interrupt(
+                account,
+                lcd_endpoint,
+                &self.trade_id,
+                action,
+                mode,
+                trade_interrupt(),
+            ))
+            .map_err(|mut error| {
+                if !json && error.code == Code::PreviewMismatch && error.details.is_some() {
+                    error
+                        .message
+                        .push_str(" Run with --dry-run to review a fresh preview.");
+                }
+                error
+            })?;
+        local::emit(&result, json)?;
+        Ok(ExitCode::Ok)
+    }
+}
+
+async fn trade_interrupt() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending().await
+    }
 }
 
 fn session_error(code: Code) -> bool {

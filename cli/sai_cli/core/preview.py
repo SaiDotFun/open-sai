@@ -12,11 +12,16 @@ ATOM = Decimal("1e-18")
 LIQUIDATION_THRESHOLD = Decimal("0.90")
 LIQUIDATION_FEE_RATE = Decimal("0.05")
 READ_ERRORS = (ValueError, TypeError, KeyError, DecimalException, keeper.KeeperError)
+UNKNOWN_ORACLE_TIME = "OraclePublicationTimeUnknown"
 ESTIMATE_FIELDS = ("fees", "liquidationPrice", "worstCaseFill")
 
 
 def unavailable(reason: str) -> dict[str, Any]:
     return {"status": "unavailable", "reason": reason}
+
+
+def close_oracle_time_unknown(estimates: dict[str, Any]) -> bool:
+    return estimates.get("execution", {}).get("code") == UNKNOWN_ORACLE_TIME
 
 
 def rejected(code: str, reason: str) -> dict[str, Any]:
@@ -343,20 +348,6 @@ def open_estimates(
     return {"fees": fees, "liquidationPrice": liq, "worstCaseFill": fill}
 
 
-def perp_prices(lcd: str, state: margin.PositionSnapshot, height: str) -> Any:
-    return margin.smart_value(
-        lcd,
-        state.contract,
-        {
-            "get_perp_prices": {
-                "market_index": state.raw["market_index"],
-                "collateral_index": state.raw["collateral_index"],
-            }
-        },
-        height=height,
-    )
-
-
 def fills_at_next_oracle_price(lcd: str, contract: str, height: str) -> bool:
     config = margin.smart_value(
         lcd, contract, {"market_order_config": {}}, height=height
@@ -417,6 +408,7 @@ def close_estimates(
     reduce_by: int | None,
     *,
     require_unchanged: bool = False,
+    rechecked: margin.RecheckedPosition | None = None,
 ) -> dict[str, Any]:
     """Check Perp's liquidation route before quoting the voluntary fee components."""
     unknown = unavailable(
@@ -438,17 +430,40 @@ def close_estimates(
 
     raw = state.raw
     try:
-        height = margin.verified_position_height(lcd, state, trade_id)
+        try:
+            height = (
+                margin.verified_position_height(lcd, state, trade_id)
+                if rechecked is None
+                else rechecked.height
+            )
+            prices = (
+                margin.perp_prices(lcd, state, height)
+                if rechecked is None
+                else rechecked.close_prices
+            )
+            oracle = prices.get("market") if isinstance(prices, dict) else None
+            published_at = (
+                oracle_publication_time(oracle) if isinstance(oracle, dict) else None
+            )
+        except margin.PositionChanged:
+            raise
+        except READ_ERRORS:
+            prices, oracle, published_at = None, None, None
+        if (
+            not isinstance(prices, dict)
+            or not isinstance(oracle, dict)
+            or published_at is None
+        ):
+            missing_time = unavailable("The oracle price publication time is unknown.")
+            return {
+                **dict.fromkeys(result, missing_time),
+                "execution": {**missing_time, "code": UNKNOWN_ORACLE_TIME},
+            }
         if fills_at_next_oracle_price(lcd, state.contract, height):
             return dict.fromkeys(
                 result,
                 unavailable("Queued closes settle on a fresh oracle update."),
             )
-        prices = perp_prices(lcd, state, height)
-        oracle = prices["market"]
-        if not isinstance(oracle, dict):
-            return result
-        published_at = oracle_publication_time(oracle)
         pair = None
         if published_at is not None:
             pair = contract_market(
@@ -488,7 +503,11 @@ def close_estimates(
             }
 
         # A full close settles directly at effective leverage. A partial close runs the guard.
-        effective, _ = margin.leverage_inputs(lcd, state, trade_id, height=height)
+        effective = (
+            margin.leverage_inputs(lcd, state, trade_id, height=height)[0]
+            if rechecked is None
+            else rechecked.effective_leverage
+        )
         if effective is None or (
             reduce_by is not None
             and effective != margin.contract_decimal(raw["leverage"])
@@ -612,7 +631,7 @@ def _leverage_estimates(
     queued = fills_at_next_oracle_price(lcd, contract, height)
     price = None
     if not queued:
-        oracle = perp_prices(lcd, state, height)["market"]
+        oracle = margin.perp_prices(lcd, state, height)["market"]
         if not isinstance(oracle, dict):
             raise TypeError("Invalid Perp market oracle price")
         published_at = oracle_publication_time(oracle)

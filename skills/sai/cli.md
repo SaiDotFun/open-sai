@@ -26,8 +26,11 @@ sai --json account history 0x0000000000000000000000000000000000000001
 sai --json watch price 3
 ```
 
-- `market list` returns Keeper's borrowing markets, and `market prices` the
-  current indexed prices.
+- `market list` returns Keeper's borrowing markets. The `market prices` command
+  and MCP tool `market_prices` return indexed prices. The
+  `lastUpdatedBlock.block_ts` field is `string | null`. A `null` timestamp means
+  the block time is unknown. The `lastUpdatedBlock.block` field still reports
+  the height.
 - `account overview` reads the active account unless you pass `--as ADDR`.
   Without either, it exits 1 with `SESSION_UNAVAILABLE`. The result has
   `addr`, `addrSource`, and sections such as `balances`, `positions`,

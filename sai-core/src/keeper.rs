@@ -24,7 +24,7 @@ pub(crate) use public::{
     intent_history, intent_log_fields, intent_record, known_intent_field, log_intent_record,
     request_hash, wait_error_code,
 };
-pub use public::{public_account_history, public_intent_status};
+pub use public::{normalize_market_price_timestamps, public_account_history, public_intent_status};
 pub use queries::*;
 pub(crate) use transport::get as lcd_get;
 

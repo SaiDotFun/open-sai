@@ -10,19 +10,28 @@ publish = false
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
+flate2.workspace = true
 libc.workspace = true
+percent-encoding = "2"
+reqwest.workspace = true
 rmcp = { version = "3.11", default-features = false, features = ["local", "server", "transport-io"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
 rustix = { workspace = true, features = ["termios"] }
 rustyline = { version = "17", default-features = false, features = ["custom-bindings"] }
 sai-core = { path = "../sai-core" }
+semver.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
-tempfile.workspace = true
 signal-hook = { version = "0.3", default-features = false }
+tar.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "process", "signal", "sync"] }
 toml_edit = { workspace = true, features = ["display"] }
-tokio = { workspace = true, features = ["process", "signal", "sync"] }
+url.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 zmij = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

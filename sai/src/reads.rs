@@ -194,8 +194,11 @@ fn read(
 ) -> Result<(), SaiError> {
     let settings = load_settings(flags, env)?;
     let keeper = Keeper::new(settings.endpoint(), events);
-    let data =
+    let mut data =
         runtime()?.block_on(keeper.read_until(query, variables, keeper::TIMEOUT, interrupted()))?;
+    if query == keeper::PRICES {
+        keeper::normalize_market_price_timestamps(&mut data);
+    }
     if query == keeper::HISTORY {
         output::read(&keeper::public_account_history(&env.home, &data), json)
     } else {

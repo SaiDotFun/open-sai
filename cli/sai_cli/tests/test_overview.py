@@ -241,6 +241,52 @@ def decode_mcp(result: Any) -> dict[str, Any]:
     return json.loads(block.text)
 
 
+def test_market_prices_reports_missing_block_times_as_null(replay):
+    prices = replay["http"][keeper.PRICES]["data"]
+    rows = prices["oracle"]["tokenPricesUsd"][:11]
+    prices["oracle"]["tokenPricesUsd"] = rows
+    del rows[0]["lastUpdatedBlock"]["block_ts"]
+    for row, stamp in zip(
+        rows[1:],
+        (
+            0,
+            None,
+            "0",
+            "1970-01-01T00:00:00Z",
+            "1970-01-01t00:00:00z",
+            "1970-01-01 01:00:00.0000000000+01:00",
+            "1969-12-31T23:00:00−01:00",
+            BLOCK_TIME,
+            "1970-01-01T00:00:00.000000001Z",
+            "1970-01-01t00:00:00.0000000001z",
+        ),
+        strict=True,
+    ):
+        row["lastUpdatedBlock"]["block_ts"] = stamp
+    heights = [row["lastUpdatedBlock"]["block"] for row in rows]
+
+    result = cli(replay, "--json", "market", "prices")
+    assert result.exit_code == 0, result.output
+    decoded = json.loads(result.stdout)
+    blocks = [row["lastUpdatedBlock"] for row in decoded["oracle"]["tokenPricesUsd"]]
+    assert [block["block"] for block in blocks] == heights
+    assert [block["block_ts"] for block in blocks] == [
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        BLOCK_TIME,
+        "1970-01-01T00:00:00.000000001Z",
+        "1970-01-01t00:00:00.0000000001z",
+    ]
+    server = create_server(replay["config"])
+    assert decode_mcp(asyncio.run(server.call_tool("market_prices", {}))) == decoded
+
+
 def save_session(replay: dict[str, Any], addr: str = ADDR):
     now = datetime.now(UTC)
     issued = (now - timedelta(days=28)).timestamp()
@@ -264,6 +310,14 @@ def static_fields(value: Any) -> Any:
             key: static_fields(item)
             for key, item in value.items()
             if key not in {"fetchedAt", "sourceAgeSeconds"}
+            and not (
+                key == "sourceAt"
+                and item is not None
+                and (
+                    item == value.get("fetchedAt")
+                    or value.get("sourceAtBasis") == "fetchedAt"
+                )
+            )
         }
     return value
 
@@ -279,9 +333,11 @@ def test_replays_mainnet_and_preserves_freshness_on_both_surfaces(replay):
     assert data["balance"]["usd"] == 150.813685
     assert data["credits"]["usd"] == 22.091064
     # The test WebSocket is served from a separate port with no proven chain.
-    assert data["balance"]["sourceAt"] is None
+    assert data["balance"]["sourceAt"] == decoded["balances"]["fetchedAt"]
+    assert data["balance"]["sourceAtBasis"] == "fetchedAt"
     assert data["balance"]["sourceAgeSeconds"] is None
     assert data["balance"]["sourceBlock"] == 49819589
+    assert data["unsettled"]["sourceAt"] is None
     assert datetime.fromisoformat(decoded["balances"]["fetchedAt"]).tzinfo == UTC
     assert decoded["positions"]["data"] == {
         "items": [],
@@ -303,7 +359,34 @@ def test_replays_mainnet_and_preserves_freshness_on_both_surfaces(replay):
     assert session["sourceAgeSeconds"] == pytest.approx(28 * 86400, abs=5)
     assert [args for query, args in replay["calls"] if query == "lcd"] == ["latest"]
     assert keeper.PRICES not in {query for query, _ in replay["calls"]}
-    assert static_fields(decoded) == static_fields(mcp(replay))
+    tool_output = mcp(replay)
+    assert static_fields(decoded) == static_fields(tool_output)
+    for output in (decoded, tool_output):
+        for key in (
+            "balances",
+            "positions",
+            "pendingOrders",
+            "queuedMarketOrders",
+            "blockingIntents",
+            "session",
+        ):
+            assert output[key]["sourceAt"] == output[key]["fetchedAt"]
+            assert datetime.fromisoformat(output[key]["sourceAt"]).tzinfo == UTC
+        assert (
+            output["balances"]["data"]["balance"]["sourceAt"]
+            == output["balances"]["sourceAt"]
+        )
+        assert output["prices"] == {
+            "fetchedAt": None,
+            "data": [],
+            "status": "skipped",
+            "skipReason": "No positions or pending orders were available to price.",
+        }
+    human = cli(replay, "account", "overview")
+    assert (
+        "Skipped. No positions or pending orders were available to price."
+        in human.stdout
+    )
     assert not (storage.home() / "intents.sqlite3").exists()
 
 
@@ -430,6 +513,7 @@ def test_open_positions_limits_stops_and_next_oracle_orders(replay):
     assert result.exit_code == 0, result.output
     decoded = json.loads(result.stdout)
     assert decoded["addrSource"] == "argument"
+    assert decoded["prices"]["sourceAt"] == decoded["prices"]["fetchedAt"]
     positions = decoded["positions"]["data"]
     long, short = positions["items"]
     assert long["collateralUsd"] == 12
@@ -507,8 +591,14 @@ def test_a_failed_read_preserves_other_sections(replay, failure):
     if failure == keeper.OVERVIEW_TRADES:
         assert result["positions"]["error"]["code"] == "KEEPER_ERROR"
         assert result["pendingOrders"]["error"] == result["positions"]["error"]
+        assert result["prices"]["status"] == "skipped"
+        assert (
+            result["prices"]["skipReason"]
+            == "Positions and pending orders could not be loaded."
+        )
     if failure == keeper.PRICES:
         assert result["prices"]["error"]["code"] == "KEEPER_ERROR"
+        assert "status" not in result["prices"]
         position = result["positions"]["data"]["items"][0]
         assert position["unrealizedPnlUsd"] == 12
         assert position["liquidationPriceUsd"] == 50
@@ -519,7 +609,9 @@ def test_a_failed_read_preserves_other_sections(replay, failure):
     else:
         balance = result["balances"]["data"]["balance"]
         assert balance["sourceBlock"] == 49819589
-        assert balance["sourceAt"] is balance["sourceAgeSeconds"] is None
+        assert balance["sourceAt"] == result["balances"]["fetchedAt"]
+        assert balance["sourceAtBasis"] == "fetchedAt"
+        assert balance["sourceAgeSeconds"] is None
     assert result["queuedMarketOrders"]["data"][0]["sequence"] == 400
 
 
@@ -660,7 +752,8 @@ def test_lcd_must_match_keeper_before_assigning_block_times(replay, lcd):
     result = mcp(replay, addr=ADDR)
     balances = result["balances"]
     assert balances["data"]["balance"]["sourceBlock"] == 49819589
-    assert balances["data"]["balance"]["sourceAt"] is None
+    assert balances["data"]["balance"]["sourceAt"] == balances["fetchedAt"]
+    assert balances["data"]["balance"]["sourceAgeSeconds"] is None
     assert result["positions"]["data"]["items"][0]["riskStatus"] == "unavailable"
     calls = [args for query, args in replay["calls"] if query == "lcd"]
     assert calls == ([] if lcd == "default" else ["latest"])
@@ -672,6 +765,22 @@ def test_verified_lcd_only_assigns_times_for_its_own_chain(replay):
     assert chain.block_time(49819589) == datetime.fromisoformat(BLOCK_TIME)
     replay["lcdChain"] = "another-chain"
     assert chain.block_time(49819589) is None
+
+
+def test_future_lcd_block_time_has_zero_source_age(replay):
+    fetched = datetime.now(UTC)
+    future = (fetched + timedelta(minutes=5)).isoformat()
+    replay["riskTime"] = future
+    chain = overview._chain_read(replay["config"])
+    assert chain is not None
+    assert overview._block_source(
+        {"block": RISK_BLOCK}, fetched.isoformat(), chain.block_time
+    ) == {"sourceBlock": RISK_BLOCK, "sourceAt": future, "sourceAgeSeconds": 0.0}
+
+    membership = mcp(replay, addr=ADDR)["positions"]["membership"]
+    assert membership["status"] == "stale"
+    assert membership["sourceAt"] == future
+    assert membership["sourceAgeSeconds"] == 0.0
 
 
 @pytest.mark.parametrize("settles", [True, False])
