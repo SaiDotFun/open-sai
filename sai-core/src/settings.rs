@@ -467,7 +467,11 @@ pub struct Settings {
 
 impl Settings {
     pub fn load(flags: &Flags, env: &Environment) -> Result<Self, SettingsError> {
-        Self::resolve(flags, env, FileSettings::read(&env.path())?)
+        let overridden = |key| flags.value(key).is_some() || env.raw(key).is_some();
+        let file = FileSettings::read_effective(&env.path(), |key| {
+            overridden(key) || key == Key::KeeperWsEndpoint && overridden(Key::KeeperEndpoint)
+        })?;
+        Self::resolve(flags, env, file)
     }
 
     /// Inspect the file even when flags or environment settings override it.
@@ -632,6 +636,13 @@ impl FileSettings {
     }
 
     fn read(path: &Path) -> Result<Self, SettingsError> {
+        Self::read_effective(path, |_| false)
+    }
+
+    fn read_effective(
+        path: &Path,
+        overridden: impl Fn(Key) -> bool,
+    ) -> Result<Self, SettingsError> {
         let Some(text) = read_text(path)? else {
             return Ok(Self::default());
         };
@@ -648,6 +659,9 @@ impl FileSettings {
                             .push(format!("{path}: ignoring unknown setting {}", repr(&name)));
                         continue;
                     };
+                    if overridden(key) {
+                        continue;
+                    }
                     let entry = key.read_value(item, &parsed);
                     if let Err(ref error) = entry {
                         if !key.is_log() {
@@ -658,23 +672,32 @@ impl FileSettings {
                     }
                     file.entries[key as usize] = Some(entry);
                 }
-            } else if section == "logs" {
+            } else {
+                let in_section = |key: &Key| key.section_and_name().0 == section;
+                if !KEYS.iter().any(in_section) {
+                    file.warnings.push(format!(
+                        "{path}: ignoring unknown setting {}",
+                        repr(section)
+                    ));
+                    continue;
+                }
+                let mut active = KEYS
+                    .into_iter()
+                    .filter(in_section)
+                    .filter(|key| !overridden(*key))
+                    .peekable();
+                if active.peek().is_none() {
+                    continue;
+                }
                 let message = table_error(section);
-                for key in [Key::LogsEnabled, Key::LogsKeepDays] {
+                if section != "logs" {
+                    return Err(SettingsError::invalid(format!("{path}: {message}")));
+                }
+                for key in active {
                     file.entries[key as usize] = Some(Err(SettingsError::invalid(message.clone())));
                 }
                 file.warnings.push(format!(
                     "{path}: {message}; logging is off until it is fixed"
-                ));
-            } else if KEYS.iter().any(|key| key.section_and_name().0 == section) {
-                return Err(SettingsError::invalid(format!(
-                    "{path}: {}",
-                    table_error(section)
-                )));
-            } else {
-                file.warnings.push(format!(
-                    "{path}: ignoring unknown setting {}",
-                    repr(section)
                 ));
             }
         }

@@ -305,3 +305,27 @@ def test_doctor_preserves_foreign_logs(
         ]
         assert logs["status"] == "warn"
         assert "moving the profile to a dedicated directory" in logs["fix"]
+
+
+@pytest.mark.parametrize("command", [("config", "list"), ("mcp", "serve")])
+def test_invalid_update_override_wins_over_invalid_file_value(
+    wave_clis: tuple[str, str], tmp_path: Path, command: tuple[str, ...]
+) -> None:
+    private = "synthetic-invalid-update-value"
+    for index, binary in enumerate(wave_clis):
+        home = tmp_path / str(index)
+        (home / "sai").mkdir(parents=True)
+        config = home / "sai/config.toml"
+        config.write_text('[update]\nauto = "bad-file-value"\n')
+        result = run_cli(
+            binary, home, "--json", *command, overrides={"SAI_UPDATE_AUTO": private}
+        )
+        assert result.returncode == 2
+        assert private not in result.stdout + result.stderr
+        message = json.loads(result.stdout)["error"]["message"]
+        assert message.endswith(
+            "SAI_UPDATE_AUTO: Invalid value for update.auto: expected true or false"
+        )
+        assert str(config) not in message
+        valid = run_cli(binary, home, "--json", *command)
+        assert valid.returncode == 0
