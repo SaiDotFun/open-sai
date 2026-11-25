@@ -3473,6 +3473,57 @@ def test_intent_cursor_keeps_invocation_attribution_from_prior_page(home):
     assert "nextBefore" not in third
 
 
+@pytest.mark.parametrize("linked_event", ["command.end", "log.dropped"])
+def test_intent_cursor_replays_newer_rows_after_finding_older_anchor(
+    home, linked_event
+):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    common = {"ts": f"{day}T11:00:00.000Z", "surface": "cli"}
+    invocation = {"runId": "target", "commandId": "command"}
+    anchor = {
+        **common,
+        **invocation,
+        "event": "intent.keeper",
+        "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": "h1_" + "a" * 64,
+        "seq": 1,
+    }
+    linked = {**common, **invocation, "event": linked_event, "seq": 2}
+    unrelated = {**linked, "runId": "other", "seq": 3}
+    filler = log.encode({**common, "event": "command.start", "runId": "noise"})
+    log.file_path("cli", day, root).write_bytes(
+        log.encode(anchor)
+        + filler * (2 * log.MAX_SCAN_ROWS)
+        + log.encode(linked)
+        + log.encode(unrelated)
+    )
+
+    args = ("--json", "logs", "intent", "KEY", "--offline")
+    seen_events, seen_gaps = [], []
+    cursors = set()
+    continuation: tuple[str, ...] = ()
+    while True:
+        code, output = run_cli(*args, *continuation)
+        assert code == 0
+        page = json.loads(output)
+        seen_events.extend(page["events"])
+        seen_gaps.extend(page["gaps"])
+        before = page.get("nextBefore")
+        if before is None:
+            break
+        assert before not in cursors and len(cursors) < 7
+        cursors.add(before)
+        continuation = ("--before", before)
+
+    assert seen_events == (
+        [linked, anchor] if linked_event == "command.end" else [anchor]
+    )
+    assert seen_gaps == ([linked] if linked_event == "log.dropped" else [])
+
+
 def test_intent_cursor_keeps_anchors_from_each_scan_window(home):
     root = home / "logs"
     root.mkdir()

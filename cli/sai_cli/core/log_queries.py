@@ -200,6 +200,8 @@ def _trail_scan() -> log.PageScan:
 
 
 NO_CALL_PARENT = "-"
+# Intent cursors use the otherwise unused parent field after anchor discovery.
+INTENT_ATTRIBUTION_COMPLETE = "-"
 
 
 def _parse_position(day: str, parts: str) -> log.ScanPosition:
@@ -694,7 +696,11 @@ def intent(
             for position, line in following:
                 remember_anchor(position, line)
             scan.truncated |= truncated
-        pending = set().union(*links.values()) - checked if links else set()
+        pending = (
+            set().union(*links.values()) - checked
+            if links and cursor.replay is None
+            else set()
+        )
         # Leave part of the same budget for links the selected rows need.
         reserved = log.ScanBudget(
             min(sum(ref.size for ref in pending), budget.bytes_left // 2),
@@ -806,8 +812,11 @@ def intent(
     page = _PageReport(report)
     last = None
     stop = None
+    replay = cursor.replay
+    parent = cursor.parent
+    can_defer = scan.resume is not None and parent != INTENT_ATTRIBUTION_COMPLETE
     unattributed = []
-    for position, ts, line in rows:
+    for position, ts, line in rows if replay is None else ():
         if line.get("event") == "log.dropped":
             run_id = _id(line, "runId")
             if (
@@ -819,23 +828,38 @@ def intent(
                 stop = position
                 break
             if run_id not in matched_runs:
+                if run_id and can_defer:
+                    replay = position
+                    break
                 unattributed.append(line)
                 continue
             field = "gaps"
         elif scope is not None and _has_intent(line, key) and _scope(line) == scope:
             field = "events"
         elif (
-            scope is not None
-            and (match := _invocation(line)) is not None
+            (match := _invocation(line)) is not None
             and line.get("intentKey") in (None, key)
-            and _address(line) in (None, scope[0])
-            and (line.get("endpoint") is None or line.get("endpointId") == scope[1])
-            and line.get("endpointId") in (None, scope[1])
+            and (
+                scope is None
+                or (
+                    _address(line) in (None, scope[0])
+                    and (
+                        line.get("endpoint") is None
+                        or line.get("endpointId") == scope[1]
+                    )
+                    and line.get("endpointId") in (None, scope[1])
+                )
+            )
         ):
-            if not resolve_link(_link_tag("invocation", match)):
+            if scope is not None and not resolve_link(_link_tag("invocation", match)):
                 stop = position
                 break
-            if match not in invocations or match in conflicting:
+            if scope is None or match not in invocations:
+                if can_defer:
+                    replay = position
+                    break
+                continue
+            if match in conflicting:
                 continue
             field = "events"
         else:
@@ -855,12 +879,17 @@ def intent(
         # The first unread row needs more context than this page can verify.
         scan.truncated = True
         scan.resume = stop = None
-    page.finish(scan, cursor, last, stop)
+    keep_all_links = replay is not None
+    if replay is not None and complete_scan:
+        # The search has reached the end of the snapshot. Resume output at
+        # the first withheld row with the anchors found across all windows.
+        stop, replay, parent = replay, None, INTENT_ATTRIBUTION_COMPLETE
+    page.finish(scan, cursor, last, stop, parent, replay=replay)
     if frontier := stop or scan.resume:
         # Scope evidence can be deeper than the next page's scan. Links to
         # unread anchors are only needed when the scan already saw related rows.
         remaining_rows = rows
-        if complete_scan and stop is not None:
+        if complete_scan and stop is not None and not keep_all_links:
             first_unread = next(
                 index for index, (position, _, _) in enumerate(rows) if position == stop
             )
@@ -876,7 +905,7 @@ def intent(
             for _, _, line in remaining_rows
             if line.get("event") == "log.dropped"
         }
-        if complete_scan:
+        if complete_scan and not keep_all_links:
             # The entire unread range was visible. Drop links it cannot use.
             needed = {_link_tag("invocation", match) for match in related_invocations}
             needed.update(_link_tag("run", run) for run in related_runs if run)
@@ -895,12 +924,14 @@ def intent(
                 )
             )
             if (match := _invocation(line)) and (
-                (not unread and (not complete_scan or match in related_invocations))
+                keep_all_links
+                or (not unread and (not complete_scan or match in related_invocations))
                 or (not complete_scan and match in related_invocations)
             ):
                 links.setdefault(_link_tag("invocation", match), set()).add(position)
             if (run_id := _id(line, "runId")) and (
-                (not unread and (not complete_scan or run_id in related_runs))
+                keep_all_links
+                or (not unread and (not complete_scan or run_id in related_runs))
                 or (not complete_scan and run_id in related_runs)
             ):
                 links.setdefault(_link_tag("run", run_id), set()).add(position)
