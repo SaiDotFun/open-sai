@@ -742,7 +742,7 @@ seed = "accounts"
 name = "auth-use"
 args = ["--json","auth","use","{addr}"]
 seed = "accounts"
-state = { "trader/sessions.json#payload.active" = "0x1111111111111111111111111111111111111111", "trader/sessions.json#@mode" = 0o600 }
+state = { "trader/sessions.json#payload.active" = "0x1111111111111111111111111111111111111111", "trader/sessions.json#@mode" = 0o600, "trader/sessions.lock#@mode" = 0o644 }
 
 [[case]]
 name = "auth-use-missing"
@@ -769,7 +769,7 @@ state = { "trader/sessions.json#payload.active" = "0x222222222222222222222222222
 name = "auth-logout"
 args = ["--json","auth","logout","{addr}"]
 seed = "accounts"
-state = { "trader/sessions.json#payload.sessions.0x1111111111111111111111111111111111111111" = "<absent>" }
+state = { "trader/sessions.json#payload.sessions.0x1111111111111111111111111111111111111111" = "<absent>", "trader/sessions.lock#@mode" = 0o644 }
 
 [[case]]
 name = "intent-local-empty"

@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, fs, io, path::Path, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs::{self, OpenOptions},
+    io,
+    path::Path,
+    time::Duration,
+};
 
 use aes::Aes256;
 use aes_gcm::{
@@ -12,10 +18,7 @@ use sha2::{Digest, Sha256};
 use tempfile::Builder;
 use zeroize::Zeroizing;
 
-use super::{
-    SessionError, Storage, StorageError, StorageEvent, endpoint_origin, private_file,
-    remove_if_exists,
-};
+use super::{SessionError, Storage, StorageError, StorageEvent, endpoint_origin, remove_if_exists};
 use crate::errors::{Code, SaiError};
 
 const SESSIONS: &str = "sessions.json";
@@ -352,7 +355,13 @@ impl Storage<'_> {
     }
 
     fn session_lock_file(&self) -> io::Result<fs::File> {
-        private_file(&self.directory()?.join("sessions.lock"))
+        // Match Python's append open: honor the umask for a new lock and keep
+        // the mode of an existing lock. Session data lives in a separate file.
+        OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(self.directory()?.join("sessions.lock"))
     }
 
     fn lock_sessions(&self) -> io::Result<fs::File> {

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from scenarios import ADDRESS, child_env, loopback, seed_home
 from sai_cli.core import keeper, storage
 from sai_cli.tests.test_auth_connect import (
     ADDR,
@@ -162,6 +163,43 @@ def test_auth_use_missing(
     assert "Requested account is not connected" in expected[1] + expected[2]
     assert marker not in expected[1] + expected[2]
     assert observed(rust.run(*flags, "auth", "use", marker)) == expected
+
+
+@pytest.mark.parametrize("action", ["use", "logout"])
+@pytest.mark.parametrize(
+    ("umask", "existing_mode", "expected_mode"),
+    [(0o022, None, 0o644), (0o077, None, 0o600), (0o077, 0o640, 0o640)],
+    ids=["default-umask", "private-umask", "existing-lock"],
+)
+def test_auth_session_lock_mode(
+    tmp_path: Path,
+    cli_pair: tuple[CLI, CLI],
+    action: str,
+    umask: int,
+    existing_mode: int | None,
+    expected_mode: int,
+) -> None:
+    with loopback("normal") as endpoints:
+        for index, cli in enumerate(cli_pair):
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "accounts")
+            lock = home / "sai" / "trader" / "sessions.lock"
+            if existing_mode is None:
+                lock.unlink()
+            else:
+                lock.chmod(existing_mode)
+            result = subprocess.run(
+                [*cli, "--json", "auth", action, ADDRESS],
+                env=child_env(home, endpoints),
+                capture_output=True,
+                timeout=10,
+                umask=umask,
+                check=False,
+            )
+            assert result.returncode == 0, result.stderr
+            assert lock.stat().st_mode & 0o777 == expected_mode
+            assert lock.read_bytes() == b""
+        assert not endpoints.wire
 
 
 @pytest.mark.parametrize(
