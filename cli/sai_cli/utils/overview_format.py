@@ -25,7 +25,8 @@ def _source(row: dict[str, Any]) -> str:
 def _collateral(row: dict[str, Any]) -> str:
     if row["collateralUsd"] is not None:
         return _value(row["collateralUsd"])
-    return f"{row['collateralBaseUnits']} {row['collateralToken']} base units"
+    token = row["collateralToken"] or row["collateralTokenId"]
+    return f"{row['collateralBaseUnits']} {token} base units"
 
 
 def _trigger(row: dict[str, Any], prefix: str) -> str:

@@ -108,6 +108,10 @@ def _text(value: Any) -> str:
     return value
 
 
+def _optional_text(value: Any) -> str | None:
+    return None if value is None else _text(value)
+
+
 def _token_name(token: Mapping[str, Any]) -> str:
     symbol = token["symbol"]
     return (_text(symbol) if symbol is not None else "") or _text(token["name"])
@@ -702,13 +706,13 @@ def _trade_row(
 ) -> dict[str, Any]:
     market = trade["perpBorrowing"]
     collateral, quote = market["collateralToken"], market["quoteToken"]
-    symbol = _text(collateral["symbol"])
+    symbol = _optional_text(collateral["symbol"])
     collateral_id, quote_id = _uint(collateral["id"]), _uint(quote["id"])
     _uint(market["baseToken"]["id"])
     _check_block(trade["lastUpdatedBlock"])
     if not isinstance(trade["isLong"], bool):
         raise TypeError("Expected a boolean trade side")
-    scale = COLLATERAL_SCALE.get(symbol)
+    scale = COLLATERAL_SCALE.get(symbol) if symbol is not None else None
     collateral_price = (
         1 if symbol == "USDC" else prices.get(collateral_id, {}).get("usd")
     )
@@ -726,7 +730,7 @@ def _trade_row(
     row = {
         "id": trade["id"],
         "marketId": _uint(market["marketId"]),
-        "market": _text(market["baseToken"]["symbol"]),
+        "market": _optional_text(market["baseToken"]["symbol"]),
         "side": "long" if trade["isLong"] else "short",
         "collateralToken": symbol,
         "collateralTokenId": collateral_id,

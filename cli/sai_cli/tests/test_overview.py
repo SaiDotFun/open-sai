@@ -667,6 +667,23 @@ def test_queued_orders_keep_valid_actions_beside_invalid_rows(replay, paginated)
     ] == ([0, 100, 0, 100] if paginated else [0])
 
 
+def test_overview_keeps_positions_with_null_token_symbols(replay):
+    long, short = populate_trades(replay)
+    long["perpBorrowing"]["baseToken"]["symbol"] = None
+    short["perpBorrowing"]["collateralToken"]["symbol"] = None
+
+    positions = mcp(replay, addr=ADDR)["positions"]
+    long_row, short_row = positions["data"]["items"]
+    assert long_row["market"] is None
+    assert long_row["marketId"] == long["perpBorrowing"]["marketId"]
+    assert long_row["riskStatus"] == "verified"
+    assert short_row["collateralToken"] is None
+    assert short_row["collateralBaseUnits"] == short["collateralAmount"]
+    assert short_row["collateralUsd"] is None
+    assert short_row["riskStatus"] == "partial"
+    assert positions["data"]["unrealizedPnlUsd"] is None
+
+
 def test_no_default_account_gives_an_address_hint(replay):
     result = cli(replay, "account", "overview")
     assert result.exit_code != 0 and "--as ADDR" in result.output
