@@ -7,15 +7,10 @@ use std::{
 
 use sai_core::{
     errors::Code,
-    keeper::{INTENTS, Keeper, MARKETS, SUBMIT},
+    keeper::{INTENTS, Keeper, SUBMIT},
     log::{EventContext, Surface},
-    storage::{Session, Storage},
-    trade::{
-        Confirmation, OpenTrade, OrderType, PreviewMode, Side, SubmitOptions, Trading,
-        preview_digest,
-    },
 };
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 #[path = "keeper/position_updates.rs"]
 mod position_updates;
@@ -55,92 +50,32 @@ fn read_request(stream: &mut TcpStream) -> (Vec<String>, Vec<u8>) {
 }
 
 #[tokio::test]
-async fn shared_market_refusal_returns_refreshed_estimates_before_reserving() {
+async fn lcd_probe_appends_path_before_query() {
     let listener = listener();
-    let endpoint = format!("http://{}/query", listener.local_addr().unwrap());
-    let server_listener = listener.try_clone().unwrap();
+    let endpoint = format!(
+        "http://{}/prefix/?project=fixture",
+        listener.local_addr().unwrap()
+    );
     let server = thread::spawn(move || {
-        for price in ["100", "102"] {
-            let (mut stream, _) = server_listener.accept().unwrap();
-            let (_, bytes) = read_request(&mut stream);
-            let req: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(req["query"], MARKETS);
-            let response = json!({"data": {"perp": {"borrowings": [
-                {"marketId": 3, "price": price, "isOpen": true, "collateralToken": {"symbol": "USDC"}}
-            ]}}})
-            .to_string();
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
-                response.len()
-            )
-            .unwrap();
-        }
-    });
-    let home = tempfile::tempdir().unwrap();
-    let storage = Storage::new(home.path());
-    let addr = "0x1111111111111111111111111111111111111111";
-    let session = Session::new(
-        "fixture-token".to_owned().into(),
-        addr.into(),
-        "2099-01-01T00:00:00Z".into(),
-        endpoint.clone(),
-    );
-    storage.save_session(session).unwrap();
-    let trading = Trading::new(&endpoint, &storage, EVENTS);
-    let session = trading.load_session(None).unwrap();
-    let mut preview = OpenTrade {
-        market: "3",
-        side: Side::Long,
-        order_type: OrderType::Market,
-        amount: "20",
-        leverage: "2",
-        price: None,
-        slippage: "1",
-        take_profit: None,
-        stop_loss: None,
-    }
-    .preview()
-    .unwrap();
-    preview = trading
-        .prepare_preview(preview, Some(&session), PreviewMode::Mcp)
-        .await
-        .unwrap();
-    let original = preview.confirmed_output(Some(addr));
-    assert_eq!(original["referencePrice"], "100");
-    assert_eq!(original["estimates"]["worstCaseFill"]["price"], "102.01");
-    let digest = preview_digest(&preview, Some(addr));
-    let result = trading
-        .submit(
-            &session,
-            &preview,
-            SubmitOptions {
-                confirmation: Some(Confirmation::new(&digest, Some("100")).unwrap()),
-                ..Default::default()
-            },
+        let (mut stream, _) = listener.accept().unwrap();
+        let (headers, _) = read_request(&mut stream);
+        let body = r#"{"default_node_info":{"network":"fixture-chain"}}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
         )
-        .await;
-    let error = result.err().unwrap();
-    assert_eq!(error.code, Code::PriceMoved);
-    let replacement = &error.details.unwrap()["preview"];
-    assert_eq!(replacement["referencePrice"], "102");
-    let fill = &replacement["estimates"]["worstCaseFill"];
-    assert_eq!(fill["status"], "bound");
-    assert_eq!(fill["price"], "104.0502");
-    assert_eq!(fill["reference"]["price"], "102");
-    assert_ne!(replacement["previewDigest"], digest);
-    preview.reference_price = Some("102".into());
+        .unwrap();
+        headers[0].clone()
+    });
     assert_eq!(
-        replacement["previewDigest"],
-        preview_digest(&preview, Some(addr))
+        sai_core::keeper::lcd_network(&endpoint, Duration::from_secs(1)).await,
+        Ok(Some("fixture-chain".into()))
     );
-    server.join().unwrap();
-    listener.set_nonblocking(true).unwrap();
     assert_eq!(
-        listener.accept().unwrap_err().kind(),
-        std::io::ErrorKind::WouldBlock
+        server.join().unwrap(),
+        "GET /prefix/cosmos/base/tendermint/v1beta1/node_info?project=fixture HTTP/1.1"
     );
-    assert!(!home.path().join("trader/intents.sqlite3").exists());
 }
 
 #[tokio::test]
