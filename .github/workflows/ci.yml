@@ -305,9 +305,7 @@ jobs:
           printf 'C2/C3 Python v0.1.1 reference '
           git -C "$SAI_PYTHON_REFERENCE" rev-parse HEAD
           uv run --locked python tests/parity/parity.py \
-            --reference "$SAI_PYTHON_REFERENCE/.venv/bin/sai" \
-            --case 'config-get-*' --case config-set --case config-set-existing \
-            --case config-unset --case config-invalid-value --case config-unknown-key
+            --reference "$SAI_PYTHON_REFERENCE/.venv/bin/sai" --c2-v011
           unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
             cargo test --locked -p sai --test storage_parity -- --include-ignored \
               rust_saved_session_round_trips_in_python rust_reads_and_migrates_python_v2_session \

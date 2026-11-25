@@ -19,10 +19,18 @@ class Gap:
 
 
 class ManifestGaps:
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        case_ids: set[str] | None = None,
+        row_label: str = "CUTOVER_ROW",
+    ) -> None:
         with path.open("rb") as file:
             self.gaps = {
-                name: Gap(**entry) for name, entry in tomllib.load(file)["gap"].items()
+                name: Gap(**entry)
+                for name, entry in tomllib.load(file)["gap"].items()
+                if case_ids is None or name in case_ids
             }
         for name, gap in self.gaps.items():
             if (
@@ -36,6 +44,7 @@ class ManifestGaps:
                 raise ValueError(f"Invalid release gap entry for {name}")
         self.seen: set[str] = set()
         self.failed = False
+        self.row_label = row_label
 
     def result(self, name: str, differences: list[str]) -> tuple[str, str]:
         if name in self.seen:
@@ -72,7 +81,7 @@ class ManifestGaps:
             "title": (gap.title or None) if gap else None,
             "differences": differences,
         }
-        print("CUTOVER_ROW " + json.dumps(evidence, sort_keys=True), flush=True)
+        print(self.row_label + " " + json.dumps(evidence, sort_keys=True), flush=True)
         owner = f"{gap.owner} " if gap else ""
         if status == "XPASS":
             return status, f"{owner}remove the repaired signature"

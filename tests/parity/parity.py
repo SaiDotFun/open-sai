@@ -61,6 +61,18 @@ from scenarios import (
     write_seed,
 )
 
+C2_CONFIG_CASE_IDS = {
+    "config-get-default",
+    "config-get-env",
+    "config-get-file",
+    "config-get-text",
+    "config-invalid-value",
+    "config-set",
+    "config-set-existing",
+    "config-unknown-key",
+    "config-unset",
+}
+
 
 @dataclass(frozen=True)
 class Case:
@@ -903,12 +915,21 @@ def main() -> int:
         action="store_true",
         help="Require each release row to pass or match its reviewed signature",
     )
+    parser.add_argument(
+        "--c2-v011",
+        action="store_true",
+        help="Run the C2 config comparisons with their exact logging signatures",
+    )
     args = parser.parse_args()
-    if args.cutover and (
-        args.case or not args.reference or not os.getenv("SAI_PARITY_BIN")
+    comparing_release = args.cutover or args.c2_v011
+    if comparing_release and (
+        args.case
+        or not args.reference
+        or not os.getenv("SAI_PARITY_BIN")
+        or (args.cutover and args.c2_v011)
     ):
         parser.error(
-            "--cutover needs the full manifest, --reference, and SAI_PARITY_BIN"
+            "Select one release suite with --reference and SAI_PARITY_BIN, without --case"
         )
     if sqlite3.sqlite_version_info < MIN_SQLITE_SCHEMA:
         parser.error(SQLITE_SCHEMA_REQUIREMENT)
@@ -951,9 +972,17 @@ def main() -> int:
     selected = [
         case
         for case in cases
-        if not args.case
-        or any(fnmatch.fnmatchcase(case.name, pattern) for pattern in args.case)
+        if (
+            case.name in C2_CONFIG_CASE_IDS
+            if args.c2_v011
+            else not args.case
+            or any(fnmatch.fnmatchcase(case.name, pattern) for pattern in args.case)
+        )
     ]
+    if args.c2_v011 and (
+        missing := C2_CONFIG_CASE_IDS - {case.name for case in selected}
+    ):
+        parser.error(f"Missing C2 config case IDs: {', '.join(sorted(missing))}")
     if not selected:
         parser.error("No parity cases matched")
     candidate = reference
@@ -985,7 +1014,15 @@ def main() -> int:
     expected_differences = 0
     tools: dict[str, str] = {}
     evidence: dict[str, list[str]] = {}
-    gaps = ManifestGaps(HERE / "manifest-xfails.toml") if args.cutover else None
+    gaps = None
+    if comparing_release:
+        gaps = ManifestGaps(
+            HERE / "manifest-xfails.toml",
+            case_ids={f"case:{name}" for name in C2_CONFIG_CASE_IDS}
+            if args.c2_v011
+            else None,
+            row_label="C2_V011_ROW" if args.c2_v011 else "CUTOVER_ROW",
+        )
     overview_reference = os.environ.get("SAI_PARITY_OVERVIEW_PYTHON")
     for case in selected:
         if args.reference is not None:
@@ -1006,7 +1043,7 @@ def main() -> int:
         ) and case.mcp_checkout_wire is not None:
             case = replace(case, wire=case.mcp_checkout_wire)
         executable = oracle if candidate is reference else candidate
-        if args.cutover:
+        if comparing_release:
             case = replace(
                 case,
                 accepted_divergence=None,
@@ -1016,7 +1053,7 @@ def main() -> int:
             case,
             oracle,
             executable,
-            cutover=args.cutover,
+            cutover=comparing_release,
             tool_evidence=evidence if gaps else None,
         )
         for tool, status in listed.items():
@@ -1042,7 +1079,7 @@ def main() -> int:
                 else ""
             ),
         )
-    if not args.case:
+    if not args.case and not args.c2_v011:
         for name, reason in sorted(deferred.items()):
             if gaps:
                 row(
@@ -1073,7 +1110,7 @@ def main() -> int:
     if expected_differences:
         print(f"Expected differences: {expected_differences}.")
     if gaps:
-        if not tools:
+        if args.cutover and not tools:
             print("Cutover could not verify an MCP inventory.")
             return 1
         return gaps.finish()

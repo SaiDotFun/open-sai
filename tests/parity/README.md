@@ -55,7 +55,10 @@ against the same `sai-cli/v0.1.2` executable. Run the manifest locally with
 `SAI_PARITY_BIN` to the native executable.
 
 Each `CUTOVER_ROW` in the CI log carries a stable ID, a result, and the
-observed difference paths. `case:` IDs use names in `cases.toml`, `cli:` IDs
+observed difference paths. Hashes bind the normalized values without exposing
+them in the job log. The full manifest must contain every case ID in
+[`release-case-ids.txt`](release-case-ids.txt). `case:` IDs use names in
+`cases.toml`, `cli:` IDs
 use deferred command names, and `mcp:` IDs use tool names. The MCP result
 includes tool metadata and requires a matching `tools/call` transcript.
 
@@ -64,6 +67,11 @@ each reviewed difference signature. An exact match reports `XFAIL`. A changed
 signature, unexpected pass, or unused entry fails the required job. Owners
 remove their entries in the same change that repairs the corresponding gaps.
 `M2-unassigned` entries include proposed issue titles for triage.
+
+CI records the C3 storage replays against v0.1.2 and a separate C2/C3 replay
+against v0.1.1. The nine C2 config cases share their exact log-schema
+signatures across both releases. Each v0.1.1 config result appears as a
+`C2_V011_ROW`.
 
 ## Auth Security Parity
 
