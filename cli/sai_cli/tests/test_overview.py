@@ -18,6 +18,7 @@ from urllib.parse import unquote, urlsplit
 
 import pytest
 from click.testing import CliRunner
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import TextContent
 from sai_cli.core import keeper, overview, reconcile, settings, storage, stream
 from sai_cli.mcp_server.server import create_server
@@ -620,6 +621,47 @@ def test_no_default_account_gives_an_address_hint(replay):
     assert result.exit_code != 0 and "--as ADDR" in result.output
     assert mcp(replay)["code"] == "SESSION_UNAVAILABLE"
     assert replay["calls"] == []
+
+
+@pytest.mark.parametrize("source", ["argument", "global", "empty", "session"])
+def test_overview_rejects_invalid_addresses_before_reading(replay, source):
+    invalid = "https://overview-fixture.invalid/address"
+    if source == "session":
+        save_session(replay, addr=invalid)
+        args, mcp_args = [], {}
+    elif source == "global":
+        args, mcp_args = ["--as", invalid], {"addr": invalid}
+    else:
+        addr = "" if source == "empty" else invalid
+        args, mcp_args = [], {"addr": addr}
+
+    command = [*args, "account", "overview"]
+    if source in {"argument", "empty"}:
+        command += ["--as", mcp_args["addr"]]
+    code = "SESSION_UNAVAILABLE" if source == "session" else "INVALID_REQUEST"
+    result = cli(replay, "--json", *command)
+    response = mcp(replay, **mcp_args)
+
+    assert replay["calls"] == []
+    assert result.exit_code != 0
+    assert json.loads(result.output)["error"]["code"] == code
+    assert response["code"] == code
+    assert invalid not in result.output
+    assert invalid not in json.dumps(response)
+    server = create_server(replay["config"])
+    assert server.loggable("account_overview", mcp_args) == ({}, 0)
+
+
+def test_mcp_overview_rejects_a_non_string_address_before_reading(replay):
+    invalid = {"value": "synthetic-overview-address"}
+    server = create_server(replay["config"])
+    with pytest.raises(ToolError) as caught:
+        asyncio.run(server.call_tool("account_overview", {"addr": invalid}))
+
+    assert replay["calls"] == []
+    assert invalid["value"] not in str(caught.value)
+    assert str(caught.value) == "Argument 'addr' must be a string or null."
+    assert server.loggable("account_overview", {"addr": invalid}) == ({}, 0)
 
 
 def test_contract_threshold_reports_crossing_even_when_keeper_estimate_does_not(replay):

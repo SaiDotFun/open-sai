@@ -14,7 +14,7 @@ from threading import BoundedSemaphore
 from typing import Any
 
 from . import keeper, margin, reconcile, session, storage, stream
-from .errors import Code, SaiError
+from .errors import Code, ExitCode, SaiError, SessionError
 from .log import origin
 from .settings import Settings
 
@@ -989,6 +989,12 @@ def _session_info(
 
 def account_overview(settings: Settings, addr: str | None = None) -> dict[str, Any]:
     """Read one account, keeping available sections when a source fails."""
+    if addr is not None and not keeper.is_address(addr):
+        raise SaiError(
+            "Pass a 0x-prefixed EVM address.",
+            Code.INVALID_REQUEST,
+            exit_code=ExitCode.USAGE,
+        )
     source = "argument" if addr is not None else "session"
     try:
         accounts = storage.load_accounts()
@@ -1009,7 +1015,12 @@ def account_overview(settings: Settings, addr: str | None = None) -> dict[str, A
                 raise AccountUnavailable(
                     "The active session belongs to another Keeper endpoint"
                 )
-            addr = stored["evmAddress"]
+            try:
+                addr = session.session_address(stored, key)
+            except SessionError as exc:
+                raise AccountUnavailable(
+                    "Stored session has an invalid address"
+                ) from exc
         session_read = datetime.now(UTC)
         session_section = _read(
             lambda: _session_info(stored, settings.endpoint, session_read)
