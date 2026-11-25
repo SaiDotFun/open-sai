@@ -260,8 +260,17 @@ driver uses the Python entry point from its own environment.
 
 Doctor cases that query `node_info` use the checkout's Python entry point.
 The LCD comparison contract comes from Python main at
-`59a694fc3bebcf18954de864d9aa8e009a8ac558`. The fixtures cover matching
-chains, a chain mismatch with a reflected endpoint path, and malformed chain IDs.
+`59a694fc3bebcf18954de864d9aa8e009a8ac558`. The native CI gate runs
+`--case doctor-network --case 'doctor-lcd-*'`. These cases cover matching
+chains, a missing Keeper chain ID, a reflected LCD path, an unreachable
+LCD, and malformed chain IDs. The driver compares the CLI streams byte
+for byte after masking the temporary home path, report timestamp, and
+probe and check durations.
+
+The logging-enabled mismatch case checks the LCD warning event and scans
+the raw logs for the fixture path. It allows the existing difference in
+the Keeper probe event, where Python includes `command` and `commandId`
+and Rust omits both fields.
 
 The `client_seed` key supplies private Claude Code, Codex, and Cursor
 configs. The runner uses fixture programs for client subprocesses and
@@ -275,8 +284,8 @@ original bytes and mode. The pinned Python reference leaves the replacement
 on disk.
 
 The `lcd-origin-only` cases project the LCD endpoint in Python's report to
-its origin before comparing it with Rust. They cover successful probes and
-an unavailable LCD with a private path. Rust output is compared as emitted.
+its origin before comparing it with Rust. The byte-comparison cases use
+Python's origin-only report directly.
 
 ## TP/SL and Leverage
 

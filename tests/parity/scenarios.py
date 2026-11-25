@@ -364,7 +364,9 @@ def loopback(
             "data": {
                 "oneClickTrading": {
                     "enabled": enabled,
-                    "chainId": chain,
+                    "chainId": None
+                    if scenario == "doctor-lcd-unknown-keeper-chain"
+                    else chain,
                     "contractAddress": contract,
                 }
             }

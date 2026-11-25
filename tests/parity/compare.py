@@ -35,6 +35,8 @@ SQLITE_SCHEMA_REQUIREMENT = (
 )
 SIDECARS = ("-wal", "-shm", "-journal")
 DURATION = re.compile(r"(?<= in )\d+(?= ms\b)")
+DOCTOR_GENERATED_AT = re.compile(r'("generatedAt":)"([^"\\]+)"')
+DOCTOR_DURATION_MS = re.compile(r'(?<="durationMs":)(?:0|[1-9]\d*)(?=[,}])')
 INTENT_ID = re.compile(r"\b\d{8}T\d{9}Z_[0-9A-HJKMNP-TV-Z]{16}\b")
 TOML_TABLE = re.compile(r"\s*\[([^\[\]]+)\]\s*(?:#.*)?")
 SQLITE_TRIVIA = r"[ \t\n\f\r]+|--[^\n]*|/\*[\s\S]*?(?:\*/|$)"
@@ -351,6 +353,16 @@ def doctor_report(value: dict[str, Any]) -> None:
         replace_if(sai, "version", is_version)
         if isinstance(install := sai.get("install"), dict):
             doctor_provenance(install)
+
+
+def mask_doctor_stream(raw: str) -> str:
+    """Mask clock values without changing the CLI's serialization or layout."""
+    raw = DOCTOR_GENERATED_AT.sub(
+        lambda match: f'{match[1]}"<generatedAt>"' if timestamp(match[2]) else match[0],
+        raw,
+    )
+    raw = DOCTOR_DURATION_MS.sub('"<durationMs>"', raw)
+    return DURATION.sub("<durationMs>", raw)
 
 
 def rewrite_mcp_fields(text: str, updates: dict[str, Any]) -> str:
