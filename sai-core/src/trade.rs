@@ -61,7 +61,7 @@ pub struct TradePreview {
     pub quote: Option<Value>,
     pub warning: Option<&'static str>,
     position_route: Option<position::PositionRoute>,
-    close_owner_verified: Option<bool>,
+    position_owner_verified: Option<bool>,
     estimates: Option<Value>,
 }
 
@@ -73,7 +73,7 @@ impl TradePreview {
             quote: None,
             warning: None,
             position_route: None,
-            close_owner_verified: None,
+            position_owner_verified: None,
             estimates: None,
         }
     }
@@ -87,7 +87,7 @@ impl TradePreview {
             output["quote"] = quote.clone();
         }
         output["intent"] = json!(self.intent);
-        if self.close_owner_verified == Some(false) {
+        if self.position_owner_verified == Some(false) {
             output["positionOwnerVerified"] = json!(false);
         }
         if let Some(estimates) = &self.estimates {
@@ -106,7 +106,7 @@ impl TradePreview {
 
     pub fn confirmed_output(&self, account: Option<&str>) -> Value {
         let mut output = self.output(account);
-        if self.intent.kind == "CLOSE_POSITION" && self.close_owner_verified != Some(true) {
+        if self.intent.kind == "CLOSE_POSITION" && self.position_owner_verified != Some(true) {
             return output;
         }
         if let Some(route) = &self.position_route {

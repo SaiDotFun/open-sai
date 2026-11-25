@@ -154,10 +154,9 @@ impl Trading<'_> {
         addr: &str,
         id: &Value,
         confirming: bool,
-    ) -> Result<PositionRoute, SaiError> {
+    ) -> Result<(PositionRoute, Value), SaiError> {
         let route = self.position_route(lcd, confirming).await?;
-        let (route, _) = Self::verify_contract_owner(lcd, addr, id, route).await?;
-        Ok(route)
+        Ok(Self::verify_contract_owner(lcd, addr, id, route).await?)
     }
 
     pub async fn close_position_preview(

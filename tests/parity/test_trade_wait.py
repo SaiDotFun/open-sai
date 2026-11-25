@@ -667,6 +667,10 @@ def test_trade_wait_dry_run(
                 assert "receipt" not in document
                 assert len(requests) == preflight
                 assert not replies
+                if update:
+                    assert requests[2].path == NODE_INFO
+                    assert requests[3].path.startswith(SMART_QUERY)
+                    assert "positionOwnerVerified" not in document
                 assert all(
                     not request.body
                     or not json.loads(request.body)["query"].startswith("mutation")

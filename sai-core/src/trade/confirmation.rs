@@ -285,7 +285,7 @@ mod tests {
             preview.quote = input.get("quote").cloned();
             preview.estimates = Some(data["estimates"].clone());
             if kind == "CLOSE_POSITION" {
-                preview.close_owner_verified = Some(true);
+                preview.position_owner_verified = Some(true);
             }
             if let Some(route) = input.get("positionRoute") {
                 preview.position_route = Some(crate::trade::position::PositionRoute {
