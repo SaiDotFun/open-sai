@@ -333,10 +333,6 @@ impl Trading<'_> {
             .filter(|chain| !chain.is_empty())
             .ok_or_else(|| invalid(NETWORK_MISMATCH))?;
         let network = lcd.network().await?;
-        let network = network
-            .as_str()
-            .filter(|network| !network.is_empty())
-            .ok_or_else(|| invalid(NETWORK_MISMATCH))?;
         let contract = route["contractAddress"]
             .as_str()
             .filter(|contract| !contract.is_empty())
