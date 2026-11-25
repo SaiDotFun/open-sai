@@ -258,6 +258,21 @@ def test_sign_in_and_logout_recover_from_an_unreadable_store(session):
     assert not storage.session_exists()
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+def test_logout_without_a_matching_session_does_not_create_a_lock(session, explicit):
+    storage.save_session(session)
+    other = {**session, "evmAddress": "0x" + "c" * 40}
+    storage.save_session(other)
+    assert storage.delete_session() == other["evmAddress"]
+    lock = storage.home() / "sessions.lock"
+    lock.unlink()
+
+    missing = other["evmAddress"] if explicit else None
+    assert storage.delete_session(missing) is None
+    assert not lock.exists()
+    assert storage.load_session(session["evmAddress"]) == session
+
+
 @pytest.mark.parametrize("failure", ["expired", "wrong_endpoint"])
 def test_session_refuses_expired_or_wrong_network(session, failure):
     if failure == "expired":
@@ -417,32 +432,30 @@ def test_margin_quote_uses_exact_contract_integer_math():
     effective = Decimal(10)
     assert (
         margin.margin_quote(
-            raw, funds, market, "add", "10", effective_leverage=effective
+            raw, funds, market, "add", 10_000_000, effective_leverage=effective
         )["requestedLeverage"]
         == "5"
     )
     assert (
         margin.margin_quote(
-            raw, funds, market, "remove", "5", effective_leverage=effective
+            raw, funds, market, "remove", 5_000_000, effective_leverage=effective
         )["requestedLeverage"]
         == "20"
     )
     with pytest.raises(ValueError, match="six decimal"):
-        margin.margin_quote(
-            raw, funds, market, "add", "0.0000001", effective_leverage=effective
-        )
+        margin.margin_amount_usdc("0.0000001")
     with pytest.raises(ValueError, match="Insufficient"):
         margin.margin_quote(
             raw,
             {"available_to_trade": "1"},
             market,
             "add",
-            "1",
+            1_000_000,
             effective_leverage=effective,
         )
     with pytest.raises(ValueError, match="Keep some margin"):
         margin.margin_quote(
-            raw, funds, market, "remove", "10", effective_leverage=effective
+            raw, funds, market, "remove", 10_000_000, effective_leverage=effective
         )
 
 
@@ -478,7 +491,7 @@ def test_margin_rounding_vectors(
         {"available_to_trade": "9000000"},
         {"minLeverage": 1, "maxLeverage": 100},
         direction,
-        amount,
+        margin.margin_amount_usdc(amount),
         effective_leverage=Decimal(leverage),
     )
     assert quote["requestedLeverage"] == result
