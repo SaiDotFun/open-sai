@@ -729,35 +729,54 @@ def test_exact_decimal_checks_intentionally_differ_from_python(
             assert not rows(home)
 
 
-def test_non_ascii_market_id_is_an_accepted_parity_divergence(
-    trade_pair: tuple[CLI, CLI], tmp_path: Path
+@pytest.mark.parametrize(
+    "args",
+    [
+        *(
+            (*OPEN, option, "3٣")
+            for option in (
+                "--market",
+                "--amount",
+                "--leverage",
+                "--price",
+                "--slippage",
+                "--take-profit",
+                "--stop-loss",
+            )
+        ),
+        (*CLOSE[:2], "3٣"),
+        (*CANCEL[:2], "3٣"),
+        ("trade", "tpsl", "3٣", "--take-profit", "110"),
+        ("trade", "tpsl", "7", "--take-profit", "3٣"),
+        ("trade", "tpsl", "7", "--stop-loss", "3٣"),
+        ("trade", "leverage", "3٣", "--leverage", "5"),
+        ("trade", "leverage", "7", "--leverage", "3٣"),
+        ("trade", "margin", "3٣", "--direction", "add", "--amount", "1"),
+        ("trade", "margin", "7", "--direction", "add", "--amount", "3٣"),
+        ("trade", "partial-close", "3٣", "--percent", "50"),
+        ("trade", "partial-close", "7", "--percent", "3٣"),
+    ],
+)
+def test_non_ascii_trade_numbers_are_usage_errors(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, args: CLI
 ) -> None:
-    for index, cli in enumerate(trade_pair):
+    python = (str(Path(sys.executable).with_name("sai")),)
+    results = []
+    for index, cli in enumerate((python, cli_pair[1])):
         with loopback("trade-accepted") as endpoints:
             home = tmp_path / str(index)
             seed_home(home, endpoints, "empty")
-            code, result, stderr = run(
-                cli,
-                home,
-                endpoints,
-                (*OPEN, "--market", "٣", "--dry-run"),
-                python=index == 0,
-            )
-            assert stderr == ""
-            if index == 0:
-                assert code == 0
-                assert (
-                    result["intent"]["body"]["market"]["marketIndex"]
-                    == "MarketIndex(3)"
-                )
-            else:
-                assert code == 2
-                assert (
-                    result["error"]["message"]
-                    == "Invalid value for '--market': expected an integer."
-                )
+            outcome = run(cli, home, endpoints, args, python=index == 0)
+            code, result, stderr = outcome
+            assert (code, result.get("error", {}).get("code"), stderr) == (
+                2,
+                "INVALID_REQUEST",
+                "",
+            ), result
             assert not endpoints.wire
             assert not rows(home)
+            results.append(outcome)
+    assert results[0] == results[1]
 
 
 @pytest.mark.parametrize(

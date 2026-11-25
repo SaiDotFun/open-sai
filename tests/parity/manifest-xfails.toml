@@ -595,7 +595,7 @@ signature = "239f76a3be30caf98fa3d5ed7716a23e0f36dcc0934cb4b833f4f5f4f0b6841d"
 
 [gap."case:trade-partial-close-unicode-percent"]
 owner = "#139"
-signature = "ffaba9f1d2410e69746974d2d655c7d53671af6a9ae4836609cfc08d0dd2b9b3"
+signature = "5b545493cbedb49797318e5516595b2029764cc350bda78b5c3493f002389a5e"
 
 [gap."case:trade-partial-close-unknown-blocks-retry"]
 owner = "#174"
