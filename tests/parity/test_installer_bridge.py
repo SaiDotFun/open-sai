@@ -347,7 +347,7 @@ def native_artifact(replay: Replay, name: str = "RUST") -> str:
             )
         )
         .strip()
-        .split()[1]
+        .split()[-1]
     )
     replay.add(version, {asset_name(version): archive(binary)})
     return version
@@ -369,7 +369,7 @@ def test_standalone_installs_release(install: Install, replay: Replay) -> None:
     pre_mcp_xfail(result)
     ok(result)
     install.pin(version)
-    assert ok(install.run("sai", "--version")).strip() == f"sai {version}"
+    assert ok(install.run("sai", "--version")).strip() == f"sai, version {version}"
     assert install.launcher.readlink() == Path(".sai-native/current")
     target = install.launcher.resolve(strict=True)
     assert target.parent.name.startswith(f"{version}-")

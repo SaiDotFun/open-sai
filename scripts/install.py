@@ -920,7 +920,10 @@ def smoke_native(
                         )
                 if args[0] == "--version":
                     output.seek(0)
-                    if output.read(512).strip() != f"sai {version}".encode():
+                    if output.read(512).strip() not in (
+                        f"sai, version {version}".encode(),
+                        f"sai {version}".encode(),
+                    ):
                         raise LookupFailed(f"`{label}` did not report {version}")
             except subprocess.TimeoutExpired as error:
                 raise LookupFailed(f"`{label}` timed out") from error

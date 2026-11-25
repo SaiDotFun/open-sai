@@ -223,7 +223,7 @@ def test_shim_repairs_digest_directory_permissions_offline(
                 d.tool.sai,
                 "--version",
             )
-            == f"sai {d.version}\n"
+            == f"sai, version {d.version}\n"
         )
         assert stat.S_IMODE(binary.parent.stat().st_mode) == 0o700
 
@@ -258,7 +258,7 @@ def test_shim_replaces_malformed_cache_entries(
                 run(
                     d.tool, "Replace the malformed cache entry", d.tool.sai, "--version"
                 )
-                == f"sai {d.version}\n"
+                == f"sai, version {d.version}\n"
             )
             assert d.replay.get_requests == requests * 2
             assert stat.S_IMODE(folder.stat().st_mode) == 0o700
@@ -355,7 +355,7 @@ def test_native_shim_selects_exact_asset_and_reuses_it_offline(
     tool, replay = d.tool, d.replay
     replay.add_release(d.wheel, d.version, d.archive)
     replay.latest = "99.0.0"
-    expected_version = f"sai {d.version}\n"
+    expected_version = f"sai, version {d.version}\n"
     expected_requests = [f"{d.release}/SHA256SUMS", f"{d.release}/{d.archive.name}"]
     sums, media_type = replay.assets[expected_requests[0]]
     wrong_target = (

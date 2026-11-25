@@ -36,12 +36,15 @@ fn read_json(output: &Output) -> Value {
 fn prints_workspace_version_without_reading_config() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("config.toml"), "invalid TOML").unwrap();
-    let output = sai(root.path()).arg("--version").output().unwrap();
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        format!("sai {}\n", env!("CARGO_PKG_VERSION"))
-    );
+    for args in [&["--version"][..], &["--json", "--version"]] {
+        let output = sai(root.path()).args(args).output().unwrap();
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("sai, version {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
     assert!(!root.path().join("logs").exists());
 }
 

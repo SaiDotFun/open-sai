@@ -98,7 +98,10 @@ def smoke(
             return (
                 f"{label} failed: {done.stderr[:512].decode(errors='replace').strip()}"
             )
-        if args == ["--version"] and done.stdout.strip() != f"sai {version}".encode():
+        if args == ["--version"] and done.stdout.strip() not in (
+            f"sai, version {version}".encode(),
+            f"sai {version}".encode(),
+        ):
             return f"{label} did not report {version}"
         if version_only:
             return None
