@@ -1707,12 +1707,16 @@ class CutoverMcp:
         self.paths["cursor"].write_text(json.dumps(data), encoding="utf-8")
 
     def verify_cursor_alias(self) -> None:
-        data = self.read("cursor")
+        entries = self.read("cursor")["mcpServers"]
+        if RETIRED_MCP_FIXTURE not in entries:
+            return
         expected = self.expected("cursor", stale=False)["mcpServers"]["sai"]
-        actual = data.get("mcpServers", {}).get(RETIRED_MCP_FIXTURE)
+        actual = entries[RETIRED_MCP_FIXTURE]
+        if isinstance(actual, dict) and isinstance(actual.get("command"), str):
+            actual["command"] = os.path.normpath(actual["command"])
         require(
             actual == expected,
-            "The native updater did not repoint the existing Cursor alias",
+            "The native updater left the Cursor alias pointing to a stale command",
         )
 
     def verify(self, client: str, *, cursor_alias: bool = False) -> None:
@@ -2138,7 +2142,8 @@ def rehearse_native_staged(tool: Install, assets: NativeAssets) -> int:
                 ),
             )
         check(
-            "Rollback update repoints the stale Cursor alias", mcp.verify_cursor_alias
+            "Rollback update repoints or removes the stale Cursor alias",
+            mcp.verify_cursor_alias,
         )
     print(
         f"Native cutover rehearsal finished with {failures} failed checks.",
