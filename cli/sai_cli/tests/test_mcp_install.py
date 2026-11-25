@@ -1221,6 +1221,13 @@ def test_claude_install_reports_an_explicit_command_blocked_by_a_legacy_alias(
     assert not env.calls()
 
 
+def claude_add_command(hint: str) -> str:
+    [command] = [
+        part for part in hint.split("`")[1::2] if part.startswith("claude mcp add ")
+    ]
+    return command
+
+
 def test_claude_manual_commands_are_copyable(env: Env, monkeypatch: pytest.MonkeyPatch):
     profile = env.root / "a profile"
     monkeypatch.setenv("SAI_HOME", str(profile))
@@ -1236,7 +1243,7 @@ def test_claude_manual_commands_are_copyable(env: Env, monkeypatch: pytest.Monke
     [row] = payload(result)["error"]["details"]["results"]
     assert config.read_bytes() == before
     assert not env.calls()
-    [command] = row["fix"].split("`")[1::2]
+    command = claude_add_command(row["fix"])
     shell = shutil.which("sh", path=os.defpath)
     assert shell is not None
     assert f"The user sai entry in {config} differs in env, cwd." in row["fix"]
@@ -1268,11 +1275,42 @@ def test_claude_printed_profile_matches_normal_install(
     assert shell
     monkeypatch.delenv("SAI_HOME")
     config.write_text('{"mcpServers": {}}')
-    [command] = commands
+    command = claude_add_command(row["fix"])
     subprocess.run([shell, "-c", command], cwd=env.home, check=True)
     assert env.claude_json()["mcpServers"]["sai"]["env"] == {"SAI_HOME": expected_home}
     monkeypatch.setenv("SAI_HOME", profile)
     assert actions(invoke("mcp", "install", "claude")) == {"claude": "unchanged"}
+
+
+@pytest.mark.parametrize("unavailable", ["missing", "not-executable"])
+def test_claude_advice_checks_the_launcher_before_manual_removal(
+    env: Env, unavailable: str
+):
+    config = env.home / ".claude.json"
+    original = json.dumps({"mcpServers": {"sai": claude_entry(["old-launcher"])}})
+    config.write_text(original)
+    result = invoke("mcp", "install", "claude")
+    failure(result)
+    [row] = payload(result)["error"]["details"]["results"]
+    hint = row["fix"]
+    [check, add] = hint.split("`")[1::2]
+    assert (
+        check
+        == f"test -f {shlex.quote(str(env.sai))} && test -x {shlex.quote(str(env.sai))}"
+    )
+    assert hint.index(check) < hint.index("Remove the existing") < hint.index(add)
+    assert "Continue only if it succeeds." in hint
+    assert "claude mcp remove" not in hint
+
+    shell = shutil.which("sh", path=os.defpath)
+    assert shell
+    subprocess.run([shell, "-c", check], check=True)
+    if unavailable == "missing":
+        env.sai.unlink()
+    else:
+        env.sai.chmod(0o600)
+    assert subprocess.run([shell, "-c", check], check=False).returncode != 0
+    assert config.read_text() == original and not env.calls()
 
 
 def test_claude_printed_add_uses_the_absolute_launcher_and_inline_profile(
@@ -1286,7 +1324,7 @@ def test_claude_printed_add_uses_the_absolute_launcher_and_inline_profile(
     result = invoke("mcp", "install", "claude")
     failure(result)
     [row] = payload(result)["error"]["details"]["results"]
-    [command] = row["fix"].split("`")[1::2]
+    command = claude_add_command(row["fix"])
     assert shlex.split(command) == [
         "claude",
         "mcp",
@@ -1346,7 +1384,7 @@ def test_claude_local_report_reads_the_git_root_entry(
         [row] = payload(result)["error"]["details"]["results"]
         fix = row["fix"]
     assert env.claude_json() == original
-    [command] = fix.split("`")[1::2]
+    command = claude_add_command(fix)
     assert shlex.split(command) == [
         "claude",
         "mcp",
@@ -1401,7 +1439,7 @@ def test_claude_report_names_the_relative_config_without_changing_directory(
         fix = updater.mcp_notice(outcome.mcp_results(), outcome.mcp_notes)
     assert f"The local sai entry in {nested_file} differs in command, args, env." in fix
     assert str(root_file) not in fix and SECRET not in fix
-    [command] = fix.split("`")[1::2]
+    command = claude_add_command(fix)
     assert shlex.split(command) == [
         "claude",
         "mcp",
@@ -1559,7 +1597,7 @@ def test_update_keeps_the_saved_claude_profile(
         updater.Outcome(updater.UPDATED, "updated"), env.sai, False
     )
     notice = updater.mcp_notice(updated.mcp_results(), updated.mcp_notes)
-    [command] = notice.split("`")[1::2]
+    command = claude_add_command(notice)
     expected = profile if profile is not None else str(fallback)
     assert shlex.split(command) == [
         "claude",
@@ -2478,7 +2516,7 @@ def test_claude_custom_advice_uses_the_invoked_sai_without_sai_on_path(env: Env)
 
     assert result.returncode == 1
     [row] = json.loads(result.stdout)["error"]["details"]["results"]
-    [command] = row["fix"].split("`")[1::2]
+    command = claude_add_command(row["fix"])
     assert shlex.split(command) == [
         "claude",
         "mcp",

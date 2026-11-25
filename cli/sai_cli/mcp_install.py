@@ -240,8 +240,11 @@ def claude_repair_hint(entries: tuple[ClaudeRepair, ...]) -> str:
                     "serve",
                 ]
             )
+            launcher = shlex.quote(entry.launcher)
+            check = f"test -f {launcher} && test -x {launcher}"
             hints.append(
-                f"{hint} Remove the existing {label} in Claude from the project"
+                f"{hint}\nRun `{check}` before removing the entry. Continue only if it succeeds.\n"
+                f"Remove the existing {label} in Claude from the project"
                 f" directory you normally use, then run `{add}`."
             )
             continue
@@ -292,7 +295,10 @@ def report_different_claude_entry(
     )
     hint = claude_repair_hint((entry,))
     if target.explicit_command:
-        hint += " For a custom launcher, substitute your requested command after --."
+        hint += (
+            " For a custom launcher, substitute your requested command after --"
+            " and use its executable in the check."
+        )
     result.command = None
     result.path = str(path)
     result.error = f"The existing {scope} Claude Code sai registration differs from the requested settings"
