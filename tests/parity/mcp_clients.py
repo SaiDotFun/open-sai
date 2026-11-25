@@ -37,7 +37,7 @@ with (home / "argv.jsonl").open("a") as trace:
     trace.write(json.dumps([program, scope, *argv]) + "\\n")
 if program == "codex":
     action, name = argv[1:3]
-    assert argv == ["mcp", "get", name, "--json"]
+    assert argv[:4] == ["mcp", "get", name, "--json"]
     config = Path(os.environ["CODEX_HOME"]) / "config.toml"
     servers = tomllib.loads(config.read_text()).get("mcp_servers", {}) if config.exists() else {}
     entry = servers.get(name)
@@ -56,6 +56,10 @@ if program == "codex":
         if name == "sai" and (home / "fail-uninstall-verification").exists():
             sys.exit(9)
         sys.exit(f"Error: No MCP server named '{name}' found.")
+    for index in range(4, len(argv), 2):
+        assert argv[index] == "-c"
+        key, value = argv[index + 1].split("=", 1)
+        entry[key.removeprefix(f"mcp_servers.{name}.")] = tomllib.loads(f"item = {value}")["item"]
     if (home / "fail-verification").exists() and entry["command"] == str(home / "bin/sai"):
         print("private-fixture-value-must-stay-in-client-config", file=sys.stderr)
         sys.exit(9)
