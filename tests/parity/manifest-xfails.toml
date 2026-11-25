@@ -75,7 +75,7 @@ signature = "b9cd24acfe95b5081aa533032dcf6d737785a5b3a3137f1f7646a9464a5d7765"
 
 [gap."case:auth-logout"]
 owner = "#213"
-signature = "9007efd465789399076bcdfd3f12aff7a92a31744c714a3d9d2b579c7e470564"
+signature = "3d90c0ac924b0ee4ede71e61d34a078f89ded1255e95ac382ed214eb83ca5276"
 
 [gap."case:auth-status-signed-out"]
 owner = "#211"
@@ -83,7 +83,7 @@ signature = "f723398d06b9a2175fd86982b2249fe4ee6baf193fe28ad0c951a5d195e2f1ec"
 
 [gap."case:auth-use"]
 owner = "#213"
-signature = "9007efd465789399076bcdfd3f12aff7a92a31744c714a3d9d2b579c7e470564"
+signature = "3d90c0ac924b0ee4ede71e61d34a078f89ded1255e95ac382ed214eb83ca5276"
 
 [gap."case:auth-use-invalid-expiry-json"]
 owner = "#171"

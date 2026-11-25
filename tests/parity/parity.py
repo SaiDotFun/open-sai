@@ -1315,6 +1315,8 @@ def main() -> int:
         parser.error(SQLITE_SCHEMA_REQUIREMENT)
     try:
         enter_loopback()
+        # Use the CLI subprocess umask when seeding fixtures.
+        os.umask(0o022)
         configured_reference = args.reference or os.environ.get("SAI_PARITY_PYTHON")
         if configured_reference is None:
             reference = [
