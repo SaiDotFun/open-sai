@@ -20,7 +20,7 @@ import threading
 import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -482,7 +482,22 @@ def observe(
         if SECRET in result.stdout or SECRET in result.stderr:
             raise ValueError("Client config value escaped into CLI output")
         files.update(client_state(home, client_before, normalize))
-    check_state(case.state or {}, files)
+    state = dict(case.state or {})
+    if candidate and case.accepted_divergence == "codex-uninstall-rollback":
+        state["clients/.codex/config.toml#changed"] = False
+        state["clients/.codex/config.toml#data.settings.mcp_servers.sai.args"] = [
+            "mcp",
+            "serve",
+        ]
+        del state["clients/.codex/config.toml#data.settings.mcp_servers.sai"]
+    if case.accepted_divergence == "uninstall-read-only":
+        filename, entry = read_only_uninstall_path(case)
+        state[f"{filename}#changed"] = not candidate
+        if candidate:
+            state[f"{filename}#{entry}.args"] = ["mcp", "serve"]
+        else:
+            state[f"{filename}#{entry}"] = "<absent>"
+    check_state(state, files)
     display = result.stdout
     if case.command == "account overview" and case.mode == "text":
         display = mask_overview_stdout(display, case.mode)
@@ -508,6 +523,8 @@ def observe(
     if case.mode == "mcp":
         check_mcp_calls(output, case.mcp_profile)
     stderr = stderr_category(result.stderr)
+    if case.accepted_divergence == "uninstall-read-only":
+        check_read_only_uninstall(case, result.returncode, output, stderr, candidate)
     if contender:
         stderr += tuple(
             f"contender {category}" for category in stderr_category(contender.stderr)
@@ -527,6 +544,37 @@ def observe(
         diagnostic = normalize.text(mask_doctor_stream(diagnostic))
     raw = (display.encode(), diagnostic.encode()) if exact else None
     return Observation(result.returncode, output, stderr, files, raw)
+
+
+def read_only_uninstall_path(case: Case) -> tuple[str, str]:
+    if case.args[3] == "codex":
+        return "clients/.codex/config.toml", "data.settings.mcp_servers.sai"
+    return "clients/.cursor/mcp.json", "data.mcpServers.sai"
+
+
+def check_read_only_uninstall(
+    case: Case, code: int, output: Any, stderr: tuple[str, ...], candidate: bool
+) -> None:
+    if candidate:
+        error = output["error"]
+        if code != 1 or error["code"] != "INTERNAL_ERROR" or stderr:
+            raise ValueError("Expected the native read-only uninstall error")
+        report = error["details"]
+        (row,) = report["results"]
+        if row["error"] != "The client config is read-only" or row["changed"]:
+            raise ValueError("The read-only error reported a change")
+    else:
+        report = output
+        (row,) = report["results"]
+        if code != 0 or stderr != ("diagnostic",):
+            raise ValueError("Expected Python to remove the read-only entry")
+    if (
+        row["client"] != case.args[3]
+        or row["scope"] != "user"
+        or row["action"] != ("failed" if candidate else "removed")
+        or report["reconnectNeeded"] != (not candidate)
+    ):
+        raise ValueError("Unexpected read-only uninstall result")
 
 
 def mcp_tools(output: Any) -> dict[str, dict[str, Any]]:
@@ -797,6 +845,7 @@ def run_case(
             tools,
             None,
         )
+    reference_exit = left.exit_code
     if candidate != reference and case.accepted_divergence == "lcd-origin-only":
         project_reference_lcd_origin(left.output)
     if (
@@ -804,6 +853,54 @@ def run_case(
         and case.accepted_divergence == "doctor-keeper-log-context"
     ):
         project_reference_doctor_keeper_log(left, right)
+    if (
+        candidate != reference
+        and case.accepted_divergence == "codex-uninstall-rollback"
+    ):
+        # The fixture asserts deletion on Python and byte-for-byte restoration
+        # on Rust. Compare the error and every other file and log record.
+        error = left.output["error"]
+        report = error["details"]
+        report["results"][0]["changed"] = False
+        report["reconnectNeeded"] = False
+        reconnect = "\nClient registrations changed."
+        error["message"] = error["message"].removesuffix(reconnect)
+        if log := left.files.get("logs/cli.jsonl"):
+            for record in log.data:
+                if record["event"] == "command.end" and isinstance(
+                    record.get("error"), str
+                ):
+                    record["error"] = record["error"].removesuffix(reconnect)
+        filename = "clients/.codex/config.toml"
+        left.files[filename] = right.files[filename]
+        left = replace(
+            left, stderr=tuple(item for item in left.stderr if item != "diagnostic")
+        )
+    if candidate != reference and case.accepted_divergence == "uninstall-read-only":
+        # Both sides already checked exit, report, mode and changed bytes.
+        # A successful removal also changes the command end record and trace.
+        filename, _ = read_only_uninstall_path(case)
+        left.files[filename] = right.files[filename]
+        log = "logs/cli.jsonl"
+        if log in left.files and log in right.files:
+            left.files[log] = replace(
+                left.files[log],
+                data=left.files[log].data[:-1] + right.files[log].data[-1:],
+            )
+        trace = "clients/argv.jsonl"
+        if trace in left.files and trace in right.files:
+            python_trace = left.files[trace].data
+            rust_trace = right.files[trace].data
+            left.files[trace] = replace(
+                left.files[trace],
+                data={
+                    **python_trace,
+                    "data": python_trace["data"][: len(rust_trace["data"])],
+                },
+            )
+        left = replace(
+            left, exit_code=right.exit_code, output=right.output, stderr=right.stderr
+        )
     expected = None
     if case.mode == "mcp" and reference != candidate:
         expected = expect_native_mcp_info(
@@ -821,8 +918,8 @@ def run_case(
             or None
         )
     diffs = differences(left, right)
-    if left.exit_code != case.expect:
-        diffs.insert(0, f"expected reference exit {case.expect}, got {left.exit_code}")
+    if reference_exit != case.expect:
+        diffs.insert(0, f"expected reference exit {case.expect}, got {reference_exit}")
     if (case.mode in {"mcp", "jsonl"} or case.expect == 0) and left.output == "":
         diffs.insert(0, "expected reference JSON output")
     if case.mode == "mcp":
@@ -887,6 +984,7 @@ def main() -> int:
     candidate = reference
     checkout_python = str(Path(sys.executable).with_name("sai"))
     c9a_python = os.environ.get("SAI_C9A_PYTHON") or checkout_python
+    uninstall_python = os.environ.get("SAI_MCP_UNINSTALL_PYTHON") or c9a_python
     if "SAI_PARITY_BIN" in os.environ:
         executable = shutil.which(os.environ["SAI_PARITY_BIN"])
         if not executable:
@@ -919,6 +1017,8 @@ def main() -> int:
             oracle = [str(Path(overview_reference).absolute())]
         elif case.mode == "mcp":
             oracle = mcp_reference
+        elif case.command == "mcp uninstall":
+            oracle = [uninstall_python]
         elif case.command == "doctor" and "node_info" in (case.wire or []):
             oracle = [checkout_python]
         elif case.client_seed or case.command in {"doctor", "mcp install", "mcp list"}:
