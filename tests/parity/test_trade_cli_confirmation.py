@@ -582,3 +582,57 @@ def test_verified_close_refuses_unconfirmable_oracle(
             assert not endpoints.errors
             refusals.append(result)
     assert refusals[0] == refusals[1]
+
+
+@pytest.mark.parametrize(
+    ("scenario", "accepted"),
+    [
+        ("quote-close-height-failed", False),
+        ("quote-close-collateral-changed", True),
+    ],
+)
+def test_confirmed_close_rechecks_position_height(
+    pair: tuple[CLI, CLI], tmp_path: Path, scenario: str, accepted: bool
+) -> None:
+    python, _ = pair
+    with loopback("quote-queued") as endpoints:
+        home = tmp_path / "preview"
+        seed_home(home, endpoints, "session")
+        code, preview, stderr = run(
+            python, home, endpoints, (*CLOSE, "--dry-run"), python=True
+        )
+        assert (code, stderr) == (0, "")
+        assert not endpoints.errors
+        assert not rows(home)
+
+    for index, cli in enumerate(pair):
+        replay = TradeReplay()
+        with loopback(scenario, trade_replay=replay) as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            code, result, stderr = run(
+                cli,
+                home,
+                endpoints,
+                (*CLOSE, "--preview-digest", preview["previewDigest"]),
+                python=index == 0,
+            )
+            assert not endpoints.errors
+            assert [entry.label for entry in endpoints.wire].count("get_trade_raw") == 2
+            if accepted:
+                assert (code, stderr) == (0, "")
+                (key,) = replay.admitted_keys()
+                assert replay.attempts() == {key: 1}
+                assert replay.intent(key)["kind"] == "CLOSE_POSITION"
+                assert [row[:6] for row in rows(home)] == [
+                    (key, "CLOSE_POSITION", "accepted", "7", preview["addr"], None)
+                ]
+            else:
+                assert (code, stderr) == (4, "")
+                error = result["error"]
+                assert error["code"] == "PREVIEW_MISMATCH"
+                assert error["details"]["preview"]["estimates"]["execution"][
+                    "code"
+                ] == ("OraclePublicationTimeUnknown")
+                assert not replay.attempts()
+                assert not rows(home)

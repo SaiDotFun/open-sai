@@ -1430,6 +1430,13 @@ def loopback(
                         if owner_read and scenario == "quote-owner-read-error":
                             self.reply({}, 503)
                             return
+                        if (
+                            scenario == "quote-close-height-failed"
+                            and name == "get_trade_raw"
+                            and anchor
+                        ):
+                            self.reply({}, 503)
+                            return
                         if name == "get_trade_raw" and cancel_target is not None:
                             [nonce] = parse_qs(urlsplit(self.path).query).get(
                                 "_sai_query", [""]
@@ -1453,6 +1460,17 @@ def loopback(
                                     self.reject("Cancellation session gate timed out")
                                     return
                         data = contract_data(name, pinned=HEIGHT_HEADER in self.headers)
+                        if (
+                            scenario == "quote-close-collateral-changed"
+                            and name == "get_trade_raw"
+                            and anchor
+                        ):
+                            data = {
+                                **data,
+                                "collateral_amount": str(
+                                    int(data["collateral_amount"]) + 1
+                                ),
+                            }
                         self.reply({"data": data}, lcd=True)
                         return
                     except (ValueError, KeyError, TypeError):
