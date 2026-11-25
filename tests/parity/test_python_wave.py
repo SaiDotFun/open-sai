@@ -452,3 +452,43 @@ def test_mcp_install_dry_run_redacts_endpoint_query(
     assert "synthetic-private-query" not in installed.stdout + installed.stderr
     entry = json.loads((tmp_path / ".claude.json").read_text())["mcpServers"]["sai"]
     assert entry["args"] == list(command[1:])
+
+
+@pytest.mark.parametrize("kind", ["cwd", "remote"])
+def test_mcp_install_reports_claude_extra_fields(
+    wave_clis: tuple[str, str], tmp_path: Path, kind: str
+) -> None:
+    for index, binary in enumerate(wave_clis):
+        home = tmp_path / str(index)
+        home.mkdir()
+        overrides = {"PATH": os.defpath}
+        seed_clients(home, overrides, "current")
+        config = home / ".claude.json"
+        data = json.loads(config.read_text())
+        entry = data["mcpServers"]["sai"]
+        if kind == "cwd":
+            entry["cwd"] = "synthetic-old-working-directory"
+        else:
+            data["mcpServers"]["sai"] = {
+                "type": "http",
+                "url": "https://fixture.invalid/private-path?token=synthetic-remote-value",
+                "headers": {"Authorization": SECRET},
+            }
+        config.write_text(json.dumps(data))
+        original = config.read_bytes()
+        result = run_cli(
+            binary, home, "--json", "mcp", "install", "claude", overrides=overrides
+        )
+        assert result.returncode == 1
+        assert config.read_bytes() == original
+        [report] = json.loads(result.stdout)["error"]["details"]["results"]
+        assert report["changed"] is False
+        if kind == "cwd":
+            assert "differs in cwd." in report["fix"]
+        else:
+            assert all(field in report["fix"] for field in ["url", "headers", "type"])
+            assert SECRET not in result.stdout + result.stderr
+            assert "synthetic-remote-value" not in result.stdout + result.stderr
+            if index == 1:
+                assert "http at https://fixture.invalid" in report["fix"]
+                assert "claude mcp add" not in report["fix"]

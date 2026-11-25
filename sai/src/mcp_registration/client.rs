@@ -105,11 +105,10 @@ impl Client {
         let user = read_json(&self.path(Scope::User, home, home), deadline)?;
         let Some(cwd) = cwd else {
             let entry = &user["mcpServers"][name];
-            return Ok(
-                Registration::new(entry.clone(), entry, Scope::User, false, Vec::new())
-                    .into_iter()
-                    .collect(),
-            );
+            return Ok(self
+                .json_registration(entry, Scope::User, name, false)
+                .into_iter()
+                .collect());
         };
         let project = read_json(&self.path(Scope::Project, home, cwd), deadline)?;
         let local = &user["projects"][cwd.to_string_lossy().as_ref()];
@@ -129,9 +128,41 @@ impl Client {
                 if scope == Scope::Local && self != Self::Claude {
                     return None;
                 }
-                Registration::new(raw.clone(), raw, scope, disabled, Vec::new())
+                self.json_registration(raw, scope, name, disabled)
             })
             .collect())
+    }
+
+    fn json_registration(
+        self,
+        entry: &Value,
+        scope: Scope,
+        name: &str,
+        disabled: bool,
+    ) -> Option<Registration> {
+        let mut extra = Vec::new();
+        if self == Self::Claude
+            && name == NAMES[0]
+            && let Some(fields) = entry.as_object()
+        {
+            extra.extend(
+                ["cwd", "url", "headers"]
+                    .into_iter()
+                    .filter(|key| fields.contains_key(*key)),
+            );
+            if fields.get("type").is_some_and(|kind| kind != "stdio") {
+                extra.push("type");
+            }
+            if fields.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "type" | "command" | "args" | "env" | "cwd" | "url" | "headers"
+                )
+            }) {
+                extra.push("custom settings");
+            }
+        }
+        Registration::new(entry.clone(), entry, scope, disabled, extra)
     }
 
     #[allow(clippy::too_many_arguments)]

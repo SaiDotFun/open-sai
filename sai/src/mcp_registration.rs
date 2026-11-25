@@ -1387,8 +1387,6 @@ impl Clients {
         target: &Target,
         result: &mut RegistrationResult,
     ) {
-        const ARG: &str = "<original-argument>";
-        const PROFILE: &str = "<original-SAI_HOME>";
         let scope = entry.scope.name();
         let path = absolute(&Client::Claude.path(entry.scope, &self.home, self.cwd()));
         let mut fields = Vec::new();
@@ -1412,6 +1410,45 @@ impl Clients {
         }
         fix.push('.');
 
+        if !entry.stdio {
+            let transport = match entry.raw["type"].as_str() {
+                Some(kind @ ("http" | "sse" | "streamable-http")) => kind,
+                _ => "remote",
+            };
+            let endpoint = entry.raw["url"]
+                .as_str()
+                .map(|url| format!(" at {}", sai_core::log::origin(url)))
+                .unwrap_or_default();
+            fix.push_str(&format!(
+                " The saved transport is {transport}{endpoint}. Review the entry in Claude Code and keep its transport, URL, headers, and other settings."
+            ));
+        } else if !entry.extra.is_empty() {
+            fix.push_str(" Edit the differing fields in Claude Code or its config. Keep the saved working directory and any custom settings you still need.");
+        } else {
+            Self::claude_replacement_hint(entry, target, args, &label, &mut fix);
+        }
+        result
+            .report
+            .as_object_mut()
+            .expect("result object")
+            .remove("command");
+        result.report["path"] = json!(path);
+        result.report["fix"] = json!(fix);
+        result.failed(format!(
+            "The existing {scope} Claude Code sai registration differs from the requested settings"
+        ));
+    }
+
+    fn claude_replacement_hint(
+        entry: &Registration,
+        target: &Target,
+        args: &[String],
+        label: &str,
+        fix: &mut String,
+    ) {
+        const ARG: &str = "<original-argument>";
+        const PROFILE: &str = "<original-SAI_HOME>";
+        let scope = entry.scope.name();
         let launcher = if target.explicit {
             which("sai")
                 .map(|path| absolute(&path))
@@ -1465,16 +1502,6 @@ impl Clients {
         if target.explicit {
             fix.push_str(" For a custom launcher, substitute your requested command after -- and use its executable in the check.");
         }
-        result
-            .report
-            .as_object_mut()
-            .expect("result object")
-            .remove("command");
-        result.report["path"] = json!(path);
-        result.report["fix"] = json!(fix);
-        result.failed(format!(
-            "The existing {scope} Claude Code sai registration differs from the requested settings"
-        ));
     }
 
     fn legacy_install(
