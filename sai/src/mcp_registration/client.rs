@@ -13,8 +13,17 @@ use serde_json::{Map, Value};
 
 use super::{Client, Registration, Scope, Target};
 
+#[cfg(test)]
+mod tests;
+
 pub(super) type Result<T> = std::result::Result<T, String>;
 pub(super) const READ_ONLY_CONFIG: &str = "The client config is read-only";
+
+#[derive(Clone, Copy)]
+pub(super) enum CodexLookup {
+    Discover,
+    Verify,
+}
 
 enum JsonUpdate<'a> {
     Install(Option<&'a Registration>),
@@ -75,23 +84,32 @@ impl Client {
     pub(super) fn registrations(
         self,
         home: &Path,
-        cwd: &Path,
+        cwd: Option<&Path>,
         name: &str,
+        lookup: CodexLookup,
         deadline: Instant,
     ) -> Result<Vec<Registration>> {
         if self == Self::Codex {
             let neutral = self.codex_neutral(home);
-            let user = codex_get(&neutral, Scope::User, name, deadline)?;
-            let project = if resolved(&neutral) == resolved(cwd) {
-                None
-            } else {
-                codex_get(cwd, Scope::Project, name, deadline)?
+            let user = codex_get(&neutral, Scope::User, name, lookup, deadline)?;
+            let project = if let Some(cwd) = cwd.filter(|cwd| resolved(&neutral) != resolved(cwd)) {
+                codex_get(cwd, Scope::Project, name, lookup, deadline)?
                     .filter(|entry| user.as_ref().is_none_or(|user| user.raw != entry.raw))
+            } else {
+                None
             };
             return Ok(project.into_iter().chain(user).collect());
         }
 
-        let user = read_json(&self.path(Scope::User, home, cwd), deadline)?;
+        let user = read_json(&self.path(Scope::User, home, home), deadline)?;
+        let Some(cwd) = cwd else {
+            let entry = &user["mcpServers"][name];
+            return Ok(
+                Registration::new(entry.clone(), entry, Scope::User, false, Vec::new())
+                    .into_iter()
+                    .collect(),
+            );
+        };
         let project = read_json(&self.path(Scope::Project, home, cwd), deadline)?;
         let local = &user["projects"][cwd.to_string_lossy().as_ref()];
         let disabled = self == Self::Claude && has_name(&local["disabledMcpServers"], name);
@@ -135,6 +153,54 @@ impl Client {
         }
         let update = old.map_or(JsonUpdate::Install(None), JsonUpdate::Repair);
         self.write_json(&path, cwd, scope, name, target, update, deadline)
+            .map(|_| ())
+    }
+
+    pub(super) fn repair_cursor(
+        home: &Path,
+        cwd: &Path,
+        name: &str,
+        target: &Target,
+        old: &Registration,
+        deadline: Instant,
+    ) -> Result<()> {
+        let path = Self::Cursor.path(old.scope, home, cwd);
+        let published = Self::Cursor.write_json(
+            &path,
+            cwd,
+            old.scope,
+            name,
+            target,
+            JsonUpdate::Repair(old),
+            deadline,
+        )?;
+        Self::verify_cursor_repair(&path, old.scope, name, target, published, deadline)
+    }
+
+    fn verify_cursor_repair(
+        path: &Path,
+        scope: Scope,
+        name: &str,
+        target: &Target,
+        published: Option<PublishedConfig>,
+        deadline: Instant,
+    ) -> Result<()> {
+        let verification = read_json(path, deadline).and_then(|doc| {
+            let raw = &doc["mcpServers"][name];
+            let actual = Registration::new(raw.clone(), raw, scope, false, vec![]);
+            if actual.is_some_and(|entry| entry.stdio && entry.argv == target.argv) {
+                Ok(())
+            } else {
+                Err("Cursor did not load the repaired Sai registration".into())
+            }
+        });
+        if let Err(error) = &verification
+            && let Some(published) = published
+            && let Err(restore) = published.restore(path, Instant::now() + Duration::from_secs(1))
+        {
+            return Err(format!("{error}. {restore}"));
+        }
+        verification
     }
 
     pub(super) fn repair_codex(
@@ -150,14 +216,20 @@ impl Client {
         let published = edit(&path, true, deadline, |source| {
             edit_codex(source, name, target, Some(old))
         })?;
-        let verification = codex_get(&client.codex_neutral(home), Scope::User, name, deadline)
-            .and_then(|entry| {
-                if entry.is_some_and(|entry| entry.matches_command(target)) {
-                    Ok(())
-                } else {
-                    Err("Codex did not load the repaired Sai registration".into())
-                }
-            });
+        let verification = codex_get(
+            &client.codex_neutral(home),
+            Scope::User,
+            name,
+            CodexLookup::Verify,
+            deadline,
+        )
+        .and_then(|entry| {
+            if entry.is_some_and(|entry| entry.matches_command(target)) {
+                Ok(())
+            } else {
+                Err("Codex did not load the repaired Sai registration".into())
+            }
+        });
         if verification.is_err()
             && let Some(published) = published
         {
@@ -166,6 +238,35 @@ impl Client {
             published.restore(&path, Instant::now() + Duration::from_secs(1))?;
         }
         verification
+    }
+
+    pub(super) fn remove(
+        self,
+        path: &Path,
+        name: &str,
+        old: &Registration,
+        deadline: Instant,
+    ) -> Result<Option<PublishedConfig>> {
+        edit(path, false, deadline, |source| {
+            if self == Self::Codex {
+                return remove_codex(source, name, old);
+            }
+            let mut doc = json_object(source, path)?;
+            if doc["mcpServers"].get(name).is_none() {
+                return String::from_utf8(source.to_vec())
+                    .map_err(|_| "Could not write MCP config".into());
+            }
+            let entries = doc["mcpServers"]
+                .as_object_mut()
+                .ok_or("The Sai registration changed concurrently")?;
+            if entries.get(name) != Some(&old.raw) {
+                return Err("The Sai registration changed concurrently".into());
+            }
+            entries.remove(name);
+            let rendered =
+                serde_json::to_string_pretty(&doc).map_err(|_| "Could not write MCP config")?;
+            Ok(format!("{}\n", crate::local::ascii_json(&rendered)))
+        })
     }
 
     pub(super) fn replace_claude(
@@ -188,6 +289,7 @@ impl Client {
             JsonUpdate::Install(Some(old)),
             deadline,
         )
+        .map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -200,7 +302,7 @@ impl Client {
         target: &Target,
         update: JsonUpdate<'_>,
         deadline: Instant,
-    ) -> Result<()> {
+    ) -> Result<Option<PublishedConfig>> {
         let existing = match update {
             JsonUpdate::Install(old) => old,
             JsonUpdate::Repair(old) => Some(old),
@@ -262,7 +364,6 @@ impl Client {
                 serde_json::to_string_pretty(&doc).map_err(|_| "Could not write MCP config")?;
             Ok(format!("{}\n", crate::local::ascii_json(&rendered)))
         })
-        .map(|_| ())
     }
 }
 
@@ -330,10 +431,14 @@ pub(super) fn codex_get(
     cwd: &Path,
     scope: Scope,
     name: &str,
+    lookup: CodexLookup,
     deadline: Instant,
 ) -> Result<Option<Registration>> {
     let Some(exe) = Client::Codex.executable() else {
-        return Ok(None);
+        return match lookup {
+            CodexLookup::Discover => Ok(None),
+            CodexLookup::Verify => Err("`codex` is not on PATH".into()),
+        };
     };
     let label = format!("codex mcp get {name} --json");
     let args = [
@@ -574,7 +679,7 @@ fn read_json(path: &Path, deadline: Instant) -> Result<Value> {
     }
 }
 
-struct PublishedConfig {
+pub(super) struct PublishedConfig {
     destination: PathBuf,
     original: Option<Vec<u8>>,
     replacement: String,
@@ -582,12 +687,12 @@ struct PublishedConfig {
 }
 
 impl PublishedConfig {
-    fn restore(self, path: &Path, deadline: Instant) -> Result<()> {
+    pub(super) fn restore(self, path: &Path, deadline: Instant) -> Result<()> {
         // A concurrent edit belongs to the client or user. Restore only the
         // file this repair published, even if a newer file has identical text.
         let original = self
             .original
-            .ok_or("The original Codex config is unavailable")?;
+            .ok_or("The original client config is unavailable")?;
         let restored = replace_if_current(
             path,
             &self.destination,
@@ -599,7 +704,7 @@ impl PublishedConfig {
         if restored.is_some() {
             Ok(())
         } else {
-            Err("Codex config.toml changed before Sai could restore it".into())
+            Err("The client config changed before Sai could restore it".into())
         }
     }
 }
@@ -614,14 +719,15 @@ fn edit(
     for _ in 0..attempts {
         let destination = resolved(path);
         let seen = read(&destination, deadline).map_err(io_kind)?;
-        let rendered = render(seen.as_deref().unwrap_or(
-            if retry && path.extension().is_some_and(|e| e == "toml") {
-                b""
-            } else {
-                b"{}"
-            },
-        ))?;
-        if seen.as_deref() == Some(rendered.as_bytes()) {
+        let source =
+            seen.as_deref()
+                .unwrap_or(if retry && path.extension().is_some_and(|e| e == "toml") {
+                    b""
+                } else {
+                    b"{}"
+                });
+        let rendered = render(source)?;
+        if source == rendered.as_bytes() {
             return Ok(None);
         }
         let original_metadata = if seen.is_some() {
@@ -671,11 +777,8 @@ fn replace_if_current(
     original_metadata: Option<&Metadata>,
     deadline: Instant,
 ) -> Result<Option<Metadata>> {
-    if let Some(meta) = original_metadata
-        && (meta.permissions().readonly()
-            || rustix::fs::access(destination, rustix::fs::Access::WRITE_OK).is_err())
-    {
-        return Err(READ_ONLY_CONFIG.into());
+    if let Some(meta) = original_metadata {
+        writable(destination, meta)?;
     }
     let parent = destination.parent().ok_or("Missing config directory")?;
     fs::create_dir_all(parent).map_err(io_kind)?;
@@ -706,6 +809,177 @@ fn replace_if_current(
     temp.persist(destination)
         .map_err(|error| io_kind(error.error))?;
     Ok(Some(published_metadata))
+}
+
+pub(super) fn check_writable(path: &Path) -> Result<()> {
+    writable(path, &path.metadata().map_err(io_kind)?)
+}
+
+fn writable(path: &Path, metadata: &Metadata) -> Result<()> {
+    if metadata.permissions().readonly()
+        || rustix::fs::access(path, rustix::fs::Access::WRITE_OK).is_err()
+    {
+        return Err(READ_ONLY_CONFIG.into());
+    }
+    Ok(())
+}
+
+fn remove_codex(source: &[u8], name: &str, old: &Registration) -> Result<String> {
+    use toml_edit::{Document, Item};
+
+    let bad = "Could not edit Codex config.toml";
+    let source = std::str::from_utf8(source).map_err(|_| bad)?;
+    let doc = Document::parse(source).map_err(|_| bad)?;
+    let changed = "The Sai registration changed concurrently";
+    let servers = doc.get("mcp_servers").ok_or(changed)?;
+    let item = servers.get(name).ok_or(changed)?;
+    let entry = item.as_table_like().ok_or(changed)?;
+    let matches = if old.stdio {
+        codex_argv_matches(entry, old)
+    } else {
+        let url = old.raw["transport"]["url"].as_str();
+        url.is_some() && entry.get("url").and_then(Item::as_str) == url
+    };
+    if !matches {
+        return Err(changed.into());
+    }
+
+    // The parser's spans exclude trivia. Expand only the statements we
+    // delete to whole lines; separate table comments and endings stay intact.
+    let line = |span: std::ops::Range<usize>| {
+        let start = source[..span.start].rfind('\n').map_or(0, |at| at + 1);
+        let end = source[span.end..]
+            .find('\n')
+            .map_or(source.len(), |at| span.end + at + 1);
+        start..end
+    };
+    let mut removed = Vec::new();
+    if let Some(inline) = servers.as_inline_table() {
+        let mut parts = inline
+            .get_values()
+            .into_iter()
+            .map(|(keys, value)| {
+                let leaf = keys.last().ok_or(bad)?;
+                Ok((
+                    leaf.span().ok_or(bad)?.start..value.span().ok_or(bad)?.end,
+                    keys[0].get() == name,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        parts.sort_by_key(|(span, _)| span.start);
+        let mut offset = 0;
+        for group in parts.chunk_by(|left, right| left.1 == right.1) {
+            if group[0].1 {
+                let leaf = group[0].0.start;
+                let end = group.last().expect("nonempty group").0.end;
+                let comma = |start, end| source[start..end].find(',').map(|at| start + at);
+                // A repeated dotted prefix can reuse its first key's span.
+                // Find this assignment's start from the preceding delimiter.
+                let delimiter = if offset == 0 {
+                    inline.span().ok_or(bad)?.start
+                } else {
+                    comma(parts[offset - 1].0.end, leaf).ok_or(bad)?
+                };
+                let gap = &source[delimiter + 1..leaf];
+                let start = leaf - gap.trim_start().len();
+                let span = if let Some(next) = parts.get(offset + group.len()) {
+                    start..comma(end, next.0.start).ok_or(bad)? + 1
+                } else if offset != 0 {
+                    delimiter..end
+                } else {
+                    let close = inline.span().ok_or(bad)?.end;
+                    start..comma(end, close).map_or(end, |at| at + 1)
+                };
+                removed.push(span);
+            }
+            offset += group.len();
+        }
+    } else {
+        // Dotted assignments may share the root or an explicit parent table
+        // with other servers and may be interleaved with their assignments.
+        let dotted = |table: &toml_edit::Table, parent: &[&str]| {
+            table
+                .get_values()
+                .into_iter()
+                .filter_map(|(keys, value)| {
+                    let path = keys.iter().map(|key| key.get()).take(parent.len());
+                    if !path.eq(parent.iter().copied()) {
+                        return None;
+                    }
+                    Some(line(keys.last()?.span()?.start..value.span()?.end))
+                })
+                .collect::<Vec<_>>()
+        };
+        removed.extend(dotted(doc.as_table(), &["mcp_servers", name]));
+        if let Some(table) = servers.as_table().filter(|table| !table.is_implicit()) {
+            removed.extend(dotted(table, &[name]));
+        }
+        let mut tables = vec![item];
+        while let Some(item) = tables.pop() {
+            let mut visit = |table: &toml_edit::Table| {
+                if !table.is_implicit()
+                    && let Some(span) = table.span()
+                {
+                    let end = table
+                        .get_values()
+                        .iter()
+                        .filter_map(|(_, value)| value.span())
+                        .map(|span| span.end)
+                        .max()
+                        .unwrap_or(span.end);
+                    removed.push(line(span.start..end));
+                }
+            };
+            match item {
+                Item::Table(table) => {
+                    visit(table);
+                    tables.extend(table.iter().map(|(_, item)| item));
+                }
+                Item::ArrayOfTables(array) => {
+                    for table in array.iter() {
+                        visit(table);
+                        tables.extend(table.iter().map(|(_, item)| item));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    removed.sort_by_key(|span| span.start);
+    let mut rendered = String::new();
+    let mut offset = 0;
+    for span in removed {
+        rendered.push_str(source.get(offset..span.start).ok_or(bad)?);
+        offset = span.end;
+    }
+    rendered.push_str(&source[offset..]);
+    let after = Document::parse(rendered.as_str()).map_err(|_| bad)?;
+    if after
+        .get("mcp_servers")
+        .and_then(|servers| servers.get(name))
+        .is_some()
+    {
+        return Err(bad.into());
+    }
+    check_preserved_codex(doc.as_table(), after.as_table(), name)?;
+    Ok(rendered)
+}
+
+fn codex_argv_matches(entry: &dyn toml_edit::TableLike, old: &Registration) -> bool {
+    use toml_edit::Item;
+
+    entry
+        .get("command")
+        .and_then(Item::as_str)
+        .into_iter()
+        .chain(
+            entry
+                .get("args")
+                .and_then(Item::as_array)
+                .into_iter()
+                .flat_map(|args| args.iter().map(|arg| arg.as_str().unwrap_or_default())),
+        )
+        .eq(old.argv.iter().map(String::as_str))
 }
 
 fn edit_codex(
@@ -752,18 +1026,7 @@ fn edit_codex(
         .map(String::as_str)
         .collect::<Array>();
     if let Some(old) = old {
-        let saved = entry
-            .get("command")
-            .and_then(Item::as_str)
-            .into_iter()
-            .chain(
-                entry
-                    .get("args")
-                    .and_then(Item::as_array)
-                    .into_iter()
-                    .flat_map(|args| args.iter().map(|arg| arg.as_str().unwrap_or_default())),
-            );
-        if !saved.eq(old.argv.iter().map(String::as_str)) {
+        if !codex_argv_matches(entry, old) {
             return Err("The Sai registration changed concurrently".into());
         }
     } else {
@@ -796,24 +1059,44 @@ fn edit_codex(
         }
         entry.insert(key, Item::Value(next));
     }
+    render_codex(original, doc, name)
+}
+
+fn render_codex(
+    before: toml_edit::DocumentMut,
+    doc: toml_edit::DocumentMut,
+    name: &str,
+) -> Result<String> {
+    use toml_edit::DocumentMut;
+
     let rendered = doc.to_string();
     // Reparse so changes to TOML table boundaries cannot move unrelated keys.
-    let mut after = rendered.parse::<DocumentMut>().map_err(|_| bad)?;
-    let mut before = original;
-    let without_entry = |doc: &mut DocumentMut| {
-        if let Some(entries) = doc.get_mut("mcp_servers").and_then(Item::as_table_like_mut) {
+    let after = rendered
+        .parse::<DocumentMut>()
+        .map_err(|_| "Could not edit Codex config.toml")?;
+    check_preserved_codex(before.as_table(), after.as_table(), name)?;
+    Ok(rendered)
+}
+
+fn check_preserved_codex(
+    before: &toml_edit::Table,
+    after: &toml_edit::Table,
+    name: &str,
+) -> Result<()> {
+    let without_entry = |doc: &toml_edit::Table| {
+        let mut values = semantic_table(doc);
+        if let Some(Value::Object(entries)) = values.get_mut("mcp_servers") {
             entries.remove(name);
             if entries.is_empty() {
-                doc.remove("mcp_servers");
+                values.remove("mcp_servers");
             }
         }
+        values
     };
-    without_entry(&mut before);
-    without_entry(&mut after);
-    if semantic_table(before.as_table()) != semantic_table(after.as_table()) {
+    if without_entry(before) != without_entry(after) {
         return Err("Could not preserve settings outside the Sai registration".into());
     }
-    Ok(rendered)
+    Ok(())
 }
 
 fn semantic_table(table: &dyn toml_edit::TableLike) -> std::collections::BTreeMap<String, Value> {

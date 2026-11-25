@@ -174,7 +174,9 @@ fn main() -> process::ExitCode {
         None
     } else {
         let start = match command {
-            "doctor" | "mcp install" | "mcp list" => LogWriter::start_diagnostic_command,
+            "doctor" | "mcp install" | "mcp list" | "mcp uninstall" => {
+                LogWriter::start_diagnostic_command
+            }
             "intent status" | "mcp serve" => LogWriter::start_command,
             _ if matches!(
                 command.split(' ').next(),
@@ -349,7 +351,7 @@ fn usage(command: &str) -> String {
         "config set" => " KEY VALUE",
         "config list" | "auth status" | "auth list" | "auth import" | "doctor" | "mcp list"
         | "mcp serve" | "market list" | "market prices" | "trade open" | "account overview" => "",
-        "mcp install" => " [CLIENTS]...",
+        "mcp install" | "mcp uninstall" => " [CLIENTS]...",
         "auth login" => " NAME",
         "intent status" | "intent local" | "auth use" | "account positions" | "account history"
         | "account balances" | "watch positions" | "watch balances" => " ADDR",
@@ -645,7 +647,7 @@ fn print_parse_error(
         }
         _ => {}
     }
-    if command == "mcp install"
+    if matches!(command, "mcp install" | "mcp uninstall")
         && error.kind() == ErrorKind::InvalidValue
         && context_text(error, ContextKind::InvalidArg)
             .is_some_and(|arg| arg.split(' ').next() == Some("--scope"))
