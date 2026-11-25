@@ -1,4 +1,5 @@
 mod install;
+mod logs;
 mod session;
 mod stdio;
 mod validation;
@@ -95,6 +96,7 @@ impl ServeArgs {
             local_ledger_slots: Arc::new(Semaphore::new(2)),
             reconcile_slots: Arc::new(Semaphore::new(8)),
             wait_slots: Arc::new(Semaphore::new(stdio::MAX_IN_FLIGHT)),
+            log_slots: Arc::new(Semaphore::new(2)),
         };
         server.events().event(
             "mcp.server_start",
@@ -130,6 +132,7 @@ struct SaiMcp {
     local_ledger_slots: Arc<Semaphore>,
     reconcile_slots: Arc<Semaphore>,
     wait_slots: Arc<Semaphore>,
+    log_slots: Arc<Semaphore>,
 }
 
 impl SaiMcp {
@@ -174,6 +177,7 @@ impl SaiMcp {
             "market_prices" => keeper::PRICES,
             "mcp_info" => return self.info(&storage).await,
             "intent_wait" => return self.wait_for_intent(args, call_id).await,
+            "logs_intent" => return self.logs_intent(args).await,
             "auth_list" | "auth_status" | "auth_use" => {
                 return self
                     .auth(name, args.get("addr").and_then(Value::as_str), call_id)
@@ -719,6 +723,7 @@ mod tests {
             local_ledger_slots: Arc::new(Semaphore::new(2)),
             reconcile_slots: Arc::new(Semaphore::new(8)),
             wait_slots: Arc::new(Semaphore::new(0)),
+            log_slots: Arc::new(Semaphore::new(2)),
         };
         let args = json!({
             "addr": "https://keeper.invalid/?key=fixture-wait-addr",

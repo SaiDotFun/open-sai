@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import select
@@ -28,6 +30,16 @@ def native() -> Path:
     executable = shutil.which(os.getenv("SAI_PARITY_BIN", ""))
     if not executable:
         pytest.skip("SAI_PARITY_BIN must name the native candidate")
+    return Path(executable).absolute()
+
+
+@pytest.fixture
+def python_v013() -> Path:
+    reference = os.getenv("SAI_MCP_PARITY_V013_PYTHON")
+    if reference is None:
+        pytest.skip("set SAI_MCP_PARITY_V013_PYTHON to sai from Python v0.1.3")
+    executable = shutil.which(reference)
+    assert executable, "SAI_MCP_PARITY_V013_PYTHON must name an executable"
     return Path(executable).absolute()
 
 
@@ -411,7 +423,14 @@ def test_audit_boolean_coercion(native: Path, tmp_path: Path, offline: object) -
     ):
         result = stdio.call(2, "logs_intent", key="fixture", offline=offline)
         assert result["isError"] is False
-        assert json.loads(result["content"][0]["text"])["code"] == "NOT_IMPLEMENTED"
+        assert json.loads(result["content"][0]["text"]) == {
+            "intentKey": None,
+            "events": [],
+            "gaps": [],
+            "keeper": None,
+            "txHash": None,
+        }
+        assert not endpoints.wire
         refused = stdio.call(3, "logs_intent", key="fixture", offline=" True ")
         assert refused["isError"] is True
         assert refused["content"][0]["text"] == "Argument 'offline' must be a boolean."
@@ -765,27 +784,80 @@ def test_stdout_failure_ends_session_with_stdin_open(
         stdio.proc.wait(timeout=3)
 
 
-@pytest.mark.parametrize(
-    ("tool", "arguments"),
-    [
-        ("account_overview", {"addr": ADDRESS}),
-        ("logs_intent", {"key": INTENT, "offline": True}),
-        ("logs_intent", {"key": INTENT, "offline": False}),
-    ],
-)
-def test_deferred_read_tools_accept_valid_arguments_without_requests(
-    native: Path, tmp_path: Path, tool: str, arguments: dict[str, Any]
+def tool_text(result: dict[str, Any]) -> str:
+    assert result["isError"] is False
+    assert len(result["content"]) == 1
+    block = result["content"][0]
+    assert block["type"] == "text"
+    text = block["text"]
+    assert isinstance(text, str)
+    assert result["structuredContent"] == {"result": text}
+    return text
+
+
+def test_logs_intent_v013_offline_and_live(
+    native: Path, python_v013: Path, tmp_path: Path
 ) -> None:
-    with (
-        loopback("normal") as endpoints,
-        server(native, tmp_path / "home", endpoints, seed="session") as stdio,
-    ):
-        result = stdio.call(2, tool, **arguments)
-        assert result["isError"] is False
-        text = result["content"][0]["text"]
-        assert result["structuredContent"] == {"result": text}
-        assert json.loads(text)["code"] == "NOT_IMPLEMENTED"
-        assert not endpoints.wire
+    transcripts = []
+    with loopback("normal") as endpoints:
+        for index, executable in enumerate((python_v013, native)):
+            home = tmp_path / str(index)
+            with server(executable, home, endpoints, seed="session") as stdio:
+                stdio.send("tools/list", id_=2)
+                [schema] = [
+                    tool
+                    for tool in stdio.receive()["result"]["tools"]
+                    if tool["name"] == "logs_intent"
+                ]
+                stamp = "2026-11-19T12:00:00.000Z"
+                logs = home / "sai/logs"
+                logs.mkdir(mode=0o700, exist_ok=True)
+                key = bytes(32)
+                profile_key = logs / ".endpoint-key"
+                profile_key.write_bytes(key)
+                profile_key.chmod(0o600)
+                digest = hashlib.sha256(f"{endpoints.keeper}?".encode()).digest()
+                row = {
+                    "schema": 2,
+                    "ts": stamp,
+                    "level": "info",
+                    "event": "intent.status",
+                    "runId": "fixture-run",
+                    "seq": 1,
+                    "surface": "cli",
+                    "intentKey": INTENT,
+                    "addr": ADDRESS,
+                    "endpointId": "h1_" + hmac.digest(key, digest, "sha256").hex(),
+                    "status": "pending",
+                }
+                trail = logs / f"cli-{stamp[:10]}.jsonl"
+                trail.write_text(json.dumps(row) + "\n")
+                trail.chmod(0o600)
+
+                offline = tool_text(
+                    stdio.call(
+                        3,
+                        "logs_intent",
+                        key=INTENT,
+                        offline=True,
+                        before="2026-11-20T00:00:00Z",
+                    )
+                )
+                assert json.loads(offline)["events"] == [row]
+                assert json.loads(offline)["keeper"] is None
+                assert not endpoints.wire
+                live = tool_text(stdio.call(4, "logs_intent", key=INTENT))
+                report = json.loads(live)
+                assert report["events"] == [row]
+                assert report["keeper"]["evmAddress"] == ADDRESS
+                rejected = tool_text(stdio.call(5, "logs_intent", key="bad key"))
+                assert json.loads(rejected)["code"] == "INVALID_REQUEST"
+                transcripts.append((schema, offline, live, rejected))
+            assert not endpoints.errors
+            assert [request.label for request in endpoints.wire] == ["userIntents"]
+            assert not (home / "sai/trader/intents.sqlite3").exists()
+            endpoints.wire.clear()
+    assert transcripts[0] == transcripts[1]
 
 
 def test_auth_switch_keeps_rejected_arguments_private(
