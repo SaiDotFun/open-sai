@@ -1231,6 +1231,19 @@ mode = "text"
 expect = 2
 
 [[case]]
+name = "trade-bare-group-text"
+args = ["trade"]
+mode = "text"
+expect = 2
+exact_output = true
+
+[[case]]
+name = "trade-bare-group-json"
+args = ["--json", "trade"]
+expect = 2
+exact_output = true
+
+[[case]]
 name = "bare-help-trade-close"
 args = ["trade", "close"]
 mode = "text"

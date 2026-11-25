@@ -646,7 +646,9 @@ fn print_parse_error(
     };
     match error.kind() {
         ErrorKind::DisplayHelp => {
-            if let Some(help) = help() {
+            if command == "trade" {
+                println!("{}", trade::group_help(true));
+            } else if let Some(help) = help() {
                 println!("{help}");
             } else {
                 let _ = error.print();
@@ -660,10 +662,10 @@ fn print_parse_error(
         ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::MissingSubcommand
             if !command.is_empty() && operands.is_empty() =>
         {
-            let message = if command == "auth" {
-                Some("Invalid arguments to auth.".into())
-            } else {
-                help().or_else(|| clap_help(command))
+            let message = match command {
+                "auth" => Some("Invalid arguments to auth.".into()),
+                "trade" => Some(trade::group_help(false)),
+                _ => help().or_else(|| clap_help(command)),
             };
             if let Some(message) = message {
                 return complete(Err(SaiError::usage(message)), Some(command), json, home);

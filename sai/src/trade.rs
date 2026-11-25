@@ -180,6 +180,31 @@ impl Open {
     }
 }
 
+pub fn group_help(show_cancel: bool) -> String {
+    let cancel = if show_cancel {
+        "  cancel         Cancel a pending order.\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"{}
+
+  Submit authenticated trading intents.
+
+Options:
+  --help  Show this message and exit.
+
+Commands:
+{cancel}  close          Close a position or cancel a pending order.
+  leverage       Set target leverage without changing TP or SL.
+  margin         Add or remove margin through a target-leverage intent.
+  open           Open a market, limit, or stop trade.
+  partial-close  Reduce an open USDC position by a whole percentage.
+  tpsl           Set or clear take-profit and stop-loss prices."#,
+        crate::usage("trade")
+    )
+}
+
 // Render Click's help for the trade commands shared with Python.
 pub fn help(command: &str) -> Option<String> {
     let body = match command {

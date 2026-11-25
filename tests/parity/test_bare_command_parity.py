@@ -120,6 +120,28 @@ def test_bare_group(binaries: tuple[str, str], tmp_path: Path, group: str) -> No
             assert expected in bare.stderr
 
 
+def test_bare_trade_group_matches_python(
+    binaries: tuple[str, str], tmp_path: Path
+) -> None:
+    python, rust = binaries
+    for args in (("trade",), ("--json", "trade")):
+        expected = invoke(python, tmp_path / "python", *args)
+        actual = invoke(rust, tmp_path / "rust", *args)
+        assert actual.returncode == expected.returncode == 2
+        assert actual.stdout == expected.stdout
+        assert actual.stderr == expected.stderr
+
+    expected = invoke(python, tmp_path / "python", "trade", "--help")
+    actual = invoke(rust, tmp_path / "rust", "trade", "--help")
+    assert actual.returncode == expected.returncode == 0
+    assert actual.stderr == expected.stderr == b""
+    assert actual.stdout == expected.stdout.replace(
+        b"Commands:\n",
+        b"Commands:\n  cancel         Cancel a pending order.\n",
+        1,
+    )
+
+
 def test_root_help_and_json_usage(binaries: tuple[str, str], tmp_path: Path) -> None:
     for label, binary in zip(("python", "rust"), binaries, strict=True):
         home = tmp_path / label
