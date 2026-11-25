@@ -19,7 +19,7 @@ import sqlite3
 import traceback
 from collections.abc import Callable
 from datetime import UTC, datetime
-from decimal import Decimal, localcontext
+from decimal import Decimal
 from typing import Any
 
 from ..core import (
@@ -553,17 +553,9 @@ def bound(
         if reference is None or slippage is None:
             return
         current = Decimal(str(preview["referencePrice"]))
-        fraction = Decimal(slippage).scaleb(-2)
-        lower = estimates.slippage_price(reference, fraction, False)
-        upper = estimates.slippage_price(reference, fraction, True)
-        if not lower <= current <= upper:
-            with localcontext() as context:
-                context.prec = 90
-                moved = abs(current - reference) / reference * 100
-                message = PRICE_MOVED.format(
-                    moved=format(moved.quantize(Decimal("0.0001")), "f"),
-                    slippage=slippage,
-                )
+        moved = estimates.market_price_move(reference, current, slippage)
+        if moved is not None:
+            message = PRICE_MOVED.format(moved=moved, slippage=slippage)
             raise Refused(message, Code.PRICE_MOVED, fresh)
 
     return check
@@ -594,9 +586,11 @@ def finish(
     if not dry_run:
         return {**result, "addr": load.pinned}
     preview = {**result, "addr": load.account()}
-    if preview.get("positionOwnerVerified") is False:
-        return preview
-    return confirmation.with_digest(preview)
+    return (
+        confirmation.with_digest(preview)
+        if confirmation.is_confirmable(preview)
+        else preview
+    )
 
 
 # Trading: each action previews with dry_run and submits without it. A
@@ -634,12 +628,15 @@ def open_trade(
     check = submit_check(
         load, dry_run, preview_digest, reference_price, slippage if market else None
     )
-    if not dry_run:
+
+    def check_pending(preview: dict[str, Any]) -> None:
+        bound(load, preview_digest, reference_price)(preview)
         storage.check_open_pending(
             settings.endpoint,
             load()["evmAddress"],
             allow_concurrent_open=allow_concurrent_open,
         )
+
     notices: list[str] = []
     result = trading.open_trade(
         settings.endpoint,
@@ -657,6 +654,7 @@ def open_trade(
         lcd_endpoint=settings.lcd_endpoint,
         mcp_market=True,
         notify=notices.append,
+        before_price_refresh=check_pending,
         before_submit=check,
         allow_concurrent_open=allow_concurrent_open,
     )
@@ -666,7 +664,11 @@ def open_trade(
         return finish(load, dry_run, result)
     preview = {**result, "addr": load.account()}
     if preview["addr"] is not None:
-        return confirmation.with_digest(preview)
+        return (
+            confirmation.with_digest(preview)
+            if confirmation.is_confirmable(preview)
+            else preview
+        )
     preview["confirmationStatus"] = "informational"
     if estimates.rejection_reason(result.get("estimates", {})) is None:
         preview["recovery"] = {

@@ -559,10 +559,6 @@ def trading_route(endpoint: str, lcd: str) -> PositionRoute:
     return {"chainId": chain_id, "contractAddress": contract}
 
 
-def trading_contract(endpoint: str, lcd: str) -> str:
-    return trading_route(endpoint, lcd)["contractAddress"]
-
-
 @dataclass(frozen=True)
 class VerifiedPosition:
     route: PositionRoute
@@ -570,10 +566,16 @@ class VerifiedPosition:
 
 
 def verify_position_owner(
-    endpoint: str, lcd: str, addr: str, trade_id: int
+    endpoint: str,
+    lcd: str,
+    addr: str,
+    trade_id: int,
+    *,
+    route: PositionRoute | None = None,
 ) -> VerifiedPosition:
     """Read the live target and check its trade index and owner."""
-    route = trading_route(endpoint, lcd)
+    if route is None:
+        route = trading_route(endpoint, lcd)
     raw = smart_value(
         lcd,
         route["contractAddress"],

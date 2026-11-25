@@ -255,7 +255,8 @@ nothing. Use the returned `preview` for confirmation if it has a
 `previewDigest`. Otherwise, check the reported cause and request a fresh
 preview before asking for confirmation.
 
-- Every trade: the signed-in account and the trade's arguments.
+- Every trade digest binds the signed-in account, the trade's arguments,
+  the verified chain ID, and the Perp contract address.
 - `trade_margin` also binds the margin quote, including the position's
   starting collateral and leverage.
 - `trade_partial_close` also binds the close percentage, starting collateral
@@ -264,12 +265,9 @@ preview before asking for confirmation.
 - `trade_open` for a market order also takes the preview's `referencePrice`
   as `reference_price`. A move beyond the allowed slippage requires a fresh
   preview and confirmation.
-- `trade_close`, `trade_tpsl`, and `trade_leverage`: nothing beyond the
-  account and arguments.
 
 On `main`, Sai refuses trades on positions owned by a different account.
 A preview with `positionOwnerVerified: false` has no confirmation digest.
-Margin and partial-close digests also bind the chain ID and Perp contract.
 
 Ask the agent to call `mcp_info` to see the version, endpoints, and active
 account. Its `trading` field reports the active account's session readiness.
