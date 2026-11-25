@@ -3,20 +3,21 @@ use std::sync::LazyLock;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hyper::HeaderMap;
 use regex::Regex;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use url::{Url, form_urlencoded::byte_serialize};
 use uuid::Uuid;
 
 use crate::{
-    endpoint::Endpoint,
+    endpoint::{Endpoint, append_path},
     errors::SaiError,
-    keeper::{self, ROUTE, TIMEOUT},
+    keeper::{self, TIMEOUT},
     storage::Session,
 };
 
 use super::{
     TradePreview, Trading,
-    actions::{incomplete, invalid},
+    actions::invalid,
+    position::{Lcd, PositionRoute, same_account},
 };
 
 impl Trading<'_> {
@@ -29,20 +30,20 @@ impl Trading<'_> {
         if preview.intent.kind != "CANCEL_PENDING_TRADE" || preview.intent.target.is_none() {
             return Err(SaiError::internal());
         }
-        Ok(self
-            .prepare_preview(preview.clone(), Some(session), super::PreviewMode::Cli)
-            .await?
-            .output(Some(session.addr())))
+        self.storage
+            .check_active_trade(session, self.keeper.endpoint())?;
+        self.basic_trade_route(session, preview, false, None)
+            .await?;
+        Ok(preview.output(Some(session.addr())))
     }
 
-    pub(super) async fn check_pending_order(
+    pub(super) async fn check_pending_target(
         &self,
         session: &Session,
         preview: &TradePreview,
+        lcd: &Lcd<'_>,
+        route: &PositionRoute,
     ) -> Result<(), SaiError> {
-        let lcd = self
-            .lcd_endpoint
-            .ok_or_else(|| invalid("Cannot verify the pending order without an LCD"))?;
         let id = preview
             .intent
             .target
@@ -50,15 +51,7 @@ impl Trading<'_> {
             .filter(|_| preview.intent.kind == "CANCEL_PENDING_TRADE")
             .map(|target| target.trade_id.as_str())
             .ok_or_else(SaiError::internal)?;
-        let contract = self.trading_contract(lcd).await?;
-        let trade =
-            read_cancel_target(lcd.trim_end_matches('/'), &contract, session.addr(), id).await?;
-        let owner = trade["user"].as_str().and_then(keeper::canonical_account);
-        if owner.is_none() || owner != keeper::canonical_account(session.addr()) {
-            return Err(invalid(&format!(
-                "Trade {id} was not found for this account."
-            )));
-        }
+        let trade = read_cancel_target(lcd.0, &route.contract_address, session.addr(), id).await?;
         if trade["user_trade_index"] != format!("UserTradeIndex({id})")
             || trade["is_open"].as_bool() != Some(true)
             || !matches!(trade["trade_type"].as_str(), Some("limit" | "stop"))
@@ -67,43 +60,12 @@ impl Trading<'_> {
                 "Target is not an open pending order. Preview a market close for a filled position.",
             ));
         }
-        Ok(())
-    }
-
-    pub(super) async fn trading_contract(&self, lcd: &str) -> Result<String, SaiError> {
-        let route = self
-            .keeper
-            .request(ROUTE, Map::new(), None, TIMEOUT)
-            .await?;
-        let route = route
-            .get("oneClickTrading")
-            .ok_or_else(|| incomplete("KeyError"))?;
-        let lcd = lcd.trim_end_matches('/');
-        let network_url = format!("{lcd}/cosmos/base/tendermint/v1beta1/node_info");
-        let (status, _, bytes) =
-            keeper::lcd_get(lcd_url(&network_url)?.as_str(), HeaderMap::new(), TIMEOUT)
-                .await
-                .map_err(|_| invalid("Unable to read contract state"))?;
-        let node = read_object(status.is_success(), &bytes)
-            .ok_or_else(|| invalid("Unable to read contract state"))?;
-        let enabled = route
-            .as_object()
-            .ok_or_else(|| incomplete("TypeError"))?
-            .get("enabled")
-            .ok_or_else(|| incomplete("KeyError"))?;
-        let network = node["default_node_info"]["network"].as_str();
-        if !keeper::truthy(enabled)
-            || !network
-                .is_some_and(|id| !id.trim().is_empty() && route["chainId"].as_str() == Some(id))
-        {
-            return Err(invalid("Keeper trading route and LCD network do not match"));
+        if !same_account(session.addr(), trade.get("user")) {
+            return Err(invalid(
+                "Contract pending order belongs to a different account",
+            ));
         }
-        route
-            .get("contractAddress")
-            .ok_or_else(|| incomplete("KeyError"))?
-            .as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| incomplete("TypeError"))
+        Ok(())
     }
 }
 
@@ -135,8 +97,8 @@ async fn read_cancel_target(
     let encoded = STANDARD.encode(query.to_string());
     let encoded: String = byte_serialize(encoded.as_bytes()).collect();
     let contract: String = byte_serialize(contract.as_bytes()).collect();
-    let url = format!("{lcd}/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}");
-    let mut url = lcd_url(&url)?;
+    let path = format!("/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}");
+    let mut url = lcd_url(lcd, &path)?;
     url.query_pairs_mut()
         .append_pair("_sai_query", &Uuid::new_v4().simple().to_string());
     let (status, _, bytes) = keeper::lcd_get(url.as_str(), HeaderMap::new(), TIMEOUT)
@@ -165,7 +127,7 @@ fn read_object(success: bool, bytes: &[u8]) -> Option<Value> {
         .filter(Value::is_object)
 }
 
-pub(super) fn lcd_url(raw: &str) -> Result<Url, SaiError> {
+pub(super) fn lcd_url(raw: &str, path: &str) -> Result<Url, SaiError> {
     let Some(endpoint) = Endpoint::split(raw).filter(|endpoint| {
         endpoint.scheme == "https"
             || (endpoint.scheme == "http"
@@ -181,5 +143,7 @@ pub(super) fn lcd_url(raw: &str) -> Result<Url, SaiError> {
     {
         return Err(invalid("Credentials are not allowed in the LCD URL"));
     }
-    Url::parse(raw).map_err(|_| invalid("Unable to read contract state"))
+    let mut url = Url::parse(raw).map_err(|_| invalid("Unable to read contract state"))?;
+    append_path(&mut url, path);
+    Ok(url)
 }
