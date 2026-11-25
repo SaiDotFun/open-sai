@@ -610,6 +610,11 @@ signature = "c5518fd726653ffa4de5825a746831742557dbfbcf7f74dc1076a69e6e920962"
 owner = "#211"
 signature = "c679060efa7aa7397617b86a739843d544153b80d6eb63798ac9bdaa21ef9ca9"
 
+[gap."case:version"]
+owner = "#213"
+# The published v0.1.3 updater requires the native banner during its trial.
+signature = "d1a087013957a4980439a4e5a774af1a6843531593dbb0cf17ba98d2869d2007"
+
 [gap."case:watch-balances"]
 owner = "#211"
 signature = "91ff02e2c24963e3808b26c07ab8657a453ee341cd25dc31a614b3066d89ed99"

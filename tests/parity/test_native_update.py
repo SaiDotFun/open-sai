@@ -323,8 +323,8 @@ def standalone(
     version = subprocess.check_output(
         [binary, "--version"], env=env, text=True, timeout=10
     ).strip()
-    assert version.startswith("sai, version ")
-    installed = version.removeprefix("sai, version ")
+    executable, installed = version.split(" ", 1)
+    assert executable == "sai"
     old = root / ".sai-native" / f"{installed}-{'b' * 64}" / "sai"
     old.parent.mkdir(parents=True, mode=0o700)
     old.parent.parent.chmod(0o700)
@@ -447,8 +447,7 @@ def test_failed_smoke_check_keeps_or_restores_standalone(
     assert "did not initialize" in json.loads(result.stdout)["error"]["message"]
     assert standalone.launcher.readlink() == initial
     assert (
-        standalone.invoke("--version").stdout.strip()
-        == f"sai, version {standalone.installed}"
+        standalone.invoke("--version").stdout.strip() == f"sai {standalone.installed}"
     )
     assert standalone.state()["result"]["rolledBack"] is (phase == "installed")
     assert not (standalone.executable.parent.parent / "pending.json").exists()

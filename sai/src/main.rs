@@ -661,7 +661,7 @@ fn print_parse_error(
             return (ExitCode::Ok, None);
         }
         ErrorKind::DisplayVersion => {
-            println!("sai, version {}", env!("CARGO_PKG_VERSION"));
+            let _ = error.print();
             return (ExitCode::Ok, None);
         }
         ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::MissingSubcommand

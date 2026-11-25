@@ -42,7 +42,7 @@ fn prints_workspace_version_without_reading_config() {
         assert!(output.stderr.is_empty());
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
-            format!("sai, version {}\n", env!("CARGO_PKG_VERSION"))
+            format!("sai {}\n", env!("CARGO_PKG_VERSION"))
         );
     }
     assert!(!root.path().join("logs").exists());

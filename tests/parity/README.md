@@ -102,6 +102,12 @@ Python v0.1.2 records the address operand and flags.
 
 ## Native Distribution
 
+The Linux installer rehearsal installs the published Python v0.1.3 wheel
+with uv, then runs `sai update` against the candidate shim and archive over
+loopback. The published updater checks for the `sai VERSION` banner during
+its trial. Rust keeps that banner for the handoff, and the manifest records
+the resulting difference from Python's `sai, version VERSION` banner.
+
 The Native Distribution workflow installs the built shim wheel with uv on
 each native target and serves the matching archive over loopback. Build the
 loopback-only wheel with `python scripts/native-dist.py rehearsal-wheel DIR`.

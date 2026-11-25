@@ -27,6 +27,9 @@ ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "scripts" / "install.py"
 REPO = "/SaiDotFun/open-sai"
 PRE_BRIDGE_COMMIT = "8557a7e13dceab0accc369191182c8e01423c91b"
+PUBLISHED_BRIDGE_SHA256 = (
+    "65e736ea6468144e93b4fb0de1f2c16f949e81d78cd27c56c449943e821b3bc0"
+)
 OLD_MCP_COMMAND = "sai" + "-mcp"
 WINDOWS = os.name == "nt"
 
@@ -347,7 +350,7 @@ def native_artifact(replay: Replay, name: str = "RUST") -> str:
             )
         )
         .strip()
-        .split()[-1]
+        .split()[1]
     )
     replay.add(version, {asset_name(version): archive(binary)})
     return version
@@ -369,7 +372,7 @@ def test_standalone_installs_release(install: Install, replay: Replay) -> None:
     pre_mcp_xfail(result)
     ok(result)
     install.pin(version)
-    assert ok(install.run("sai", "--version")).strip() == f"sai, version {version}"
+    assert ok(install.run("sai", "--version")).strip() == f"sai {version}"
     assert install.launcher.readlink() == Path(".sai-native/current")
     target = install.launcher.resolve(strict=True)
     assert target.parent.name.startswith(f"{version}-")
@@ -1235,6 +1238,30 @@ def test_pre_bridge_updater_can_skip_to_the_native_shim(
     assert result["status"] == "updated"
     install.pin(version)
     assert profile.read_bytes() == contents
+
+
+@pytest.mark.skipif(WINDOWS, reason="native uv updates run on POSIX")
+def test_published_v013_updater_installs_the_native_shim(
+    install: Install, replay: Replay
+) -> None:
+    published = artifact("PUBLISHED_BRIDGE")
+    assert hashlib.sha256(published.read_bytes()).hexdigest() == PUBLISHED_BRIDGE_SHA256
+    assert wheel_version(published) == "0.1.3"
+    prepare_uv(install, published, replay)
+    launcher = install.launcher.resolve(strict=True)
+    profile, contents = save_profile(install, replay)
+    version = add_shim(replay, wheel_artifact("SHIM"), artifact("RUST"))
+    result = json.loads(ok(install.update(replay)))
+    assert (result["status"], result["target"]) == ("updated", version)
+    assert install.launcher.resolve(strict=True) == launcher
+    assert profile.read_bytes() == contents
+
+    del replay.assets[
+        f"{REPO}/releases/download/sai-cli/v{version}/{asset_name(version)}"
+    ]
+    requests = len(replay.requests)
+    install.pin(version)
+    assert len(replay.requests) == requests
 
 
 @pytest.mark.skipif(not WINDOWS, reason="requires a Windows uv launcher")
