@@ -1561,25 +1561,27 @@ args = ["--json", "trade", "partial-close", "7", "--percent", "5__0", "--dry-run
 seed = "session"
 expect = 2
 state = { "trader/intents.sqlite3" = "<absent>" }
-output = { "error.message" = "Invalid value for '--percent': '5__0' is not a valid integer range." }
+output = { "error.code" = "INVALID_REQUEST", "error.message" = "Invalid value for '--percent': '5__0' is not a valid integer." }
+accepted_difference = "Python PR #194 changed the invalid percent diagnostic."
+rust = { output = { "error.code" = "INVALID_REQUEST", "error.message" = "Invalid value for '--percent': '5__0' is not a valid integer range." } }
 
 [[case]]
 name = "trade-partial-close-unicode-percent"
 args = ["--json", "trade", "partial-close", "7", "--percent", "٥_٠", "--dry-run"]
 seed = "session"
 server = "position-default"
-wire = [
-    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "get_collateral_price",
-]
+expect = 2
 state = { "trader/intents.sqlite3" = "<absent>" }
-output = { "quote.percent" = 50 }
+output = { "error.code" = "INVALID_REQUEST", "error.message" = "Invalid value for '--percent': '٥_٠' is not a valid integer." }
+accepted_difference = "Python PR #194 rejects non-ASCII percent digits. Rust accepts the pinned Python syntax."
 
 [case.rust]
+expect = 0
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
     "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
 ]
+output = { "quote.percent" = 50 }
 
 [[case]]
 name = "trade-partial-close-invalid-id"
@@ -1638,23 +1640,22 @@ output = { "quote.effectiveLeverage" = "1.234567890123456789", "quote.actualDelt
 name = "trade-margin-signed-out-before-amount"
 args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "invalid", "--dry-run"]
 seed = "empty"
-expect = 6
+expect = 2
 state = { "trader/intents.sqlite3" = "<absent>" }
-output = { "error.code" = "SIGNED_OUT" }
+output = { "error.code" = "INVALID_REQUEST", "error.message" = "Invalid value for '--amount': 'invalid' is not a valid decimal." }
+accepted_difference = "Python PR #194 validates the amount before loading the session. Rust checks the session first."
+rust = { expect = 6, output = { "error.code" = "SIGNED_OUT" } }
 
 [[case]]
 name = "trade-margin-chain-before-amount"
 args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "invalid", "--dry-run"]
 seed = "session"
 server = "position-wrong-chain"
-expect = 1
-wire = [
-    "oneClickTrading", "node_info",
-]
+expect = 2
 state = { "trader/intents.sqlite3" = "<absent>" }
-output = { "error.message" = "Keeper trading route and LCD network do not match" }
-rust = { wire = ["oneClickTrading", "trade", "node_info"] }
-rust_early_position_reads = 1
+output = { "error.code" = "INVALID_REQUEST", "error.message" = "Invalid value for '--amount': 'invalid' is not a valid decimal." }
+accepted_difference = "Python PR #194 validates the amount before reading the route. Rust checks the chain first."
+rust = { expect = 1, wire = ["oneClickTrading", "trade", "node_info"], output = { "error.code" = "INVALID_REQUEST", "error.message" = "Keeper trading route and LCD network do not match" } }
 
 [[case]]
 name = "trade-margin-recheck-height"
