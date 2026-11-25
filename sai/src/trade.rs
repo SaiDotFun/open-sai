@@ -1,4 +1,5 @@
 use std::{
+    future::{Future, pending},
     sync::OnceLock,
     time::{Duration, Instant},
 };
@@ -15,7 +16,7 @@ use sai_core::{
     },
     wait,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::{load_settings, local};
 
@@ -31,6 +32,8 @@ pub enum TradeCommand {
         cancel_order: bool,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long)]
+        preview_digest: Option<String>,
         /// Wait up to 30 seconds for the intent outcome.
         #[arg(long)]
         wait: bool,
@@ -58,6 +61,8 @@ pub enum TradeCommand {
         clear_stop_loss: bool,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long)]
+        preview_digest: Option<String>,
         /// Wait up to 30 seconds for the intent outcome.
         #[arg(long)]
         wait: bool,
@@ -71,6 +76,8 @@ pub enum TradeCommand {
         leverage: String,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long)]
+        preview_digest: Option<String>,
         /// Wait up to 30 seconds for the intent outcome.
         #[arg(long)]
         wait: bool,
@@ -105,6 +112,9 @@ pub struct Position {
     lcd_endpoint: Option<String>,
     #[arg(long)]
     dry_run: bool,
+    /// Wait up to 30 seconds for the intent outcome.
+    #[arg(long)]
+    wait: bool,
     /// Confirm the digest printed by --dry-run.
     #[arg(long)]
     preview_digest: Option<String>,
@@ -121,6 +131,27 @@ enum OrderType {
     Market,
     Limit,
     Stop,
+}
+
+pub fn missing_open_option(option: &str) -> Option<SaiError> {
+    match option {
+        "--side" => Some(missing_enum_option::<Side>(option)),
+        "--type" => Some(missing_enum_option::<OrderType>(option)),
+        _ => None,
+    }
+}
+
+fn missing_enum_option<T: ValueEnum>(option: &str) -> SaiError {
+    let choices = T::value_variants()
+        .iter()
+        .filter_map(ValueEnum::to_possible_value)
+        .map(|value| value.get_name().to_owned())
+        .collect::<Vec<_>>()
+        .join(",\n\t");
+    SaiError::usage(format!(
+        "Missing option {}. Choose from:\n\t{choices}",
+        repr(option)
+    ))
 }
 
 #[derive(Args)]
@@ -151,14 +182,16 @@ pub struct Open {
     allow_concurrent_open: bool,
     #[arg(long)]
     dry_run: bool,
+    #[arg(long)]
+    preview_digest: Option<String>,
     /// Wait up to 30 seconds for the intent outcome.
     #[arg(long)]
     wait: bool,
 }
 
 impl Open {
-    fn preview(&self) -> Result<TradePreview, SaiError> {
-        OpenTrade {
+    fn preview(&self, price: Option<&str>, confirmed: bool) -> Result<TradePreview, SaiError> {
+        let trade = OpenTrade {
             market: &self.market,
             side: match self.side {
                 Side::Long => trade::Side::Long,
@@ -171,13 +204,148 @@ impl Open {
             },
             amount: &self.amount,
             leverage: &self.leverage,
-            price: self.price.as_deref(),
+            price,
             slippage: &self.slippage,
             take_profit: self.take_profit.as_deref(),
             stop_loss: self.stop_loss.as_deref(),
+        };
+        if confirmed {
+            trade.confirmed_cli_preview()
+        } else {
+            trade.preview()
         }
-        .preview()
     }
+
+    fn confirmation(&self) -> Result<Option<trade::Confirmation<'_>>, SaiError> {
+        let Some(digest) = self.preview_digest.as_deref().filter(|_| !self.dry_run) else {
+            return Ok(None);
+        };
+        if matches!(self.order_type, OrderType::Market) {
+            return trade::Confirmation::for_market_cli(digest, self.price.as_deref()).map(Some);
+        }
+        Ok(Some(trade::Confirmation::for_cli(digest)))
+    }
+}
+
+pub fn group_help(show_cancel: bool) -> String {
+    let cancel = if show_cancel {
+        "  cancel         Cancel a pending order.\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"{}
+
+  Submit authenticated trading intents.
+
+Options:
+  --help  Show this message and exit.
+
+Commands:
+{cancel}  close          Close a position or cancel a pending order.
+  leverage       Set target leverage without changing TP or SL.
+  margin         Add or remove margin through a target-leverage intent.
+  open           Open a market, limit, or stop trade.
+  partial-close  Reduce an open USDC position by a whole percentage.
+  tpsl           Set or clear take-profit and stop-loss prices."#,
+        crate::usage("trade")
+    )
+}
+
+// Render Click's help for the trade commands shared with Python.
+pub fn help(command: &str) -> Option<String> {
+    let body = match command {
+        "trade close" => {
+            r#"  Close a position or cancel a pending order.
+
+Options:
+  --cancel-order         Cancel a pending order instead of closing a position.
+  --dry-run
+  --preview-digest TEXT  Submit only if the trade matches this dry-run digest.
+  --wait                 Wait up to 30 seconds for the intent outcome.
+  --help                 Show this message and exit."#
+        }
+        "trade leverage" => {
+            r#"  Set target leverage without changing TP or SL.
+
+Options:
+  --leverage DECIMAL     Target leverage as a decimal.  [required]
+  --dry-run
+  --preview-digest TEXT  Submit only if the trade matches this dry-run digest.
+  --wait                 Wait up to 30 seconds for the intent outcome.
+  --help                 Show this message and exit."#
+        }
+        "trade margin" => {
+            r#"  Add or remove margin through a target-leverage intent.
+
+  The amount is a quote, not a cap: collateral can change before execution.
+
+Options:
+  --direction [add|remove]  [required]
+  --amount DECIMAL          USDC amount for a leverage quote, not an execution
+                            cap.  [required]
+  --lcd-endpoint TEXT       Nibiru REST endpoint for exact contract state.
+                            Defaults to the lcd.endpoint setting.
+  --dry-run
+  --preview-digest TEXT     Submit only if the trade matches this dry-run
+                            digest.
+  --wait                    Wait up to 30 seconds for the intent outcome.
+  --help                    Show this message and exit."#
+        }
+        "trade open" => {
+            r#"  Open a market, limit, or stop trade.
+
+Options:
+  --market INTEGER            [x<=None; required]
+  --side [long|short]         [required]
+  --type [market|limit|stop]  [required]
+  --amount DECIMAL            USDC amount in USD.  [required]
+  --leverage DECIMAL          [required]
+  --price DECIMAL             Trigger for limit and stop orders. For market
+                              orders, pass the preview's reference price when
+                              submitting with --preview-digest.
+  --slippage TEXT             Maximum slippage percentage, greater than 0 and
+                              at most 100.  [required]
+  --take-profit DECIMAL
+  --stop-loss DECIMAL
+  --allow-concurrent-open     Allow another open while an earlier open is
+                              unknown or accepted. Any locally pending open on
+                              the same account and Keeper still blocks,
+                              including a late acknowledgement.
+  --dry-run
+  --preview-digest TEXT       Submit only if the trade matches this dry-run
+                              digest.
+  --wait                      Wait up to 30 seconds for the intent outcome.
+  --help                      Show this message and exit."#
+        }
+        "trade partial-close" => {
+            r#"  Reduce an open USDC position by a whole percentage.
+
+Options:
+  --percent INTEGER      [1<=x<=99; required]
+  --lcd-endpoint TEXT    Nibiru REST endpoint for exact contract state.
+                         Defaults to the lcd.endpoint setting.
+  --dry-run
+  --preview-digest TEXT  Submit only if the trade matches this dry-run digest.
+  --wait                 Wait up to 30 seconds for the intent outcome.
+  --help                 Show this message and exit."#
+        }
+        "trade tpsl" => {
+            r#"  Set or clear take-profit and stop-loss prices.
+
+Options:
+  --take-profit DECIMAL
+  --stop-loss DECIMAL
+  --clear-take-profit
+  --clear-stop-loss
+  --dry-run
+  --preview-digest TEXT  Submit only if the trade matches this dry-run digest.
+  --wait                 Wait up to 30 seconds for the intent outcome.
+  --help                 Show this message and exit."#
+        }
+        _ => return None,
+    };
+    Some(format!("{}\n\n{body}", crate::usage(command)))
 }
 
 pub fn run(
@@ -195,6 +363,14 @@ pub fn run(
     let storage = Storage::new(&env.home).with_event_sink(&log_storage);
     let trading = Trading::new(settings.endpoint(), &storage, events)
         .with_lcd_endpoint(settings.lcd_endpoint());
+    let waiting = WaitTrade {
+        endpoint: settings.endpoint(),
+        storage: &storage,
+        events,
+        env,
+        json,
+        reservation: OnceLock::new(),
+    };
     let cancelling = matches!(
         command,
         TradeCommand::Cancel { .. }
@@ -203,102 +379,123 @@ pub fn run(
                 ..
             }
     );
-    let (preview, dry_run, wait_for_trade, allow_concurrent_open, supplied_price) = match command {
-        TradeCommand::Open(open) => (
-            open.preview()?,
-            open.dry_run,
-            open.wait,
-            open.allow_concurrent_open,
-            open.price.is_some(),
-        ),
-        TradeCommand::Close {
-            trade_id,
-            cancel_order,
-            dry_run,
-            wait,
-        } => (
-            close_preview(&trade_id, cancel_order)?,
-            dry_run,
-            wait,
-            false,
-            false,
-        ),
-        TradeCommand::Cancel {
-            trade_id,
-            dry_run,
-            wait,
-        } => (close_preview(&trade_id, true)?, dry_run, wait, false, false),
-        TradeCommand::Margin {
-            position,
-            direction,
-            amount,
-        } => {
-            let direction = match direction.as_str() {
-                "add" => MarginDirection::Add,
-                "remove" => MarginDirection::Remove,
-                _ => {
-                    return Err(SaiError::usage(format!(
-                        "Invalid value for '--direction': {} is not one of 'add', 'remove'.",
-                        repr(&direction),
-                    )));
-                }
-            };
-            return position.run(
-                &trading,
-                &settings,
-                account,
-                PositionAction::Margin {
-                    direction,
-                    amount: &amount,
-                },
-                json,
-            );
-        }
-        TradeCommand::PartialClose { position, percent } => {
-            return position.run(
-                &trading,
-                &settings,
-                account,
-                PositionAction::PartialClose {
-                    percent: trade::parse_partial_close_percent(&percent)?,
-                },
-                json,
-            );
-        }
-        TradeCommand::Tpsl {
-            trade_id,
-            take_profit,
-            stop_loss,
-            clear_take_profit,
-            clear_stop_loss,
-            dry_run,
-            wait,
-        } => (
-            trade::tpsl_preview(
-                &trade_id,
-                take_profit.as_deref(),
-                stop_loss.as_deref(),
+    let (preview, dry_run, wait_for_trade, allow_concurrent_open, supplied_price, confirmation) =
+        match &command {
+            TradeCommand::Open(open) => {
+                let confirmation = open.confirmation()?;
+                let confirmed_market =
+                    confirmation.is_some() && matches!(open.order_type, OrderType::Market);
+                let supplied = open.price.as_deref();
+                (
+                    open.preview(
+                        if confirmed_market { None } else { supplied },
+                        open.dry_run || confirmation.is_some(),
+                    )?,
+                    open.dry_run,
+                    open.wait,
+                    open.allow_concurrent_open,
+                    supplied.is_some(),
+                    confirmation,
+                )
+            }
+            TradeCommand::Close {
+                trade_id,
+                cancel_order,
+                dry_run,
+                preview_digest,
+                wait,
+            } => (
+                close_preview(trade_id, *cancel_order)?,
+                *dry_run,
+                *wait,
+                false,
+                false,
+                preview_digest.as_deref().map(trade::Confirmation::for_cli),
+            ),
+            TradeCommand::Cancel {
+                trade_id,
+                dry_run,
+                wait,
+            } => (
+                close_preview(trade_id, true)?,
+                *dry_run,
+                *wait,
+                false,
+                false,
+                None,
+            ),
+            TradeCommand::Margin {
+                position,
+                direction,
+                amount,
+            } => {
+                let direction = match direction.as_str() {
+                    "add" => MarginDirection::Add,
+                    "remove" => MarginDirection::Remove,
+                    _ => {
+                        return Err(SaiError::usage(format!(
+                            "Invalid value for '--direction': {} is not one of 'add', 'remove'.",
+                            repr(direction),
+                        )));
+                    }
+                };
+                return position.run(
+                    &trading,
+                    &settings,
+                    account,
+                    PositionAction::Margin { direction, amount },
+                    &waiting,
+                );
+            }
+            TradeCommand::PartialClose { position, percent } => {
+                return position.run(
+                    &trading,
+                    &settings,
+                    account,
+                    PositionAction::PartialClose {
+                        percent: trade::parse_partial_close_percent(percent)?,
+                    },
+                    &waiting,
+                );
+            }
+            TradeCommand::Tpsl {
+                trade_id,
+                take_profit,
+                stop_loss,
                 clear_take_profit,
                 clear_stop_loss,
-            )?,
-            dry_run,
-            wait,
-            false,
-            false,
-        ),
-        TradeCommand::Leverage {
-            trade_id,
-            leverage,
-            dry_run,
-            wait,
-        } => (
-            trade::leverage_preview(&trade_id, &leverage)?,
-            dry_run,
-            wait,
-            false,
-            false,
-        ),
-    };
+                dry_run,
+                preview_digest,
+                wait,
+            } => (
+                trade::tpsl_preview(
+                    trade_id,
+                    take_profit.as_deref(),
+                    stop_loss.as_deref(),
+                    *clear_take_profit,
+                    *clear_stop_loss,
+                )?,
+                *dry_run,
+                *wait,
+                false,
+                false,
+                preview_digest.as_deref().map(trade::Confirmation::for_cli),
+            ),
+            TradeCommand::Leverage {
+                trade_id,
+                leverage,
+                dry_run,
+                preview_digest,
+                wait,
+            } => (
+                trade::leverage_preview(trade_id, leverage)?,
+                *dry_run,
+                *wait,
+                false,
+                false,
+                preview_digest.as_deref().map(trade::Confirmation::for_cli),
+            ),
+        };
     let session = match trading.load_session(account) {
         Ok(session) => Some(session),
         Err(error) if dry_run && !cancelling && account.is_none() && session_error(error.code) => {
@@ -325,118 +522,144 @@ pub fn run(
             session.as_ref(),
             PreviewMode::Cli,
         ))?;
-        local::emit(&preview.output(session.as_ref().map(Session::addr)), json)?;
+        local::emit(
+            &preview.cli_preview_output(session.as_ref().map(Session::addr)),
+            json,
+        )?;
         return Ok(ExitCode::Ok);
     }
     let session = session.ok_or_else(SaiError::internal)?;
-    let endpoint = settings.endpoint();
-    let addr = session.addr();
-    let reservation = OnceLock::<String>::new();
-    let track = |key: &str| {
-        let _ = reservation.set(key.to_owned());
-    };
-    if preview.requires_market_price_refresh() && supplied_price {
+    if preview.requires_market_price_refresh() && supplied_price && confirmation.is_none() {
         eprintln!("{}", trade::MARKET_PRICE_NOTICE);
     }
+    let track = |addr: &str, key: &str| waiting.track(addr, key);
     let options = SubmitOptions {
         allow_concurrent_open,
-        on_reserved: wait_for_trade.then_some(&track as &(dyn Fn(&str) + Sync)),
-        ..SubmitOptions::default()
+        confirmation,
+        on_reserved: wait_for_trade.then_some(&track),
+    };
+    let submit = async {
+        let (result, reference_price) = trading
+            .submit_with_reference_price(
+                &session,
+                &preview,
+                options,
+                trade_interrupt(wait_for_trade),
+            )
+            .await?;
+        let mut output = json!({
+            "addr": session.addr(), "intentKey": result.intent_key, "status": result.status,
+            "message": result.message,
+        });
+        if let Some(price) = reference_price {
+            output["referencePrice"] = json!(price);
+        }
+        Ok(output)
     };
     if wait_for_trade {
+        return runtime.block_on(waiting.finish(submit));
+    }
+    local::emit(&runtime.block_on(submit)?, json)?;
+    Ok(ExitCode::Ok)
+}
+
+struct WaitTrade<'a> {
+    endpoint: &'a str,
+    storage: &'a Storage<'a>,
+    events: EventContext<'a>,
+    env: &'a Environment,
+    json: bool,
+    reservation: OnceLock<(String, String)>,
+}
+
+impl WaitTrade<'_> {
+    fn track(&self, addr: &str, key: &str) {
+        let _ = self.reservation.set((addr.into(), key.into()));
+    }
+
+    async fn finish(
+        &self,
+        submit: impl Future<Output = Result<Value, SaiError>>,
+    ) -> Result<ExitCode, SaiError> {
         let recover = |interrupted, error: SaiError| {
-            let Some(key) = reservation.get() else {
+            let Some((addr, key)) = self.reservation.get() else {
                 return Err(error);
             };
             let confirmed = (error.code == Code::NotSent).then_some(wait::Outcome::NotSent);
             Ok((
-                wait::recovery_result(&storage, endpoint, addr, key, interrupted, confirmed),
+                wait::recovery_result(
+                    self.storage,
+                    self.endpoint,
+                    addr,
+                    key,
+                    interrupted,
+                    confirmed,
+                ),
                 None,
                 true,
             ))
         };
-        return runtime.block_on(async {
-            let mut signal = local::wait_signal()?;
-            let waited = async {
-                let submission = trading
-                    .submit_with_reference_price(
-                        &session,
-                        &preview,
-                        options,
-                        std::future::pending(),
-                    )
-                    .await;
-                let (key, metadata) = match submission {
-                    Ok((accepted, price)) => {
-                        let mut metadata = Map::from_iter([
-                            ("intentKey".into(), json!(accepted.intent_key)),
-                            ("status".into(), json!(accepted.status)),
-                        ]);
-                        if let Some(price) = price {
-                            metadata.insert("referencePrice".into(), json!(price));
-                        }
-                        (accepted.intent_key, Some(metadata))
-                    }
-                    Err(error) if error.code == Code::AdmissionRejected => {
-                        let Some(key) = reservation.get() else {
-                            return Err(error);
-                        };
-                        return Ok((
-                            wait::rejected_result(key, addr, &error.message),
-                            None,
-                            false,
-                        ));
-                    }
-                    Err(error) if error.code == Code::OutcomeUnknown => {
-                        (reservation.get().ok_or(error)?.clone(), None)
-                    }
-                    Err(error) => return Err(error),
-                };
-                let receipt = wait::for_intent(
-                    endpoint,
-                    addr,
-                    &key,
-                    Duration::from_secs_f64(wait::DEFAULT_TIMEOUT),
-                    Instant::now(),
-                    &storage,
-                    events,
-                )
-                .await?;
-                Ok((receipt, metadata, false))
+        let mut signal = local::wait_signal()?;
+        let waited = async {
+            let result = submit.await;
+            let Some((addr, key)) = self.reservation.get() else {
+                return result.and_then(|_| Err(SaiError::internal()));
             };
-            let (mut receipt, metadata, recovered) = tokio::select! {
-                biased;
-                _ = signal.recv() => recover(true, local::wait_aborted()),
-                result = waited => result.or_else(|error| recover(false, error)),
-            }?;
-            if let Some(mut metadata) = metadata {
-                let Value::Object(body) = receipt.body else {
-                    return Err(SaiError::internal());
-                };
-                metadata.extend(body);
-                receipt.body = Value::Object(metadata);
-            }
-            if !recovered {
-                receipt.body["status"] = json!(receipt.outcome);
-            }
-            local::emit_wait(receipt, endpoint, env, json, recovered, &mut signal).await
-        });
+            let metadata = match result {
+                Ok(Value::Object(mut metadata)) => {
+                    // The receipt supplies the address after the submission metadata.
+                    metadata.shift_remove("addr");
+                    metadata.shift_remove("message");
+                    Some(metadata)
+                }
+                Ok(_) => return Err(SaiError::internal()),
+                Err(error) if error.code == Code::AdmissionRejected => {
+                    return Ok((
+                        wait::rejected_result(key, addr, &error.message),
+                        None,
+                        false,
+                    ));
+                }
+                Err(error) if error.code == Code::OutcomeUnknown => None,
+                Err(error) => return Err(error),
+            };
+            let receipt = wait::for_intent(
+                self.endpoint,
+                addr,
+                key,
+                Duration::from_secs_f64(wait::DEFAULT_TIMEOUT),
+                Instant::now(),
+                self.storage,
+                self.events,
+            )
+            .await?;
+            Ok((receipt, metadata, false))
+        };
+        let (mut receipt, metadata, recovered) = tokio::select! {
+            biased;
+            _ = signal.recv() => recover(true, local::wait_aborted()),
+            result = waited => result.or_else(|error| recover(false, error)),
+        }?;
+        if let Some(mut metadata) = metadata {
+            let Value::Object(body) = receipt.body else {
+                return Err(SaiError::internal());
+            };
+            metadata.extend(body);
+            receipt.body = Value::Object(metadata);
+        }
+        if !recovered {
+            receipt.body["status"] = json!(receipt.outcome);
+        }
+        local::emit_wait(
+            receipt,
+            self.endpoint,
+            self.env,
+            self.json,
+            recovered,
+            &mut signal,
+        )
+        .await
     }
-    let (result, reference_price) = runtime.block_on(trading.submit_with_reference_price(
-        &session,
-        &preview,
-        options,
-        trade_interrupt(),
-    ))?;
-    let mut output = json!({
-        "addr": session.addr(), "intentKey": result.intent_key, "status": result.status,
-        "message": result.message,
-    });
-    if let Some(price) = reference_price {
-        output["referencePrice"] = json!(price);
-    }
-    local::emit(&output, json)?;
-    Ok(ExitCode::Ok)
 }
 
 pub fn missing_position_option(argument: &str) -> Option<SaiError> {
@@ -451,12 +674,12 @@ pub fn missing_position_option(argument: &str) -> Option<SaiError> {
 
 impl Position {
     fn run(
-        self,
+        &self,
         trading: &Trading<'_>,
         settings: &Settings,
         account: Option<&str>,
         action: PositionAction<'_>,
-        json: bool,
+        waiting: &WaitTrade<'_>,
     ) -> Result<ExitCode, SaiError> {
         if let Some(endpoint) = &self.lcd_endpoint {
             Key::LcdEndpoint.parse_value(endpoint)?;
@@ -465,44 +688,60 @@ impl Position {
             .lcd_endpoint
             .as_deref()
             .unwrap_or_else(|| settings.lcd_endpoint());
+        let wait_for_trade = self.wait && !self.dry_run;
+        let track = |addr: &str, key: &str| waiting.track(addr, key);
         let mode = if self.dry_run {
             PositionMode::Preview
         } else {
-            PositionMode::Submit(
-                self.preview_digest
+            PositionMode::Submit(SubmitOptions {
+                confirmation: self
+                    .preview_digest
                     .as_deref()
-                    .map(trade::Confirmation::for_position_cli),
-            )
+                    .map(trade::Confirmation::for_cli),
+                on_reserved: wait_for_trade.then_some(&track),
+                ..SubmitOptions::default()
+            })
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|_| SaiError::internal())?;
-        let result = runtime
-            .block_on(trading.position_trade_with_interrupt(
-                account,
-                lcd_endpoint,
-                &self.trade_id,
-                action,
-                mode,
-                trade_interrupt(),
-            ))
-            .map_err(|mut error| {
-                if !json && error.code == Code::PreviewMismatch && error.details.is_some() {
+        let submit = async {
+            trading
+                .position_trade_with_interrupt(
+                    account,
+                    lcd_endpoint,
+                    &self.trade_id,
+                    action,
+                    mode,
+                    trade_interrupt(wait_for_trade),
+                )
+                .await
+                .map_err(|mut error| {
+                    if !waiting.json
+                        && error.code == Code::PreviewMismatch
+                        && error.details.as_ref().is_some_and(|details| {
+                            details["preview"]["estimates"]["execution"]["reason"] != error.message
+                        })
+                    {
+                        error
+                            .message
+                            .push_str(" Run with --dry-run to review a fresh preview.");
+                    }
                     error
-                        .message
-                        .push_str(" Run with --dry-run to review a fresh preview.");
-                }
-                error
-            })?;
-        local::emit(&result, json)?;
+                })
+        };
+        if wait_for_trade {
+            return runtime.block_on(waiting.finish(submit));
+        }
+        local::emit(&runtime.block_on(submit)?, waiting.json)?;
         Ok(ExitCode::Ok)
     }
 }
 
-async fn trade_interrupt() {
-    if tokio::signal::ctrl_c().await.is_err() {
-        std::future::pending().await
+async fn trade_interrupt(waiting_handles_interrupt: bool) {
+    if waiting_handles_interrupt || tokio::signal::ctrl_c().await.is_err() {
+        pending().await
     }
 }
 
