@@ -497,15 +497,22 @@ def test_standalone_reinstall_keeps_public_inode_without_link_or_renameat2(
 
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
 @pytest.mark.parametrize("boundary", ["selector", "public-startup", "doctor"])
-def test_standalone_refuses_to_commit_a_same_version_replacement(
+def test_standalone_refuses_to_commit_after_the_launcher_is_replaced(
     install: Install, replay: Replay, boundary: str
 ) -> None:
     native_artifact(replay)
     ok(install.install(replay, "--native"))
     binary = install.launcher.resolve(strict=True)
+    target = install.launcher.readlink()
+    started = install.home / "competing-launcher-started"
+    if boundary == "public-startup":
+        target = install.home / "replacement"
+        target.write_text('#!/bin/sh\n: > "$HOME/competing-launcher-started"\n')
+        target.chmod(0o700)
     competitor = install.launcher.with_name("competing-sai")
-    competitor.symlink_to(install.launcher.readlink())
+    competitor.symlink_to(target)
     expected = competitor.lstat()
+    destination = competitor.resolve(strict=True)
     selector = pending(install).parent / "current"
     probe = """
 import os, runpy, sys
@@ -544,7 +551,8 @@ runpy.run_path(script, run_name='__main__')
     assert str(install.launcher) in result.stderr and str(binary) in result.stderr
     assert "Installed sai" not in result.stdout
     assert os.path.samestat(install.launcher.lstat(), expected)
-    assert install.launcher.resolve(strict=True) == binary
+    assert install.launcher.resolve(strict=True) == destination
+    assert not started.exists()
 
 
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")

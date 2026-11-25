@@ -883,6 +883,7 @@ def smoke_native(
     home: Path,
     version: str,
     *,
+    argv0: Path | None = None,
     check_launcher: Callable[[], None] | None = None,
 ) -> None:
     env = {**os.environ, "SAI_HOME": str(home), "SAI_LOG": "false", "CI": "1"}
@@ -893,7 +894,8 @@ def smoke_native(
                 check_launcher()
             try:
                 with subprocess.Popen(
-                    [executable, *args],
+                    [argv0 or executable, *args],
+                    executable=executable,
                     cwd=home,
                     env=env,
                     stdin=subprocess.PIPE,
@@ -1100,9 +1102,10 @@ def install_native(args: argparse.Namespace) -> int:
 
             try:
                 smoke_native(
-                    launcher,
+                    binary,
                     Path(profile),
                     version,
+                    argv0=launcher,
                     check_launcher=check_public_launcher,
                 )
             except LauncherChanged:
