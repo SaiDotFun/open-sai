@@ -20,6 +20,7 @@ from urllib.parse import unquote, urlsplit
 
 import pytest
 from sai_cli.core import keeper, log, storage
+from scenarios import ADDRESS, loopback, seed_home
 from test_intent_status import (
     ADDR,
     CLI,
@@ -40,6 +41,9 @@ from test_intent_wait import (
     intent,
     ledger_state,
 )
+from test_trade import rows
+from test_trade import run as run_trade
+from trade_replay import REQUEST_HASH, TradeReplay
 
 OPEN = (
     "open",
@@ -369,6 +373,84 @@ def indexed_update(change: str, key: str, args: tuple[str, ...]) -> dict[str, An
         **INDEXED_POSITIONS[args],
     )
     return row
+
+
+@pytest.mark.parametrize(
+    ("args", "scenario", "kind", "change", "outcome"),
+    [
+        (
+            ("margin", "7", "--direction", "add", "--amount", "1"),
+            "margin-accepted",
+            "UPDATE_TRADE",
+            "leverage_updated",
+            "succeeded",
+        ),
+        (
+            ("partial-close", "7", "--percent", "50"),
+            "partial-accepted",
+            "DECREASE_POSITION_SIZE",
+            "trade_size_decrease",
+            "filled",
+        ),
+    ],
+    ids=["margin", "partial-close"],
+)
+def test_position_size_wait_v012(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    args: CLI,
+    scenario: str,
+    kind: str,
+    change: str,
+    outcome: str,
+) -> None:
+    reference = os.environ.get("SAI_PARITY_POSITION_V012_PYTHON")
+    assert reference is not None, "Set SAI_PARITY_POSITION_V012_PYTHON to sai v0.1.2"
+    observations = []
+    for index, cli in enumerate(((reference,), cli_pair[1])):
+        replay = TradeReplay(
+            kind, "7", change, phase="pending", fill_on_second_poll=True
+        )
+        with loopback(scenario, trade_replay=replay) as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            command = ("trade", *args)
+            dry_run = (*command, "--dry-run")
+            expected = run_trade(cli, home, endpoints, dry_run, python=index == 0)
+            actual = run_trade(
+                cli, home, endpoints, (*dry_run, "--wait"), python=index == 0
+            )
+            assert actual == expected
+            assert actual[0] == 0 and actual[1]["dryRun"] is True
+            assert not rows(home) and not replay.attempts()
+            endpoints.wire.clear()
+
+            code, result, stderr = run_trade(
+                cli, home, endpoints, (*command, "--wait"), python=index == 0
+            )
+            assert (code, stderr) == (0, ""), result
+            key = result["intentKey"]
+            assert result["addr"] == ADDRESS
+            assert result["status"] == result["outcome"] == outcome
+            assert result["receipt"]["requestTxHash"] == REQUEST_HASH
+            assert [entry[:6] for entry in rows(home)] == [
+                (key, kind, "terminal", "7", ADDRESS, "terminal")
+            ]
+            assert replay.attempts() == {key: 1}
+            assert not endpoints.errors
+            assert [
+                entry.label
+                for entry in endpoints.wire
+                if entry.label
+                in {"recordUserIntent", "waitUserIntents", "intentTradeHistory"}
+            ] == [
+                "recordUserIntent",
+                "waitUserIntents",
+                "waitUserIntents",
+                "intentTradeHistory",
+            ]
+            observations.append(normalized(result, key))
+    assert observations[0] == observations[1]
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)

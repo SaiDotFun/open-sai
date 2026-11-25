@@ -56,9 +56,7 @@ pub(super) fn margin(
     effective: &ContractDecimal,
     mut inputs: Value,
 ) -> Result<TradePreview, SaiError> {
-    let Snapshot {
-        raw, funds, market, ..
-    } = snapshot;
+    let Snapshot { raw, market, .. } = snapshot;
     let amount = round_decimal(BigUint::from(positive_decimal(amount, "Margin amount")?));
     let amount_scale = SCALE / u128::from(MICROS);
     if &amount % amount_scale != BigUint::ZERO {
@@ -118,9 +116,6 @@ pub(super) fn margin(
     };
     if actual == BigUint::ZERO || actual > delta || leverage == old {
         return Err(invalid("Margin change is too small after rounding"));
-    }
-    if adding && BigInt::from(actual.clone()) > integer(field(funds, "available_to_trade")?)? {
-        return Err(invalid("Insufficient balance on Sai"));
     }
     if trade_id.to_string().starts_with('-') {
         return Err(invalid("Trade id must not be negative"));
@@ -321,7 +316,6 @@ mod tests {
     fn margin_digest_matches_python_for_a_carried_position() {
         let snapshot = Snapshot {
             raw: json!({"collateral_amount": "10000003", "leverage": "2.123456789012345678"}),
-            funds: json!({"available_to_trade": "10000000"}),
             market: json!({"minLeverage": 1, "maxLeverage": 100}),
             route: crate::trade::position::PositionRoute {
                 chain_id: String::new(),

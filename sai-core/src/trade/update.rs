@@ -1,6 +1,7 @@
 //! Standalone TP/SL and target-leverage intents.
 
 mod estimates;
+pub(super) use estimates::{leverage_execution_estimates, unknown_execution_inputs};
 
 use serde_json::{Value, json};
 
@@ -130,15 +131,21 @@ impl Trading<'_> {
         if confirmed && verified.is_none() {
             return Err(invalid("Cannot verify the position without an LCD"));
         }
-        let (route, raw) = verified.unzip();
-        preview.position_owner_verified = Some(route.is_some());
-        self.estimate_position_update(&mut preview, addr, &id, route.clone(), indexed, raw)
-            .await?;
-        preview.position_route = route;
+        preview.position_owner_verified = Some(verified.is_some());
+        preview.position_route = verified.as_ref().map(|(route, _)| route.clone());
+        self.estimate_position_update(
+            &mut preview,
+            addr,
+            &id,
+            verified.map(|(route, raw)| (route, Some(raw))),
+            indexed,
+            false,
+        )
+        .await?;
         Ok(if confirmed {
             preview.confirmed_output(Some(addr))
         } else {
-            preview.output(Some(addr))
+            preview.cli_preview_output(Some(addr))
         })
     }
 
@@ -178,9 +185,9 @@ impl Trading<'_> {
                     &mut update.preview,
                     addr,
                     &id,
-                    route,
+                    route.map(|route| (route, None)),
                     update.indexed,
-                    None,
+                    false,
                 )
                 .await
             {
