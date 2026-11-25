@@ -397,7 +397,7 @@ impl Storage<'_> {
     }
 
     pub fn load_session(&self, addr: Option<&str>) -> Result<Session, StorageError> {
-        self.load_session_with_label(addr, addr)
+        self.load_session_with_label(addr, None)
     }
 
     /// Read a session for an MCP tool without quoting its untrusted address argument.
@@ -413,8 +413,15 @@ impl Storage<'_> {
         let mut accounts = self.load_accounts()?;
         let key = if let Some(addr) = addr {
             accounts
-                .find(addr, label.unwrap_or(addr))
-                .map_err(|error| SessionError(SaiError::new(Code::SignedOut, error.0.message)))?
+                .find(addr, label.unwrap_or("That account"))
+                .map_err(|error| {
+                    let message = if label.is_some() || crate::keeper::is_evm_address(addr) {
+                        error.0.message
+                    } else {
+                        "Expected an EVM address for the account.".into()
+                    };
+                    SessionError(SaiError::new(Code::SignedOut, message))
+                })?
         } else {
             accounts.active.take().ok_or_else(|| {
                 if accounts.sessions.is_empty() {

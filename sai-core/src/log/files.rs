@@ -22,11 +22,21 @@ pub(super) struct LogDir(std::path::PathBuf);
 
 impl LogDir {
     pub fn open(root: &Path) -> io::Result<Self> {
+        Self::open_at(root, true)
+    }
+
+    pub fn read_only(root: &Path) -> io::Result<Self> {
+        Self::open_at(root, false)
+    }
+
+    fn open_at(root: &Path, create: bool) -> io::Result<Self> {
         let parent = root
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        paths::profile(parent)?;
+        if create {
+            paths::profile(parent)?;
+        }
         #[cfg(unix)]
         {
             use rustix::{
@@ -41,26 +51,94 @@ impl LogDir {
             if rustix::fs::fstat(&parent)?.st_uid != getuid().as_raw() {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
-            paths::create_managed_at(&parent, Path::new(name))?;
+            if create {
+                paths::create_managed_at(&parent, Path::new(name))?;
+            }
             let fd = openat(parent, name, flags, Mode::empty())?;
             let dir = File::from(fd);
             let info = dir.metadata()?;
             if info.uid() != geteuid().as_raw() {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
-            restrict(&dir, &info)?;
+            if create {
+                restrict(&dir, &info)?;
+            }
             Ok(Self(dir))
         }
         #[cfg(not(unix))]
         {
-            if !root.exists() {
+            if create && !root.exists() {
                 paths::managed(root)?;
             }
-            if redirected(&fs::symlink_metadata(root)?) {
+            let metadata = fs::symlink_metadata(root)?;
+            if !metadata.is_dir() || redirected(&metadata) {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
             Ok(Self(root.into()))
         }
+    }
+
+    #[cfg(unix)]
+    pub fn read_file(&self, name: &str) -> io::Result<File> {
+        use rustix::{
+            fs::{Mode, OFlags, openat},
+            process::geteuid,
+        };
+        use std::os::unix::fs::MetadataExt;
+
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+        let file = File::from(openat(&self.0, name, flags, Mode::empty())?);
+        let info = file.metadata()?;
+        if !info.is_file() || info.nlink() > 1 || info.uid() != geteuid().as_raw() {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    pub fn read_file(&self, name: &str) -> io::Result<File> {
+        let path = self.0.join(name);
+        let info = fs::symlink_metadata(&path)?;
+        if !info.is_file() || redirected(&info) {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        File::open(path)
+    }
+
+    #[cfg(unix)]
+    pub fn names(&self) -> io::Result<Vec<String>> {
+        use rustix::fs::{AtFlags, Dir, FileType, statat};
+
+        let mut names = Vec::new();
+        for entry in Dir::read_from(&self.0)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if let Ok(text) = name.to_str()
+                && parse_name(text).is_some()
+                && statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|stat| {
+                    FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
+                })
+            {
+                names.push(text.into());
+            }
+        }
+        Ok(names)
+    }
+
+    #[cfg(not(unix))]
+    pub fn names(&self) -> io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&self.0)? {
+            let entry = entry?;
+            if let Ok(name) = entry.file_name().into_string()
+                && parse_name(&name).is_some()
+                && !redirected(&fs::symlink_metadata(entry.path())?)
+                && entry.file_type()?.is_file()
+            {
+                names.push(name);
+            }
+        }
+        Ok(names)
     }
 
     #[cfg(unix)]
@@ -154,39 +232,15 @@ impl LogDir {
         result
     }
 
-    fn read_endpoint_key(&self) -> io::Result<[u8; 32]> {
+    pub(super) fn read_endpoint_key(&self) -> io::Result<[u8; 32]> {
+        let file = self.read_file(ENDPOINT_KEY)?;
         #[cfg(unix)]
-        let file = {
-            use rustix::{
-                fs::{Mode, OFlags, openat},
-                process::geteuid,
-            };
-            use std::os::unix::fs::MetadataExt;
-            let file = File::from(openat(
-                &self.0,
-                ENDPOINT_KEY,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-                Mode::empty(),
-            )?);
-            let metadata = file.metadata()?;
-            if !metadata.is_file()
-                || metadata.nlink() > 1
-                || metadata.uid() != geteuid().as_raw()
-                || metadata.mode() & 0o077 != 0
-            {
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if file.metadata()?.permissions().mode() & 0o077 != 0 {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
-            file
-        };
-        #[cfg(not(unix))]
-        let file = {
-            let target = self.0.join(ENDPOINT_KEY);
-            let metadata = fs::symlink_metadata(&target)?;
-            if !metadata.is_file() || redirected(&metadata) {
-                return Err(io::ErrorKind::PermissionDenied.into());
-            }
-            File::open(target)?
-        };
+        }
         let mut bytes = Vec::with_capacity(33);
         file.take(33).read_to_end(&mut bytes)?;
         bytes
@@ -281,23 +335,20 @@ fn redirected(metadata: &fs::Metadata) -> bool {
     metadata.is_symlink()
 }
 
-fn expired(name: &str, keep_days: u64, today: NaiveDate) -> bool {
-    let Some((surface, date)) = name
-        .strip_suffix(".jsonl")
-        .and_then(|name| name.split_once('-'))
-    else {
-        return false;
-    };
-    if !Surface::ALL.iter().any(|valid| valid.as_str() == surface)
-        || date.len() != 10
-        || date.as_bytes()[4] != b'-'
-        || date.as_bytes()[7] != b'-'
-    {
-        return false;
+pub(super) fn parse_name(name: &str) -> Option<(NaiveDate, usize)> {
+    let (surface, date) = name.strip_suffix(".jsonl")?.split_once('-')?;
+    let slot = Surface::ALL
+        .iter()
+        .position(|valid| valid.as_str() == surface)?;
+    if date.len() != 10 || date.as_bytes()[4] != b'-' || date.as_bytes()[7] != b'-' {
+        return None;
     }
-    NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok_and(|date| {
-        date.format("%Y-%m-%d").to_string().len() == 10
-            && date.year_ce().0
-            && (today - date).num_days() >= i64::try_from(keep_days).unwrap_or(i64::MAX)
+    let day = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    (day.year_ce().0 && day.format("%Y-%m-%d").to_string() == date).then_some((day, slot))
+}
+
+fn expired(name: &str, keep_days: u64, today: NaiveDate) -> bool {
+    parse_name(name).is_some_and(|(date, _)| {
+        (today - date).num_days() >= i64::try_from(keep_days).unwrap_or(i64::MAX)
     })
 }

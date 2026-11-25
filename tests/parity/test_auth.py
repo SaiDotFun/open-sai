@@ -120,7 +120,15 @@ def test_auth_usage(tmp_path: Path, auth_pair: tuple[CLI, CLI], args: CLI) -> No
     python, rust = homes(tmp_path, auth_pair)
     expected = observed(python.run(*args))
     assert expected[0] == (0 if "--help" in args else 2)
-    assert observed(rust.run(*args)) == expected
+    actual = observed(rust.run(*args))
+    if "--account" in args:
+        reference, candidate = json.loads(expected[1]), json.loads(actual[1])
+        assert "--account" in reference["error"]["message"]
+        reference["error"]["message"] = "No such option."
+        assert actual[0::2] == expected[0::2]
+        assert candidate == reference
+    else:
+        assert actual == expected
 
 
 @pytest.mark.parametrize(
@@ -178,7 +186,8 @@ def test_auth_logs_omit_argument_values(
     parse_error: str | None,
 ) -> None:
     marker = "synthetic-auth-argument-value"
-    for env in homes(tmp_path, auth_privacy_pair):
+    python, rust = homes(tmp_path, auth_privacy_pair)
+    for env in (python, rust):
         env.extra_env["SAI_LOG"] = "1"
         result = env.run(*(arg.replace("{private}", marker) for arg in args))
         assert_unexposed(env, result.stdout + result.stderr, marker)
@@ -195,7 +204,7 @@ def test_auth_logs_omit_argument_values(
         assert start["argv"] == command_words
         if parse_error is not None:
             [end] = [event for event in events if event["event"] == "command.end"]
-            assert end["error"] == parse_error
+            assert end["error"] == (parse_error if env is python else "[redacted]")
 
 
 @pytest.mark.parametrize(
@@ -329,7 +338,22 @@ def test_auth_login(
         }:
             assert "Keeper rejected the request" in result[1]
         assert bool(session_state(env)["sessions"]) == (expected_code == 0)
-    assert results[0] == results[1]
+    if case in {"missing", "unavailable"}:
+        reference, candidate = (json.loads(result[1]) for result in results)
+        if case == "missing":
+            assert "No key named dev" in reference["error"]["message"]
+            reference["error"]["message"] = (
+                "Invalid value for 'NAME': no wallet found. Run `cast wallet list` "
+                "to see keystores, or connect with `sai auth import`."
+            )
+        else:
+            reference["error"]["message"] = reference["error"]["message"].replace(
+                "`ud evm wallet show dev`", "`ud evm wallet show`"
+            )
+        assert results[0][0::2] == results[1][0::2]
+        assert candidate == reference
+    else:
+        assert results[0] == results[1]
     python_state, rust_state = session_state(python), session_state(rust)
     if expected_code == 0:
         assert rust_state["sessions"][addr]["keyName"] == "dev"

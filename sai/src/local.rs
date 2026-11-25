@@ -103,14 +103,14 @@ pub fn intent(
                 .enable_all()
                 .build()
                 .map_err(|_| SaiError::internal())?;
-            let data = runtime.block_on(reconcile::reconcile(
+            let data = runtime.block_on(crate::repl::interruptible(reconcile::reconcile(
                 settings.endpoint(),
                 &addr,
                 key.as_deref(),
                 keeper::TIMEOUT,
                 &storage,
                 events,
-            ))?;
+            )))?;
             emit(&keeper::public_intent_status(&env.home, &data), json)?;
         }
         IntentCommand::Local { addr } => {

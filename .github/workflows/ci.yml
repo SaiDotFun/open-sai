@@ -134,7 +134,8 @@ jobs:
     needs: changes
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The stack runs the combined Rust, shared-state, and update replays.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
@@ -236,6 +237,14 @@ jobs:
           path: .parity-position-owner
           persist-credentials: false
 
+      - name: Check out Python main for position wait parity
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 20493c984e3398756365ea1a2b8786a7a0115a11
+          path: .parity-position-wait
+          persist-credentials: false
+
       - name: Check out Python main for close and cancel parity
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -257,6 +266,7 @@ jobs:
           uv sync --project .parity-intent-python --locked --all-groups
           uv sync --project .parity-position-v012 --locked --all-groups
           uv sync --project .parity-position-owner --locked --all-groups
+          uv sync --project .parity-position-wait --locked --all-groups
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
       - run: cargo build --locked --bin sai
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
@@ -308,6 +318,7 @@ jobs:
           SAI_PARITY_POSITION_V012_PYTHON: ${{ github.workspace }}/.parity-position-v012/.venv/bin/sai
           SAI_PARITY_POSITION_OWNER_PYTHON: ${{ github.workspace }}/.parity-position-owner/.venv/bin/sai
           SAI_PARITY_ESTIMATES_PYTHON: ${{ github.workspace }}/.parity-position-v012/.venv/bin/sai
+          SAI_PARITY_POSITION_WAIT_PYTHON: ${{ github.workspace }}/.parity-position-wait/.venv/bin/sai
         run: >-
           uv run --locked pytest tests/parity
           --ignore=tests/parity/test_intent_status_v012.py
@@ -407,3 +418,22 @@ jobs:
         env:
           SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
         run: uv run --locked python tests/parity/parity.py --case market-prices-epoch-spellings
+
+      - name: Compare Rust update checks with the pinned Python CLI
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        env:
+          SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
+        run: |
+          if ! unshare -Urn ip link set lo up; then
+            sudo apparmor_parser -r <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          /usr/bin/unshare flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+          fi
+          uv run --locked python tests/parity/parity.py \
+            --python-reference "$GITHUB_WORKSPACE/.parity-python-c7/.venv/bin/sai" \
+            --case 'update-check*'
