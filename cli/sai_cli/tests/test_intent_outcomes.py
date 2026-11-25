@@ -1277,9 +1277,7 @@ def test_wait_retries_provisional_sweep_and_returns_fill_receipt(keeper_replay):
     assert receipt["execution"]["historyId"] == 1007
     assert receipt["execution"]["marketOrderSequence"] == 49
     assert receipt["fill"] == {
-        "price": None,
         "oraclePrice": 81000.5,
-        "sizeCollateralBaseUnits": None,
         "escrowedCollateralBaseUnits": 4000000,
     }
     assert receipt["positionFeesUsd"] == {"opening": 0.05, "closing": 0, "borrowing": 0}
@@ -1537,9 +1535,10 @@ def test_wait_keeps_resized_position_out_of_original_fill(keeper_replay):
     result = wait.for_intent(endpoint, ADDR, KEY)
     receipt = result["receipt"]
     assert receipt["execution"]["historyId"] == 1007
-    assert receipt["fill"]["price"] is None
-    assert receipt["fill"]["sizeCollateralBaseUnits"] is None
-    assert receipt["fill"]["oraclePrice"] == 81000.5
+    assert receipt["fill"] == {
+        "oraclePrice": 81000.5,
+        "escrowedCollateralBaseUnits": 4000000,
+    }
     assert receipt["positionNow"]["openPrice"] == 87000
     assert receipt["positionNow"]["openCollateralAmount"] == 6000000
 
@@ -1772,5 +1771,9 @@ def test_trade_wait_uses_submission_key(keeper_replay, admission, exit_code, out
     assert [row["intentKey"] for row in local] == [value["intentKey"]]
     assert local[0]["status"] == ("terminal" if outcome == "filled" else "rejected")
     if outcome == "filled":
-        assert value["receipt"]["fill"]["price"] is None
+        assert value["receipt"]["fill"] == {
+            "oraclePrice": 81000.5,
+            "escrowedCollateralBaseUnits": 4000000,
+        }
         assert value["receipt"]["positionNow"]["isOpen"] is False
+        assert value["receipt"]["positionNow"]["closePrice"] == 81001.25

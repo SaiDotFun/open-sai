@@ -223,8 +223,6 @@ def build(
         # collateral can change after this fill. The oracle quote and escrow
         # in the correlated market order describe the indexed execution.
         fill = {
-            "price": None,
-            "sizeCollateralBaseUnits": None,
             "oraclePrice": _number(order.get("execPrice")),
             "escrowedCollateralBaseUnits": _number(order.get("collateralAmount")),
         }
