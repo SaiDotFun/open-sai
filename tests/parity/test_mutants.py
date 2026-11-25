@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import socket
@@ -15,12 +16,13 @@ from pathlib import Path
 import pytest
 from compare import MIN_SQLITE_SCHEMA, SQLITE_SCHEMA_REQUIREMENT
 from manifest_gaps import ManifestGaps
-from network import require_loopback
+from network import enter_loopback
 from parity import Case, run_case
 from release_mismatch import difference_signature
 
 HERE = Path(__file__).parent
 ROOT = HERE.parents[1]
+AUTH_IMPORT_TEXT_CASE = "auth-import-rejected-operand-text"
 pytestmark = [
     pytest.mark.parity_namespace,
     pytest.mark.skipif(
@@ -139,19 +141,21 @@ def test_release_auth_import_rejects_wrong_diagnostic(
     detail: str,
     status: str,
 ) -> None:
-    require_loopback()
-    case_id = "auth-import-rejected-operand-text"
-    cases = tomllib.loads((HERE / "cases.toml").read_text())["case"]
-    case = Case(**next(item for item in cases if item["name"] == case_id))
-    reference = [str(Path(sys.executable).with_name("sai"))]
-    candidate = [str(write_mutant(tmp_path, mutation))]
-    category_only = replace(case, exact_output=False, absent_output_text=None)
-    old_differences, _, _ = run_case(category_only, reference, candidate, cutover=True)
+    candidate = write_mutant(tmp_path, mutation)
+    probe = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), str(candidate)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=40,
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stderr
+    old_differences, differences = json.loads(probe.stdout)
     assert old_differences == []
-    differences, _, _ = run_case(case, reference, candidate, cutover=True)
     assert any(detail in diff for diff in differences)
 
-    row = f"case:{case_id}"
+    row = f"case:{AUTH_IMPORT_TEXT_CASE}"
     release_gaps = ManifestGaps(HERE / "manifest-xfails.toml")
     assert release_gaps.result(row, differences)[0] == "DIFF"
     # Even registering the leaked diagnostic cannot turn it into an expected failure.
@@ -160,7 +164,7 @@ def test_release_auth_import_rejects_wrong_diagnostic(
         f'[gap."{row}"]\nowner = "#211"\nsignature = "{difference_signature(differences)}"\n'
     )
     assert ManifestGaps(registry).result(row, differences)[0] == status
-    assert case.args[-1] not in capsys.readouterr().out
+    assert auth_import_text_case().args[-1] not in capsys.readouterr().out
 
 
 def test_driver_invokes_the_explicit_python_reference(tmp_path: Path) -> None:
@@ -263,3 +267,24 @@ def test_candidate_cannot_send_to_host_unix_datagram_peer(tmp_path: Path) -> Non
             host.recv(64)
     assert run.returncode == 1, run.stdout + run.stderr
     assert "candidate attempted a blocked host socket" in run.stdout
+
+
+def auth_import_text_case() -> Case:
+    cases = tomllib.loads((HERE / "cases.toml").read_text())["case"]
+    return Case(**next(item for item in cases if item["name"] == AUTH_IMPORT_TEXT_CASE))
+
+
+def auth_import_differences(candidate: str) -> tuple[list[str], list[str]]:
+    case = auth_import_text_case()
+    reference = [str(Path(sys.executable).with_name("sai"))]
+    category_only = replace(case, exact_output=False, absent_output_text=None)
+    old_differences, _, _ = run_case(
+        category_only, reference, [candidate], cutover=True
+    )
+    differences, _, _ = run_case(case, reference, [candidate], cutover=True)
+    return old_differences, differences
+
+
+if __name__ == "__main__":
+    enter_loopback()
+    print(json.dumps(auth_import_differences(sys.argv[1])))
