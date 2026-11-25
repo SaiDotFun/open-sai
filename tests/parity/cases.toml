@@ -1250,6 +1250,7 @@ exact_output = true
 [[case]]
 name = "bare-help-trade-cancel"
 current_only = true
+reference_stderr_contains = ["Usage: sai trade cancel", "--preview-digest"]
 accepted_difference = "Issue #231 adds Click help and --preview-digest for cancel."
 args = ["trade", "cancel"]
 mode = "text"

@@ -106,6 +106,7 @@ class Case:
     overview_expected: dict[str, Any] | None = None
     exact_output: bool = False
     current_only: bool = False
+    reference_stderr_contains: list[str] | None = None
     collateral_price_after: str | None = None
 
     @property
@@ -527,6 +528,10 @@ def observe(
         for marker in case.absent_output_text or ()
     ):
         raise ValueError("Fixture credential appeared in CLI output")
+    if not candidate and any(
+        marker not in result.stderr for marker in case.reference_stderr_contains or ()
+    ):
+        check_failed("Reference stderr is missing required help text")
     for error in endpoints.errors:
         check_failed(error)
     actual, expected = [request.label for request in endpoints.wire], case.wire or []
@@ -1409,14 +1414,21 @@ def main() -> int:
     cases = [Case(**item) for item in configured["case"]]
     deferred: dict[str, str] = configured.get("deferred", {})
     commands = cli_commands(python_cli)
-    if args.cutover:
-        try:
+    try:
+        reference_commands = (
+            release_commands(reference)
+            if configured_reference is not None
+            else commands
+        )
+        if args.cutover:
             require_manifest_case_ids(
                 (case.name for case in cases), HERE / "release-case-ids.txt"
             )
-            commands |= release_commands(reference)
-        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
-            parser.error(str(exc))
+            commands = commands | reference_commands
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        parser.error(str(exc))
+    # The new cancel command and the current margin preview shipped together.
+    python_main = not comparing_release and "trade cancel" in reference_commands
     missing = commands - ({case.command for case in cases} | deferred.keys())
     if missing:
         parser.error(
@@ -1425,7 +1437,7 @@ def main() -> int:
     selected = [
         case
         for case in cases
-        if not (args.reference is not None and case.current_only)
+        if (python_main or not case.current_only)
         and (
             case.name in C2_CONFIG_CASE_IDS
             if args.c2_v011
@@ -1508,7 +1520,7 @@ def main() -> int:
             oracle,
             executable,
             cutover=comparing_release,
-            python_main=configured_reference is None and oracle is reference,
+            python_main=python_main and oracle is reference,
             tool_evidence=evidence if gaps else None,
         )
         for tool, status in listed.items():

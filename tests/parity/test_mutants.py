@@ -288,3 +288,19 @@ def auth_import_differences(candidate: str) -> tuple[list[str], list[str]]:
 if __name__ == "__main__":
     enter_loopback()
     print(json.dumps(auth_import_differences(sys.argv[1])))
+
+
+@pytest.mark.parametrize("selector", ["--reference", "SAI_PARITY_PYTHON"])
+def test_current_reference_selects_cancel_and_margin_fixtures(selector: str) -> None:
+    launcher = str(Path(sys.executable).with_name("sai"))
+    environment = {**os.environ}
+    environment.pop("SAI_PARITY_BIN", None)
+    options = ["--case", "trade-margin"]
+    if selector == "--reference":
+        options.extend(("--reference", launcher))
+    else:
+        environment[selector] = launcher
+    run = run_driver("bare-help-trade-cancel", environment, *options)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert "(bare-help-trade-cancel) | PASS |" in run.stdout
+    assert "(trade-margin) | PASS |" in run.stdout
