@@ -323,7 +323,6 @@ impl Trading<'_> {
                         &id,
                         Some((verified.0, Some(verified.1))),
                         indexed,
-                        true,
                     )
                     .await?;
                 }

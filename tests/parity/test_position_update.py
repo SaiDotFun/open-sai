@@ -184,7 +184,11 @@ def update_loopback(mode: str) -> Generator[Endpoints]:
     }
     lcd_replies = {
         "get_trade_raw": raw,
-        "get_exchange_balance": {"collateral_index": "TokenIndex(0)"},
+        "get_exchange_balance": (
+            {}
+            if mode == "balance-missing-index"
+            else {"collateral_index": "TokenIndex(0)"}
+        ),
         "is_after_hours_market": mode == "after-hours",
         "get_market": {
             "group_index": "GroupIndex(0)",
@@ -608,6 +612,42 @@ def test_missing_pair_cap_still_checks_liquidation(
             assert error["details"]["preview"]["estimates"]["execution"]["code"] == (
                 "LiquidationReached"
             )
+
+
+def test_confirmed_leverage_with_unavailable_preliminary_balance(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    _, rust = cli_pair
+    python = (str(Path(sys.executable).with_name("sai")),)
+    with update_loopback("default") as endpoints:
+        home = tmp_path / "preview"
+        seed_home(home, endpoints, "session")
+        code, preview, stderr = run(
+            python, home, endpoints, (*LEVERAGE, "--dry-run"), python=True
+        )
+        assert (code, stderr) == (0, "")
+        assert not endpoints.errors
+        assert not rows(home)
+
+    args = (*LEVERAGE, "--preview-digest", preview["previewDigest"])
+    for index, cli in enumerate((python, rust)):
+        home = tmp_path / str(index)
+        with update_loopback("balance-missing-index") as endpoints:
+            seed_home(home, endpoints, "session")
+            code, _, stderr = run(cli, home, endpoints, args, python=index == 0)
+            assert (code, stderr) == (0, "")
+            assert not endpoints.errors
+            (request,) = [
+                entry.variables["input"]
+                for entry in endpoints.wire
+                if entry.label == "recordUserIntent"
+            ]
+            assert {key: request["intent"][key] for key in intent(LEVERAGE)} == intent(
+                LEVERAGE
+            )
+            assert [row[:6] for row in rows(home)] == [
+                (request["intentKey"], "UPDATE_TRADE", "accepted", "7", ADDRESS, None)
+            ]
 
 
 @pytest.mark.parametrize("command", [TPSL, LEVERAGE], ids=["tpsl", "leverage"])
