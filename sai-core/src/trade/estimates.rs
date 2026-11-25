@@ -14,6 +14,7 @@ use super::{
     actions::decimal_price,
     cancel,
     confirmation::{plain_decimal, positive_decimal},
+    position::Lcd,
 };
 use crate::{errors::SaiError, storage::Session};
 
@@ -57,7 +58,14 @@ impl Trading<'_> {
             let session = session.ok_or_else(SaiError::internal)?;
             self.storage
                 .check_active_trade(session, self.keeper.endpoint())?;
-            self.check_pending_order(session, &preview).await?;
+            preview.position_route = self
+                .basic_trade_route(session, &preview, false, None)
+                .await?;
+        } else if preview.is_market_close()
+            && let Some(session) = session
+        {
+            self.storage
+                .check_active_trade(session, self.keeper.endpoint())?;
         }
         self.estimate_preview(&mut preview, session, mode, market_row)
             .await?;
@@ -116,7 +124,7 @@ impl Trading<'_> {
             "worstCaseFill": fill,
         });
         if let (Some(endpoint), Some(row)) = (self.lcd_endpoint, market_row.as_ref()) {
-            self.quote_open(endpoint, body, row, reference.as_ref(), &mut result)
+            self.quote_open(endpoint, preview, row, reference.as_ref(), &mut result)
                 .await;
         }
         result
@@ -125,14 +133,23 @@ impl Trading<'_> {
     async fn quote_open(
         &self,
         endpoint: &str,
-        body: &Value,
+        preview: &TradePreview,
         row: &Value,
         reference: Option<&Price>,
         result: &mut Value,
     ) -> Option<()> {
         let token = json_index(row.get("collateralToken")?.get("id")?)?;
-        let contract = self.trading_contract(endpoint).await.ok()?;
+        let contract = match &preview.position_route {
+            Some(route) => route.contract_address.clone(),
+            None => {
+                self.position_route(&Lcd(endpoint), false)
+                    .await
+                    .ok()?
+                    .contract_address
+            }
+        };
         let lcd = lcd::QuoteLcd::new(endpoint, contract);
+        let body = &preview.intent.body;
         let market = body["market"].get("marketIndex")?;
         let pair = lcd.market(market, None).await?;
         let pending = body["orderType"] != "market";

@@ -7,7 +7,7 @@ use crate::{
     trade::{
         TradePreview, Trading,
         actions::invalid,
-        position::{Lcd, Read, Snapshot, SnapshotError, contract_owner_error, same_account},
+        position::{ContractPositionError, Lcd, Snapshot, SnapshotError},
     },
 };
 
@@ -35,6 +35,7 @@ impl Trading<'_> {
             },
         });
         preview.close_owner_verified = session.map(|_| false);
+        preview.position_route = None;
         let (Some(endpoint), Some(session), Some(target)) =
             (self.lcd_endpoint, session, &preview.intent.target)
         else {
@@ -47,35 +48,30 @@ impl Trading<'_> {
         let Ok(route) = self.position_route(&lcd, false).await else {
             return Ok(result);
         };
-        let Ok((raw, _)) = lcd
-            .position(&route.contract_address, account, &id, Read::Fresh)
-            .await
-        else {
-            return Ok(result);
+        let (route, raw) = match Self::verify_contract_owner(&lcd, account, &id, route).await {
+            Ok(verified) => verified,
+            Err(error @ ContractPositionError::Owner) => return Err(error.into()),
+            Err(ContractPositionError::Read(_)) => return Ok(result),
         };
-        if raw["user_trade_index"] != format!("UserTradeIndex({id})") {
-            return Ok(result);
-        }
-        if !same_account(account, raw.get("user")) {
-            return Err(contract_owner_error());
-        }
-        // Ownership verification stands even if the estimate inputs are unavailable.
-        preview.close_owner_verified = Some(true);
-        let state = match self
-            .position_snapshot(&lcd, account, &id, route, indexed, Some(raw))
-            .await
-        {
-            Ok(state) => state,
+        let quote = async {
+            let state = self
+                .position_snapshot(&lcd, account, &id, route.clone(), indexed, Some(raw))
+                .await?;
+            if let Some(height) = state.verified_height(&lcd, &id).await? {
+                let quote_lcd = QuoteLcd::new(endpoint, state.route.contract_address.clone());
+                Self::quote_close(&quote_lcd, &lcd, &state, &id, &height, &mut result).await;
+            }
+            Ok(())
+        };
+        match quote.await {
             Err(SnapshotError::Owner(message)) => return Err(invalid(message)),
-            Err(SnapshotError::Unavailable) => return Ok(result),
-        };
-        let height = match state.verified_height(&lcd, &id).await {
-            Ok(Some(height)) => height,
-            Err(SnapshotError::Owner(message)) => return Err(invalid(message)),
-            _ => return Ok(result),
-        };
-        let quote_lcd = QuoteLcd::new(endpoint, state.route.contract_address.clone());
-        Self::quote_close(&quote_lcd, &lcd, &state, &id, &height, &mut result).await;
+            Err(SnapshotError::IndexMismatch) => return Ok(result),
+            Ok(()) | Err(SnapshotError::Unavailable) => {
+                // Missing estimate inputs do not invalidate the verified owner and index.
+                preview.close_owner_verified = Some(true);
+                preview.position_route = Some(route);
+            }
+        }
         Ok(result)
     }
 
