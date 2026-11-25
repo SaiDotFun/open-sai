@@ -334,15 +334,29 @@ Each component of this repository releases under its own tag prefix. The CLI
 uses `sai-cli/vX.Y.Z`, where `X.Y.Z` is the version in `pyproject.toml`, and
 `sai-cli/vX.Y.Z-rc.N` for a pre-release.
 
-To release, merge the version bump and complete the
-[upgrade and downgrade rehearsal](#rehearse-an-upgrade-and-downgrade), then
-run `just release X.Y.Z` on `main`.
-It is a dry run that checks the tree and prints the Git commands; add `--run`
-to create and push the tag. The tag starts the
-[Release workflow](.github/workflows/release.yml), which runs the tests,
-builds the wheel and sdist, writes `SHA256SUMS`, and publishes all three as a
-GitHub Release. The install script and `sai update` look for the highest
-`sai-cli/v*` release that is not a pre-release.
+Before tagging, merge a version bump that aligns the Python package, Cargo
+workspace, and shim on the same release version. Use the Python spelling
+`X.Y.ZrcN` in the shim for release candidates. Run the
+[Release workflow](.github/workflows/release.yml) manually on the candidate
+commit with the planned tag, then complete the
+[upgrade and downgrade rehearsal](#rehearse-an-upgrade-and-downgrade).
+The manual workflow checks the planned version, smokes the native binaries
+on all four runners, and uploads the `sai-release-candidate` Actions artifact.
+
+Run `just release X.Y.Z` on `main` to check the tree and preview the Git
+commands. Add `--run` to create and push the tag. The tag workflow checks that
+the tagged commit is on main's first-parent history. It publishes the full
+Python wheel and sdist, four native archives, and one `SHA256SUMS` file in
+one immutable release. After publication, it checks the tag and every file
+against GitHub's signed release attestation. Keep immutable releases enabled
+in the repository settings. Sai does not sign the binaries separately.
+
+Native Linux builds and smoke tests use glibc 2.35 on x86_64 and arm64.
+Native macOS builds target macOS 11 on Intel and Apple silicon. The hosted
+smoke tests run on macOS 15, the tested support floor. The full Python
+package remains the published Python distribution during this stage of the
+handoff. The shim keeps the same package name and is exercised in CI until
+the handoff release can use that filename for the shim.
 
 ### Rehearse an Upgrade and Downgrade
 

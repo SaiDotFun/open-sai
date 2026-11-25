@@ -12,9 +12,7 @@ launching the native CLI. The native updater uses uv's receipt to tell
 a persistent tool install from an isolated `uvx` run.
 
 The Native Distribution workflow builds the shim, the four native archives,
-and `SHA256SUMS` as the `sai-native-ci` Actions artifact. The Linux runners
-build and smoke on glibc 2.35. The macOS builds target macOS 11 and run the
-smoke tests on macOS 15.
-
-Keep these artifacts in CI until native MCP startup passes both the archive
-and Python upgrade checks. Those checks track [C8](https://github.com/SaiDotFun/open-sai/pull/120).
+and `SHA256SUMS` as the `sai-native-ci` Actions artifact. The Release workflow
+uses that same build and smoke test matrix. Release tags ship the native
+archives alongside the full Python packages. The shim uses the same wheel
+and sdist filenames and stays in CI until the Python package handoff.
