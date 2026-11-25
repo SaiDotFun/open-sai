@@ -354,7 +354,9 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         },
         malformed_expiry=malformed_expiry,
     )
-    if malformed_expiry or seed in {
+    if seed == "accounts":
+        (sai_home / "trader" / "sessions.lock").chmod(0o644)
+    elif malformed_expiry or seed in {
         "mcp-auth-switch",
         "mcp-auth-redaction",
         "invalid-expiry",

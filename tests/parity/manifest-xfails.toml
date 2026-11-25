@@ -85,17 +85,9 @@ signature = "b9cd24acfe95b5081aa533032dcf6d737785a5b3a3137f1f7646a9464a5d7765"
 owner = "#211"
 signature = "daa6bb6c28c5e4088d2b9ede7a99c4b8086fd9b4c28dc6defba571e677319b8f"
 
-[gap."case:auth-logout"]
-owner = "#213"
-signature = "3d90c0ac924b0ee4ede71e61d34a078f89ded1255e95ac382ed214eb83ca5276"
-
 [gap."case:auth-status-signed-out"]
 owner = "#211"
 signature = "f723398d06b9a2175fd86982b2249fe4ee6baf193fe28ad0c951a5d195e2f1ec"
-
-[gap."case:auth-use"]
-owner = "#213"
-signature = "3d90c0ac924b0ee4ede71e61d34a078f89ded1255e95ac382ed214eb83ca5276"
 
 [gap."case:auth-use-invalid-expiry-json"]
 owner = "#171"
@@ -107,7 +99,8 @@ signature = "5219af5b19ddc2160975b3fdcad6f0369df5e397ce7c2b0d57bf68c5bb2e0264"
 
 [gap."case:auth-use-missing"]
 owner = "#213"
-signature = "8fb1bd41d5d04c4e0773494c2ea1869c4bb8571f0c104785980e21412bde8b3b"
+# Keep the fixed diagnostic from Python main. The release echoes the operand.
+signature = "a5a3b63e5e796da8b5dea0a7978511ab96dcc1925e743e83475668032cf065cf"
 
 [gap."case:bare-help-trade-close"]
 owner = "#172"
@@ -627,6 +620,7 @@ signature = "c679060efa7aa7397617b86a739843d544153b80d6eb63798ac9bdaa21ef9ca9"
 
 [gap."case:version"]
 owner = "#213"
+# The published v0.1.3 updater requires the native banner during its trial.
 signature = "d1a087013957a4980439a4e5a774af1a6843531593dbb0cf17ba98d2869d2007"
 
 [gap."case:watch-balances"]
