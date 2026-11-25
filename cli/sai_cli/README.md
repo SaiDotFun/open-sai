@@ -429,8 +429,9 @@ or an unreadable file `SESSION_UNAVAILABLE`. Each message tells the agent to
 have the user run `sai auth login NAME` or `sai auth import`. A signed-in trade
 still needs the `previewDigest` of the preview the user confirmed.
 
-The partial-close digest covers the close percentage, starting collateral and
-leverage, and the contract inputs used to quote the requested slice. The
+The partial-close digest covers the close percentage, starting collateral,
+reduction amount, and leverage inputs. A tick in the collateral/USD price
+updates the USD estimate without changing the digest. The
 margin digest covers the full quote, including starting collateral, stored
 leverage, and the inputs that determine effective leverage. Before submitting,
 both tools re-read the position and the effective-leverage inputs, including

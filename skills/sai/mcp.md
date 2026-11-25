@@ -141,9 +141,9 @@ the one the person confirmed. The digest covers:
   collateral, stored leverage, and the inputs that determine effective
   leverage. If `quote.marginChangeIsEstimate` is true, say that after-hours
   guard fees can change the amount.
-- `trade_partial_close` also binds the close percentage, starting collateral
-  and leverage, and the contract inputs used to quote the requested slice,
-  including the applicable after-hours cap and collateral/USD oracle price.
+- `trade_partial_close` also binds the close percentage, starting collateral,
+  and leverage inputs, including the applicable after-hours cap. A tick in the
+  collateral/USD price updates the USD estimate without changing the digest.
   Show the quoted notional and say whether `quote.closedNotionalIsEstimate`
   is true. If the collateral oracle price is unavailable, the partial-close
   estimate cannot be submitted. Preview again when Sai can verify the price
