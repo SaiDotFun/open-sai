@@ -11,11 +11,10 @@ from datetime import UTC, datetime
 from decimal import Decimal, DecimalException
 from functools import cache
 from threading import BoundedSemaphore
-from typing import Any
+from typing import Any, TypeGuard
 
-from . import keeper, margin, reconcile, session, storage, stream
+from . import keeper, log, margin, reconcile, session, storage, stream
 from .errors import Code, ExitCode, SaiError, SessionError
-from .log import origin
 from .settings import Settings
 
 PAGE_SIZE = 100
@@ -71,6 +70,48 @@ def _number(value: Any) -> float:
     return result
 
 
+def _is_uint(value: object, bits: int = 64) -> TypeGuard[int]:
+    return type(value) is int and 0 <= value < 2**bits
+
+
+def _uint(value: Any, bits: int = 64) -> int:
+    if not _is_uint(value, bits):
+        raise TypeError("Expected an unsigned integer")
+    return value
+
+
+def _uint_text(value: Any, bits: int = 64) -> int:
+    if not isinstance(value, str) or not value.isascii() or not value.isdecimal():
+        raise TypeError("Expected unsigned integer text")
+    return _uint(int(value), bits)
+
+
+def _base_units(value: Any) -> Decimal:
+    return Decimal(
+        _uint_text(value, 128) if isinstance(value, str) else _uint(value, 128)
+    )
+
+
+def _text(value: Any) -> str:
+    if not isinstance(value, str):
+        raise TypeError("Expected text")
+    return value
+
+
+def _token_name(token: Mapping[str, Any]) -> str:
+    symbol = token["symbol"]
+    return (_text(symbol) if symbol is not None else "") or _text(token["name"])
+
+
+def _check_block(block: Any) -> None:
+    if not isinstance(block, dict):
+        raise TypeError("Expected a block object")
+    if block.get("block") is not None:
+        _uint(block["block"])
+    if block.get("block_ts") is not None:
+        _text(block["block_ts"])
+
+
 def _instant(value: Any) -> datetime | None:
     if not isinstance(value, str):
         return None
@@ -87,7 +128,7 @@ def _unix_instant(value: Any) -> datetime | None:
         return None
     try:
         return datetime.fromtimestamp(_number(value), UTC)
-    except (ValueError, OverflowError, OSError):
+    except (TypeError, ValueError, OverflowError, OSError):
         return None
 
 
@@ -146,7 +187,10 @@ class ChainRead:
                 ),
                 self.deadline,
             )
-            if header["chain_id"] == self.chain_id and int(header["height"]) == height:
+            if (
+                header["chain_id"] == self.chain_id
+                and _uint_text(header["height"]) == height
+            ):
                 return _instant(header["time"])
         except (KeyError, TypeError, ValueError):
             pass
@@ -155,7 +199,10 @@ class ChainRead:
 
 def _is_contract(address: Any) -> bool:
     return (
-        isinstance(address, str) and address.startswith("nibi1") and address.isalnum()
+        isinstance(address, str)
+        and address.startswith("nibi1")
+        and address.isascii()
+        and address.isalnum()
     )
 
 
@@ -177,7 +224,7 @@ def _chain_read(settings: Settings) -> ChainRead | None:
             deadline,
         )
         at = _instant(header["time"])
-        height = int(header["height"])
+        height = _uint_text(header["height"])
         chain_id = route["chainId"]
         contract = route["contractAddress"]
         if (
@@ -203,7 +250,7 @@ def _block_source(
 ) -> dict[str, Any]:
     height = block.get("block")
     at = _instant(block.get("block_ts"))
-    if at is None and lookup is not None and isinstance(height, int) and height > 0:
+    if at is None and lookup is not None and height:
         at = lookup(height)
     return {"sourceBlock": height, **_age(at, fetched)}
 
@@ -215,10 +262,16 @@ def _balances(settings: Settings, addr: str) -> dict[str, dict[str, Any]]:
     balances: dict[str, dict[str, Any]] = {}
     for row in response["data"]["userBalances"]:
         token = row["token_info"]
-        if token["type"] == "sai" and token["name"] in BALANCE_KEYS:
-            balances[BALANCE_KEYS[token["name"]]] = {
+        if _text(token["type"]) != "sai":
+            continue
+        name = _text(token["name"])
+        if name in BALANCE_KEYS:
+            height = row.get("lastUpdatedBlock")
+            if height is not None:
+                _uint(height)
+            balances[BALANCE_KEYS[name]] = {
                 "usd": _number(row["usd_value"]),
-                "block": row.get("lastUpdatedBlock"),
+                "block": height,
             }
     return balances
 
@@ -246,7 +299,7 @@ def _scan_pages(
             page = response["perp"][field]
             if not isinstance(page, list):
                 raise TypeError("Expected a list")
-            entries = [(row[id_field], row) for row in page]
+            entries = [(_uint(row[id_field]), row) for row in page]
         except (keeper.KeeperError, KeyError, TypeError):
             if not rows:
                 raise
@@ -301,14 +354,18 @@ def _trades(endpoint: str, addr: str) -> Pages:
 
 def _prices(endpoint: str) -> dict[int, dict[str, Any]]:
     rows = keeper.request(endpoint, keeper.PRICES)["oracle"]["tokenPricesUsd"]
+    if not isinstance(rows, list):
+        raise TypeError("Expected a list of token prices")
     prices = {}
     for row in rows:
         price = _number(row["priceUsd"])
         if price > 0:
-            prices[row["token"]["id"]] = {
+            token, block = row["token"], row["lastUpdatedBlock"]
+            _check_block(block)
+            prices[_uint(token["id"])] = {
                 "usd": price,
-                "block": row["lastUpdatedBlock"],
-                "token": row["token"]["symbol"] or row["token"]["name"],
+                "block": block,
+                "token": _token_name(token),
             }
     return prices
 
@@ -317,10 +374,12 @@ def _distance(mark: Decimal, level: Decimal | None, above: bool) -> float | None
     if level is None:
         return None
     # Negative means the mark crossed onto the trigger side.
-    return float((level - mark) / mark * (100 if above else -100))
+    return _number(float((level - mark) / mark * (100 if above else -100)))
 
 
 def _decimal(value: Any) -> Decimal:
+    if type(value) not in (str, int, float):
+        raise TypeError("Expected a decimal")
     result = Decimal(str(value))
     if not result.is_finite():
         raise ValueError("Expected a finite decimal")
@@ -335,24 +394,34 @@ def _level(value: Any) -> Decimal | None:
 
 
 def _usd(value: Decimal | None, price: Decimal | None) -> float | None:
-    return float(value * price) if value is not None and price is not None else None
+    return (
+        _number(float(value * price))
+        if value is not None and price is not None
+        else None
+    )
 
 
 def _agrees(indexed: dict[str, Any], raw: dict[str, Any]) -> bool:
     market = indexed["perpBorrowing"]
+    if not isinstance(raw["is_open"], bool) or not isinstance(raw["long"], bool):
+        raise TypeError("Expected boolean contract trade flags")
+    amount = _base_units(raw["collateral_amount"])
+    leverage = _number(float(_decimal(raw["leverage"])))
+    entry = _number(float(_decimal(raw["open_price"])))
+    levels = [_usd(_level(raw[name]), Decimal(1)) for name in ("tp", "sl")]
     return (
-        raw["user"] == indexed["trader"]
-        and raw["user_trade_index"] == f"UserTradeIndex({indexed['id']})"
-        and raw["market_index"] == f"MarketIndex({market['marketId']})"
-        and raw["collateral_index"] == f"TokenIndex({market['collateralToken']['id']})"
+        _text(raw["user"]) == _text(indexed["trader"])
+        and _text(raw["user_trade_index"]) == f"UserTradeIndex({indexed['id']})"
+        and _text(raw["market_index"]) == f"MarketIndex({market['marketId']})"
+        and _text(raw["collateral_index"])
+        == f"TokenIndex({market['collateralToken']['id']})"
         and raw["is_open"] is True
-        and raw["trade_type"] == "trade"
+        and _text(raw["trade_type"]) == "trade"
         and raw["long"] is indexed["isLong"]
-        and int(raw["collateral_amount"]) == indexed["collateralAmount"]
-        and float(_decimal(raw["leverage"])) == indexed["leverage"]
-        and float(_decimal(raw["open_price"])) == indexed["openPrice"]
-        and [_usd(_level(raw[name]), Decimal(1)) for name in ("tp", "sl")]
-        == [_usd(_level(indexed[name]), Decimal(1)) for name in ("tp", "sl")]
+        and amount == _base_units(indexed["collateralAmount"])
+        and leverage == indexed["leverage"]
+        and entry == indexed["openPrice"]
+        and levels == [_usd(_level(indexed[name]), Decimal(1)) for name in ("tp", "sl")]
     )
 
 
@@ -364,14 +433,14 @@ def _oracle_time(value: Any, chain: ChainRead) -> datetime | None:
 def _oracle_source(
     stamp: dict[str, Any], published: datetime | None, chain: ChainRead, fetched: str
 ) -> dict[str, Any]:
+    if not isinstance(stamp, dict):
+        raise TypeError("Expected an oracle price stamp")
     written_ms = stamp.get("price_block_time_ms")
-    written = (
-        _oracle_time(written_ms / 1000, chain) if isinstance(written_ms, int) else None
-    )
+    written = _oracle_time(written_ms / 1000, chain) if _is_uint(written_ms) else None
     height = stamp.get("price_block")
     return {
         "sourceBlock": height
-        if isinstance(height, int) and 0 < height <= chain.height
+        if _is_uint(height) and 0 < height <= chain.height
         else None,
         **_age(written or published, fetched),
     }
@@ -399,12 +468,7 @@ class ContractReads:
         if index not in self.groups:
             try:
                 value = self.query({"get_group": {"index": index}})
-                expiration = value["stale_price_expiration_secs"]
-                self.groups[index] = (
-                    expiration
-                    if isinstance(expiration, int) and expiration >= 0
-                    else None
-                )
+                self.groups[index] = _uint(value["stale_price_expiration_secs"])
             except (KeyError, TypeError, ValueError):
                 self.groups[index] = None
         return self.groups[index]
@@ -432,6 +496,8 @@ class ContractReads:
                     {"get_exchange_rate_stamped": {"base": base, "quote": quote}},
                     contract=self.oracle,
                 )
+                if not isinstance(data, dict):
+                    raise TypeError("Expected a contract oracle rate")
                 self.rates[key] = data, datetime.now(UTC).isoformat()
             except (TypeError, ValueError):
                 self.oracle = self.oracle or ""
@@ -459,7 +525,9 @@ def _contract_risk(
         liquidation = _decimal(result["liquidation_price"])
         entry = _decimal(raw["open_price"])
         base_id, quote_id = market["baseToken"]["id"], market["quoteToken"]["id"]
-        adjustment = bool(result.get("needs_after_hours_trigger"))
+        adjustment = result.get("needs_after_hours_trigger", False)
+        if not isinstance(adjustment, bool):
+            raise TypeError("Expected a boolean after-hours flag")
         if liquidation < 0 or entry <= 0:
             raise ValueError("Invalid contract trade price")
         risk = {
@@ -470,8 +538,8 @@ def _contract_risk(
                 "sourceBlock": chain.height,
                 **_age(chain.time, fetched),
             },
-            "liquidationPriceQuote": float(liquidation),
-            "liquidationPriceUsd": float(liquidation)
+            "liquidationPriceQuote": _number(float(liquidation)),
+            "liquidationPriceUsd": _number(float(liquidation))
             if quote_id == USD_TOKEN_ID
             else None,
         }
@@ -479,8 +547,8 @@ def _contract_risk(
         if contract_market is None:
             raise ValueError("Contract market is unavailable")
         if (
-            contract_market["base"] != f"TokenIndex({base_id})"
-            or contract_market["quote"] != f"TokenIndex({quote_id})"
+            _text(contract_market["base"]) != f"TokenIndex({base_id})"
+            or _text(contract_market["quote"]) != f"TokenIndex({quote_id})"
         ):
             return {
                 "riskStatus": "inconsistent",
@@ -530,7 +598,7 @@ def _contract_risk(
             markPriceUsd=_usd(mark, quote_usd),
             liquidationPriceUsd=_usd(liquidation, quote_usd),
         )
-        expiration = reads.group_expiration(contract_market["group_index"])
+        expiration = reads.group_expiration(_text(contract_market["group_index"]))
         if expiration is None:
             return {**risk, "riskReason": "Contract oracle staleness limit is unknown"}
         if base_at is None or (quote_id != USD_TOKEN_ID and quote_at is None):
@@ -594,7 +662,7 @@ def _contract_risk(
                 ),
             }
         leverage = _decimal(raw["leverage"])
-        amount = Decimal(raw["collateral_amount"])
+        amount = _base_units(raw["collateral_amount"])
         pnl = ((mark - entry) if is_long else (entry - mark)) / entry * leverage
         pnl = max(Decimal(-1), min(MAX_GROSS_PNL, pnl))
         return {
@@ -619,38 +687,40 @@ def _trade_row(
 ) -> dict[str, Any]:
     market = trade["perpBorrowing"]
     collateral, quote = market["collateralToken"], market["quoteToken"]
-    scale = COLLATERAL_SCALE.get(collateral["symbol"])
+    symbol = _text(collateral["symbol"])
+    collateral_id, quote_id = _uint(collateral["id"]), _uint(quote["id"])
+    _uint(market["baseToken"]["id"])
+    _check_block(trade["lastUpdatedBlock"])
+    if not isinstance(trade["isLong"], bool):
+        raise TypeError("Expected a boolean trade side")
+    scale = COLLATERAL_SCALE.get(symbol)
     collateral_price = (
-        1
-        if collateral["symbol"] == "USDC"
-        else prices.get(collateral["id"], {}).get("usd")
+        1 if symbol == "USDC" else prices.get(collateral_id, {}).get("usd")
     )
     conversion = (
         _decimal(collateral_price) / scale
         if collateral_price is not None and scale
         else None
     )
-    amount = _decimal(trade["collateralAmount"])
+    amount = _base_units(trade["collateralAmount"])
     leverage = _decimal(trade["leverage"])
-    quote_price = (
-        1 if quote["id"] == USD_TOKEN_ID else prices.get(quote["id"], {}).get("usd")
-    )
+    quote_price = 1 if quote_id == USD_TOKEN_ID else prices.get(quote_id, {}).get("usd")
     quote_usd = _decimal(quote_price) if quote_price is not None else None
     entry = _decimal(trade["openPrice"])
     tp, sl = _level(trade["tp"]), _level(trade["sl"])
     row = {
         "id": trade["id"],
-        "marketId": market["marketId"],
-        "market": market["baseToken"]["symbol"],
+        "marketId": _uint(market["marketId"]),
+        "market": _text(market["baseToken"]["symbol"]),
         "side": "long" if trade["isLong"] else "short",
-        "collateralToken": collateral["symbol"],
-        "collateralTokenId": collateral["id"],
+        "collateralToken": symbol,
+        "collateralTokenId": collateral_id,
         "collateralBaseUnits": trade["collateralAmount"],
         "collateralUsd": _usd(amount, conversion),
-        "leverage": float(leverage),
+        "leverage": _number(float(leverage)),
         "sizeUsd": _usd(amount * leverage, conversion),
-        "quoteToken": quote["symbol"] or quote["name"],
-        "quoteTokenId": quote["id"],
+        "quoteToken": _token_name(quote),
+        "quoteTokenId": quote_id,
         "takeProfitPriceUsd": _usd(tp, quote_usd),
         "stopLossPriceUsd": _usd(sl, quote_usd),
     }
@@ -720,11 +790,7 @@ def _live_trade_ids(chain: ChainRead | None, addr: str) -> set[int] | None:
                 return None
             for row in page:
                 index = row["trade_index"]
-                if (
-                    not isinstance(index, int)
-                    or index < 0
-                    or (last is not None and index <= last)
-                ):
+                if not _is_uint(index) or (last is not None and index <= last):
                     return None
                 ids.add(index)
                 last = index
@@ -906,12 +972,24 @@ def _queued_rows(endpoint: str, addr: str) -> Pages:
     snapshot = _pages(
         endpoint, keeper.PENDING_MARKET_ORDERS, "marketOrders", "sequence", addr
     )
-    snapshot.rows = [
-        {
+    rows = []
+    for row in snapshot.rows:
+        trade_id = row["tradeId"]
+        if trade_id is not None:
+            _uint(trade_id)
+        _base_units(row["collateralAmount"])
+        if (
+            row["side"] not in ("open", "close")
+            or row["status"] != "pending_exec"
+            or keeper.request_hash(row["orderReqTxHash"])[1]
+            or keeper.request_hash(row["orderReqEvmTxHash"])[1]
+        ):
+            raise ValueError("Invalid queued market order")
+        mapped = {
             "sequence": row["sequence"],
-            "tradeId": row["tradeId"],
+            "tradeId": trade_id,
             "action": row["side"],
-            "marketId": row["perpMarketId"],
+            "marketId": _uint(row["perpMarketId"]),
             "status": row["status"],
             "collateralBaseUnits": row["collateralAmount"],
             "requestTxHash": row["orderReqTxHash"],
@@ -920,8 +998,9 @@ def _queued_rows(endpoint: str, addr: str) -> Pages:
             "block_ts": row["orderReqBlockTs"],
             "fetchedAt": row["fetchedAt"],
         }
-        for row in snapshot.rows
-    ]
+        _check_block(mapped)
+        rows.append(mapped)
+    snapshot.rows = rows
     return snapshot
 
 
@@ -987,6 +1066,27 @@ def _session_info(
     }
 
 
+def _clean_section(
+    value: Any, tokens: tuple[str, ...], *, display: bool = False
+) -> Any:
+    if isinstance(value, str):
+        if "//" in value:
+            return log.REDACTED_URL
+        return log.scrub(log.Untrusted(value) if display else value, tokens)
+    if isinstance(value, list):
+        return [_clean_section(item, tokens) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _clean_section(
+                item,
+                tokens,
+                display=key in ("market", "collateralToken", "quoteToken", "token"),
+            )
+            for key, item in value.items()
+        }
+    return value
+
+
 def account_overview(settings: Settings, addr: str | None = None) -> dict[str, Any]:
     """Read one account, keeping available sections when a source fails."""
     if addr is not None and not keeper.is_address(addr):
@@ -1040,10 +1140,6 @@ def account_overview(settings: Settings, addr: str | None = None) -> dict[str, A
 
     balances = _read(lambda: _balances(settings, addr))
     same_keeper = settings.ws_endpoint == stream.derive_ws(settings.endpoint)
-    balances["source"] = {
-        "endpoint": origin(settings.ws_endpoint),
-        "matchesKeeper": same_keeper,
-    }
     if not same_keeper:
         balances["warning"] = (
             "Balance WebSocket is independent. These funds may be on a different chain."
@@ -1079,7 +1175,15 @@ def account_overview(settings: Settings, addr: str | None = None) -> dict[str, A
         "blockingIntents": intents,
         "session": session_section,
     }
-    for section in sections.values():
+    tokens = log.known_tokens(check=True)
+    for name, section in sections.items():
         if section["fetchedAt"] is not None:
             section["sourceAt"] = section["fetchedAt"]
+        # Session guidance uses the configured Keeper and its shared formatter.
+        if name != "session":
+            sections[name] = _clean_section(section, tokens)
+    sections["balances"]["source"] = {
+        "endpoint": log.scrub(log.origin(settings.ws_endpoint), tokens),
+        "matchesKeeper": same_keeper,
+    }
     return {"addr": addr, "addrSource": source, **sections}

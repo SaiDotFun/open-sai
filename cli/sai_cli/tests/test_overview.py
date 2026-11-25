@@ -288,13 +288,13 @@ def test_market_prices_reports_missing_block_times_as_null(replay):
     assert decode_mcp(asyncio.run(server.call_tool("market_prices", {}))) == decoded
 
 
-def save_session(replay: dict[str, Any], addr: str = ADDR):
+def save_session(replay: dict[str, Any], addr: str = ADDR, *, token: str | None = None):
     now = datetime.now(UTC)
     issued = (now - timedelta(days=28)).timestamp()
     part = base64.urlsafe_b64encode(json.dumps({"iat": issued}).encode()).decode()
     storage.save_session(
         {
-            "token": f"test.{part}.signature",
+            "token": token if token is not None else f"test.{part}.signature",
             "evmAddress": addr,
             "expiresAt": (now + timedelta(hours=48)).isoformat(),
             "keyName": "fixture",
@@ -484,7 +484,7 @@ def populate_trades(replay: dict[str, Any]):
                         "collateralAmount": 5_000_000,
                         "orderReqBlock": 41148706,
                         "orderReqBlockTs": BLOCK_TIME,
-                        "orderReqTxHash": "SYNTHETIC_COSMOS_REQUEST",
+                        "orderReqTxHash": "A" * 64,
                         "orderReqEvmTxHash": None,
                     },
                 ]
@@ -566,7 +566,7 @@ def test_open_positions_limits_stops_and_next_oracle_orders(replay):
         "Open Positions",
         "Pending Limit and Stop Orders",
         "Queued Market Orders",
-        "SYNTHETIC_COSMOS_REQUEST",
+        "A" * 64,
         "BTC",
         "ARB",
         "12.5%",
@@ -662,6 +662,63 @@ def test_mcp_overview_rejects_a_non_string_address_before_reading(replay):
     assert invalid["value"] not in str(caught.value)
     assert str(caught.value) == "Argument 'addr' must be a string or null."
     assert server.loggable("account_overview", {"addr": invalid}) == ({}, 0)
+
+
+def test_overview_validates_keeper_fields_and_cleans_display_text(replay):
+    long, short = populate_trades(replay)
+    url = "https://overview-fixture.invalid/private"
+    relative_url = "//overview-fixture.invalid/relative"
+    token = "synthetic-overview-session-marker"
+    hex_text = "D" * 64
+    save_session(replay, token=token)
+    replay["ws"]["data"]["userBalances"][-1]["lastUpdatedBlock"] = {"url": url}
+    queued = replay["http"][keeper.PENDING_MARKET_ORDERS]["data"]["perp"][
+        "marketOrders"
+    ]
+    queued[0]["orderReqTxHash"] = url
+    long["perpBorrowing"]["baseToken"]["symbol"] = token
+    long["perpBorrowing"]["quoteToken"].update(symbol=None, name=hex_text)
+    short["perpBorrowing"]["baseToken"]["symbol"] = relative_url
+
+    result = cli(replay, "--json", "account", "overview")
+    assert result.exit_code == 0, result.output
+    for report in (json.loads(result.stdout), mcp(replay)):
+        assert report["balances"]["error"]["code"] == "INCOMPLETE_DATA"
+        assert report["queuedMarketOrders"]["error"]["code"] == "INCOMPLETE_DATA"
+        positions = report["positions"]["data"]["items"]
+        assert len(positions) == 2
+        assert positions[0]["market"] == "[redacted session token]"
+        assert positions[0]["quoteToken"] == "[redacted hex]"
+        assert positions[1]["market"] == "[redacted url]"
+        assert all(
+            text not in json.dumps(report)
+            for text in (url, relative_url, token, hex_text)
+        )
+
+
+@pytest.mark.parametrize("invalid_field", ["trade_side", "price_block", "lcd_stamp"])
+def test_overview_checks_field_types_before_use(replay, invalid_field):
+    long, _ = populate_trades(replay)
+    if invalid_field == "trade_side":
+        long["isLong"] = "false"
+    elif invalid_field == "price_block":
+        row = replay["http"][keeper.PRICES]["data"]["oracle"]["tokenPricesUsd"][0]
+        row["lastUpdatedBlock"]["block"] = True
+    else:
+        base = long["perpBorrowing"]["baseToken"]["id"]
+        rate = replay["oracleRates"][base, 0]
+        rate["base"]["price_block"] = True
+
+    report = mcp(replay, addr=ADDR)
+    if invalid_field == "trade_side":
+        assert report["positions"]["error"]["code"] == "INCOMPLETE_DATA"
+        assert "data" not in report["positions"]
+    elif invalid_field == "price_block":
+        assert report["prices"]["error"]["code"] == "INCOMPLETE_DATA"
+    else:
+        position = report["positions"]["data"]["items"][0]
+        assert position["markSource"]["sourceBlock"] is None
+        assert position["riskStatus"] == "verified"
 
 
 def test_contract_threshold_reports_crossing_even_when_keeper_estimate_does_not(replay):
