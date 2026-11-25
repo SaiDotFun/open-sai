@@ -1,6 +1,12 @@
 use std::{net::Ipv6Addr, str::FromStr};
 
 use unicode_normalization::UnicodeNormalization;
+use url::Url;
+
+pub(crate) fn append_path(url: &mut Url, suffix: &str) {
+    let path = format!("{}{}", url.path().trim_end_matches('/'), suffix);
+    url.set_path(&path);
+}
 
 pub(crate) struct Endpoint {
     pub scheme: String,
