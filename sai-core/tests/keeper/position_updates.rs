@@ -42,6 +42,7 @@ struct ReplyState {
     indexed_position_missing: bool,
     close_height_check_index: Option<u8>,
     target_missing: bool,
+    market_close_only: bool,
 }
 
 struct PositionServer {
@@ -70,6 +71,7 @@ impl PositionServer {
             indexed_position_missing: false,
             close_height_check_index: None,
             target_missing: false,
+            market_close_only: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let replies = Arc::clone(&state);
@@ -194,12 +196,18 @@ impl ReplyState {
                 self.contract
             ))
             .unwrap_or_else(|| panic!("Unexpected LCD request: {request}"));
+        let (target, _) = path.split_once(' ').unwrap();
+        let path = target.split('?').next().unwrap();
+        let (encoded, _) = url::form_urlencoded::parse(path.as_bytes()).next().unwrap();
+        let message: Value =
+            serde_json::from_slice(&STANDARD.decode(encoded.as_bytes()).unwrap()).unwrap();
+        if message == json!({"get_market": {"index": "MarketIndex(3)"}}) {
+            self.requests.push("market_state".into());
+            return json!({"data": {
+                "market_trading_state": if self.market_close_only { "close_only" } else { "open" }
+            }});
+        }
         if let Some(latest_index) = self.close_height_check_index {
-            let (target, _) = path.split_once(' ').unwrap();
-            let path = target.split('?').next().unwrap();
-            let (encoded, _) = url::form_urlencoded::parse(path.as_bytes()).next().unwrap();
-            let message: Value =
-                serde_json::from_slice(&STANDARD.decode(encoded.as_bytes()).unwrap()).unwrap();
             if message.get("get_exchange_balance").is_some() {
                 assert_eq!(
                     message,
@@ -601,9 +609,51 @@ async fn shared_market_submit_refreshes_before_reserving() {
             "markets",
             "route",
             "node_info",
-            "markets"
+            "markets",
+            "market_state",
+            "route",
+            "node_info"
         ]
     );
+    assert!(!home.path().join("trader/intents.sqlite3").exists());
+}
+
+#[tokio::test]
+async fn confirmed_core_open_checks_market_state_before_reserving() {
+    let server = PositionServer::start(ACCOUNT, ACCOUNT);
+    let endpoint = format!("{}/query", server.url);
+    let home = tempfile::tempdir().unwrap();
+    let storage = fixture_storage(&home, &endpoint);
+    let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+    let session = trading.load_session(None).unwrap();
+    let preview = market_open();
+    let issued = trading
+        .confirmed_trade_preview(&session, preview.clone())
+        .await
+        .unwrap();
+    server.state.lock().unwrap().market_close_only = true;
+
+    let error = trading
+        .submit(
+            &session,
+            &preview,
+            SubmitOptions {
+                confirmation: Some(
+                    Confirmation::new(issued["previewDigest"].as_str().unwrap(), Some("100"))
+                        .unwrap(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, Code::PreviewMismatch);
+    assert_eq!(
+        error.details.unwrap()["preview"]["estimates"]["execution"]["code"],
+        "MarketClosed"
+    );
+    assert!(!server.requests().iter().any(|label| label == "admission"));
     assert!(!home.path().join("trader/intents.sqlite3").exists());
 }
 

@@ -53,6 +53,15 @@ CLOSE = ("trade", "close", "7")
 CANCEL = ("trade", "cancel", "7")
 CANCEL_READS = ["oneClickTrading", "node_info", "get_trade_raw"]
 CLOSE_READS = ["trade", *CANCEL_READS]
+OPEN_ESTIMATE_READS = [
+    "oneClickTrading",
+    "node_info",
+    "get_market",
+    "get_group",
+    "get_pair_custom_max_leverage",
+    "get_fees",
+    "get_collateral_price",
+]
 
 
 @pytest.fixture
@@ -197,6 +206,7 @@ def test_numeric_keeper_price_rounds_to_even(
             assert code == 0
             assert [request.label for request in endpoints.wire] == [
                 "borrowings",
+                *([] if index == 0 else OPEN_ESTIMATE_READS),
                 "recordUserIntent",
             ]
             body = endpoints.wire[-1].variables["input"]["intent"]["body"]
@@ -788,10 +798,14 @@ def test_trade_submission(
             )
             assert exit_status == exit_code
             assert not endpoints.errors
-            assert [request.label for request in endpoints.wire] == (
-                (["borrowings"] if markets else CANCEL_READS if cancel else CLOSE_READS)
-                + ["recordUserIntent"]
-            )
+            if markets:
+                reads = ["borrowings", *([] if index == 0 else OPEN_ESTIMATE_READS)]
+            else:
+                reads = CANCEL_READS if cancel else CLOSE_READS
+            assert [request.label for request in endpoints.wire] == [
+                *reads,
+                "recordUserIntent",
+            ]
             variables = endpoints.wire[-1].variables
             envelope = variables["input"]
             key = envelope["intentKey"]
@@ -842,7 +856,9 @@ def test_trade_submission(
             else:
                 assert output["error"]["intentKey"] == key
                 assert output["error"]["code"] == code
-            keeper_reads = 2 if close else int(markets or cancel)
+            keeper_reads = sum(
+                label in {"borrowings", "oneClickTrading", "trade"} for label in reads
+            )
             expected_events = [("keeper.request", "ok")] * keeper_reads
             expected_events.extend(
                 [
@@ -893,7 +909,7 @@ def test_open_retry_preserves_first_reservation(
             assert error["error"]["code"] == "RECENT_OPEN_PENDING"
             assert error["error"]["intentKey"] == key
             assert len(rows(home)) == 1
-            assert len(endpoints.wire) == 1
+            assert sum(r.label == "recordUserIntent" for r in endpoints.wire) == 1
             observations.append(
                 (json.dumps(error, sort_keys=True).replace(key, "<intent>"), stderr)
             )
@@ -905,7 +921,7 @@ def test_open_retry_preserves_first_reservation(
                 (*args, "--allow-concurrent-open"),
                 python=index == 0,
             )
-            assert len(endpoints.wire) == 2
+            assert sum(r.label == "recordUserIntent" for r in endpoints.wire) == 2
             assert len(rows(home)) == 2
             assert not endpoints.errors
     assert observations[0] == observations[1]
@@ -1154,7 +1170,11 @@ def test_mixed_clients_reconcile_a_post_dispatch_timeout(
         assert code == 1
         assert result["error"]["code"] == "RECENT_OPEN_PENDING"
         assert result["error"]["intentKey"] == key
-        assert [request.label for request in endpoints.wire] == ["recordUserIntent"]
+        assert [
+            request.label
+            for request in endpoints.wire
+            if request.label in {"recordUserIntent", "userIntents"}
+        ] == ["recordUserIntent"]
 
         code, _, _ = run(
             peer,
@@ -1166,7 +1186,11 @@ def test_mixed_clients_reconcile_a_post_dispatch_timeout(
         assert code == 0
         assert [row[2] for row in rows(home)] == ["terminal"]
         assert run(sender, home, endpoints, args, python=first == 0)[0] == 0
-        assert [request.label for request in endpoints.wire] == [
+        assert [
+            request.label
+            for request in endpoints.wire
+            if request.label in {"recordUserIntent", "userIntents"}
+        ] == [
             "recordUserIntent",
             "userIntents",
             "recordUserIntent",

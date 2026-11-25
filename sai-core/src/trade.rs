@@ -371,8 +371,7 @@ impl<'a> Trading<'a> {
             None
         };
         let checked_route = route.is_some() || cli_preview.is_some();
-        let market = preview.requires_market_price_refresh();
-        let mut market_row = None;
+        let open = preview.intent.kind == "OPEN_TRADE";
         let update = if cli_preview.is_none() && preview.is_standalone_position_update() {
             Some(
                 self.preflight_position_update(account, preview, options.confirmation.is_some())
@@ -384,21 +383,12 @@ impl<'a> Trading<'a> {
         let mut prepared;
         let preview = if let Some(preview) = &cli_preview {
             preview
-        } else if market || confirming && checked_route {
+        } else if open || confirming && checked_route {
             prepared = preview.clone();
             prepared.position_route = route;
-            if market {
-                market_row = Some(self.refresh_market_quote(&mut prepared).await?);
-                let price = prepared
-                    .reference_price
-                    .as_deref()
-                    .ok_or_else(SaiError::internal)?;
-                if confirming {
-                    confirmation::reference_price_units(price, "Current price")?;
-                } else {
-                    positive_decimal(price, "Current price")?;
-                }
-                prepared.intent.body["intentPrice"] = json!(price);
+            if open {
+                self.prepare_open_submission(session, &mut prepared, confirming)
+                    .await?;
             }
             &prepared
         } else if let Some(update) = &update {
@@ -409,7 +399,7 @@ impl<'a> Trading<'a> {
         // Live reads can outlast the session. Reload the pinned account
         // before confirmation and reserve with its current token.
         let reloaded;
-        let session = if checked_route || market || update.is_some() || confirming {
+        let session = if checked_route || open || update.is_some() || confirming {
             reloaded = self.load_session(Some(account))?;
             &reloaded
         } else {
@@ -427,23 +417,15 @@ impl<'a> Trading<'a> {
                 .and_then(|details| details.get_mut("preview"))
             {
                 let mut replacement = preview.clone();
-                self.estimate_preview(
-                    &mut replacement,
-                    Some(session),
-                    PreviewMode::Mcp,
-                    market_row,
-                )
-                .await?;
+                if replacement.estimates.is_none() {
+                    self.estimate_preview(&mut replacement, Some(session), PreviewMode::Mcp, None)
+                        .await?;
+                }
                 *fresh = replacement.confirmed_output(Some(account));
             }
             return Err(error);
         }
-        if cli_preview.is_some()
-            || preview.margin_change
-            || preview.intent.kind == "DECREASE_POSITION_SIZE"
-        {
-            preview.check_cli_execution(account, confirming)?;
-        }
+        preview.check_cli_execution(account, confirming)?;
 
         let (key, stamp) = intent_identity();
         let intent = &preview.intent;

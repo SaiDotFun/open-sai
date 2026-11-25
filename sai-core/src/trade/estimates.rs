@@ -31,6 +31,7 @@ pub enum PreviewMode {
     Cli,
     CliSubmission,
     Mcp,
+    McpSubmission,
 }
 
 impl Trading<'_> {
@@ -97,10 +98,14 @@ impl Trading<'_> {
         mut market_row: Option<Value>,
     ) -> Value {
         let market = preview.requires_market_price_refresh();
-        let mcp_market = market && matches!(mode, PreviewMode::Mcp);
+        let mcp_market = market && matches!(mode, PreviewMode::Mcp | PreviewMode::McpSubmission);
         if market_row.is_none()
             && self.lcd_endpoint.is_some()
-            && !(market && matches!(mode, PreviewMode::CliSubmission))
+            && !(market
+                && matches!(
+                    mode,
+                    PreviewMode::CliSubmission | PreviewMode::McpSubmission
+                ))
         {
             market_row = self.open_market_row(preview, QUOTE_TIMEOUT).await.ok();
         }

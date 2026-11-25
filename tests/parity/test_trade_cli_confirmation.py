@@ -28,6 +28,40 @@ def pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
 @pytest.mark.parametrize(
     ("command", "scenario", "kind", "execution_code"),
     [
+        (OPEN, "quote-close-only", "OPEN_TRADE", "MarketClosed"),
+        (LIMIT, "quote-close-only", "OPEN_TRADE", "MarketClosed"),
+    ],
+    ids=["market-open", "limit-open"],
+)
+def test_unconfirmed_trade_checks_execution_before_reserving(
+    pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    command: CLI,
+    scenario: str,
+    kind: str,
+    execution_code: str,
+) -> None:
+    for index, cli in enumerate(pair):
+        home = tmp_path / str(index)
+        replay = TradeReplay(kind)
+        with loopback(scenario, trade_replay=replay) as endpoints:
+            seed_home(home, endpoints, "session")
+            code, result, _ = run(cli, home, endpoints, command, python=index == 0)
+            assert not endpoints.errors
+            assert not replay.attempts()
+            assert not rows(home)
+            assert code == 4
+            error = result["error"]
+            assert error["code"] == "PREVIEW_MISMATCH"
+            assert (
+                error["details"]["preview"]["estimates"]["execution"]["code"]
+                == execution_code
+            )
+
+
+@pytest.mark.parametrize(
+    ("command", "scenario", "kind", "execution_code"),
+    [
         (MARGIN, "position-execution-close-only", "UPDATE_TRADE", "MarketClosed"),
         (
             MARGIN,
