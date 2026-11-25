@@ -195,7 +195,8 @@ impl ReplyState {
             ))
             .unwrap_or_else(|| panic!("Unexpected LCD request: {request}"));
         if let Some(latest_index) = self.close_height_check_index {
-            let (path, _) = path.split_once(' ').unwrap();
+            let (target, _) = path.split_once(' ').unwrap();
+            let path = target.split('?').next().unwrap();
             let (encoded, _) = url::form_urlencoded::parse(path.as_bytes()).next().unwrap();
             let message: Value =
                 serde_json::from_slice(&STANDARD.decode(encoded.as_bytes()).unwrap()).unwrap();
