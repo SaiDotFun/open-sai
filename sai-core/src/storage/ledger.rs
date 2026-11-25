@@ -130,7 +130,7 @@ fn check_open_pending(
                 allow_concurrent_open
             ],
             |row| row.get(0),
-        )
+        )?
         .collect::<Result<_, _>>()?;
     if let Some(key) = keys.first() {
         let hint = storage.intent_status_hint(endpoint, account, key);
