@@ -1829,6 +1829,13 @@ def check_registration(
             name, "fail", "Could not inspect Sai registration", "Put `codex` on PATH"
         )
     try:
+        if (
+            isinstance(client, Cursor)
+            and client.cwd is not None
+            and client.config_path("user").resolve()
+            == client.config_path("project").resolve()
+        ):
+            client = Cursor(client.home, client.environ, None)
         found = [
             (server, reg)
             for server in SERVER_NAMES
