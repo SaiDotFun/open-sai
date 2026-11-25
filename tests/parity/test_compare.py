@@ -14,6 +14,7 @@ from compare import (
     Normalize,
     first_difference,
     ledger,
+    mask_overview_stdout,
     snapshot,
     sqlite_schema,
     stdout,
@@ -672,4 +673,27 @@ def test_mcp_compares_schema_property_order(tmp_path: Path) -> None:
         decode_inventory({"first": one, "second": two}),
         decode_inventory({"second": two, "first": one}),
         "MCP",
+    )
+
+
+def test_overview_text_ignores_clock_driven_table_widths():
+    def table(age: str, status: str = "accepted") -> str:
+        source = f"2000-01-01T00:00:00+00:00 ({age} s)"
+        return (
+            f"  {'Status':<8} │ {'Reserved (Age)':<{len(source)}}\n"
+            f"  {'─' * (8 + 3 + len(source))}\n"
+            f"  {status:<8} │ {source}\n"
+            f"  {'unknown':<8} │ {'unknown':<{len(source)}}\n"
+        )
+
+    short = mask_overview_stdout(table("8.49e+08"), "text")
+    long = mask_overview_stdout(table("8.4900001e+08"), "text")
+    assert short == long
+    leading_table = "  ID │ Price\n  ──────────\n  7  │ 100  \n"
+    assert mask_overview_stdout(leading_table + table("8.49e+08"), "text") == (
+        leading_table + long
+    )
+    assert short != mask_overview_stdout(table("8.49e+08", "rejected"), "text")
+    assert short != mask_overview_stdout(
+        table("8.49e+08").replace("──", "─", 1), "text"
     )

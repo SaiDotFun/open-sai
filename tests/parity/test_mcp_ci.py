@@ -34,6 +34,7 @@ def test_cutover_ci_uses_one_release_for_focused_and_full_parity() -> None:
     )
     assert "env: &release-parity" in focused
     assert "/.parity-python/.venv/bin/sai" in focused
+    manifest = manifest.split("\n      - name: ", 1)[0]
     assert "env: *release-parity" in manifest
     assert 'parity.py --reference "$SAI_PARITY_PYTHON" --cutover' in manifest
     assert "--case " not in manifest

@@ -15,7 +15,7 @@ use crate::{
     storage::{IntentStatus, StatusUpdateOptions, Storage, StorageError},
 };
 
-const OUTCOME_NOT_INDEXED: &str = "market_order_outcome_not_indexed";
+pub(crate) const OUTCOME_NOT_INDEXED: &str = "market_order_outcome_not_indexed";
 const HISTORY_TIMEOUT: Duration = Duration::from_secs(2);
 const HISTORY_RETRY_DELAY: Duration = Duration::from_millis(250);
 const HISTORY_PAGE_SIZE: usize = 25;
