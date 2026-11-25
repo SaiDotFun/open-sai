@@ -458,8 +458,10 @@ impl Uv {
         self.owner(false)?;
         if let Some(staged) = staged {
             self.bind_restored_receipt(&staged)?;
+        } else {
+            self.pin_rollback_receipt(&path)?;
         }
-        provenance::record(&self.prefix, wheel, &self.wheel_path(wheel)?)?;
+        provenance::record(&self.prefix, wheel, &path)?;
         remove_record(&self.pending_path())?;
         Ok(version)
     }
@@ -503,11 +505,7 @@ impl Uv {
     }
 
     fn bind_restored_receipt(&self, staged: &Path) -> Result<()> {
-        let receipt = self.prefix.join(RECEIPT);
-        let mut document: DocumentMut = fs::read_to_string(&receipt)
-            .map_err(io_error)?
-            .parse()
-            .map_err(|_| "could not read the restored uv receipt".to_owned())?;
+        let mut document = self.read_receipt()?;
         let entry = document
             .get_mut("tool")
             .and_then(|tool| tool.get_mut("entrypoints"))
@@ -524,6 +522,45 @@ impl Uv {
             .to_str()
             .ok_or_else(|| "the uv launcher path is not valid UTF-8".to_owned())?;
         entry.insert("install-path", public.into());
+        self.write_receipt(&document)
+    }
+
+    fn pin_rollback_receipt(&self, wheel: &Path) -> Result<()> {
+        let path = wheel
+            .to_str()
+            .ok_or_else(|| "the rollback wheel path is not valid UTF-8".to_owned())?;
+        let mut document = self.read_receipt()?;
+        let requirement = document
+            .get_mut("tool")
+            .and_then(|tool| tool.get_mut("requirements"))
+            .and_then(toml_edit::Item::as_array_mut)
+            .and_then(|requirements| {
+                requirements
+                    .iter_mut()
+                    .filter_map(toml_edit::Value::as_inline_table_mut)
+                    .find(|entry| {
+                        entry.get("name").and_then(toml_edit::Value::as_str) == Some(TOOL)
+                    })
+            })
+            .ok_or_else(|| "uv's receipt has no Sai requirement".to_owned())?;
+        // uv pip leaves uv tool's requirements alone. Pin the restored wheel so a
+        // subsequent uv tool upgrade cannot reinstall a failed candidate.
+        let mut rollback = InlineTable::new();
+        rollback.insert("name", TOOL.into());
+        rollback.insert("path", path.into());
+        *requirement = rollback;
+        self.write_receipt(&document)
+    }
+
+    fn read_receipt(&self) -> Result<DocumentMut> {
+        fs::read_to_string(self.prefix.join(RECEIPT))
+            .map_err(io_error)?
+            .parse()
+            .map_err(|_| "could not read the uv receipt".to_owned())
+    }
+
+    fn write_receipt(&self, document: &DocumentMut) -> Result<()> {
+        let receipt = self.prefix.join(RECEIPT);
         let mut file = NamedTempFile::new_in(&self.prefix).map_err(io_error)?;
         file.write_all(document.to_string().as_bytes())
             .map_err(io_error)?;

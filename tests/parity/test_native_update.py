@@ -1185,6 +1185,60 @@ def test_uv_recovers_an_interrupted_in_place_bridge_install(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+def test_uv_tool_upgrade_keeps_the_rolled_back_wheel(
+    standalone: NativeInstall, tmp_path: Path
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    pending = interrupted_uv_install(install, initial)
+    journal = json.loads(pending.read_text(encoding="utf-8"))
+    candidate = wheel(tmp_path, NEW, fail="installed")
+    digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    cached = pending.parent / ".sai-cli-native-wheels" / digest / candidate.name
+    cached.parent.mkdir(parents=True, mode=0o700)
+    shutil.copyfile(candidate, cached)
+    journal["next"] = {"version": NEW, "digest": digest}
+    pending.write_text(json.dumps(journal), encoding="utf-8")
+    uv = install.launcher.with_name("uv")
+    changed = subprocess.run(
+        [
+            uv,
+            "tool",
+            "install",
+            "--force",
+            "--offline",
+            "--python",
+            sys.executable,
+            cached,
+        ],
+        env=install.env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert changed.returncode == 0, changed.stderr
+    assert install.invoke("--version").stdout.strip() == f"sai {NEW}"
+    public_inode = install.launcher.lstat().st_ino
+
+    recovered = install.invoke("--json", "update", "--recover", exe=install.executable)
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    assert install.launcher.lstat().st_ino == public_inode
+    assert not pending.exists()
+    assert install.invoke("--version").stdout.strip() == f"sai {install.installed}"
+
+    upgraded = subprocess.run(
+        [uv, "tool", "upgrade", "--offline", "sai-cli"],
+        env=install.env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert upgraded.returncode == 0, upgraded.stderr
+    assert install.invoke("--version").stdout.strip() == f"sai {install.installed}"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
 @pytest.mark.parametrize("cooperative", [True, False])
 def test_uv_recovery_preserves_a_competing_public_launcher(
     standalone: NativeInstall, tmp_path: Path, cooperative: bool
