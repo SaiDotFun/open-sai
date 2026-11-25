@@ -537,7 +537,6 @@ pub fn run(
         allow_concurrent_open,
         confirmation,
         on_reserved: wait_for_trade.then_some(&track),
-        ..SubmitOptions::default()
     };
     let submit = async {
         let (result, reference_price) = trading
