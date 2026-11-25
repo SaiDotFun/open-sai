@@ -107,3 +107,44 @@ def test_install_reports_differing_claude_entry(
         assert "differs in command, args, env." in report["fix"]
         assert "test -f" in report["fix"]
         assert "claude mcp add --scope user sai" in report["fix"]
+
+
+def test_doctor_validates_codex_repair_before_writing(
+    wave_clis: tuple[str, str], tmp_path: Path
+) -> None:
+    for index, binary in enumerate(wave_clis):
+        home = tmp_path / str(index)
+        home.mkdir()
+        overrides = {"PATH": os.defpath}
+        original = seed_clients(home, overrides, "partial")
+        config = home / ".codex/config.toml"
+        before = config.stat()
+        result = run_cli(
+            binary, home, "--json", "doctor", "--offline", overrides=overrides
+        )
+        assert result.returncode == 1
+        assert config.read_bytes() == original[".codex/config.toml"]
+        after = config.stat()
+        assert (after.st_ino, after.st_mode, after.st_mtime_ns) == (
+            before.st_ino,
+            before.st_mode,
+            before.st_mtime_ns,
+        )
+        assert set(config.parent.iterdir()) == {config}
+        calls = (home / "argv.jsonl").read_text()
+        assert SECRET not in calls + result.stdout + result.stderr
+        assert "token=private" not in calls + result.stdout + result.stderr
+        previews = [
+            call for line in calls.splitlines() if "-c" in (call := json.loads(line))
+        ]
+        assert len(previews) == 1
+        assert 'mcp_servers.sai.args=["mcp", "serve"]' in previews[0]
+        checks = json.loads(result.stdout)["error"]["details"]["checks"]
+        [codex] = [check for check in checks if check["id"] == "mcp.codex"]
+        assert codex["status"] == "fail"
+        assert (
+            "Codex rejected the proposed repair. The original Sai entry is unchanged."
+            in codex["summary"]
+        )
+        assert "codex mcp add sai" in codex["fix"]
+        assert "<original-launcher>" in codex["fix"]

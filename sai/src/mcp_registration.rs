@@ -785,13 +785,13 @@ impl Clients {
                 {
                     failure = Some((
                         "A stale Codex project registration is still active".into(),
-                        "Edit the Sai registration in .codex/config.toml",
+                        "Edit the Sai registration in .codex/config.toml".into(),
                     ));
                 }
                 Err(_) => {
                     failure = Some((
                         "Could not verify the Codex registration".into(),
-                        "Check the Sai registration and rerun `sai doctor`",
+                        "Check the Sai registration and rerun `sai doctor`".into(),
                     ))
                 }
                 Ok(_) => {}
@@ -802,7 +802,7 @@ impl Clients {
                 summary.push_str(". ");
                 summary.push_str(&legacy_warning);
             }
-            check("fail", &summary, Some(hint.into()))
+            check("fail", &summary, Some(hint))
         } else if pinned || different_profile || legacy {
             let warnings = [
                 pinned.then_some("Sai uses a pinned launcher from a different install"),
@@ -839,48 +839,61 @@ impl Clients {
         target: Option<&Target>,
         fix: bool,
         deadline: Instant,
-    ) -> Result<(), (String, &'static str)> {
+    ) -> Result<(), (String, String)> {
         let Some(args) = &issue.args else {
             return Err((
                 issue.reason.into(),
-                "Edit the Sai registration in this client's config",
+                "Edit the Sai registration in this client's config".into(),
             ));
         };
         if client == Client::Codex && entry.scope == Scope::Project {
             return Err((
                 issue.reason.into(),
-                "Edit the Sai registration in this client's config",
+                "Edit the Sai registration in this client's config".into(),
             ));
         }
         let Some(target) = target else {
-            return Err((issue.reason.into(), "Install a stable Sai launcher on PATH"));
+            return Err((
+                issue.reason.into(),
+                "Install a stable Sai launcher on PATH".into(),
+            ));
         };
         if !fix {
-            return Err((issue.reason.into(), "Run `sai doctor` with fixes enabled"));
+            return Err((
+                issue.reason.into(),
+                "Run `sai doctor` with fixes enabled".into(),
+            ));
         }
         let target = target.repair(args.clone(), client == Client::Codex);
-        let problem = |error: String| {
+        let problem = |error: String, hint: Option<String>| {
             if error == client::READ_ONLY_CONFIG {
                 return (
                     format!("{}. {error}", issue.reason),
-                    "Edit the Sai registration in this client's config",
+                    "Edit the Sai registration in this client's config".into(),
                 );
             }
+            let mut summary = format!(
+                "{}. Could not repair the {} registration",
+                issue.reason,
+                entry.scope.name()
+            );
+            if hint.is_some() {
+                summary.push_str(&format!(". {error}"));
+            }
             (
-                format!(
-                    "{}. Could not repair the {} registration",
-                    issue.reason,
-                    entry.scope.name()
-                ),
-                "Check this client's Sai registration and rerun `sai doctor`",
+                summary,
+                hint.unwrap_or_else(|| {
+                    "Check this client's Sai registration and rerun `sai doctor`".into()
+                }),
             )
         };
         if client == Client::Codex {
             Client::repair_codex(&self.home, self.cwd(), name, &target, entry, deadline)
+                .map_err(|(error, hint)| problem(error, hint))
         } else {
             Client::repair_cursor(&self.home, self.cwd(), name, &target, entry, deadline)
+                .map_err(|error| problem(error, None))
         }
-        .map_err(problem)
     }
 }
 
@@ -931,7 +944,7 @@ fn claude_check(issues: &[(&str, &Registration, &Stale)]) -> RegistrationCheck {
     result
 }
 
-fn private_server_args(args: &[String], placeholder: &str) -> Vec<String> {
+fn private_server_args(args: &[String], placeholder: &str, attached: &str) -> Vec<String> {
     let mut expects_value = false;
     args.iter()
         .map(|arg| {
@@ -939,12 +952,15 @@ fn private_server_args(args: &[String], placeholder: &str) -> Vec<String> {
                 return placeholder.to_owned();
             }
             let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
-            if matches!(flag, "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as") {
+            if matches!(
+                flag,
+                "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as"
+            ) {
                 if flag.len() == arg.len() {
                     expects_value = true;
                     arg.clone()
                 } else {
-                    format!("{flag}={placeholder}")
+                    format!("{flag}={attached}")
                 }
             } else if matches!(arg.as_str(), "mcp" | "serve" | "--json" | "--") {
                 arg.clone()
@@ -1253,7 +1269,11 @@ impl Clients {
             return Ok(());
         }
         if client == Client::Claude && existing.is_some_and(|entry| entry.disabled) {
-            result.report.as_object_mut().expect("result object").remove("command");
+            result
+                .report
+                .as_object_mut()
+                .expect("result object")
+                .remove("command");
             return Err(format!(
                 "Claude Code has disabled the {} sai registration. Review MCP approvals and settings in the client.",
                 scope.name()
@@ -1272,7 +1292,9 @@ impl Clients {
             result.report["action"] = json!("unchanged");
             return Ok(());
         }
-        if client == Client::Claude && let Some(entry) = existing {
+        if client == Client::Claude
+            && let Some(entry) = existing
+        {
             self.report_different_claude(entry, target, result);
             return Ok(());
         }
@@ -1361,7 +1383,9 @@ impl Clients {
         fix.push('.');
 
         let launcher = if target.explicit {
-            which("sai").map(|path| absolute(&path)).or_else(|| env::current_exe().ok())
+            which("sai")
+                .map(|path| absolute(&path))
+                .or_else(|| env::current_exe().ok())
         } else {
             Some(PathBuf::from(&target.argv[0]))
         };
@@ -1380,16 +1404,22 @@ impl Clients {
             } else {
                 args
             };
-            let args = private_server_args(args, ARG);
+            let args = private_server_args(args, ARG, ARG);
             let extra_env = entry.stale_env.len() + usize::from(entry.invalid_profile);
-            if profile == Some(PROFILE) || extra_env != 0 || args.iter().any(|arg| arg.contains(ARG)) {
+            if profile == Some(PROFILE)
+                || extra_env != 0
+                || args.iter().any(|arg| arg.contains(ARG))
+            {
                 fix.push_str("\nFill in the placeholders from the existing config before removing the entry. You can edit just the launcher in the config to keep those settings in place.");
             }
             let add = ["claude", "mcp", "add", "--scope", scope, NAMES[0]]
                 .into_iter()
                 .map(str::to_owned)
                 .chain(profile.map(|profile| format!("--env=SAI_HOME={profile}")))
-                .chain(std::iter::repeat_n("--env=<NAME>=<value>".to_owned(), extra_env))
+                .chain(std::iter::repeat_n(
+                    "--env=<NAME>=<value>".to_owned(),
+                    extra_env,
+                ))
                 .chain(["--".to_owned(), launcher.to_string()])
                 .chain(args)
                 .map(|arg| shell_quote(&arg))
@@ -1405,7 +1435,11 @@ impl Clients {
         if target.explicit {
             fix.push_str(" For a custom launcher, substitute your requested command after -- and use its executable in the check.");
         }
-        result.report.as_object_mut().expect("result object").remove("command");
+        result
+            .report
+            .as_object_mut()
+            .expect("result object")
+            .remove("command");
         result.report["path"] = json!(path);
         result.report["fix"] = json!(fix);
         result.failed(format!(
@@ -1481,8 +1515,13 @@ fn finish(results: Vec<RegistrationResult>, json_output: bool) -> Result<(), Sai
     } else {
         let mut text_summary = summary.clone();
         let mut hints = Vec::new();
-        for row in text_summary["results"].as_array_mut().expect("JSON results") {
-            if let Some(Value::String(fix)) = row.as_object_mut().expect("result object").remove("fix") {
+        for row in text_summary["results"]
+            .as_array_mut()
+            .expect("JSON results")
+        {
+            if let Some(Value::String(fix)) =
+                row.as_object_mut().expect("result object").remove("fix")
+            {
                 hints.push(fix);
             }
         }

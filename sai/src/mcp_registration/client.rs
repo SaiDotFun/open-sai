@@ -11,7 +11,7 @@ use std::{
 
 use serde_json::{Map, Value};
 
-use super::{Client, Registration, Scope, Target};
+use super::{Client, NAMES, Registration, Scope, Target, private_server_args, shell_quote};
 
 #[cfg(test)]
 mod tests;
@@ -20,9 +20,10 @@ pub(super) type Result<T> = std::result::Result<T, String>;
 pub(super) const READ_ONLY_CONFIG: &str = "The client config is read-only";
 
 #[derive(Clone, Copy)]
-pub(super) enum CodexLookup {
+pub(super) enum CodexLookup<'a> {
     Discover,
     Verify,
+    Preview(&'a [String]),
 }
 
 enum JsonUpdate<'a> {
@@ -86,7 +87,7 @@ impl Client {
         home: &Path,
         cwd: Option<&Path>,
         name: &str,
-        lookup: CodexLookup,
+        lookup: CodexLookup<'_>,
         deadline: Instant,
     ) -> Result<Vec<Registration>> {
         if self == Self::Codex {
@@ -210,34 +211,41 @@ impl Client {
         target: &Target,
         old: &Registration,
         deadline: Instant,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), (String, Option<String>)> {
         let client = Self::Codex;
         let path = client.path(Scope::User, home, cwd);
-        let published = edit(&path, true, deadline, |source| {
-            edit_codex(source, name, target, Some(old))
-        })?;
-        let verification = codex_get(
-            &client.codex_neutral(home),
-            Scope::User,
-            name,
-            CodexLookup::Verify,
-            deadline,
-        )
-        .and_then(|entry| {
-            if entry.is_some_and(|entry| entry.matches_command(target)) {
-                Ok(())
-            } else {
-                Err("Codex did not load the repaired Sai registration".into())
-            }
-        });
-        if verification.is_err()
-            && let Some(published) = published
-        {
-            // A verification timeout can consume the inspection budget.
-            // Allow a separate bounded read to check whether rollback is safe.
-            published.restore(&path, Instant::now() + Duration::from_secs(1))?;
+        let neutral = client.codex_neutral(home);
+        let mut overrides = vec![format!(
+            "mcp_servers.{name}.command={}",
+            toml_edit::Value::from(target.argv[0].as_str())
+        )];
+        let mut expected = target.clone();
+        if old.argv[1..] != target.argv[1..] {
+            // Validate the standard prefix without sending saved operands on
+            // Codex's command line. The file retains the full argument list.
+            overrides.push(format!("mcp_servers.{name}.args=[\"mcp\", \"serve\"]"));
+            expected.argv.truncate(1);
+            expected.argv.extend(["mcp".into(), "serve".into()]);
         }
-        verification
+        let mut hint = None;
+        edit(&path, true, deadline, |source| {
+            let rendered = edit_codex(source, name, target, Some(old))?;
+            if source != rendered.as_bytes()
+                && !matches!(
+                    codex_get(
+                        &neutral, Scope::User, name, CodexLookup::Preview(&overrides), deadline
+                    ),
+                    Ok(Some(entry)) if entry.matches_command(&expected)
+                )
+            {
+                hint = Some(codex_restore_hint(source, name, old));
+                let state = codex_entry_state(&path, source, name, deadline);
+                return Err(format!("Codex rejected the proposed repair. {state}"));
+            }
+            Ok(rendered)
+        })
+        .map(|_| ())
+        .map_err(|error| (error, hint))
     }
 
     pub(super) fn remove(
@@ -408,23 +416,28 @@ pub(super) fn codex_get(
     cwd: &Path,
     scope: Scope,
     name: &str,
-    lookup: CodexLookup,
+    lookup: CodexLookup<'_>,
     deadline: Instant,
 ) -> Result<Option<Registration>> {
     let Some(exe) = Client::Codex.executable() else {
         return match lookup {
             CodexLookup::Discover => Ok(None),
-            CodexLookup::Verify => Err("`codex` is not on PATH".into()),
+            CodexLookup::Verify | CodexLookup::Preview(_) => Err("`codex` is not on PATH".into()),
         };
     };
     let label = format!("codex mcp get {name} --json");
-    let args = [
+    let mut args = vec![
         exe.to_string_lossy().into_owned(),
         "mcp".into(),
         "get".into(),
         name.into(),
         "--json".into(),
     ];
+    if let CodexLookup::Preview(overrides) = lookup {
+        for value in overrides {
+            args.extend(["-c".into(), value.clone()]);
+        }
+    }
     let (status, out, err) =
         invoke(&args, cwd, deadline, true).map_err(|e| format!("`{label}` did not run: {e}"))?;
     if !status.success() {
@@ -690,7 +703,7 @@ fn edit(
     path: &Path,
     retry: bool,
     deadline: Instant,
-    render: impl Fn(&[u8]) -> Result<String>,
+    mut render: impl FnMut(&[u8]) -> Result<String>,
 ) -> Result<Option<PublishedConfig>> {
     let attempts = if retry { 2 } else { 1 };
     for _ in 0..attempts {
@@ -957,6 +970,77 @@ fn codex_argv_matches(entry: &dyn toml_edit::TableLike, old: &Registration) -> b
                 .flat_map(|args| args.iter().map(|arg| arg.as_str().unwrap_or_default())),
         )
         .eq(old.argv.iter().map(String::as_str))
+}
+
+fn codex_entry(source: &[u8], name: &str) -> Result<Option<toml_edit::Item>> {
+    let doc = std::str::from_utf8(source)
+        .ok()
+        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+        .ok_or("Could not read Codex config.toml")?;
+    Ok(doc
+        .get("mcp_servers")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|entries| entries.get(name))
+        .cloned())
+}
+
+fn codex_entry_state(path: &Path, source: &[u8], name: &str, deadline: Instant) -> &'static str {
+    let current = read(path, deadline)
+        .map_err(io_kind)
+        .and_then(|bytes| codex_entry(bytes.as_deref().unwrap_or_default(), name));
+    match current {
+        Ok(Some(current))
+            if codex_entry(source, name)
+                .ok()
+                .flatten()
+                .as_ref()
+                .map(semantic_item)
+                == Some(semantic_item(&current)) =>
+        {
+            "The original Sai entry is unchanged."
+        }
+        Ok(Some(_)) => "The Sai entry was changed by another process.",
+        Ok(None) => "The Sai entry is missing.",
+        Err(_) => "Could not read the current Sai entry.",
+    }
+}
+
+fn codex_restore_hint(source: &[u8], name: &str, old: &Registration) -> String {
+    let original = codex_entry(source, name).ok().flatten();
+    let original = original.as_ref().and_then(toml_edit::Item::as_table_like);
+    let env_count = original
+        .and_then(|entry| entry.get("env"))
+        .and_then(toml_edit::Item::as_table_like)
+        .map_or(0, |env| env.len());
+    let launcher = if NAMES.contains(&old.argv[0].as_str()) {
+        old.argv[0].as_str()
+    } else {
+        "<original-launcher>"
+    };
+    let command = ["codex", "mcp", "add", name]
+        .into_iter()
+        .chain(std::iter::repeat_n(["--env", "<NAME>=<value>"], env_count).flatten())
+        .chain(["--", launcher])
+        .map(shell_quote)
+        .chain(
+            private_server_args(&old.argv[1..], "<original-argument>", "<original-value>")
+                .iter()
+                .map(|arg| shell_quote(arg)),
+        )
+        .collect::<Vec<_>>()
+        .join(" ");
+    let plural = if env_count == 1 { "" } else { "s" };
+    let mut hint = format!(
+        "If you need to restore the entry, use the same Codex home. The saved entry has {env_count} environment assignment{plural}. Replace the placeholders with the original values in `{command}`."
+    );
+    if original.is_some_and(|entry| {
+        entry
+            .iter()
+            .any(|(key, _)| !matches!(key, "command" | "args" | "env"))
+    }) {
+        hint.push_str(" Restore settings such as tool filters in Codex config.toml.");
+    }
+    hint
 }
 
 fn edit_codex(
