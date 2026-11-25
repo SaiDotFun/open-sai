@@ -7,11 +7,12 @@ import json
 import os
 import select
 import signal
+import sqlite3
 import subprocess
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -646,6 +647,113 @@ def test_trade_wait_dry_run(
             assert not replies
             assert not (home / "trader/intents.sqlite3").exists()
             assert documents[0] == documents[1]
+
+
+@pytest.mark.parametrize("args", POSITION_ACTIONS, ids=lambda args: args[0])
+def test_position_update_submits_same_request_with_wait(
+    position_wait_cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    args: tuple[str, ...],
+) -> None:
+    kind = "UPDATE_TRADE"
+    change = "tpsl_updated" if args == TPSL else "leverage_updated"
+    with replay(get=lambda request: cancel_lcd(request, trade_type="trade")) as (
+        endpoint,
+        replies,
+        requests,
+    ):
+
+        def dispatch(cli: CLI, home: Path, wait_flag: tuple[str, ...]) -> Any:
+            connect(home, endpoint, monkeypatch)
+            requests.clear()
+            keys: list[str] = []
+            admissions = []
+
+            def admit(request: Request) -> Reply:
+                key = submitted_key(request, kind)
+                keys.append(key)
+                with closing(
+                    sqlite3.connect(home / "trader/intents.sqlite3")
+                ) as ledger:
+                    reservation = ledger.execute(
+                        "SELECT id, endpoint, account, kind, entity, status, keeper_status FROM intents"
+                    ).fetchall()
+                assert reservation == [
+                    (key, endpoint, ADDR, kind, "17", "unknown", None)
+                ]
+                wire = json.loads(request.body)
+                assert wire["query"] == keeper.SUBMIT
+                envelope = wire["variables"]["input"]
+                stamp = envelope["intent"].pop("tsIntentInit")
+                assert stamp and envelope["lifecycle"].pop("tsLifecycleStep") == stamp
+                preflight = [
+                    (
+                        urlsplit(item.path).path,
+                        json.loads(item.body) if item.body else None,
+                    )
+                    for item in requests[:-1]
+                ]
+                assert len(preflight) == 4
+                admissions.append(normalized([preflight, wire, reservation], key))
+                return accepted(key, kind)
+
+            queue_update_preflight(replies)
+            replies.append(admit)
+            if wait_flag:
+                replies.extend(
+                    (
+                        lambda _: response(
+                            intent(
+                                "filled",
+                                kind=kind,
+                                intentKey=keys[0],
+                                body=UPDATES[args],
+                            )
+                        ),
+                        lambda _: response(
+                            history(indexed_update(change, keys[0], args))
+                        ),
+                    )
+                )
+            result = invoke(
+                cli,
+                home,
+                "--endpoint",
+                endpoint,
+                "--lcd-endpoint",
+                endpoint.removesuffix("/query"),
+                "--json",
+                "trade",
+                *args,
+                *wait_flag,
+            )
+            assert (result.returncode, result.stderr) == (0, b""), result
+            document = json.loads(result.stdout)
+            key = document["intentKey"]
+            assert keys == [key]
+            assert not replies
+            assert (
+                sum(
+                    json.loads(item.body)["query"].startswith("mutation")
+                    for item in requests
+                    if item.body
+                )
+                == 1
+            )
+            if wait_flag:
+                assert document["status"] == "succeeded"
+                assert ledger_state(home) == [(key, "terminal", "terminal")]
+            else:
+                assert document["status"] == "accepted"
+                assert ledger_state(home) == [(key, "accepted", None)]
+            return admissions[0]
+
+        for index, cli in enumerate(position_wait_cli_pair):
+            root = tmp_path / str(index)
+            assert dispatch(cli, root / "submit" / "sai", ()) == dispatch(
+                cli, root / "wait" / "sai", ("--wait",)
+            )
 
 
 @pytest.mark.parametrize(
