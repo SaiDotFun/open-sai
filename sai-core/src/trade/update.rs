@@ -13,7 +13,7 @@ use crate::{
 use super::{
     TradeIntent, TradePreview, Trading,
     actions::{id, invalid},
-    position::{Lcd, PositionRoute, Read, contract_owner_error, same_account},
+    position::Lcd,
     positive_decimal,
 };
 
@@ -159,26 +159,6 @@ impl Trading<'_> {
         Ok(PositionUpdate { preview, indexed })
     }
 
-    async fn verify_position_owner(
-        &self,
-        lcd: &Lcd<'_>,
-        addr: &str,
-        id: &Value,
-        confirming: bool,
-    ) -> Result<PositionRoute, SaiError> {
-        let route = self.position_route(lcd, confirming).await?;
-        let (raw, _) = lcd
-            .position(&route.contract_address, addr, id, Read::Fresh)
-            .await?;
-        if raw["user_trade_index"] != format!("UserTradeIndex({id})") {
-            return Err(invalid(&format!("Unable to verify contract position {id}")));
-        }
-        if !same_account(addr, raw.get("user")) {
-            return Err(contract_owner_error());
-        }
-        Ok(route)
-    }
-
     pub(super) async fn update_refusal(
         &self,
         addr: &str,
@@ -210,7 +190,7 @@ impl Trading<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trade::{Confirmation, digest_bytes, preview_digest};
+    use crate::trade::{Confirmation, digest_bytes, position::PositionRoute, preview_digest};
 
     #[test]
     fn position_update_confirmation_matches_python_route_digest() {
