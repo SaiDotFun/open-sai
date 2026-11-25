@@ -380,6 +380,7 @@ def test_standalone_update_selects_the_latest_platform_archive(
 ) -> None:
     unlisted, other_platform, python = "9999.0.1", "9999.0.2", "9999.0.3"
     unavailable, malformed = "9999.0.4", "9999.0.5"
+    oversized, streamed = "9999.0.6", "9999.0.7"
     versioned = {
         **assets(NEW, archive_name(), archive()),
         **assets(unlisted, archive_name(unlisted), archive(unlisted)),
@@ -389,18 +390,34 @@ def test_standalone_update_selects_the_latest_platform_archive(
         **assets(python, f"sai_cli-{python}-py3-none-any.whl", b"full Python"),
         **assets(unavailable, archive_name(unavailable), archive(unavailable)),
         **assets(malformed, archive_name(malformed), archive(malformed)),
+        **assets(oversized, archive_name(oversized), archive(oversized)),
+        **assets(streamed, archive_name(streamed), archive(streamed)),
         asset_key(unlisted, "SHA256SUMS"): b"",
         asset_key(unavailable, "SHA256SUMS"): Redirect("/missing-checksum"),
         asset_key(malformed, "SHA256SUMS"): b"\xff",
+        asset_key(oversized, "SHA256SUMS"): b"x" * (65536 + 1),
+        asset_key(streamed, "SHA256SUMS"): Streamed(b"x" * 1024, 65),
     }
     with releases(
-        versioned, tags=(other_platform, NEW, python, unlisted, malformed, unavailable)
+        versioned,
+        tags=(
+            other_platform,
+            NEW,
+            python,
+            unlisted,
+            malformed,
+            unavailable,
+            streamed,
+            oversized,
+        ),
     ) as server:
         checked = standalone.update(server, "--check")
         assert checked.returncode == 0, checked.stdout
         assert json.loads(checked.stdout)["latest"] == NEW
         assert server.reads == [
             f"/repos{REPO}/releases",
+            asset_key(streamed, "SHA256SUMS"),
+            asset_key(oversized, "SHA256SUMS"),
             asset_key(malformed, "SHA256SUMS"),
             asset_key(unavailable, "SHA256SUMS"),
             "/missing-checksum",
@@ -414,6 +431,15 @@ def test_standalone_update_selects_the_latest_platform_archive(
         assert archive_name(python) in json.loads(pinned.stdout)["error"]["message"]
         assert server.reads == [asset_key(python, "SHA256SUMS")]
         assert standalone.launcher.resolve() == standalone.executable
+
+        server.reads.clear()
+        too_large = standalone.update(server, "--to", oversized)
+        assert too_large.returncode == 1, too_large.stdout
+        assert (
+            "SHA256SUMS is too large"
+            in json.loads(too_large.stdout)["error"]["message"]
+        )
+        assert server.reads == [asset_key(oversized, "SHA256SUMS")]
 
         updated = standalone.update(server)
         assert updated.returncode == 0, updated.stdout
@@ -473,7 +499,8 @@ def test_update_bounds_streamed_release_assets(
     with releases(
         {**published, asset_key(NEW, name): Streamed(b"x" * chunk, 65)}
     ) as server:
-        result = standalone.update(server)
+        target = ("--to", NEW) if name == "SHA256SUMS" else ()
+        result = standalone.update(server, *target)
     assert result.returncode == 1
     assert f"{name} is too large" in json.loads(result.stdout)["error"]["message"]
     assert standalone.launcher.resolve() == standalone.executable

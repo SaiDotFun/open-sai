@@ -92,21 +92,22 @@ fn request_error(exc: reqwest::Error) -> ReleaseError {
     }
 }
 
-async fn bytes(mut response: Response, limit: usize, message: &str) -> Result<Vec<u8>> {
+/// Return None if the body exceeds the size limit.
+async fn bytes(mut response: Response, limit: usize) -> Result<Option<Vec<u8>>> {
     if response
         .content_length()
         .is_some_and(|len| len > limit as u64)
     {
-        return Err(error(message));
+        return Ok(None);
     }
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(request_error)? {
         if chunk.len() > limit - body.len() {
-            return Err(error(message));
+            return Ok(None);
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(body)
+    Ok(Some(body))
 }
 
 fn truthy(value: &Value) -> bool {
@@ -194,7 +195,9 @@ impl Releases {
                 .get("link")
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|link| link.contains("rel=\"next\""));
-            let data = bytes(response, MAX_PAGE, "GitHub API answer is too large").await?;
+            let data = bytes(response, MAX_PAGE)
+                .await?
+                .ok_or_else(|| error("GitHub API answer is too large"))?;
             let releases: Vec<Value> = serde_json::from_slice(&data)
                 .map_err(|_| error("GitHub API answered with malformed JSON"))?;
             let versions = releases
@@ -238,7 +241,9 @@ impl Releases {
             if matches!(response.status().as_u16(), 404 | 410) {
                 continue;
             }
-            let manifest = read_asset(response, MAX_SUMS, "SHA256SUMS").await?;
+            let Some(manifest) = asset_body(response, MAX_SUMS, "SHA256SUMS").await? else {
+                continue;
+            };
             if let Ok(manifest) = std::str::from_utf8(&manifest)
                 && expected_digest(manifest, &name).is_ok()
             {
@@ -356,13 +361,19 @@ impl Releases {
 }
 
 async fn read_asset(response: Response, limit: usize, name: &str) -> Result<Vec<u8>> {
+    asset_body(response, limit, name)
+        .await?
+        .ok_or_else(|| error(format!("{name} is too large")))
+}
+
+async fn asset_body(response: Response, limit: usize, name: &str) -> Result<Option<Vec<u8>>> {
     if response.status().as_u16() != 200 {
         return Err(error(format!(
             "download of {name} answered HTTP {}",
             response.status().as_u16()
         )));
     }
-    bytes(response, limit, &format!("{name} is too large")).await
+    bytes(response, limit).await
 }
 
 fn has_uploaded_asset(release: &Value, name: &str) -> bool {

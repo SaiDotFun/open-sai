@@ -101,7 +101,8 @@ class Replay:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 path = unquote(self.path.split("?", 1)[0])
-                replay.requests.append(path)
+                if path != "/":
+                    replay.requests.append(path)
                 if location := replay.redirects.get(path):
                     self.send_response(302)
                     self.send_header("Location", location)
@@ -411,7 +412,7 @@ def test_native_selection_skips_releases_without_a_platform_archive_and_checksum
     install: Install, replay: Replay
 ) -> None:
     native, unlisted, other_platform, python = "0.1.4", "0.1.5", "0.1.6", "0.1.7"
-    unavailable, malformed = "0.1.8", "0.1.9"
+    unavailable, malformed, oversized = "0.1.8", "0.1.9", "0.1.10"
     replay.add(native, {asset_name(native): archive()})
     replay.add(unlisted, {asset_name(unlisted): archive()})
     replay.assets[f"{REPO}/releases/download/sai-cli/v{unlisted}/SHA256SUMS"] = b""
@@ -423,11 +424,15 @@ def test_native_selection_skips_releases_without_a_platform_archive_and_checksum
     )
     replay.add(malformed, {asset_name(malformed): archive()})
     replay.assets[f"{REPO}/releases/download/sai-cli/v{malformed}/SHA256SUMS"] = b"\xff"
+    replay.add(oversized, {asset_name(oversized): archive()})
+    oversized_manifest = f"{REPO}/releases/download/sai-cli/v{oversized}/SHA256SUMS"
+    replay.assets[oversized_manifest] = b"x" * (65536 + 1)
 
     preview = install.install(replay, "--native", "--dry-run")
     assert asset_name(native) in ok(preview)
     assert replay.requests == [
         f"/repos{REPO}/releases",
+        oversized_manifest,
         f"{REPO}/releases/download/sai-cli/v{malformed}/SHA256SUMS",
         f"{REPO}/releases/download/sai-cli/v{unavailable}/SHA256SUMS",
         "/missing-checksum",
@@ -435,6 +440,12 @@ def test_native_selection_skips_releases_without_a_platform_archive_and_checksum
         f"{REPO}/releases/download/sai-cli/v{native}/SHA256SUMS",
     ]
     assert not install.launcher.parent.exists()
+
+    replay.requests.clear()
+    too_large = install.install(replay, "--native", "--version", oversized)
+    assert too_large.returncode == 1, too_large.stdout
+    assert "SHA256SUMS is larger than expected" in too_large.stderr
+    assert replay.requests == [oversized_manifest]
 
     replay.requests.clear()
     pinned = install.install(replay, "--native", "--version", python)

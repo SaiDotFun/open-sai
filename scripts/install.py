@@ -94,6 +94,10 @@ class MissingAsset(LookupFailed):
     """The release download returned a definitive not-found status."""
 
 
+class OversizedAsset(LookupFailed):
+    """The release download exceeded its size limit."""
+
+
 class LauncherChanged(LookupFailed):
     """A different install now owns the launcher."""
 
@@ -356,7 +360,7 @@ def download(
                     break
                 size += len(chunk)
                 if size > limit:
-                    raise LookupFailed(f"{name} is larger than expected")
+                    raise OversizedAsset(f"{name} is larger than expected")
                 handle.write(chunk)
     except urllib.error.HTTPError as error:
         if error.code in (404, 410):
@@ -594,7 +598,7 @@ def latest_native_tag(
                     origin=web_base,
                 )
                 sums = manifest.read_text(encoding="utf-8")
-            except (MissingAsset, UnicodeDecodeError):
+            except (MissingAsset, OversizedAsset, UnicodeDecodeError):
                 continue
             if native_digest(sums, name) is not None:
                 return tag
