@@ -1245,6 +1245,7 @@ def emit_wait(ctx: click.Context, result: dict[str, Any]) -> None:
     outcome = result["outcome"]
     exit_code = ExitCode.OK
     if outcome == "unknown":
+        result["message"] = "The intent outcome is still unknown. Do not resubmit."
         addr_args = ["--addr", result["addr"]] if result.get("addr") else []
         result["hint"] = storage.keeper_command_hint(
             keeper_url(ctx),

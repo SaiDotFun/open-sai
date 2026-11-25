@@ -1400,6 +1400,13 @@ def test_trade_wait_budget(
         assert clock.now() == 60
         assert document["outcome"] == document["status"] == "unknown"
         assert document["code"] == document["error"]["code"] == "OUTCOME_UNKNOWN"
+        assert "Do not resubmit." in document["message"]
+        assert document["error"]["message"] == document["message"]
+        hint = document["hint"]
+        assert hint == document["error"]["hint"]
+        assert "SAI_RECONCILE_ENDPOINT" in hint
+        assert hint.endswith(f"intent wait {document['intentKey']} --addr {ADDR}")
+        assert endpoint not in hint
         assert document["receipt"]["execution"] is None
         assert status(endpoint) == "pending"
 
