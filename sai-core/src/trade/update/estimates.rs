@@ -34,13 +34,14 @@ impl Trading<'_> {
         id: &Value,
         route: Option<PositionRoute>,
         indexed: Value,
+        verified_raw: Option<Value>,
     ) -> Result<(), SaiError> {
         let result = if let (Some(endpoint), Some(route)) = (self.lcd_endpoint, route) {
             let lcd = Lcd(endpoint);
             let target = preview.intent.body["requestedLeverage"].as_str();
             let quote = async {
                 let snapshot = self
-                    .position_snapshot(&lcd, addr, id, route, indexed, None)
+                    .position_snapshot(&lcd, addr, id, route, indexed, verified_raw)
                     .await?;
                 let Some(height) = snapshot.verified_height(&lcd, id).await? else {
                     return Ok(None);

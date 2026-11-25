@@ -15,7 +15,7 @@ def _value(value: Any, suffix: str = "") -> str:
 
 
 def _source(row: dict[str, Any]) -> str:
-    if row.get("sourceAt") is not None:
+    if row.get("sourceAt") is not None and row.get("sourceAtBasis") != "fetchedAt":
         return f"{row['sourceAt']} ({_value(row['sourceAgeSeconds'], ' s')})"
     if row.get("sourceBlock") is not None:
         return f"block {row['sourceBlock']} (time unknown)"
@@ -61,6 +61,9 @@ def show(result: dict[str, Any]) -> None:
                 )
         if error := snapshot.get("error"):
             print(f"  {error['message']} ({error['code']})")
+        if snapshot.get("status") == "skipped":
+            print(f"  Skipped. {snapshot['skipReason']}")
+            return None
         return snapshot.get("data")
 
     def table(headers: list[str], rows: list[list[str]]) -> None:

@@ -155,7 +155,7 @@ elif MUTATION.startswith("network-"):
 
 
 def run() -> None:
-    if MUTATION not in {"stdout-key-order", "stderr-duplicate"}:
+    if MUTATION not in {"stdout-key-order", "stderr-duplicate", "stale-index-code"}:
         main()
         return
     output, diagnostics = io.StringIO(), io.StringIO()
@@ -166,6 +166,10 @@ def run() -> None:
         stdout = output.getvalue()
         if MUTATION == "stdout-key-order":
             stdout = json.dumps(json.loads(stdout), sort_keys=True) + "\n"
+        elif MUTATION == "stale-index-code":
+            envelope = json.loads(stdout)
+            envelope["error"]["code"] = "KEEPER_ERROR"
+            stdout = json.dumps(envelope) + "\n"
         stderr = diagnostics.getvalue()
         sys.stdout.write(stdout)
         sys.stderr.write(stderr * (2 if MUTATION == "stderr-duplicate" else 1))

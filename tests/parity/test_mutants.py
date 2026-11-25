@@ -147,6 +147,15 @@ def test_doctor_offline_rejects_trader_creation_in_both_clis(tmp_path: Path) -> 
         )
 
 
+def test_stale_index_rejects_changed_error_code(tmp_path: Path) -> None:
+    mutant = write_mutant(tmp_path, "stale-index-code")
+    env = {**os.environ, "SAI_PARITY_PYTHON": str(mutant)}
+    env.pop("SAI_PARITY_BIN", None)
+    run = run_driver("trade-partial-close-index-lag-before-minimum", env)
+    assert run.returncode == 1, run.stdout + run.stderr
+    assert "reference Stdout differs from expectation at error.code" in run.stdout
+
+
 def test_reference_uses_real_uv_with_home_dependent_shim(tmp_path: Path) -> None:
     fake = tmp_path / "uv"
     home = tmp_path / "original-home"
