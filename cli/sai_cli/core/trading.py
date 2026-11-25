@@ -505,6 +505,21 @@ def _position_preview(
         dict[str, Any],
     ],
 ) -> dict[str, Any]:
+    def verify_replacement(
+        state: margin.PositionSnapshot, inputs: dict[str, Any]
+    ) -> margin.RecheckedPosition:
+        try:
+            checked = margin.recheck_position(lcd_endpoint, state, trade_id, inputs)
+        except estimates.READ_ERRORS as exc:
+            raise PositionChanged(
+                f"Could not verify the replacement position quote. {exc}"
+            ) from exc
+        if checked is not None:
+            return checked
+        raise PositionChanged(
+            "The position quote changed again during verification. Request a new preview."
+        )
+
     def read_quote() -> PositionPreview:
         try:
             return build()
@@ -513,11 +528,14 @@ def _position_preview(
                 raise
             try:
                 state, inputs, fresh = build()
-                _attach_estimates(fresh, estimate(state, inputs, fresh, None))
+                checked = verify_replacement(state, inputs)
+                _attach_estimates(fresh, estimate(state, inputs, fresh, checked))
             except margin.TradingNetworkMismatch:
                 raise PositionChanged(
                     f"{exc}. Use an LCD on Keeper's chain and request a new preview."
                 ) from exc
+            except PositionChanged:
+                raise
             except estimates.READ_ERRORS as refresh_error:
                 raise PositionChanged(
                     "Could not refresh the position preview after an LCD network mismatch."
@@ -553,6 +571,7 @@ def _position_preview(
             raise PositionChanged(
                 f"{changed_message}. Could not quote the latest position. {exc}"
             ) from exc
+        rechecked = verify_replacement(state, inputs)
     if changed or fresh != preview:
         _attach_estimates(fresh, estimate(state, inputs, fresh, rechecked))
         raise PositionChanged(changed_message, {**fresh, "addr": addr})

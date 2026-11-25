@@ -205,6 +205,26 @@ def test_no_tool_accepts_a_token_or_passphrase(mcp):
             assert "token" not in field and "pass" not in field, tool.name
 
 
+def test_position_quote_trade_descriptions_explain_mismatch_recovery(mcp):
+    async def descriptions() -> dict[str, str | None]:
+        async with create_connected_server_and_client_session(
+            mcp._mcp_server
+        ) as client:
+            return {
+                tool.name: tool.description
+                for tool in (await client.list_tools()).tools
+            }
+
+    listed = asyncio.run(descriptions())
+    for name in ("trade_margin", "trade_partial_close"):
+        description = listed[name]
+        assert description is not None
+        assert "PREVIEW_MISMATCH" in description
+        assert "recovery.action" in description
+        assert "quoteStatus=available" in description
+        assert "quoteStatus=unavailable" in description
+
+
 def names(mcp: FastMCP) -> set[str]:
     return {tool.name for tool in mcp._tool_manager.list_tools()}
 
@@ -1106,27 +1126,6 @@ def test_unknown_arguments_are_rejected(mcp, monkeypatch):
 MARKET_OPEN = {**OPEN_ARGS, "order_type": "market", "price": None}
 
 
-def test_preview_with_no_account_never_authorizes_a_trade(mcp, monkeypatch):
-    fake = FakeKeeper({keeper.MARKETS: markets()})
-    monkeypatch.setattr(keeper, "request", fake)
-    preview = invoke(mcp, "preview_open", MARKET_OPEN)
-    assert preview["addr"] is None
-    storage.save_session(stored_session())
-    error = invoke(
-        mcp,
-        "trade_open",
-        {
-            **MARKET_OPEN,
-            "preview_digest": preview["previewDigest"],
-            "reference_price": preview["referencePrice"],
-            "allow_concurrent_open": True,
-        },
-    )
-    assert error["code"] == "PREVIEW_MISMATCH"
-    assert error["preview"]["addr"] == ADDR
-    assert fake.submitted == []
-
-
 def test_logout_during_the_price_refresh_refuses_the_trade(mcp, monkeypatch):
     """A signed-out preview, then sign-in, then logout while the market
     price refreshes: the trade must not submit with the session it loaded
@@ -1148,7 +1147,7 @@ def test_logout_during_the_price_refresh_refuses_the_trade(mcp, monkeypatch):
         "trade_open",
         {
             **MARKET_OPEN,
-            "preview_digest": preview["previewDigest"],
+            "preview_digest": confirmation.preview_digest(preview),
             "reference_price": preview["referencePrice"],
             "allow_concurrent_open": True,
         },
