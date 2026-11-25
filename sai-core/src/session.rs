@@ -13,6 +13,8 @@ use crate::{
     storage::{Session, SessionError, Storage, StorageError, StorageEvent, endpoint_origin},
 };
 
+pub(crate) const INVALID_EXPIRY: &str =
+    "Stored session has an invalid expiry; run `sai auth import` or `sai auth login NAME` again";
 const INVALID_RENEWAL_ADDRESS: &str = "Stored session address is invalid. Sign in again.";
 pub(crate) const ORIGINAL_KEEPER_HINT: &str =
     r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#;
@@ -22,11 +24,7 @@ pub fn expired(session: &Session, now: DateTime<Utc>) -> Result<bool, SessionErr
 }
 
 pub fn session_expiry(session: &Session) -> Result<DateTime<Utc>, SessionError> {
-    parse_expiry(session.expires_at()).ok_or_else(|| {
-        SessionError::new(
-            "Stored session has an invalid expiry; run `sai auth import` or `sai auth login NAME` again",
-        )
-    })
+    parse_expiry(session.expires_at()).ok_or_else(|| SessionError::new(INVALID_EXPIRY))
 }
 
 #[derive(Serialize)]
@@ -339,10 +337,11 @@ impl Storage<'_> {
         };
         let home = self.trader.parent();
         let endpoint = session.endpoint().unwrap_or_default();
-        let origin = keeper_origin(endpoint)
-            .filter(|origin| home.is_some_and(|home| log::redact(home, origin) == *origin));
-        let public_default = endpoint == MAINNET_HTTP
-            && home.is_some_and(|home| log::redact(home, endpoint) == endpoint);
+        let endpoint_is_public = home.is_some_and(|home| log::redact(home, endpoint) == endpoint);
+        let origin = keeper_origin(endpoint).filter(|origin| {
+            endpoint_is_public && home.is_some_and(|home| log::redact(home, origin) == *origin)
+        });
+        let public_default = endpoint == MAINNET_HTTP && endpoint_is_public;
         let route = if public_default {
             Some(endpoint)
         } else {
@@ -365,12 +364,21 @@ impl Storage<'_> {
     }
 
     pub fn expiry_notice(&self, session: &Session, left: TimeDelta) -> Option<ExpiryNotice> {
+        self.expiry_notice_for_address(session, left, session.addr())
+    }
+
+    pub fn expiry_notice_for_address(
+        &self,
+        session: &Session,
+        left: TimeDelta,
+        display_address: &str,
+    ) -> Option<ExpiryNotice> {
         let when = expiry_warning_time(left)?;
         let (renewal_command, renewal_guidance) = self.renewal_fields(session);
         Some(ExpiryNotice {
             expiry_warning: format!(
                 "Sai session for {} expires in {when}.",
-                escape_warning_text(session.addr())
+                escape_warning_text(display_address)
             ),
             renewal_command,
             renewal_guidance,

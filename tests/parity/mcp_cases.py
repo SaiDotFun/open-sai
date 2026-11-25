@@ -1,4 +1,4 @@
-"""Stdio calls for the Python MCP contract at ea09f0d417a53a71079bb8c5e426005fa29051a4."""
+"""Stdio calls for the Python MCP contract at 1c671b231b0fc968a44ec8dd520e67ea28e25b7f."""
 
 from __future__ import annotations
 
@@ -24,6 +24,8 @@ def handshake(version: str) -> tuple[dict[str, Any], ...]:
     )
 
 
+REJECTED_AUTH_ADDRESS = "https://keeper.invalid/private/query?key=fixture-mcp-addr"
+
 ACCOUNT_READS = (
     "account_positions",
     "account_history",
@@ -47,6 +49,8 @@ class Call:
     args: dict[str, Any] = field(default_factory=dict)
     expected: str = "ok"
     session: str | None = None
+    switch_active: str | None = None
+    outcome: str | None = None
 
     def request(self, id_: int, endpoints: Endpoints) -> dict[str, Any]:
         return {
@@ -108,7 +112,75 @@ CALLS = {
         *(Call(tool, {"addr": False}, "invalid") for tool in ACCOUNT_READS),
         Call("intent_status", {"addr": "{addr}", "key": {}}, "invalid"),
     ),
+    "auth-list": (
+        Call("auth_list"),
+        Call("auth_list", {"unexpected": REJECTED_AUTH_ADDRESS}, "invalid"),
+        Call("auth_list", session="expired"),
+    ),
+    "auth-status": (
+        Call("auth_status"),
+        Call("auth_status", {"addr": False}, "invalid"),
+        Call("auth_status", {"addr": [REJECTED_AUTH_ADDRESS]}, "invalid"),
+        Call("auth_status", {"address": REJECTED_AUTH_ADDRESS}, "invalid"),
+        Call("auth_status", {"addr": "{other_addr}"}, "SESSION_UNAVAILABLE"),
+        Call("auth_status", {"addr": REJECTED_AUTH_ADDRESS}, "SESSION_UNAVAILABLE"),
+        Call("auth_status", expected="SESSION_EXPIRED", session="expired"),
+        Call("auth_status", expected="SESSION_UNAVAILABLE", session="other-endpoint"),
+    ),
+    "auth-use": (
+        Call("auth_use", expected="invalid"),
+        Call("auth_use", {"addr": "{addr}", "address": "{other_addr}"}, "invalid"),
+        Call("auth_use", {"addr": "not-connected"}, "INVALID_REQUEST"),
+        Call("auth_use", {"addr": "{addr}"}),
+        Call("auth_status"),
+        Call("auth_status", switch_active="{other_addr}"),
+        Call("auth_status", {"addr": "{addr}"}),
+        Call("auth_list"),
+    ),
+    "auth-use-invalid-expiry": (
+        Call("auth_list", expected="SESSION_UNAVAILABLE"),
+        Call("auth_use", {"addr": "{other_addr}"}, "SESSION_UNAVAILABLE"),
+        Call("auth_status", expected="SESSION_UNAVAILABLE"),
+    ),
+    "auth-redaction": (
+        Call("auth_list"),
+        Call("auth_status", {"addr": "{addr}"}),
+        Call("auth_use", {"addr": "{addr}"}),
+    ),
+    "overview-validation": (
+        Call("account_overview", {"addr": False}, "invalid"),
+        Call("account_overview", {"address": "{addr}"}, "invalid"),
+    ),
+    "wait-validation": (
+        Call("intent_wait", expected="invalid"),
+        Call("intent_wait", {"key": "{intent}", "timeout": []}, "invalid"),
+        Call("intent_wait", {"key": "{intent}", "timeout": "later"}, "invalid"),
+        Call("intent_wait", {"key": "{intent}", "deadline": 1}, "invalid"),
+        Call("intent_wait", {"key": "{intent}", "timeout": 0}, "INVALID_REQUEST"),
+        Call("intent_wait", {"key": "{intent}", "addr": "invalid"}, "INVALID_REQUEST"),
+        Call("intent_wait", {"key": "{intent}"}, "SESSION_UNAVAILABLE"),
+    ),
+    "wait-final": (Call("intent_wait", {"key": "{intent}"}, outcome="filled"),),
+    "wait-pending": (
+        Call(
+            "intent_wait",
+            {"key": "{intent}", "addr": "{addr}", "timeout": "7e-1"},
+            "OUTCOME_UNKNOWN",
+            outcome="unknown",
+        ),
+    ),
+    "logs-validation": (
+        Call("logs_intent", expected="invalid"),
+        Call("logs_intent", {"key": "{intent}", "offline": "later"}, "invalid"),
+        Call("logs_intent", {"key": "{intent}", "before": []}, "invalid"),
+        Call("logs_intent", {"key": "{intent}", "token": True}, "invalid"),
+    ),
     "refusals": (
+        Call("auth_status", {"addr": False}, "invalid"),
+        Call("auth_status", {"addr": [REJECTED_AUTH_ADDRESS]}, "invalid"),
+        Call("auth_status", {"address": REJECTED_AUTH_ADDRESS}, "invalid"),
+        Call("auth_status", expected="SIGNED_OUT"),
+        Call("auth_list"),
         *(Call(tool, {"addr": None}, "SESSION_UNAVAILABLE") for tool in ACCOUNT_READS),
         *(
             Call(tool, {"addr": False, "unexpected": 1}, "SIGNED_OUT")

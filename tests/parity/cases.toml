@@ -1348,15 +1348,105 @@ mode = "mcp"
 mcp_profile = "reads"
 seed = "ledger"
 server = "mcp-reads"
-wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "tradeHistory", "userIntents"]
-# Python v0.1.2 and Rust use paginated history during reconciliation.
-mcp_checkout_wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "intentTradeHistory", "userIntents"]
+wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "intentTradeHistory", "userIntents"]
 
 [[case]]
 name = "mcp-argument-validation"
 args = ["mcp","serve"]
 mode = "mcp"
 mcp_profile = "validation"
+
+[[case]]
+name = "mcp-auth-list"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "auth-list"
+seed = "accounts"
+
+[[case]]
+name = "mcp-auth-status"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "auth-status"
+seed = "doctor-near-expiry"
+
+[[case]]
+name = "mcp-auth-use"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "auth-use"
+seed = "mcp-auth-switch"
+state = { "trader/sessions.json#payload.active" = "0x2222222222222222222222222222222222222222", "trader/sessions.lock#@mode" = 0o600 }
+
+[[case]]
+name = "mcp-auth-use-invalid-expiry"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "auth-use-invalid-expiry"
+seed = "mcp-invalid-expiry"
+state = { "trader/sessions.json#payload.active" = "0x1111111111111111111111111111111111111111" }
+
+[[case]]
+name = "mcp-auth-numeric-expiry"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "auth-use-invalid-expiry"
+seed = "mcp-numeric-expiry"
+state = { "trader/sessions.json#payload.active" = "0x1111111111111111111111111111111111111111", "trader/sessions.json#payload.sessions.0x1111111111111111111111111111111111111111.expiresAt" = 123 }
+
+[[case]]
+name = "mcp-auth-missing-expiry"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "auth-use-invalid-expiry"
+seed = "mcp-missing-expiry"
+state = { "trader/sessions.json#payload.active" = "0x1111111111111111111111111111111111111111", "trader/sessions.json#payload.sessions.0x1111111111111111111111111111111111111111.expiresAt" = "<absent>" }
+
+[[case]]
+name = "mcp-auth-redaction"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "auth-redaction"
+seed = "mcp-auth-redaction"
+state = { "logs/cli.jsonl" = "<absent>", "trader/sessions.json#payload.active" = "0x1111111111111111111111111111111111111111" }
+
+[[case]]
+name = "mcp-overview-validation"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "overview-validation"
+
+[[case]]
+name = "mcp-intent-wait-validation"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "wait-validation"
+
+[[case]]
+name = "mcp-intent-wait-final"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "wait-final"
+server = "mcp-wait-final"
+seed = "ledger"
+wire = ["waitUserIntents", "intentTradeHistory"]
+state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "terminal", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }
+
+[[case]]
+name = "mcp-intent-wait-pending"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "wait-pending"
+server = "mcp-wait-pending"
+seed = "ledger"
+wire = ["waitUserIntents", "waitUserIntents"]
+state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "unknown", "trader/intents.sqlite3#tables.intents.rows.0.keeper_status" = "pending", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }
+
+[[case]]
+name = "mcp-logs-intent-validation"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "logs-validation"
 
 [[case]]
 name = "mcp-session-refusals"

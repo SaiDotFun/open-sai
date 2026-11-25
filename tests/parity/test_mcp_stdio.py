@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from mcp_cases import TRADE_TOOLS
+from mcp_cases import REJECTED_AUTH_ADDRESS, TRADE_TOOLS
 from scenarios import ADDRESS, INTENT, Endpoints, child_env, loopback, seed_home
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="Uses POSIX stdio pipes")
@@ -151,9 +151,7 @@ def test_ping_during_exclusive_ledger_lock(native: Path, tmp_path: Path) -> None
         assert json.loads(response["result"]["content"][0]["text"])["intents"]
 
 
-def test_cancelling_market_read_closes_keeper_connection(
-    native: Path, tmp_path: Path
-) -> None:
+def test_cancelling_read_closes_keeper_connection(native: Path, tmp_path: Path) -> None:
     with (
         loopback("mcp-cancel") as endpoints,
         server(native, tmp_path / "home", endpoints) as stdio,
@@ -169,6 +167,90 @@ def test_cancelling_market_read_closes_keeper_connection(
         assert endpoints.interrupt_closed.wait(3), "Keeper connection remained open"
         stdio.send("ping", id_=3)
         assert stdio.receive() == {"jsonrpc": "2.0", "id": 3, "result": {}}
+
+
+@pytest.mark.parametrize("interrupt", ["cancel", "eof"])
+def test_interrupting_intent_wait_preserves_the_ledger(
+    native: Path, tmp_path: Path, interrupt: str
+) -> None:
+    home = tmp_path / "home"
+    with (
+        loopback("mcp-cancel") as endpoints,
+        server(native, home, endpoints, seed="ledger") as stdio,
+        closing(sqlite3.connect(home / "sai/trader/intents.sqlite3")) as database,
+    ):
+        original = database.execute("SELECT * FROM intents").fetchall()
+        assert len(original) == 1
+        stdio.send("tools/call", id_=2, name="intent_wait", arguments={"key": INTENT})
+        assert endpoints.interrupt_ready.wait(3), "Keeper did not receive intent_wait"
+        if interrupt == "eof":
+            assert stdio.proc.stdin is not None
+            stdio.proc.stdin.close()
+            assert stdio.proc.wait(timeout=1.5) == 0
+            assert stdio.proc.stdout is not None
+            assert stdio.proc.stdout.read() == b""
+        else:
+            stdio.send("notifications/cancelled", requestId=2, reason="fixture")
+            assert stdio.receive(timeout=1.5) == {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "error": {"code": 0, "message": "Request cancelled"},
+            }
+        assert endpoints.interrupt_closed.wait(1.5), "Keeper connection remained open"
+        assert database.execute("SELECT * FROM intents").fetchall() == original
+        assert [request.label for request in endpoints.wire] == ["waitUserIntents"]
+
+
+def test_auth_status_omits_a_rejected_address(native: Path, tmp_path: Path) -> None:
+    with (
+        loopback("normal") as endpoints,
+        server(native, tmp_path / "home", endpoints, seed="session") as stdio,
+    ):
+        result = stdio.call(2, "auth_status", addr=REJECTED_AUTH_ADDRESS)
+        assert result["isError"] is False
+        assert "fixture-mcp-addr" not in json.dumps(result)
+        body = json.loads(result["content"][0]["text"])
+        assert body["code"] == "SESSION_UNAVAILABLE"
+        assert body["error"].startswith("Requested account is not connected;")
+        assert not endpoints.wire
+
+
+def test_short_intent_wait_polls_while_eight_long_waits_are_pending(
+    native: Path, tmp_path: Path
+) -> None:
+    with (
+        loopback("interrupt-http") as endpoints,
+        server(native, tmp_path / "home", endpoints, seed="ledger") as stdio,
+    ):
+        try:
+            for id_ in range(2, 10):
+                stdio.send(
+                    "tools/call",
+                    id_=id_,
+                    name="intent_wait",
+                    arguments={"addr": ADDRESS, "key": INTENT, "timeout": 10},
+                )
+            deadline = time.monotonic() + 3
+            while len(endpoints.wire) < 8:
+                assert time.monotonic() < deadline, "Keeper did not receive eight waits"
+                time.sleep(0.01)
+            stdio.send(
+                "tools/call",
+                id_=10,
+                name="intent_wait",
+                arguments={"addr": ADDRESS, "key": INTENT, "timeout": 0.25},
+            )
+            response = stdio.receive(timeout=1.5)
+            assert response["id"] == 10
+            body = json.loads(response["result"]["content"][0]["text"])
+            assert body["code"] == "OUTCOME_UNKNOWN"
+            assert body["intentKey"] == INTENT
+            assert body["addr"] == ADDRESS
+            assert [request.label for request in endpoints.wire] == [
+                "waitUserIntents"
+            ] * 9
+        finally:
+            endpoints.interrupt_closed.set()
 
 
 def test_cancellation_is_admitted_while_request_slots_are_full(
@@ -378,6 +460,9 @@ INVALID_ADDRESS = ("addr", "Input should be a valid string", "string_type")
         ("account_positions", {REJECTED_URL: True}, (EXTRA_ARGUMENT,)),
         ("account_positions", {"extra": REJECTED_URL}, (EXTRA_ARGUMENT,)),
         ("account_positions", {"addr": [REJECTED_URL]}, (INVALID_ADDRESS,)),
+        ("auth_status", {"addr": [REJECTED_AUTH_ADDRESS]}, (INVALID_ADDRESS,)),
+        ("auth_status", {"address": REJECTED_AUTH_ADDRESS}, (EXTRA_ARGUMENT,)),
+        ("auth_list", {"unexpected": REJECTED_AUTH_ADDRESS}, (EXTRA_ARGUMENT,)),
         (
             "account_positions",
             {"addr": {"nested": [{"value": REJECTED_URL}]}},
@@ -404,6 +489,9 @@ INVALID_ADDRESS = ("addr", "Input should be a valid string", "string_type")
         "extra-name",
         "extra-value",
         "wrong-type-array",
+        "auth-status-array-addr",
+        "auth-status-misspelled-address",
+        "auth-list-unexpected-argument",
         "nested-object",
         "missing-required",
         "long-string",
@@ -675,3 +763,102 @@ def test_stdout_failure_ends_session_with_stdin_open(
         stdio.proc.stdout.close()
         stdio.send("ping", id_=2)
         stdio.proc.wait(timeout=3)
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("account_overview", {"addr": ADDRESS}),
+        ("logs_intent", {"key": INTENT, "offline": True}),
+        ("logs_intent", {"key": INTENT, "offline": False}),
+    ],
+)
+def test_deferred_read_tools_accept_valid_arguments_without_requests(
+    native: Path, tmp_path: Path, tool: str, arguments: dict[str, Any]
+) -> None:
+    with (
+        loopback("normal") as endpoints,
+        server(native, tmp_path / "home", endpoints, seed="session") as stdio,
+    ):
+        result = stdio.call(2, tool, **arguments)
+        assert result["isError"] is False
+        text = result["content"][0]["text"]
+        assert result["structuredContent"] == {"result": text}
+        assert json.loads(text)["code"] == "NOT_IMPLEMENTED"
+        assert not endpoints.wire
+
+
+def test_auth_switch_keeps_rejected_arguments_private(
+    native: Path, tmp_path: Path
+) -> None:
+    marker = "synthetic-unregistered-mcp-auth-credential"
+    home = tmp_path / "home"
+    with (
+        loopback("normal") as endpoints,
+        server(native, home, endpoints, seed="accounts", logs=True) as stdio,
+    ):
+        result = stdio.call(2, "auth_use", addr=marker)
+        assert json.loads(result["content"][0]["text"])["error"].startswith(
+            "Requested account is not connected;"
+        )
+        rejected = stdio.call(3, "auth_use", addr={"value": marker})
+        assert rejected["isError"] is True
+        assert rejected["content"][0]["text"] == "Argument 'addr' must be a string."
+        assert not endpoints.wire
+        assert stdio.proc.stdin is not None and stdio.proc.stdout is not None
+        stdio.proc.stdin.close()
+        assert stdio.proc.wait(timeout=3) == 0
+        assert stdio.proc.stdout.read() == b""
+        assert stdio.proc.stderr is not None
+        assert marker.encode() not in stdio.proc.stderr.read()
+    logs = "".join(path.read_text() for path in (home / "sai/logs").glob("mcp-*.jsonl"))
+    assert "mcp.tool_call" in logs
+    assert "session.active" not in logs
+    assert marker not in json.dumps([result, rejected]) + logs
+
+
+def test_auth_switch_succeeds_after_legacy_cleanup_failure(
+    native: Path, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    with (
+        loopback("normal") as endpoints,
+        server(native, home, endpoints, seed="accounts") as stdio,
+    ):
+        legacy = home / "sai/trader/session.json"
+        legacy.mkdir()
+        switched = json.loads(
+            stdio.call(2, "auth_use", addr=ADDRESS)["content"][0]["text"]
+        )
+        assert [row["addr"] for row in switched["accounts"] if row["active"]] == [
+            ADDRESS
+        ]
+        status = json.loads(stdio.call(3, "auth_status")["content"][0]["text"])
+        assert status["addr"] == ADDRESS
+        assert legacy.is_dir()
+        assert not endpoints.wire
+        assert stdio.proc.stderr is not None
+        assert select.select([stdio.proc.stderr], [], [], 3)[0]
+        assert (
+            b"Could not remove legacy session file trader/session.json"
+            in stdio.proc.stderr.readline()
+        )
+
+
+def test_intent_wait_reports_unknown_when_account_lookup_is_locked(
+    native: Path, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    with (
+        loopback("normal") as endpoints,
+        server(native, home, endpoints, seed="ledger") as stdio,
+        closing(sqlite3.connect(home / "sai/trader/intents.sqlite3")) as database,
+    ):
+        database.execute("BEGIN EXCLUSIVE")
+        result = stdio.call(2, "intent_wait", key=INTENT)
+        report = json.loads(result["content"][0]["text"])
+        assert report["outcome"] == "unknown"
+        assert report["code"] == "OUTCOME_UNKNOWN"
+        assert report["addr"] is None
+        assert "addrSource" not in report
+        assert not endpoints.wire

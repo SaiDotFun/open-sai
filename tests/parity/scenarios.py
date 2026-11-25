@@ -103,6 +103,14 @@ from sai_cli.core import storage
 data = json.load(sys.stdin)
 for session in data["sessions"]:
     storage.save_session(session)
+if malformed_expiry := data["malformed_expiry"]:
+    accounts = storage.load_accounts()
+    session = accounts["sessions"][data["address"]]
+    if malformed_expiry == "missing":
+        del session["expiresAt"]
+    else:
+        session["expiresAt"] = 123
+    storage._save_accounts(accounts)
 if data["ledger"]:
     if data.get("accepted_blockers"):
         for key, kind, entity in (
@@ -257,12 +265,19 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         path.chmod(0o600)
         return
     sessions = []
-    if seed in {
+    malformed_expiry = {
+        "mcp-numeric-expiry": "numeric",
+        "mcp-missing-expiry": "missing",
+    }.get(seed)
+    if malformed_expiry or seed in {
         "session",
         "accounts",
         "doctor-near-expiry",
         "doctor-ledger-session",
         "history-token",
+        "mcp-auth-switch",
+        "mcp-auth-redaction",
+        "mcp-invalid-expiry",
         "invalid-expiry",
     }:
         sessions.append(session_fixture(endpoints, "session"))
@@ -270,10 +285,29 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
             sessions[0].update(expiresAt=endpoints.near_expiry, keyName="fixture-key")
         if seed == "history-token":
             sessions[0]["token"] = HISTORY_SESSION_TOKEN
-        if seed in {"accounts", "invalid-expiry"}:
+        if malformed_expiry or seed in {
+            "accounts",
+            "mcp-auth-switch",
+            "mcp-auth-redaction",
+            "invalid-expiry",
+            "mcp-invalid-expiry",
+        }:
             sessions.append({**sessions[0], "evmAddress": OTHER_ADDRESS})
-        if seed == "invalid-expiry":
+        if seed in {"invalid-expiry", "mcp-invalid-expiry"}:
             sessions[0]["expiresAt"] = "synthetic-expiry-credential-marker"
+        if malformed_expiry or seed == "mcp-invalid-expiry":
+            sessions.reverse()
+        if seed == "mcp-auth-redaction":
+            marker = "synthetic-session-origin-credential"
+            sessions[0].update(token=marker, expiresAt=endpoints.near_expiry)
+            sessions.append(
+                {
+                    **sessions[0],
+                    "evmAddress": OTHER_ADDRESS,
+                    "token": sessions[0]["expiresAt"],
+                    "endpoint": f"{endpoints.keeper}/{marker}",
+                }
+            )
     if seed in {"overview-session", "overview-expiry", "overview-blockers"}:
         session = session_fixture(endpoints, "session")
         expires_at = (
@@ -306,9 +340,20 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         ledger=seed
         in {"ledger", "doctor-ledger-session", "overview-session", "overview-blockers"},
         accepted_blockers=seed == "overview-blockers",
-        disable_logs=seed in {"doctor-near-expiry", "doctor-ledger-session"},
+        disable_logs=seed
+        in {
+            "doctor-near-expiry",
+            "doctor-ledger-session",
+            "mcp-auth-redaction",
+        },
+        malformed_expiry=malformed_expiry,
     )
-    if seed == "invalid-expiry":
+    if malformed_expiry or seed in {
+        "mcp-auth-switch",
+        "mcp-auth-redaction",
+        "invalid-expiry",
+        "mcp-invalid-expiry",
+    }:
         (sai_home / "trader" / "sessions.lock").chmod(0o600)
 
 
@@ -331,6 +376,7 @@ def write_seed(
     ledger: bool = False,
     accepted_blockers: bool = False,
     disable_logs: bool = False,
+    malformed_expiry: str | None = None,
 ) -> None:
     env = child_env(home, endpoints)
     if disable_logs:
@@ -340,6 +386,7 @@ def write_seed(
         input=json.dumps(
             {
                 "sessions": sessions,
+                "malformed_expiry": malformed_expiry,
                 "ledger": ledger,
                 "accepted_blockers": accepted_blockers,
                 "key": INTENT,
@@ -422,7 +469,7 @@ def loopback(
     }:
         trade["id"] = 8
     status = PROTOCOL["intent_status_response"]["data"]["userIntents"][0]
-    if scenario == "mcp-reads":
+    if scenario in {"mcp-reads", "mcp-wait-final"}:
         status = {**status, "txHash": TRADE_REQUEST_HASH}
     elif scenario == "mcp-pending-malformed-hash":
         status = {
@@ -529,6 +576,18 @@ def loopback(
 
     responses["intentTradeHistory"] = responses["tradeHistory"]
     responses["waitUserIntents"] = responses["userIntents"]
+    if scenario == "mcp-wait-final":
+        history.update(
+            tradeChangeType="position_closed_user", block={"block": status["execBlock"]}
+        )
+    elif scenario == "mcp-wait-pending":
+        responses["waitUserIntents"] = {
+            "data": {
+                "userIntents": [
+                    {**status, "intentKey": INTENT, "lifecycleStep": "pending_exec"}
+                ]
+            }
+        }
     variables = {
         "tradeHistory": {"trader": ADDRESS},
         "intentTradeHistory": {"trader": ADDRESS, "limit": 25, "offset": 0},
