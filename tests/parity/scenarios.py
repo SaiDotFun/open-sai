@@ -588,6 +588,9 @@ def loopback(
             "trigger_order_fee_p": "0",
         },
     }
+    if scenario == "partial-preview":
+        contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
+        contracts["market_order_config"]["fill_at_next_oracle_price"] = True
     if scenario in {"position-precision", "position-after-hours"}:
         trade.update(collateralAmount=10000003, leverage=2.1234567890123457)
         contracts["get_trade_raw"].update(

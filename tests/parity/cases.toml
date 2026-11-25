@@ -1450,11 +1450,11 @@ rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trad
 name = "trade-partial-close"
 args = ["--json","trade","partial-close","7","--percent","50","--dry-run"]
 seed = "session"
+server = "partial-preview"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "is_after_hours_market",
-    # The fixture has no oracle publication time, so the estimate stops here.
-    "get_collateral_price", "get_trade_raw", "get_perp_prices",
+    "get_collateral_price", "get_trade_raw", "get_perp_prices", "market_order_config",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 
@@ -1889,7 +1889,7 @@ wire = [
     "get_exchange_balance", "is_after_hours_market", "get_collateral_price",
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "is_after_hours_market", "get_collateral_price",
-    "get_trade_raw", "is_after_hours_market", "get_collateral_price",
+    "get_trade_raw", "is_after_hours_market", "get_perp_prices",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "error.message" = "Position changed; review the reduction again" }
@@ -1913,7 +1913,7 @@ wire = [
     "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
     "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
     "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
-    "get_collateral_price", "recordUserIntent",
+    "get_perp_prices", "recordUserIntent",
 ]
 state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted" }
 output = { "status" = "accepted" }
@@ -1938,7 +1938,7 @@ wire = [
     "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
     "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
     "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
-    "get_collateral_price",
+    "get_perp_prices",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "error.code" = "PREVIEW_MISMATCH", "error.details" = "<absent>", "error.message" = "The trade no longer matches the confirmed preview. Run with --dry-run to review a new preview before submitting." }
@@ -1963,7 +1963,7 @@ wire = [
     "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
     "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
     "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
-    "get_collateral_price",
+    "get_perp_prices",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "error.code" = "PREVIEW_MISMATCH", "error.details" = "<absent>", "error.message" = "The trade no longer matches the confirmed preview. Run with --dry-run to review a new preview before submitting." }
@@ -2001,7 +2001,7 @@ wire = [
     "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
     "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
     "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
-    "get_collateral_price", "recordUserIntent",
+    "get_perp_prices", "recordUserIntent",
 ]
 state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted", "trader/intents.sqlite3#tables.intents.rows.0.kind" = "DECREASE_POSITION_SIZE", "trader/intents.sqlite3#tables.intents.rows.0.entity" = "7", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }
 output = { "status" = "accepted", "intentKey" = "<intentKey 1>", "quote" = "<absent>", "txHash" = "<absent>" }
@@ -2027,11 +2027,11 @@ wire = [
     "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
     "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
     "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
-    "get_collateral_price", "recordUserIntent", "oneClickTrading", "node_info", "trade",
+    "get_perp_prices", "recordUserIntent", "oneClickTrading", "node_info", "trade",
     "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market",
     "get_collateral_price", "oneClickTrading", "node_info", "trade", "borrowing",
     "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_collateral_price",
-    "get_trade_raw", "is_after_hours_market", "get_collateral_price",
+    "get_trade_raw", "is_after_hours_market", "get_perp_prices",
 ]
 state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "unknown", "trader/intents.sqlite3#tables.intents.rows.0.kind" = "DECREASE_POSITION_SIZE", "trader/intents.sqlite3#tables.intents.rows.0.entity" = "7", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }
 output = { "first.error.code" = "OUTCOME_UNKNOWN", "first.error.intentKey" = "<intentKey 1>", "retry.error.code" = "INVALID_REQUEST", "retry.error.intentKey" = "<intentKey 1>" }
@@ -2083,7 +2083,7 @@ wire = [
     "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
     "is_after_hours_market", "get_collateral_price", "oneClickTrading", "node_info",
     "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market", "get_collateral_price",
+    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market", "get_perp_prices",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "1.result.content.0.text.previewDigest" = "fc78193a03ed172d039c5d4921de5ce92b9386c50bd0858e51c305909e3f1212", "2.result.content.0.text.code" = "PREVIEW_MISMATCH", "2.result.content.0.text.preview.previewDigest" = "9d1e0a934de703d77be13e9a3fe7f2586b7db77c848e7bac3af1858810d50fe7" }
