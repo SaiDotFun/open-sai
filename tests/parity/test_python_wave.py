@@ -21,7 +21,11 @@ def wave_clis(cli_pair: tuple[tuple[str, ...], tuple[str, ...]]) -> tuple[str, s
 
 
 def run_cli(
-    binary: str, home: Path, *args: str, overrides: dict[str, str] | None = None
+    binary: str,
+    home: Path,
+    *args: str,
+    overrides: dict[str, str] | None = None,
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = {
         "HOME": str(home),
@@ -34,7 +38,7 @@ def run_cli(
     env.update(overrides or {})
     return subprocess.run(
         [binary, *args],
-        cwd=home,
+        cwd=home if cwd is None else cwd,
         env=env,
         stdin=subprocess.DEVNULL,
         capture_output=True,
@@ -492,3 +496,50 @@ def test_mcp_install_reports_claude_extra_fields(
             if index == 1:
                 assert "http at https://fixture.invalid" in report["fix"]
                 assert "claude mcp add" not in report["fix"]
+
+
+@pytest.mark.parametrize("scope", ["user", "local"])
+def test_claude_install_uses_checkout_key_for_disablement(
+    wave_clis: tuple[str, str], tmp_path: Path, scope: str
+) -> None:
+    for index, binary in enumerate(wave_clis):
+        home = tmp_path / str(index)
+        checkout = home / "checkout"
+        child = checkout / "nested"
+        child.mkdir(parents=True)
+        subprocess.run(
+            ["git", "-C", str(checkout), "init", "--quiet"],
+            env={"HOME": str(home), "PATH": os.defpath},
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+        overrides = {"PATH": os.defpath}
+        seed_clients(home, overrides, "current")
+        config = home / ".claude.json"
+        data = json.loads(config.read_text())
+        data["projects"] = {
+            str(checkout): {
+                "disabledMcpServers": ["sai"],
+                "mcpServers": data["mcpServers"],
+            }
+        }
+        config.write_text(json.dumps(data))
+        original = config.read_bytes()
+        result = run_cli(
+            binary,
+            home,
+            "--json",
+            "mcp",
+            "install",
+            "claude",
+            "--scope",
+            scope,
+            overrides=overrides,
+            cwd=child,
+        )
+        assert result.returncode == 1
+        assert config.read_bytes() == original
+        assert not (home / "argv.jsonl").exists()
+        [report] = json.loads(result.stdout)["error"]["details"]["results"]
+        assert f"disabled the {scope} sai registration" in report["error"]

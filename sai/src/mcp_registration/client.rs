@@ -111,12 +111,21 @@ impl Client {
                 .collect());
         };
         let project = read_json(&self.path(Scope::Project, home, cwd), deadline)?;
-        let local = &user["projects"][cwd.to_string_lossy().as_ref()];
+        let checkout = (self == Self::Claude).then(|| claude_checkout_key(home, cwd, deadline));
+        let local = checkout.as_ref().map_or(&Value::Null, |path| {
+            &user["projects"][path.to_string_lossy().as_ref()]
+        });
         let disabled = self == Self::Claude && has_name(&local["disabledMcpServers"], name);
         let project_entry = &project["mcpServers"][name];
         let project_disabled = self == Self::Claude
             && project_entry.is_object()
-            && claude_project_disabled(home, cwd, name, deadline)?;
+            && claude_project_disabled(
+                home,
+                cwd,
+                checkout.as_deref().unwrap_or(cwd),
+                name,
+                deadline,
+            )?;
         let entries = [
             (Scope::Local, &local["mcpServers"][name], disabled),
             (Scope::Project, project_entry, project_disabled),
@@ -184,8 +193,18 @@ impl Client {
             .map(|_| ());
         }
         let update = old.map_or(JsonUpdate::Install, JsonUpdate::Repair);
-        self.write_json(&path, cwd, scope, name, target, update, deadline)
-            .map(|_| ())
+        let checkout = (self == Self::Claude && scope == Scope::Local)
+            .then(|| claude_checkout_key(home, cwd, deadline));
+        self.write_json(
+            &path,
+            checkout.as_deref().unwrap_or(cwd),
+            scope,
+            name,
+            target,
+            update,
+            deadline,
+        )
+        .map(|_| ())
     }
 
     pub(super) fn repair_cursor(
@@ -389,12 +408,7 @@ fn has_name(value: &Value, name: &str) -> bool {
         .is_some_and(|items| items.iter().any(|item| item == name))
 }
 
-fn claude_project_disabled(home: &Path, cwd: &Path, name: &str, deadline: Instant) -> Result<bool> {
-    let mut paths = vec![
-        Client::Claude.directory(home).join("settings.json"),
-        cwd.join(".claude/settings.json"),
-        cwd.join(".claude/settings.local.json"),
-    ];
+fn claude_checkout_key(home: &Path, cwd: &Path, deadline: Instant) -> PathBuf {
     if let Ok((status, output, _)) = invoke(
         &[
             "git".into(),
@@ -419,21 +433,42 @@ fn claude_project_disabled(home: &Path, cwd: &Path, name: &str, deadline: Instan
             let root = Path::new(std::ffi::OsStr::from_bytes(root));
             if root.is_absolute()
                 && root != home
-                && root != cwd
                 && !lines.any(|line| line == b"bare")
-                && [root.to_owned(), root.join(".git"), root.join(".claude")]
-                    .iter()
-                    .all(|path| {
-                        use std::os::unix::fs::MetadataExt;
-                        match path.metadata() {
-                            Ok(meta) => meta.uid() == rustix::process::getuid().as_raw(),
-                            Err(error) => error.kind() == io::ErrorKind::NotFound,
-                        }
-                    })
+                && owned_checkout(root)
             {
-                paths.push(root.join(".claude/settings.local.json"));
+                return root.to_owned();
             }
         }
+    }
+    cwd.ancestors()
+        .find(|path| path.join(".git/HEAD").is_file() || path.join(".git").is_file())
+        .unwrap_or(cwd)
+        .to_owned()
+}
+
+fn owned_checkout(root: &Path) -> bool {
+    [root.to_owned(), root.join(".git"), root.join(".claude")]
+        .iter()
+        .all(|path| match path.metadata() {
+            Ok(meta) => meta.uid() == rustix::process::getuid().as_raw(),
+            Err(error) => error.kind() == io::ErrorKind::NotFound,
+        })
+}
+
+fn claude_project_disabled(
+    home: &Path,
+    cwd: &Path,
+    checkout: &Path,
+    name: &str,
+    deadline: Instant,
+) -> Result<bool> {
+    let mut paths = vec![
+        Client::Claude.directory(home).join("settings.json"),
+        cwd.join(".claude/settings.json"),
+        cwd.join(".claude/settings.local.json"),
+    ];
+    if checkout != cwd && checkout != home && owned_checkout(checkout) {
+        paths.push(checkout.join(".claude/settings.local.json"));
     }
     for path in paths {
         if has_name(&read_json(&path, deadline)?["disabledMcpjsonServers"], name) {
