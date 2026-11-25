@@ -131,6 +131,32 @@ impl Target {
     }
 }
 
+fn reported_argv(args: &[String]) -> Vec<String> {
+    args.iter()
+        .map(|arg| {
+            let (flag, value) = arg
+                .split_once('=')
+                .filter(|(flag, _)| flag.starts_with('-'))
+                .map_or((None, arg.as_str()), |(flag, value)| (Some(flag), value));
+            if ["http://", "https://", "ws://", "wss://"]
+                .iter()
+                .any(|scheme| {
+                    value
+                        .get(..scheme.len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+                })
+            {
+                let origin = sai_core::log::origin(value);
+                if let Some(flag) = flag {
+                    return format!("{flag}={origin}");
+                }
+                return origin;
+            }
+            arg.clone()
+        })
+        .collect()
+}
+
 struct Registration {
     // Codex compares the complete replies, ignoring key order. JSON
     // adapters use the original entry to detect an edit during repair.
@@ -204,7 +230,7 @@ impl Registration {
 
     fn report(&self, target: Option<&Target>) -> Value {
         let mut out = if let Some(target) = target.filter(|target| self.matches_command(target)) {
-            json!({"command": target.argv})
+            json!({"command": reported_argv(&target.argv)})
         } else if let Some(command) = self.argv.first() {
             let mut out = json!({"command": [basename(command)]});
             if self.argv.len() > 1 {
@@ -1236,7 +1262,7 @@ impl Clients {
         dry: bool,
     ) -> RegistrationResult {
         let mut result = RegistrationResult::new(client, scope);
-        result.report["command"] = json!(target.argv);
+        result.report["command"] = json!(reported_argv(&target.argv));
         if let Err(error) = self.install_one(client, scope, target, dry, &mut result) {
             result.failed(error);
         }
@@ -1327,7 +1353,7 @@ impl Clients {
             }
             add.push("--".into());
             add.extend(target.argv.iter().cloned());
-            result.report["argv"] = json!([add]);
+            result.report["argv"] = json!([reported_argv(&add)]);
             step = Some(add);
         } else {
             result.report["path"] = json!(client.path(scope, &self.home, self.cwd()));

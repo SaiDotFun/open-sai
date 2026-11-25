@@ -421,3 +421,34 @@ def test_mcp_install_rejects_unusable_absolute_launcher(
         )
         assert cursor["changed"] is False
         assert (home / ".cursor/mcp.json").read_bytes() == original[".cursor/mcp.json"]
+
+
+@pytest.mark.parametrize("flag_style", ["separate", "inline"])
+def test_mcp_install_dry_run_redacts_endpoint_query(
+    wave_clis: tuple[str, str], tmp_path: Path, flag_style: str
+) -> None:
+    _, rust = wave_clis
+    overrides = {"PATH": os.defpath}
+    seed_clients(tmp_path, overrides, "empty")
+    endpoint = "https://fixture.invalid/api?token=synthetic-private-query"
+    flag = (
+        ["--endpoint", endpoint]
+        if flag_style == "separate"
+        else [f"--endpoint={endpoint}"]
+    )
+    prefix = ("--json", "mcp", "install", "claude")
+    command = (str(tmp_path / "bin/sai"), "mcp", "serve", *flag)
+    planned = run_cli(
+        rust, tmp_path, *prefix, "--dry-run", "--", *command, overrides=overrides
+    )
+    assert planned.returncode == 0
+    assert "synthetic-private-query" not in planned.stdout + planned.stderr
+    [result] = json.loads(planned.stdout)["results"]
+    expected = flag[-1].replace(endpoint, "https://fixture.invalid")
+    assert result["command"][-1] == result["argv"][0][-1] == expected
+    assert not (tmp_path / ".claude.json").exists()
+    installed = run_cli(rust, tmp_path, *prefix, "--", *command, overrides=overrides)
+    assert installed.returncode == 0
+    assert "synthetic-private-query" not in installed.stdout + installed.stderr
+    entry = json.loads((tmp_path / ".claude.json").read_text())["mcpServers"]["sai"]
+    assert entry["args"] == list(command[1:])
