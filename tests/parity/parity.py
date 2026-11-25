@@ -484,6 +484,7 @@ def observe(
         fixture_values = {
             urlsplit(endpoints.http).netloc: "<fixture-http>",
             urlsplit(endpoints.ws).netloc: "<fixture-ws>",
+            urlsplit(endpoints.http).path: "<fixture-route>",
             endpoints.near_expiry: "<fixture-near-expiry>",
             endpoints.overview_expiry: "<fixture-overview-expiry>",
         }
@@ -552,6 +553,19 @@ def observe(
     }
     if case.command == "account overview" and case.mode == "json":
         display = mask_overview_stdout(display, case.mode)
+    if cutover and endpoints.overview_times is not None:
+        risk_time, mark_time = endpoints.overview_times
+        clocks = Normalize(
+            home,
+            fixture_values={
+                risk_time: "<fixture-risk-time>",
+                mark_time: "<fixture-mark-time>",
+            },
+        )
+        # Validate the timestamps and their ages in stdout before replacing
+        # the two source times allocated by the overview fixture.
+        output = clocks.paths(output)
+        display = clocks.text(display)
     raw = None
     if exact:
         raw = (
