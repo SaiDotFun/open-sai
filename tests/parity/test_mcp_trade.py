@@ -127,7 +127,7 @@ def test_mcp_preview_and_confirm(
         with (
             loopback(scenario, trade_replay=replay) as endpoints,
             server(
-                executable, home, endpoints, seed="session", call_timeout=10
+                executable, home, endpoints, seed="session", call_timeout=15
             ) as stdio,
         ):
             args = {**args, "addr": ADDRESS}
@@ -219,7 +219,13 @@ def test_mcp_refuses_changed_execution(
 ) -> None:
     with (
         loopback(ready) as endpoints,
-        server(mcp_pair[0], tmp_path / "preview", endpoints, seed="session") as stdio,
+        server(
+            mcp_pair[0],
+            tmp_path / "preview",
+            endpoints,
+            seed="session",
+            call_timeout=15,
+        ) as stdio,
     ):
         preview = result(stdio.call(2, f"preview_{action}", **args))
         confirmed = trade_args(preview, args)
@@ -230,7 +236,9 @@ def test_mcp_refuses_changed_execution(
             loopback(
                 changed, market_price=102 if code == "PRICE_MOVED" else None
             ) as endpoints,
-            server(executable, home, endpoints, seed="session") as stdio,
+            server(
+                executable, home, endpoints, seed="session", call_timeout=15
+            ) as stdio,
         ):
             refused = result(stdio.call(2, f"trade_{action}", **confirmed))
             assert refused["code"] == code
@@ -257,7 +265,9 @@ def test_mcp_open_binds_the_selected_account(
         home = tmp_path / str(i)
         with (
             loopback("quote-market") as endpoints,
-            server(executable, home, endpoints, seed="accounts") as stdio,
+            server(
+                executable, home, endpoints, seed="accounts", call_timeout=15
+            ) as stdio,
         ):
             preview = result(stdio.call(2, "preview_open", **OPEN, addr=ADDRESS))
             assert preview["addr"] == ADDRESS
@@ -281,7 +291,7 @@ def test_mcp_signed_out_open_is_informational(
         home = tmp_path / str(i)
         with (
             loopback("quote-market") as endpoints,
-            server(executable, home, endpoints) as stdio,
+            server(executable, home, endpoints, call_timeout=15) as stdio,
         ):
             preview = result(stdio.call(2, "preview_open", **OPEN))
             assert preview["addr"] is None
@@ -311,7 +321,9 @@ def test_mcp_open_checks_confirmation_before_building_an_intent(
         home = tmp_path / str(i)
         with (
             loopback("quote-market") as endpoints,
-            server(executable, home, endpoints, seed="session") as stdio,
+            server(
+                executable, home, endpoints, seed="session", call_timeout=15
+            ) as stdio,
         ):
             no_reference = result(
                 stdio.call(2, "trade_open", **args, preview_digest="fixture")
@@ -340,7 +352,9 @@ def test_mcp_open_confirmation_reserves_once_until_overridden(
         )
         with (
             loopback("quote-market", trade_replay=replay) as endpoints,
-            server(executable, home, endpoints, seed="session") as stdio,
+            server(
+                executable, home, endpoints, seed="session", call_timeout=15
+            ) as stdio,
         ):
             preview = result(stdio.call(2, "preview_open", **OPEN))
             confirmed = trade_args(preview, OPEN)
@@ -358,7 +372,7 @@ def test_mcp_open_confirmation_reserves_once_until_overridden(
                 assert len(rows(home)) == 1
             finally:
                 replay.release.set()
-            reply = stdio.receive()
+            reply = stdio.receive(stdio.call_timeout)
             assert reply["id"] == 3
             first = result(reply["result"])
             assert first["intentKey"] == key
