@@ -8,25 +8,13 @@ use serde_json::{Map, Value};
 
 const PYDANTIC_ERRORS: &str = "https://errors.pydantic.dev/2.14/v";
 
-pub(super) fn arguments(
-    tool: &Tool,
-    mut args: Map<String, Value>,
-) -> Result<Map<String, Value>, String> {
+pub(super) fn arguments<'a>(
+    tool: &'a Tool,
+    args: &Map<String, Value>,
+) -> Result<Vec<(String, Value)>, Rejected<'a>> {
     let properties = tool.input_schema["properties"]
         .as_object()
         .expect("tool properties");
-    for (name, schema) in properties {
-        // FastMCP interprets JSON containers and null for fields other than
-        // plain strings. In particular, an optional address of "null" is null.
-        if schema["type"] != "string"
-            && let Some(value) = args.get_mut(name)
-            && let Some(text) = value.as_str()
-            && let Ok(parsed @ (Value::Null | Value::Array(_) | Value::Object(_))) =
-                serde_json::from_str(text)
-        {
-            *value = parsed;
-        }
-    }
     let required = tool.input_schema.get("required").and_then(Value::as_array);
     let mut issues = Vec::new();
     let mut converted = Vec::new();
@@ -37,8 +25,17 @@ pub(super) fn arguments(
             }
             continue;
         };
+        // FastMCP interprets JSON containers and null for fields other than
+        // plain strings. Keep the original value available for log metadata.
+        let parsed = value
+            .as_str()
+            .filter(|_| schema["type"] != "string")
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .filter(|value| matches!(value, Value::Null | Value::Array(_) | Value::Object(_)));
+        let value = parsed.as_ref().unwrap_or(value);
         let schema = if let Some(alternatives) = schema.get("anyOf").and_then(Value::as_array) {
             if value.is_null() {
+                converted.extend(parsed.map(|value| (name.clone(), value)));
                 continue;
             }
             &alternatives[0]
@@ -66,8 +63,9 @@ pub(super) fn arguments(
             _ => Ok(None),
         };
         match conversion {
-            Ok(Some(value)) => converted.push((name.clone(), value)),
-            Ok(None) => {}
+            Ok(replacement) => {
+                converted.extend(replacement.or(parsed).map(|value| (name.clone(), value)))
+            }
             Err((message, code)) => issues.push(Issue::new(Some(name), message, code)),
         }
     }
@@ -80,40 +78,52 @@ pub(super) fn arguments(
             ));
         }
     }
-    let Some(first) = issues.first() else {
-        args.extend(converted);
-        return Ok(args);
-    };
-    if tool.name == "logs_intent" {
-        return Err(match first.field {
-            Some("key") => "Argument 'key' must be a string.",
-            Some("offline") => "Argument 'offline' must be a boolean.",
-            Some("addr") => "Argument 'addr' must be a string or null.",
-            Some("before") => "Argument 'before' must be a string or null.",
-            _ => "Expected audit arguments 'key' (a string), 'offline' (a boolean), 'addr' (a string or null), 'before' (a string or null).",
-        }.into());
+    if issues.is_empty() {
+        Ok(converted)
+    } else {
+        Err(Rejected(issues))
     }
-    let count = issues.len();
-    let plural = if count == 1 { "" } else { "s" };
-    let mut message = format!(
-        "Error executing tool {}: {count} validation error{plural} for {}Arguments",
-        tool.name, tool.name,
-    );
-    for Issue {
-        field,
-        message: detail,
-        code,
-    } in issues
-    {
-        if let Some(field) = field {
-            let _ = write!(message, "\n{field}");
+}
+
+pub(super) struct Rejected<'a>(Vec<Issue<'a>>);
+
+impl Rejected<'_> {
+    pub(super) fn field(&self, name: &str) -> bool {
+        self.0.iter().any(|issue| issue.field == Some(name))
+    }
+
+    pub(super) fn message(self, tool: &Tool) -> String {
+        if tool.name == "logs_intent" {
+            return match self.0[0].field {
+                Some("key") => "Argument 'key' must be a string.",
+                Some("offline") => "Argument 'offline' must be a boolean.",
+                Some("addr") => "Argument 'addr' must be a string or null.",
+                Some("before") => "Argument 'before' must be a string or null.",
+                _ => "Expected audit arguments 'key' (a string), 'offline' (a boolean), 'addr' (a string or null), 'before' (a string or null).",
+            }.into();
         }
-        let _ = write!(
-            message,
-            "\n  {detail} [type={code}]\n    For further information visit {PYDANTIC_ERRORS}/{code}",
+        let count = self.0.len();
+        let plural = if count == 1 { "" } else { "s" };
+        let mut message = format!(
+            "Error executing tool {}: {count} validation error{plural} for {}Arguments",
+            tool.name, tool.name,
         );
+        for Issue {
+            field,
+            message: detail,
+            code,
+        } in self.0
+        {
+            if let Some(field) = field {
+                let _ = write!(message, "\n{field}");
+            }
+            let _ = write!(
+                message,
+                "\n  {detail} [type={code}]\n    For further information visit {PYDANTIC_ERRORS}/{code}",
+            );
+        }
+        message
     }
-    Err(message)
 }
 
 struct Issue<'a> {

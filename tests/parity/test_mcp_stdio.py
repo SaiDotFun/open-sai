@@ -369,6 +369,59 @@ def test_validation_omits_rejected_input(
         assert not endpoints.wire
 
 
+def test_rejected_arguments_are_logged_as_metadata(
+    native: Path, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    credential = "fixture-opaque-preview-credential"
+    numeric = 21873.625
+    unknown_name = "fixture-private-field-name"
+    unknown_value = "fixture-unknown-argument-value"
+    with (
+        loopback("normal") as endpoints,
+        server(native, home, endpoints, logs=True) as stdio,
+    ):
+        first = stdio.call(
+            2,
+            "preview_close",
+            trade_id=credential,
+            addr=ADDRESS,
+            **{unknown_name: {"nested": [unknown_value]}},
+        )
+        assert first["isError"] is True
+        refused = stdio.call(3, "preview_close", trade_id=numeric)
+        assert refused["isError"] is True
+        signed_out = stdio.call(4, "trade_close", trade_id=credential)
+        assert signed_out["isError"] is False
+        assert json.loads(signed_out["content"][0]["text"])["code"] == "SIGNED_OUT"
+        assert not endpoints.wire
+
+        assert stdio.proc.stdin is not None
+        stdio.proc.stdin.close()
+        assert stdio.proc.wait(timeout=3) == 0
+        assert stdio.proc.stderr is not None
+        stderr = stdio.proc.stderr.read().decode()
+
+    logs = (home / "sai" / "logs").glob("*.jsonl")
+    log_lines = [line for log in logs for line in log.read_text().splitlines()]
+    for rejected in (credential, str(numeric), unknown_name, unknown_value):
+        assert rejected not in stderr
+        assert all(rejected not in line for line in log_lines)
+    events = [json.loads(line) for line in log_lines]
+    calls = [event for event in events if event["event"] == "mcp.tool_call"]
+    assert [call["tool"] for call in calls] == [
+        "preview_close",
+        "preview_close",
+        "trade_close",
+    ]
+    string_metadata = {"type": "string", "length": len(credential)}
+    assert calls[0]["arguments"] == {"trade_id": string_metadata, "addr": ADDRESS}
+    assert calls[0]["unknownArguments"] == 1
+    assert calls[0]["unknownArgumentMetadata"] == [{"type": "object", "length": 1}]
+    assert calls[1]["arguments"] == {"trade_id": {"type": "number", "length": 1}}
+    assert calls[2]["arguments"] == {"trade_id": string_metadata}
+
+
 def test_local_ledger_read_while_keeper_reconciliation_is_busy(
     native: Path, tmp_path: Path
 ) -> None:
