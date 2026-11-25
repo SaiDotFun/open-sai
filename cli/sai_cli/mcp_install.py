@@ -22,7 +22,7 @@ import sys
 import tempfile
 import tomllib
 from collections.abc import Callable, Mapping, MutableMapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -46,6 +46,8 @@ UNINSTALL_SCOPES = ("user", "project", "local")
 SUBPROCESS_TIMEOUT = 60
 INSTALL_URL = "git+https://github.com/SaiDotFun/open-sai"
 ENDPOINT_FLAGS = {spec.flag: spec.key for spec in settings.SETTINGS if spec.flag}
+CLAUDE_ARG_PLACEHOLDER = "<original-argument>"
+CLAUDE_HOME_PLACEHOLDER = "<original-SAI_HOME>"
 
 
 class InstallError(Exception):
@@ -148,6 +150,7 @@ class Result:
     path: str | None = None
     would: str | None = None
     error: str | None = None
+    fix: str | None = None
     scope: str | None = None
     shadowed_by: str | None = None
     # A client config was written, even if the check afterwards failed.
@@ -167,6 +170,7 @@ class Result:
             "path",
             "shadowed_by",
             "error",
+            "fix",
         ):
             value = getattr(self, key)
             if value is not None:
@@ -189,6 +193,14 @@ class ClaudeRepair:
     scope: str
     name: str
     reset_args: bool = False
+    replace_entry: bool = False
+    sai_home: str | None = None
+    config_path: Path | None = None
+    fields: tuple[str, ...] = ()
+    launcher: str | None = None
+    launcher_args: tuple[str, ...] = ()
+    server_args: tuple[str, ...] | None = None
+    extra_env: int = 0
 
 
 @dataclass(frozen=True)
@@ -201,23 +213,145 @@ class RegistrationCheck:
     pinned: bool = False
     legacy_name: bool = False
     manual_repairs: tuple[ClaudeRepair, ...] = ()
+    disabled: bool = False
 
 
 def claude_repair_hint(entries: tuple[ClaudeRepair, ...]) -> str:
-    commands = [
-        f"`sai mcp install --client claude --scope {entry.scope}"
-        f" --repair-existing {entry.name}"
-        f"{' --reset-args' if entry.reset_args else ''}`"
-        for entry in entries
-    ]
-    hint = "Run " + " and ".join(commands) + "."
-    if any(entry.scope != "user" for entry in entries):
-        hint += " Run project and local commands from the project directory."
-    if any(entry.reset_args for entry in entries):
-        hint += (
-            " The --reset-args flag replaces unsupported arguments with the defaults."
+    hints = []
+    for entry in entries:
+        if entry.replace_entry:
+            label = f"{entry.scope} {entry.name} entry"
+            source = f" in {entry.config_path}" if entry.config_path is not None else ""
+            fields = f" in {', '.join(entry.fields)}" if entry.fields else ""
+            hint = f"The {label}{source} differs{fields}."
+            if (
+                entry.launcher is None
+                or not os.path.isabs(entry.launcher)
+                or entry.server_args is None
+            ):
+                hints.append(
+                    hint + " Run `sai doctor` for current replacement instructions."
+                )
+                continue
+            profile = (
+                [f"--env=SAI_HOME={entry.sai_home}"]
+                if entry.sai_home is not None
+                else []
+            )
+            add = shlex.join(
+                [
+                    "claude",
+                    "mcp",
+                    "add",
+                    "--scope",
+                    entry.scope,
+                    entry.name,
+                    *profile,
+                    *(["--env=<NAME>=<value>"] * entry.extra_env),
+                    "--",
+                    entry.launcher,
+                    *entry.launcher_args,
+                    *entry.server_args,
+                ]
+            )
+            launcher = shlex.quote(entry.launcher)
+            check = f"test -f {launcher} && test -x {launcher}"
+            if (
+                entry.sai_home == CLAUDE_HOME_PLACEHOLDER
+                or entry.extra_env
+                or any(CLAUDE_ARG_PLACEHOLDER in arg for arg in entry.server_args)
+            ):
+                hint += (
+                    "\nFill in the placeholders from the existing config before removing the entry."
+                    " You can edit just the launcher in the config to keep those settings in place."
+                )
+            hints.append(
+                f"{hint}\nRun `{check}` before removing the entry. Continue only if it succeeds.\n"
+                f"Remove the existing {label} in Claude from the project"
+                f" directory you normally use, then run `{add}`."
+            )
+            continue
+        hint = (
+            f"Run `sai mcp install --client claude --scope {entry.scope}"
+            f" --repair-existing {entry.name}"
+            f"{' --reset-args' if entry.reset_args else ''}`."
         )
-    return hint
+        if entry.scope != "user":
+            hint += " Run this from the project directory."
+        if entry.reset_args:
+            hint += " The --reset-args flag replaces unsupported arguments with the defaults."
+        hints.append(hint)
+    return " ".join(hints)
+
+
+def claude_differing_fields(existing: Registration, target: Target) -> tuple[str, ...]:
+    fields = []
+    if not existing.argv or normalize_launcher(existing.argv[0]) != normalize_launcher(
+        target.argv[0]
+    ):
+        fields.append("command")
+    if existing.argv[1:] != target.argv[1:]:
+        fields.append("args")
+    if existing.stale_env or not existing.matches_sai_home(target.env):
+        fields.append("env")
+    return (*fields, *existing.extra_settings)
+
+
+def claude_advice_home(
+    reg: Registration, requested: str | None, *, show_saved: bool = False
+) -> str | None:
+    if reg.invalid_sai_home:
+        return None
+    if reg.sai_home is None:
+        return requested
+    if show_saved or reg.sai_home == requested:
+        return reg.sai_home
+    return CLAUDE_HOME_PLACEHOLDER
+
+
+def report_different_claude_entry(
+    client: Claude, result: Result, existing: Registration, target: Target
+) -> Result:
+    launcher = target.argv[0]
+    launcher_args: tuple[str, ...] = ()
+    if target.explicit_command:
+        # An explicit override can contain private arguments or paths.
+        default_launcher = shutil.which("sai", path=client.environ.get("PATH"))
+        spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+        if (
+            default_launcher is None
+            and spec is not None
+            and spec.name == "sai_cli.__main__"
+        ):
+            launcher = os.path.abspath(sys.executable)
+            launcher_args = ("-m", "sai_cli")
+        else:
+            launcher = os.path.abspath(default_launcher or sys.argv[0])
+    scope = existing.scope
+    path = client.registration_path(scope)
+    entry = ClaudeRepair(
+        scope,
+        NAME,
+        replace_entry=True,
+        sai_home=claude_advice_home(existing, target.env.get("SAI_HOME")),
+        config_path=path,
+        fields=claude_differing_fields(existing, target),
+        launcher=launcher,
+        launcher_args=launcher_args,
+        server_args=claude_advice_args(existing),
+        extra_env=len(existing.stale_env) + existing.invalid_sai_home,
+    )
+    hint = claude_repair_hint((entry,))
+    if target.explicit_command:
+        hint += (
+            " For a custom launcher, substitute your requested command after --"
+            " and use its executable in the check."
+        )
+    result.command = None
+    result.path = str(path)
+    result.error = f"The existing {scope} Claude Code sai registration differs from the requested settings"
+    result.fix = hint
+    return result
 
 
 def normalize_client(name: str) -> str:
@@ -557,34 +691,90 @@ class Claude(Client):
         configured = self.environ.get("CLAUDE_CONFIG_DIR")
         return (Path(configured) if configured else self.home) / ".claude.json"
 
+    def registration_path(self, scope: str) -> Path:
+        if scope == "project":
+            if self.cwd is None:
+                raise ClientError("No working directory for the project registration")
+            return self.cwd / ".mcp.json"
+        return self.config_path().absolute()
+
+    def scope_directory(self, scope: str) -> Path | None:
+        if self.cwd is None or scope == "user":
+            return None
+        if scope != "local":
+            return self.cwd
+        if main := self.main_checkout():
+            return main
+        # Claude resolves a local registration launched inside a repository
+        # to the checkout root, including when invoked from a subdirectory.
+        git = shutil.which("git", path=self.environ.get("PATH"))
+        if git is not None:
+            try:
+                result = subprocess.run(
+                    [git, "rev-parse", "--show-toplevel"],
+                    cwd=self.cwd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    check=False,
+                )
+                root = Path(os.fsdecode(result.stdout.removesuffix(b"\n")))
+                if result.returncode == 0 and root.is_absolute():
+                    return root
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        return next(
+            (
+                path
+                for path in (self.cwd, *self.cwd.parents)
+                if (path / ".git" / "HEAD").is_file() or (path / ".git").is_file()
+            ),
+            self.cwd,
+        )
+
     def registrations(self, name: str = NAME) -> list[Registration]:
         # Never `claude mcp get`: it starts the server to check its health.
         data = load_json(self.config_path())
         projects = (data or {}).get("projects")
-        projects = projects if isinstance(projects, dict) else {}
-        project = projects.get(str(self.cwd)) if self.cwd is not None else None
-        project = project if isinstance(project, dict) else {}
-        toggle_project = (
-            projects.get(str(self.main_checkout() or self.cwd)) if projects else None
+        project_dir = self.scope_directory("local")
+        project = (
+            projects.get(str(project_dir))
+            if project_dir is not None and isinstance(projects, dict)
+            else None
         )
-        toggle_project = toggle_project if isinstance(toggle_project, dict) else {}
-        toggled_off = toggle_project.get("disabledMcpServers")
+        project = project if isinstance(project, dict) else None
+        toggled_off = (project or {}).get("disabledMcpServers")
         disabled = isinstance(toggled_off, list) and name in toggled_off
         found = []
         user = servers(data).get(name)
         if user is not None:
-            found.append(entry_registration(user, "user", disabled))
+            found.append(self.read_entry(user, "user", name, disabled))
         if self.cwd is None:
             return self.ordered([r for r in found if r is not None])
         local = servers(project).get(name)
         if local is not None:
-            found.append(entry_registration(local, "local", disabled))
+            found.append(self.read_entry(local, "local", name, disabled))
         shared = servers(load_json(self.cwd / ".mcp.json")).get(name)
         if shared is not None:
             found.append(
-                entry_registration(shared, "project", self.project_disabled(name))
+                self.read_entry(shared, "project", name, self.project_disabled(name))
             )
         return self.ordered([r for r in found if r is not None])
+
+    @staticmethod
+    def read_entry(
+        entry: Any, scope: str, name: str, disabled: bool
+    ) -> Registration | None:
+        extras = []
+        if name == NAME and isinstance(entry, dict):
+            known = ("cwd", "url", "headers")
+            extras.extend(key for key in known if key in entry)
+            if entry.get("type", "stdio") != "stdio":
+                extras.append("type")
+            if entry.keys() - {"type", "command", "args", "env", *known}:
+                extras.append("custom settings")
+        return entry_registration(entry, scope, disabled, extra_settings=tuple(extras))
 
     def project_disabled(self, name: str) -> bool:
         assert self.cwd is not None
@@ -901,13 +1091,6 @@ def list_clients(
     return rows
 
 
-def replacement_steps(
-    client: Client, scope: str, target: Target, exists: bool
-) -> list[list[str]]:
-    remove = client.remove_steps(scope) if exists else []
-    return [*remove, *client.add_steps(scope, target)]
-
-
 def report_legacy_install(client: Client, reg: Registration, target: Target) -> Result:
     result = Result(
         client.name,
@@ -953,6 +1136,7 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
             if legacy is not None:
                 return report_legacy_install(client, legacy, target)
         elif isinstance(client, Claude) and existing.disabled:
+            result.command = None
             raise ClientError(
                 f"Claude Code has disabled the {existing.scope} sai registration. "
                 "Review MCP approvals and settings in the client."
@@ -969,12 +1153,14 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
         if existing is not None and existing.matches(target):
             result.action = "unchanged"
             return result
+        if isinstance(client, Claude) and existing is not None:
+            return report_different_claude_entry(client, result, existing, target)
         action = "added" if existing is None else "replaced"
         if isinstance(client, (Codex, Cursor)):
             result.path = str(client.config_path(scope))
             steps: list[list[str]] = []
         else:
-            steps = replacement_steps(client, scope, target, existing is not None)
+            steps = client.add_steps(scope, target)
             result.argv = steps
         if dry_run:
             result.action, result.would = "planned", action
@@ -984,9 +1170,6 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
         else:
             for argv in steps:
                 run(argv)
-                # Set per step: a remove that ran before a failed add still
-                # changed the client.
-                result.changed = True
         result.changed = True
         client.verify(scope, target)
         result.action = action
@@ -1107,6 +1290,29 @@ def serves_mcp(args: list[str]) -> bool:
         return False
     command = command[2:] if command[1:2] == ["--"] else command[1:]
     return command[:1] == ["serve"] and after_server_options(command[1:]) == []
+
+
+def claude_advice_args(reg: Registration) -> tuple[str, ...]:
+    """Keep argument shape while leaving private values in the saved config."""
+    args = reg.argv[1:]
+    prefixed = ["mcp", "serve", *args]
+    if not serves_mcp(args) and serves_mcp(prefixed):
+        args = prefixed
+    rendered = []
+    expects_value = False
+    for arg in args:
+        flag, equals, _ = arg.partition("=")
+        if expects_value:
+            rendered.append(CLAUDE_ARG_PLACEHOLDER)
+            expects_value = False
+        elif flag in ENDPOINT_FLAGS or flag == "--as":
+            rendered.append(f"{flag}={CLAUDE_ARG_PLACEHOLDER}" if equals else flag)
+            expects_value = not equals
+        elif arg in {"mcp", "serve", "--json", "--"}:
+            rendered.append(arg)
+        else:
+            rendered.append(CLAUDE_ARG_PLACEHOLDER)
+    return tuple(rendered)
 
 
 def stale_registration(
@@ -1380,7 +1586,12 @@ def read_client_config(client: Client, scope: str, path: Path) -> ClientConfig:
     holder = data
     if scope == "local":
         projects = data.get("projects", {})
-        holder = projects.get(str(client.cwd)) if isinstance(projects, dict) else None
+        local_dir = (
+            client.scope_directory("local")
+            if isinstance(client, Claude)
+            else client.cwd
+        )
+        holder = projects.get(str(local_dir)) if isinstance(projects, dict) else None
         if not isinstance(holder, dict):
             raise ClientError("Could not find the local MCP config")
     entries = holder.setdefault("mcpServers", {})
@@ -1395,12 +1606,7 @@ def read_client_config(client: Client, scope: str, path: Path) -> ClientConfig:
 
 def repair_path(client: Client, scope: str) -> Path:
     if isinstance(client, Claude):
-        if scope == "project" and client.cwd is None:
-            raise ClientError("No working directory for the project registration")
-        if scope == "project":
-            assert client.cwd is not None
-            return client.cwd / ".mcp.json"
-        return client.config_path()
+        return client.registration_path(scope)
     assert isinstance(client, Cursor)
     return client.config_path(scope)
 
@@ -1481,6 +1687,16 @@ def repair_claude_existing(
         existing = client.registration(scope, name)
         if existing is None:
             raise ClientError(f"No existing {name} registration in {scope} scope")
+        if name == NAME:
+            if existing.disabled:
+                raise ClientError(
+                    f"Claude Code has disabled the {scope} sai registration. "
+                    "Review MCP approvals and settings in the client."
+                )
+            if not existing.matches(target):
+                return report_different_claude_entry(client, result, existing, target)
+            result.action = "unchanged"
+            return result
         if not existing.stdio:
             raise ClientError("The existing Claude Code entry uses a remote transport")
         stale = stale_registration(client, name, existing)
@@ -1502,6 +1718,100 @@ def repair_claude_existing(
     except (OSError, ValueError):
         result.error = "Could not edit the Claude Code registration"
     return result
+
+
+def check_claude_differences(
+    client: Claude,
+    found: list[tuple[str, Registration]],
+    stale: list[StaleRegistration],
+    target: Target | None,
+    legacy_name: bool,
+    *,
+    compare_profile: bool,
+) -> RegistrationCheck | None:
+    stale_by_scope = {(issue.name, issue.registration.scope): issue for issue in stale}
+    repairs = []
+    differences = []
+    manual = []
+    disabled = False
+    profile = target.env.get("SAI_HOME") if target is not None else None
+    for name, reg in found:
+        if name == NAME and reg.disabled:
+            disabled = True
+            differences.append(
+                f"{reg.scope} {name}: Claude Code has disabled this registration"
+            )
+            manual.append("Review MCP approvals and settings in Claude Code.")
+            continue
+        issue = stale_by_scope.get((name, reg.scope))
+        expected = target
+        if name == NAME:
+            if expected is not None and not compare_profile:
+                saved_env = (
+                    {"SAI_HOME": reg.sai_home} if reg.sai_home is not None else {}
+                )
+                expected = replace(expected, env=saved_env)
+            fields = (
+                claude_differing_fields(reg, expected) if expected is not None else ()
+            )
+            if issue is None and (
+                not fields
+                or (
+                    not compare_profile
+                    and not reg.invalid_sai_home
+                    and set(fields) <= {"args", "env"}
+                    and serves_mcp(reg.argv[1:])
+                )
+            ):
+                continue
+            if expected is None:
+                manual.append("Install a stable Sai launcher on PATH.")
+            else:
+                repairs.append(
+                    ClaudeRepair(
+                        reg.scope,
+                        name,
+                        replace_entry=True,
+                        sai_home=claude_advice_home(
+                            reg, profile, show_saved=not compare_profile
+                        ),
+                        config_path=client.registration_path(reg.scope),
+                        fields=fields or ("command",),
+                        launcher=expected.argv[0],
+                        server_args=claude_advice_args(reg),
+                        extra_env=len(reg.stale_env) + reg.invalid_sai_home,
+                    )
+                )
+        elif issue is None:
+            continue
+        elif reg.stdio:
+            repairs.append(
+                ClaudeRepair(reg.scope, name, claude_repair_args(issue) is None)
+            )
+        else:
+            manual.append("Review the remote Sai registration in Claude Code.")
+        reason = (
+            issue.reason
+            if issue is not None
+            else "Sai registration has a different SAI_HOME setting"
+            if expected is not None and not reg.matches_sai_home(expected.env)
+            else "Sai registration differs from the requested settings"
+        )
+        differences.append(f"{reg.scope} {name}: {reason}")
+    if not differences:
+        return None
+    entries = tuple(repairs)
+    if entries:
+        manual.insert(0, claude_repair_hint(entries))
+    return RegistrationCheck(
+        "claude",
+        "fail" if stale else "warn",
+        ". ".join(differences),
+        " ".join(dict.fromkeys(manual)),
+        legacy_name=legacy_name,
+        manual_repairs=entries,
+        disabled=disabled,
+    )
 
 
 def check_registration(
@@ -1536,31 +1846,13 @@ def check_registration(
     stale = [issue for _, issue in inspected if issue is not None]
     legacy_name = any(server == RETIRED_NAME for server, _ in found)
     legacy_warning = f"Sai retains its existing {RETIRED_NAME} registration name"
-    if stale and isinstance(client, Claude):
-        repairs = tuple(
-            ClaudeRepair(
-                issue.registration.scope, issue.name, claude_repair_args(issue) is None
-            )
-            for issue in stale
-            if issue.registration.stdio
-        )
-        hint = claude_repair_hint(repairs) if repairs else ""
-        if len(repairs) < len(stale):
-            hint = (
-                hint + " Review the remote Sai registration in Claude Code."
-            ).strip()
-        return RegistrationCheck(
-            name,
-            "fail",
-            ". ".join(
-                f"{issue.registration.scope} {issue.name}: {issue.reason}"
-                for issue in stale
-            ),
-            hint,
-            legacy_name=legacy_name,
-            manual_repairs=repairs,
-        )
     expected_env = server_env(client.environ) if compare_profile else {}
+    if isinstance(client, Claude):
+        claude_check = check_claude_differences(
+            client, found, stale, target, legacy_name, compare_profile=compare_profile
+        )
+        if claude_check is not None:
+            return claude_check
     different_profile = compare_profile and any(
         not reg.matches_sai_home(expected_env) for reg, _ in inspected
     )

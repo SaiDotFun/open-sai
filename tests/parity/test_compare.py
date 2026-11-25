@@ -123,6 +123,22 @@ def test_log_ids_preserve_joins_and_sequence(
     )
 
 
+def test_log_error_normalizes_truncated_fixture_home(tmp_path: Path) -> None:
+    def error(home: str, clipped: str) -> str:
+        result = Normalize(tmp_path / home).log_event(
+            {
+                "event": "command.end",
+                "ts": "2026-11-24T01:00:00.000Z",
+                "error": f"Fix: --env=SAI_HOME={tmp_path / clipped}... [20 more characters]",
+            }
+        )
+        return result["error"]
+
+    expected = "Fix: --env=SAI_HOME=<HOME>... [20 more characters]"
+    assert error("reference", "refer") == error("candidate", "candi") == expected
+    assert error("reference", "unrelated") != expected
+
+
 def test_snapshot_compares_log_endpoint_key_mode_and_length(tmp_path: Path) -> None:
     logs = tmp_path / "logs"
     logs.mkdir()

@@ -712,6 +712,7 @@ class Outcome:
                 "status": check.status,
                 "changes": list(check.changes),
                 **({"pinned": True} if check.pinned else {}),
+                **({"disabled": True} if check.disabled else {}),
                 **(
                     {
                         "manualRepairs": [
@@ -719,6 +720,41 @@ class Outcome:
                                 "scope": repair.scope,
                                 "name": repair.name,
                                 **({"resetArgs": True} if repair.reset_args else {}),
+                                **(
+                                    {"replaceEntry": True}
+                                    if repair.replace_entry
+                                    else {}
+                                ),
+                                **(
+                                    {"saiHome": repair.sai_home}
+                                    if repair.sai_home is not None
+                                    else {}
+                                ),
+                                **(
+                                    {"configPath": str(repair.config_path)}
+                                    if repair.config_path is not None
+                                    else {}
+                                ),
+                                **(
+                                    {"fields": list(repair.fields)}
+                                    if repair.fields
+                                    else {}
+                                ),
+                                **(
+                                    {"launcher": repair.launcher}
+                                    if repair.launcher is not None
+                                    else {}
+                                ),
+                                **(
+                                    {"serverArgs": list(repair.server_args)}
+                                    if repair.server_args is not None
+                                    else {}
+                                ),
+                                **(
+                                    {"extraEnv": repair.extra_env}
+                                    if repair.extra_env
+                                    else {}
+                                ),
                             }
                             for repair in check.manual_repairs
                         ],
@@ -1524,7 +1560,11 @@ def repair_after_update(outcome: Outcome, launcher: Path, background: bool) -> O
             notes.append("cwd-missing")
     checks: list[mcp_install.RegistrationCheck] = []
     try:
-        target = mcp_install.launcher_target(str(launcher), {})
+        try:
+            target = mcp_install.launcher_target(str(launcher), os.environ)
+        except FileNotFoundError:
+            # A relative SAI_HOME cannot be resolved after the cwd disappears.
+            target = mcp_install.launcher_target(str(launcher), {})
         checks = mcp_install.check_registrations(target, fix=True, cwd=cwd)
     except Exception:  # noqa: BLE001 - the installation has already succeeded
         notes.append("failed")
@@ -1533,7 +1573,11 @@ def repair_after_update(outcome: Outcome, launcher: Path, background: bool) -> O
         mcp=tuple(
             check
             for check in checks
-            if check.status in ("fixed", "fail") or check.pinned or check.legacy_name
+            if check.status in ("fixed", "fail")
+            or check.pinned
+            or check.legacy_name
+            or check.manual_repairs
+            or check.disabled
         ),
         mcp_notes=tuple(notes),
     )
@@ -1562,6 +1606,7 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
     repaired, failed, pinned, legacy = [], [], [], []
     claude_manual: list[mcp_install.ClaudeRepair] = []
     old_claude_notice = False
+    claude_disabled = False
     for entry in results if isinstance(results, list) else []:
         if (
             not isinstance(entry, dict)
@@ -1576,14 +1621,40 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
         if entry["client"] == "claude" and isinstance(manual, list):
             claude_manual.extend(
                 mcp_install.ClaudeRepair(
-                    repair["scope"], repair["name"], repair.get("resetArgs") is True
+                    repair["scope"],
+                    repair["name"],
+                    repair.get("resetArgs") is True,
+                    replace_entry=repair.get("replaceEntry") is True,
+                    sai_home=repair["saiHome"]
+                    if isinstance(repair.get("saiHome"), str)
+                    else None,
+                    config_path=Path(repair["configPath"])
+                    if isinstance(repair.get("configPath"), str)
+                    else None,
+                    fields=tuple(
+                        value for value in repair["fields"] if isinstance(value, str)
+                    )
+                    if isinstance(repair.get("fields"), list)
+                    else (),
+                    launcher=repair["launcher"]
+                    if isinstance(repair.get("launcher"), str)
+                    else None,
+                    server_args=tuple(repair["serverArgs"])
+                    if isinstance(repair.get("serverArgs"), list)
+                    and all(isinstance(arg, str) for arg in repair["serverArgs"])
+                    else None,
+                    extra_env=repair["extraEnv"]
+                    if isinstance(repair.get("extraEnv"), int)
+                    else 0,
                 )
                 for repair in manual
                 if isinstance(repair, dict)
                 and repair.get("scope") in mcp_install.UNINSTALL_SCOPES
                 and repair.get("name") in mcp_install.SERVER_NAMES
             )
-        if entry.get("status") == "fail" and not manual:
+        disabled = entry["client"] == "claude" and entry.get("disabled") is True
+        claude_disabled |= disabled
+        if entry.get("status") == "fail" and not manual and not disabled:
             failed.append(entry["client"])
         keeps_name = entry.get("legacyName") == mcp_install.RETIRED_NAME
         if keeps_name:
@@ -1594,7 +1665,11 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
         old_claude_notice |= old_blocked
         # Older update records used warn exclusively for a pinned launcher.
         if entry.get("pinned") is True or (
-            entry.get("status") == "warn" and not keeps_name and not old_blocked
+            entry.get("status") == "warn"
+            and not keeps_name
+            and not old_blocked
+            and not manual
+            and not disabled
         ):
             pinned.append(entry["client"])
     messages = []
@@ -1607,6 +1682,10 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
         )
     if pinned:
         messages.append(f"Sai MCP uses a pinned launcher for {', '.join(pinned)}.")
+    if claude_disabled:
+        messages.append(
+            "Claude Code has disabled a Sai MCP registration. Review MCP approvals and settings in Claude Code."
+        )
     if claude_manual:
         messages.append(
             "Claude Code MCP registrations need manual repair. "
