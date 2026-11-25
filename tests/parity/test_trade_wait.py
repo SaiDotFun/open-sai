@@ -12,7 +12,7 @@ import subprocess
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, closing
+from contextlib import ExitStack, closing, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1134,12 +1134,29 @@ def test_trade_wait_interrupts_a_full_stdout_pipe(
                     stderr=subprocess.PIPE,
                 ) as process:
                     try:
-                        end = time.monotonic() + 3
+                        end = time.monotonic() + 5
                         expected = preflight_reads + 3
                         while len(requests) < expected and time.monotonic() < end:
                             time.sleep(0.01)
                         assert len(requests) == expected
-                        time.sleep(0.15)
+                        # Receiving the history request does not mean the receipt
+                        # has reached stdout. Rust writes it from a worker thread.
+                        threads = Path(f"/proc/{process.pid}/task")
+                        if threads.is_dir():
+                            while time.monotonic() < end:
+                                with suppress(FileNotFoundError):
+                                    if any(
+                                        channel.read_text()
+                                        .strip()
+                                        .endswith("pipe_write")
+                                        for channel in threads.glob("*/wchan")
+                                    ):
+                                        break
+                                time.sleep(0.01)
+                            else:
+                                pytest.fail("receipt writer never blocked on stdout")
+                        else:
+                            time.sleep(0.15)
                         assert process.poll() is None
                         assert os.get_blocking(write_fd), (
                             "CLI changed the inherited pipe's flags"
