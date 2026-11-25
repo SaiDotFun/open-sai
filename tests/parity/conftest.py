@@ -31,22 +31,24 @@ def pytest_collection_modifyitems(
         return
     path = Path(__file__).with_name("release-xfails.toml")
     with path.open("rb") as file:
-        owners = tomllib.load(file)["pull_request"]
+        registry = tomllib.load(file)
     reasons: dict[str, tuple[str, str]] = {}
-    for pr, cases in owners.items():
-        for case, signature in cases.items():
-            nodeid = f"tests/parity/{case}"
-            if nodeid in reasons:
-                raise pytest.UsageError(f"Multiple release owners for {nodeid}")
-            reasons[nodeid] = (pr, signature)
+    for table, endpoint in (("pull_request", "pull"), ("issue", "issues")):
+        for number, cases in registry.get(table, {}).items():
+            url = f"https://github.com/SaiDotFun/open-sai/{endpoint}/{number}"
+            for case, signature in cases.items():
+                nodeid = f"tests/parity/{case}"
+                if nodeid in reasons:
+                    raise pytest.UsageError(f"Multiple release owners for {nodeid}")
+                reasons[nodeid] = (url, signature)
     config.stash[PENDING_RELEASE_RESULTS] = set(reasons)
     for item in items:
         if entry := reasons.pop(item.nodeid, None):
-            pr, signature = entry
+            url, signature = entry
             item.stash[RELEASE_SIGNATURE] = signature
             item.add_marker(
                 pytest.mark.xfail(
-                    reason=f"https://github.com/SaiDotFun/open-sai/pull/{pr}",
+                    reason=url,
                     strict=True,
                     raises=ExpectedReleaseMismatch,
                 )

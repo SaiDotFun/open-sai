@@ -1093,8 +1093,10 @@ def test_connection_refused(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
             assert result.stderr == b""
             assert json.loads(result.stdout)["error"]["code"] == "NOT_SENT"
             assert not (home / "trader").exists()
-            outputs.append((result.stdout, normalized_events(home, cli)))
-        assert outputs[0] == outputs[1]
+            outputs.append(
+                {"stdout": result.stdout, "logs": normalized_events(home, cli)}
+            )
+        assert_release_equal(*outputs)
 
 
 @pytest.mark.parametrize(
