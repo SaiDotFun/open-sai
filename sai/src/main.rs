@@ -152,7 +152,9 @@ impl Cli {
             ),
             Some(Command::Doctor(args)) => args.run(flags, env, json, events, start_log),
             Some(Command::Market { command }) => command.run(&flags, env, json, events),
-            Some(Command::Account { command }) => command.run(&flags, env, json, events),
+            Some(Command::Account { command }) => {
+                command.run(self.account.as_deref(), &flags, env, json, events)
+            }
             Some(Command::Watch { command }) => command.run(&flags, env, events),
             Some(Command::Skill { command }) => command.run(json),
             Some(Command::Logs { command }) => {
@@ -398,7 +400,7 @@ fn usage(command: &str) -> String {
         "config get" | "config unset" => " KEY",
         "config set" => " KEY VALUE",
         "config list" | "auth status" | "auth list" | "auth import" | "doctor" | "mcp list"
-        | "mcp serve" | "market list" | "market prices" | "trade open" => "",
+        | "mcp serve" | "market list" | "market prices" | "trade open" | "account overview" => "",
         "mcp install" => " [CLIENTS]...",
         "auth login" => " NAME",
         "intent status" | "intent local" | "auth use" | "account positions" | "account history"

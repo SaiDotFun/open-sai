@@ -158,6 +158,14 @@ jobs:
           path: .parity-python
           persist-credentials: false
 
+      - name: Check out the Python account overview reference
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 20493c984e3398756365ea1a2b8786a7a0115a11
+          path: .parity-overview-python
+          persist-credentials: false
+
       - name: Check out the C7 Python parity reference
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -223,6 +231,7 @@ jobs:
       - run: |
           uv sync --locked --all-groups
           uv sync --project .parity-python --locked --all-groups
+          uv sync --project .parity-overview-python --locked --all-groups --python 3.13
           uv sync --project .parity-mcp-python --python 3.12 --locked --all-groups
           uv sync --project .parity-python-c7 --locked --all-groups
           uv sync --project .parity-python-wait --locked --all-groups
@@ -280,6 +289,26 @@ jobs:
           SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
           SAI_PARITY_PYTHON: ${{ github.workspace }}/.parity-intent-python/.venv/bin/sai
         run: uv run --locked pytest tests/parity/test_intent_status_v012.py
+
+      - name: Compare account overview in a loopback network namespace
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        env:
+          SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
+          SAI_PARITY_OVERVIEW_PYTHON: ${{ github.workspace }}/.parity-overview-python/.venv/bin/sai
+        run: |
+          if ! unshare -Urn ip link set lo up; then
+            sudo apparmor_parser -r <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          /usr/bin/unshare flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+          fi
+          uv run --locked python tests/parity/parity.py --case 'account-overview-*' --case account-bare
+          unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
+            uv run --locked pytest -m parity_namespace tests/parity/test_overview_dns.py
 
       - name: Check out the shared-state Python reference
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'

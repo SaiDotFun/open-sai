@@ -37,6 +37,8 @@ pub(super) fn operation(query: &str) -> &'static str {
         MARKETS => "markets",
         POSITION => "position",
         POSITIONS => "positions",
+        OVERVIEW_TRADES => "overview_trades",
+        PENDING_MARKET_ORDERS => "pending_market_orders",
         PRICES => "prices",
         ROUTE => "route",
         SESSION => "session",
@@ -46,12 +48,48 @@ pub(super) fn operation(query: &str) -> &'static str {
 }
 
 pub(crate) fn is_log_operation(name: &str) -> bool {
-    // These names also occur in logs written by Python account overview.
-    matches!(name, "overview_trades" | "pending_market_orders")
-        || [
-            CHALLENGE, HISTORY, INTENTS, MARKET, MARKETS, POSITION, POSITIONS, PRICES, ROUTE,
-            SESSION, SUBMIT, "",
-        ]
-        .into_iter()
-        .any(|query| operation(query) == name)
+    [
+        CHALLENGE,
+        HISTORY,
+        INTENTS,
+        MARKET,
+        MARKETS,
+        POSITION,
+        POSITIONS,
+        OVERVIEW_TRADES,
+        PENDING_MARKET_ORDERS,
+        PRICES,
+        ROUTE,
+        SESSION,
+        SUBMIT,
+        "",
+    ]
+    .into_iter()
+    .any(|query| operation(query) == name)
 }
+
+pub(crate) const OVERVIEW_TRADES: &str = "
+query($trader:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    trades(where:{trader:$trader,isOpen:true}, order_by:sequence, order_desc:false, limit:$limit, offset:$offset) {
+      id trader isLong tradeType collateralAmount leverage openPrice tp sl
+      state { liquidationPrice }
+      perpBorrowing {
+        marketId baseToken { id symbol } quoteToken { id symbol name } collateralToken { id symbol }
+      }
+      lastUpdatedBlock { block block_ts }
+    }
+  }
+}
+";
+
+pub(crate) const PENDING_MARKET_ORDERS: &str = "
+query($trader:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    marketOrders(where:{trader:$trader,status:pending_exec}, limit:$limit, offset:$offset) {
+      sequence tradeId side perpMarketId status collateralAmount orderReqBlock orderReqBlockTs
+      orderReqTxHash orderReqEvmTxHash
+    }
+  }
+}
+";
