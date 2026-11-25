@@ -169,6 +169,7 @@ _flag_keys: ContextVar[frozenset[str]] = ContextVar(
 _silenced_context = ContextVar("sai_log_silenced", default=False)
 # How many `silenced` blocks are open, in any thread.
 _silenced = 0
+_keep_modes = 0
 
 
 def home(env: Mapping[str, str] | None = None) -> Path:
@@ -631,6 +632,17 @@ def silenced() -> Generator[None]:
         _silenced_context.reset(token)
 
 
+@contextmanager
+def keep_existing_modes() -> Generator[None]:
+    """Queue diagnostics without letting the writer repair existing modes."""
+    global _keep_modes
+    _keep_modes += 1
+    try:
+        yield
+    finally:
+        _keep_modes -= 1
+
+
 def bound(name: str) -> Any:
     """The value `bind` gave NAME in this context, or None."""
     return _context.get().get(name)
@@ -673,17 +685,20 @@ class LogDir:
         self.fd = fd
 
     @classmethod
-    def open(cls, root: Path, *, create: bool = False) -> LogDir | None:
+    def open(
+        cls, root: Path, *, create: bool = False, keep_modes: bool = False
+    ) -> LogDir | None:
         """Open ROOT, or return None when it is missing, a symlink, not a
         directory, or owned by someone else. With CREATE, make it first, and
-        remove group and other access from a directory this user owns."""
+        remove group and other access from a directory this user owns.
+        KEEP_MODES refuses a loose directory instead of changing it."""
         try:
             if create:
                 paths.private_directory(root.parent, profile_root=True)
                 # Preserve owner access on existing log directories. The
                 # descriptor below is used to clear group and other access.
                 if not root.exists():
-                    paths.private_directory(root)
+                    paths.private_directory(root, only_new=keep_modes)
             if not _DIR_FD:
                 if redirected(root) or not root.is_dir():
                     return None
@@ -698,6 +713,9 @@ class LogDir:
                 return None
             mode = stat.S_IMODE(info.st_mode)
             if create and mode & 0o077:
+                if keep_modes:
+                    os.close(fd)
+                    return None
                 os.fchmod(fd, mode & ~0o077)
         except OSError:
             os.close(fd)
@@ -745,13 +763,16 @@ class LogDir:
             raise
         return fd
 
-    def append(self, name: str, data: bytes) -> None:
+    def append(self, name: str, data: bytes, *, keep_modes: bool = False) -> None:
         """Append DATA to NAME with one write, creating it at mode 0600 and
-        removing group and other access from an existing file first."""
+        removing group and other access from an existing file first.
+        KEEP_MODES refuses a loose file instead of changing it."""
         fd = self._open_file(name, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
         try:
             mode = stat.S_IMODE(os.fstat(fd).st_mode)
             if mode & 0o077 and hasattr(os, "fchmod"):
+                if keep_modes:
+                    raise OSError("log file is not private")
                 os.fchmod(fd, mode & ~0o077)
             os.write(fd, data)
         finally:
@@ -976,6 +997,7 @@ class _Item:
     target: _ConfigKey
     line: dict[str, Any]
     size: int
+    keep_modes: bool
 
 
 _queue: queue.Queue[_Item] = queue.Queue(maxsize=QUEUE_SIZE)
@@ -1014,9 +1036,10 @@ def _write(item: _Item) -> None:
     if not on:
         _skip[key] = (generation, time.monotonic(), signature)
         return
-    opened = LogDir.open(root / DIR_NAME, create=True)
+    opened = LogDir.open(root / DIR_NAME, create=True, keep_modes=item.keep_modes)
     if opened is None:
-        _skip[key] = (generation, time.monotonic(), signature)
+        if not item.keep_modes:
+            _skip[key] = (generation, time.monotonic(), signature)
         return
     with opened:
         _skip.pop(key, None)
@@ -1047,8 +1070,10 @@ def _write(item: _Item) -> None:
         # A file that cannot be appended to loses this line only; the other
         # surfaces' files may be fine.
         with suppress(OSError):
-            opened.append(file_name(line["surface"], day), data)
-        if _pruned.get(key[0]) != today:
+            opened.append(
+                file_name(line["surface"], day), data, keep_modes=item.keep_modes
+            )
+        if not item.keep_modes and _pruned.get(key[0]) != today:
             _pruned[key[0]] = today
             with suppress(OSError):
                 prune(opened, keep_days, today)
@@ -1154,7 +1179,7 @@ def event(name: str, level: str = "info", /, **fields: Any) -> None:
             _dropped += 1
             return
         try:
-            _queue.put_nowait(_Item(key, line, size))
+            _queue.put_nowait(_Item(key, line, size, keep_modes=_keep_modes > 0))
         except queue.Full:
             with _size_lock:
                 _queued_chars -= size
