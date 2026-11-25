@@ -300,6 +300,10 @@ class LoggedGroup(SaiGroup):
         names, audit_names, flag_keys = _command_parts(self, argv)
         private_args = auth_attempt(names, argv)
         quiet = unlogged(names, argv)
+        if names == ["doctor"] and not quiet:
+            from .doctor import can_log_to_profile
+
+            quiet = not can_log_to_profile()
         command = " ".join(names) or ("repl" if not argv else None)
         # Keep only command words for auth, even if a parent parser fails.
         logged_argv = names if private_args else audit_names
@@ -324,6 +328,9 @@ class LoggedGroup(SaiGroup):
             log.silenced()
             if quiet
             else log.bind(surface=surface, command=command, commandId=uuid.uuid4().hex),
+            log.keep_existing_modes()
+            if command == "doctor"
+            else contextlib.nullcontext(),
         ):
             if command == "doctor" and not quiet:
                 # Let doctor report directory creation before logging creates
@@ -331,6 +338,11 @@ class LoggedGroup(SaiGroup):
                 obj["doctor_log_start"] = log_start
             else:
                 log_start()
+            if command == "mcp serve":
+                extra["obj"] = {
+                    **(extra.get("obj") or {}),
+                    "mcp_standalone": standalone_mode,
+                }
             try:
                 result = super().main(
                     args,
@@ -1314,8 +1326,35 @@ def warn(message: str) -> None:
     click.echo(message, err=True)
 
 
+class TradeInt(click.IntRange):
+    name = "integer"
+
+    def convert(
+        self, value: Any, param: click.Parameter | None, ctx: click.Context | None
+    ) -> int:
+        if isinstance(value, str) and not intents.is_trade_integer(value):
+            self.fail(f"{value!r} is not a valid integer.", param, ctx)
+        return super().convert(value, param, ctx)
+
+
+class TradeDecimal(click.types.StringParamType):
+    name = "decimal"
+
+    def convert(
+        self, value: Any, param: click.Parameter | None, ctx: click.Context | None
+    ) -> str:
+        value = super().convert(value, param, ctx)
+        if not intents.TRADE_DECIMAL.fullmatch(value):
+            self.fail(f"{value!r} is not a valid decimal.", param, ctx)
+        return value
+
+
+TRADE_INT = TradeInt()
+TRADE_DECIMAL = TradeDecimal()
+
+
 @trade.command("open")
-@click.option("--market", "market_id", type=int, required=True)
+@click.option("--market", "market_id", type=TRADE_INT, required=True)
 @click.option("--side", type=click.Choice(["long", "short"]), required=True)
 @click.option(
     "--type",
@@ -1323,10 +1362,11 @@ def warn(message: str) -> None:
     type=click.Choice(["market", "limit", "stop"]),
     required=True,
 )
-@click.option("--amount", required=True, help="USDC amount in USD.")
-@click.option("--leverage", required=True)
+@click.option("--amount", type=TRADE_DECIMAL, required=True, help="USDC amount in USD.")
+@click.option("--leverage", type=TRADE_DECIMAL, required=True)
 @click.option(
     "--price",
+    type=TRADE_DECIMAL,
     help="Required trigger for limit/stop; optional dry-run reference for market orders. Live market orders use a refreshed price.",
 )
 @click.option(
@@ -1334,8 +1374,8 @@ def warn(message: str) -> None:
     required=True,
     help="Maximum slippage percentage, greater than 0 and at most 100.",
 )
-@click.option("--take-profit")
-@click.option("--stop-loss")
+@click.option("--take-profit", type=TRADE_DECIMAL)
+@click.option("--stop-loss", type=TRADE_DECIMAL)
 @click.option(
     "--allow-concurrent-open",
     is_flag=True,
@@ -1387,7 +1427,7 @@ def trade_open(
 
 
 @trade.command("close")
-@click.argument("trade_id", type=int)
+@click.argument("trade_id", type=TRADE_INT)
 @click.option(
     "--cancel-order",
     is_flag=True,
@@ -1417,9 +1457,9 @@ def trade_close(
 
 
 @trade.command("tpsl")
-@click.argument("trade_id", type=int)
-@click.option("--take-profit")
-@click.option("--stop-loss")
+@click.argument("trade_id", type=TRADE_INT)
+@click.option("--take-profit", type=TRADE_DECIMAL)
+@click.option("--stop-loss", type=TRADE_DECIMAL)
 @click.option("--clear-take-profit", is_flag=True)
 @click.option("--clear-stop-loss", is_flag=True)
 @click.option("--dry-run", is_flag=True)
@@ -1455,8 +1495,13 @@ def trade_tpsl(
 
 
 @trade.command("leverage")
-@click.argument("trade_id", type=int)
-@click.option("--leverage", required=True, help="Target leverage as a decimal.")
+@click.argument("trade_id", type=TRADE_INT)
+@click.option(
+    "--leverage",
+    type=TRADE_DECIMAL,
+    required=True,
+    help="Target leverage as a decimal.",
+)
 @click.option("--dry-run", is_flag=True)
 @wait_option
 @click.pass_context
@@ -1512,10 +1557,11 @@ def lcd_trade_settings(
 
 
 @trade.command("margin")
-@click.argument("trade_id", type=int)
+@click.argument("trade_id", type=TRADE_INT)
 @click.option("--direction", type=click.Choice(["add", "remove"]), required=True)
 @click.option(
     "--amount",
+    type=TRADE_DECIMAL,
     required=True,
     help="USDC amount for a leverage quote, not an execution cap.",
 )
@@ -1561,8 +1607,8 @@ def trade_margin(
 
 
 @trade.command("partial-close")
-@click.argument("trade_id", type=int)
-@click.option("--percent", type=click.IntRange(1, 99), required=True)
+@click.argument("trade_id", type=TRADE_INT)
+@click.option("--percent", type=TradeInt(1, 99), required=True)
 @click.option(
     "--lcd-endpoint",
     help="Nibiru REST endpoint for exact contract state. Defaults to the"
@@ -1946,7 +1992,7 @@ def mcp_serve(
     )
     if sys.stdin.isatty():
         click.echo(SERVE_TTY_NOTICE, err=True)
-    server.serve(flags)
+    server.serve(flags, standalone=ctx.obj.get("mcp_standalone", False))
 
 
 def serve_flags(

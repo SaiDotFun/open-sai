@@ -15,7 +15,7 @@ use sai_core::{
         stream::{self, Connection, Failure, Subscription},
     },
     log::{EventContext, Field, Level},
-    settings::{Environment, Flags, repr},
+    settings::{Environment, Flags, Key, repr},
 };
 use serde_json::{Map, Number, Value, json};
 
@@ -282,7 +282,8 @@ fn stream_endpoint(
     flags: &Flags,
     env: &Environment,
 ) -> Result<String, SaiError> {
-    if let Some(endpoint) = override_endpoint.filter(|endpoint| !endpoint.is_empty()) {
+    if let Some(endpoint) = override_endpoint {
+        Key::KeeperWsEndpoint.parse_value(&endpoint)?;
         return Ok(endpoint);
     }
     Ok(load_settings(flags, env)?.ws_endpoint().to_owned())

@@ -748,6 +748,12 @@ seed = "accounts"
 state = { "trader/sessions.json#payload.active" = "0x1111111111111111111111111111111111111111", "trader/sessions.json#@mode" = 0o600 }
 
 [[case]]
+name = "auth-use-missing"
+args = ["--json","auth","use","{addr}"]
+expect = 1
+seed = "config-logs-disabled"
+
+[[case]]
 name = "auth-use-invalid-expiry-text"
 args = ["auth","use","{addr}"]
 mode = "text"

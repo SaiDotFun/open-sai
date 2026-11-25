@@ -126,7 +126,7 @@ def test_synthetic_trading_request_goldens(synthetic):
         {"available_to_trade": "10000000"},
         {"minLeverage": 1, "maxLeverage": 100},
         "add",
-        "5",
+        5_000_000,
         effective_leverage=Decimal(10),
     )
     assert (
