@@ -72,6 +72,9 @@ def repo(tmp_path) -> Path:
     git(work, "config", "commit.gpgsign", "false")
     git(work, "config", "tag.gpgsign", "false")
     (work / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "1.2.3"\n')
+    (work / "Cargo.toml").write_text('[workspace.package]\nversion = "1.2.3"\n')
+    (work / "shim").mkdir()
+    (work / "shim/pyproject.toml").write_text('[project]\nversion = "1.2.3"\n')
     git(work, "add", ".")
     git(work, "commit", "-q", "-m", "init")
     git(work, "remote", "add", "origin", str(origin))
@@ -99,6 +102,47 @@ def test_run_tags_and_pushes(repo):
     assert "refs/tags/sai-cli/v1.2.3" in git(repo, "ls-remote", "--tags", "origin")
     # A second release of the same version is refused.
     assert run(repo, "1.2.3") == 1
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("pyproject.toml", "does not match the Cargo and shim version"),
+        ("Cargo.toml", "Cargo workspace and shim versions must name the same release"),
+        (
+            "shim/pyproject.toml",
+            "Cargo workspace and shim versions must name the same release",
+        ),
+    ],
+)
+def test_refuses_a_bump_in_only_one_package(
+    repo: Path, capsys, path: str, expected: str
+):
+    config = repo / path
+    config.write_text(config.read_text().replace("1.2.3", "1.2.4"))
+    git(repo, "add", path)
+    git(repo, "commit", "-qm", "bump one package")
+    git(repo, "push", "-q", "origin", "main")
+
+    version = "1.2.4" if path == "pyproject.toml" else "1.2.3"
+    for go in (False, True):
+        assert run(repo, version, go=go) == 1
+        assert expected in capsys.readouterr().err
+    assert git(repo, "tag", "--list") == ""
+    assert git(repo, "ls-remote", "--tags", "origin") == ""
+
+
+def test_accepts_matching_release_candidate_spellings(repo: Path, capsys):
+    for path in ("pyproject.toml", "Cargo.toml", "shim/pyproject.toml"):
+        config = repo / path
+        version = "1.2.4rc1" if path.startswith("shim/") else "1.2.4-rc.1"
+        config.write_text(config.read_text().replace("1.2.3", version))
+    git(repo, "commit", "-qam", "bump to release candidate")
+    git(repo, "push", "-q", "origin", "main")
+
+    assert run(repo, "1.2.4-rc.1") == 0
+    assert "git tag --annotate sai-cli/v1.2.4-rc.1" in capsys.readouterr().out
+    assert git(repo, "ls-remote", "--tags", "origin") == ""
 
 
 def test_refuses_version_mismatch_dirty_tree_and_unpushed_head(repo, capsys):

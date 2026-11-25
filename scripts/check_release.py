@@ -52,6 +52,27 @@ def tag_error(tag: str, version: str) -> str | None:
     return None
 
 
+def native_versions(root: Path = ROOT) -> tuple[str, str]:
+    cargo = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]
+    shim = tomllib.loads((root / "shim" / "pyproject.toml").read_text())["project"]
+    cargo_version, shim_version = cargo["version"], shim["version"]
+    if not TAG.fullmatch(
+        tag_for(cargo_version)
+    ) or shim_version != cargo_version.replace("-rc.", "rc"):
+        raise ValueError("Cargo workspace and shim versions must name the same release")
+    return cargo_version, shim_version
+
+
+def check_tag(tag: str, native_version: str, python_version: str) -> None:
+    """Require a release tag to match the full Python package and native distribution."""
+    if error := tag_error(tag, python_version):
+        raise ValueError(error)
+    if tag != tag_for(native_version):
+        raise ValueError(
+            f"tag {tag} does not match the Cargo and shim version {native_version}"
+        )
+
+
 def remote_tag_commit(listing: str, tag: str) -> str | None:
     """Return the commit TAG points at in `git ls-remote` output LISTING.
 

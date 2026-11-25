@@ -11,12 +11,11 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import tomllib
 from itertools import product
 from pathlib import Path
 from typing import Any
 
-from check_release import pyproject_version, tag_error, tag_for
+from check_release import check_tag, native_versions, pyproject_version
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -25,25 +24,7 @@ from shim.src.sai_cli.sai_cli import (
     TARGET_OS,
     archive_name,
     native_target,
-    release_version,
 )
-
-
-def versions() -> tuple[str, str]:
-    cargo = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]
-    wheel = tomllib.loads((ROOT / "shim" / "pyproject.toml").read_text())["project"]
-    if cargo["version"] != release_version(wheel["version"]):
-        raise SystemExit("Cargo workspace and shim versions must name the same release")
-    return cargo["version"], wheel["version"]
-
-
-def check_tag(tag: str, native_version: str, python_version: str) -> None:
-    if error := tag_error(tag, python_version):
-        raise ValueError(error)
-    if tag != tag_for(native_version):
-        raise ValueError(
-            f"tag {tag} does not match the Cargo and shim version {native_version}"
-        )
 
 
 def make_archive(binary: Path, destination: Path) -> None:
@@ -186,7 +167,7 @@ def run(args: argparse.Namespace) -> None:
     if args.command == "check-attestation":
         check_attestation(args.directory, args.tag_object, json.load(sys.stdin))
         return
-    release, shim = versions()
+    release, shim = native_versions()
     if args.command == "archive":
         if args.target != native_target():
             raise ValueError("the archive must be built on a runner for its target")

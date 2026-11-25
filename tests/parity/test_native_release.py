@@ -83,7 +83,7 @@ def test_stages_only_native_archives_and_the_full_python_packages(candidate) -> 
 def test_retains_full_python_bytes_when_package_names_collide(candidate) -> None:
     native, python, output, _ = candidate
     dist = runpy.run_path(str(ROOT / "scripts/native-dist.py"))
-    release, shim = dist["versions"]()
+    release, shim = dist["native_versions"]()
     for path in python.iterdir():
         path.unlink()
     for name in packages(shim):
