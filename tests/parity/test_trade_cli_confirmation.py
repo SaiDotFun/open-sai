@@ -11,7 +11,7 @@ from sai_cli.core.confirmation import preview_digest
 from sai_cli.core.settings import load as load_settings
 from sai_cli.mcp_server.tools import partial_close as mcp_partial_close
 from scenarios import child_env, loopback, seed_home
-from test_trade import CLI, CLOSE, OPEN, rows, run
+from test_trade import CANCEL, CLI, CLOSE, OPEN, rows, run
 from trade_replay import TradeReplay
 
 LIMIT = (*OPEN, "--type", "limit")
@@ -289,10 +289,11 @@ def test_confirmed_trade_refuses_funding_for_another_collateral(
         (LIMIT, "quote-trigger-fee", "OPEN_TRADE"),
         (CLOSE, "quote-queued", "CLOSE_POSITION"),
         (CANCEL_ORDER, "pending-order", "CANCEL_PENDING_TRADE"),
+        (CANCEL, "pending-order", "CANCEL_PENDING_TRADE"),
         (TPSL, "quote-close", "UPDATE_TRADE"),
         (LEVERAGE, "quote-close", "UPDATE_TRADE"),
     ],
-    ids=["open", "close", "cancel-order", "tpsl", "leverage"],
+    ids=["open", "close", "cancel-order", "cancel-alias", "tpsl", "leverage"],
 )
 def test_confirmed_trade_rejects_changed_digest_before_reserving(
     pair: tuple[CLI, CLI],
@@ -308,42 +309,39 @@ def test_confirmed_trade_rejects_changed_digest_before_reserving(
     }
     for index, cli in enumerate(pair):
         replay = TradeReplay(kind, "" if kind == "OPEN_TRADE" else "7")
-        with loopback(scenario, trade_replay=replay) as endpoints:
-            home = tmp_path / str(index)
-            seed_home(home, endpoints, "session")
-            # Run the confirmation preview in its own transcript so each quote
-            # can track its block-pinned LCD requests independently.
-            with loopback(scenario) as preview_endpoints:
-                preview_home = tmp_path / f"preview-{index}"
-                seed_home(preview_home, preview_endpoints, "session")
-                code, preview, stderr = run(
-                    cli,
-                    preview_home,
-                    preview_endpoints,
-                    (*args, "--dry-run"),
-                    python=index == 0,
-                )
-                assert (code, stderr) == (0, ""), preview
-                assert not preview_endpoints.errors
-            digest = preview["previewDigest"]
-            assert digest == preview_digest(preview)
-            stale = {
-                **preview,
-                "positionRoute": {
-                    **preview["positionRoute"],
-                    "contractAddress": "nibi1old",
-                },
-            }
-            assert run(
+        # Each command has its own transcript for block-pinned LCD reads.
+        with loopback(scenario) as endpoints:
+            preview_home = tmp_path / f"preview-{index}"
+            seed_home(preview_home, endpoints, "session")
+            code, preview, stderr = run(
                 cli,
-                home,
+                preview_home,
                 endpoints,
-                (*args, "--preview-digest", preview_digest(stale)),
+                (*args, "--dry-run"),
                 python=index == 0,
-            ) == (4, {"error": expected}, "")
-            assert not (home / "sai/trader/intents.sqlite3").exists()
-            assert not replay.attempts()
+            )
+            assert (code, stderr) == (0, ""), preview
             assert not endpoints.errors
+        digest = preview["previewDigest"]
+        assert digest == preview_digest(preview)
+        for field, old in (("chainId", "old-chain"), ("contractAddress", "nibi1old")):
+            with loopback(scenario, trade_replay=replay) as endpoints:
+                home = tmp_path / f"{index}-{field}"
+                seed_home(home, endpoints, "session")
+                stale = {
+                    **preview,
+                    "positionRoute": {**preview["positionRoute"], field: old},
+                }
+                assert run(
+                    cli,
+                    home,
+                    endpoints,
+                    (*args, "--preview-digest", preview_digest(stale)),
+                    python=index == 0,
+                ) == (4, {"error": expected}, "")
+                assert not rows(home)
+                assert not replay.attempts()
+                assert not endpoints.errors
         with loopback(scenario, trade_replay=replay) as endpoints:
             # Seed the same account at the new fixture endpoint.
             retry = tmp_path / f"retry-{index}"

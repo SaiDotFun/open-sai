@@ -43,6 +43,9 @@ pub enum TradeCommand {
         trade_id: String,
         #[arg(long)]
         dry_run: bool,
+        /// Submit only if the trade matches this dry-run digest.
+        #[arg(long)]
+        preview_digest: Option<String>,
         /// Wait up to 30 seconds for the intent outcome.
         #[arg(long)]
         wait: bool,
@@ -437,6 +440,7 @@ pub fn run(
             TradeCommand::Cancel {
                 trade_id,
                 dry_run,
+                preview_digest,
                 wait,
             } => (
                 close_preview(trade_id, true)?,
@@ -444,7 +448,7 @@ pub fn run(
                 *wait,
                 false,
                 false,
-                None,
+                preview_digest.as_deref().map(trade::Confirmation::for_cli),
             ),
             TradeCommand::Margin {
                 position,
