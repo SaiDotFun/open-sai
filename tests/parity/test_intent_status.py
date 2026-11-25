@@ -514,6 +514,8 @@ def read_state(home: Path) -> tuple[Any, ...]:
     }
     if "logs/.endpoint-key" in files:
         validate_log_endpoint_key(home / "logs/.endpoint-key")
+    if "logs/.endpoint-key.lock" in files:
+        assert files["logs/.endpoint-key.lock"] & 0o777 == 0o600
     db = home / "trader/intents.sqlite3"
     if not db.exists():
         return (files,)
@@ -1172,6 +1174,20 @@ def test_cli_errors_share_one_envelope(
             origin = None if index == 0 else keeper.MAINNET_HTTP.removesuffix("/query")
             expected_hint = origin_login_hint(origin)
             assert payload["error"].pop("hint") == expected_hint
+            outputs.append(payload)
+        elif args[0] == "--bad-option":
+            if index == 0:
+                assert "--bad-option" in payload["error"]["message"]
+                payload["error"]["message"] = "No such option."
+            outputs.append(payload)
+        elif args[1:] == ("config", "get", "invalid"):
+            if index == 0:
+                message = payload["error"]["message"]
+                assert "Valid keys: " in message
+                payload["error"]["message"] = (
+                    "Invalid value for 'KEY': unknown setting. Valid keys: "
+                    + message.split("Valid keys: ", 1)[1]
+                )
             outputs.append(payload)
         else:
             outputs.append(result.stdout)

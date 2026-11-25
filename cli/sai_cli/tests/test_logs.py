@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import json
 import os
 import stat
@@ -3473,6 +3474,258 @@ def test_intent_cursor_keeps_invocation_attribution_from_prior_page(home):
     assert "nextBefore" not in third
 
 
+@pytest.mark.parametrize("linked_event", ["command.end", "log.dropped"])
+def test_intent_cursor_replays_newer_rows_after_finding_older_anchor(
+    home, linked_event
+):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    common = {"ts": f"{day}T11:00:00.000Z", "surface": "cli"}
+    invocation = {"runId": "target", "commandId": "command"}
+    anchor = {
+        **common,
+        **invocation,
+        "event": "intent.keeper",
+        "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": "h1_" + "a" * 64,
+        "seq": 1,
+    }
+    linked = {**common, **invocation, "event": linked_event, "seq": 2}
+    unrelated = {**linked, "runId": "other", "seq": 3}
+    filler = log.encode({**common, "event": "command.start", "runId": "noise"})
+    log.file_path("cli", day, root).write_bytes(
+        log.encode(anchor)
+        + filler * (2 * log.MAX_SCAN_ROWS)
+        + log.encode(linked)
+        + log.encode(unrelated)
+    )
+
+    args = ("--json", "logs", "intent", "KEY", "--offline")
+    seen_events, seen_gaps = [], []
+    cursors = set()
+    continuation: tuple[str, ...] = ()
+    while True:
+        code, output = run_cli(*args, *continuation)
+        assert code == 0
+        page = json.loads(output)
+        seen_events.extend(page["events"])
+        seen_gaps.extend(page["gaps"])
+        before = page.get("nextBefore")
+        if before is None:
+            break
+        assert before not in cursors and len(cursors) < 7
+        cursors.add(before)
+        continuation = ("--before", before)
+
+    assert seen_events == (
+        [linked, anchor] if linked_event == "command.end" else [anchor]
+    )
+    assert seen_gaps == ([linked] if linked_event == "log.dropped" else [])
+
+
+def test_intent_cursor_discovers_only_links_needed_by_deferred_rows(home):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    before = f"{day}T11:00:00.000Z"
+    anchor = {
+        "ts": before,
+        "event": "intent.keeper",
+        "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": "h1_" + "a" * 64,
+    }
+    linked = {
+        "ts": f"{day}T10:00:00.000Z",
+        "event": "command.end",
+        "runId": "run-0",
+        "commandId": "command-0",
+    }
+    with log.file_path("cli", day, root).open("wb") as stream:
+        stream.writelines(
+            log.encode({**anchor, "runId": f"run-{i}", "commandId": f"command-{i}"})
+            for i in range(70_000)
+        )
+        stream.write(log.encode(linked))
+        stream.write(log.encode({**linked, "runId": "unrelated"}))
+
+    events = []
+    cursors = set()
+    while True:
+        page = log_queries.intent("KEY", offline=True, before=before)
+        events.extend(page["events"])
+        before = page.get("nextBefore")
+        if before is None:
+            break
+        assert before not in cursors and len(cursors) < 12
+        cursors.add(before)
+    assert events == [linked]
+
+
+def test_intent_cursor_caches_run_proofs_only_for_requested_scope(home):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    before = f"{day}T11:00:00.000Z"
+    gap = {"ts": f"{day}T10:00:00.000Z", "event": "log.dropped", "runId": "run"}
+    anchor = {
+        **gap,
+        "ts": before,
+        "event": "intent.keeper",
+        "intentKey": "KEY",
+        "endpointId": "h1_" + "a" * 64,
+    }
+    addresses = [f"0x{i:040x}" for i in range(8250)]
+    with log.file_path("cli", day, root).open("wb") as stream:
+        stream.writelines(log.encode({**anchor, "addr": addr}) for addr in addresses)
+        stream.write(
+            log.encode({"event": "command.start", "ts": gap["ts"]}) * log.MAX_SCAN_ROWS
+        )
+        stream.write(log.encode(gap))
+
+    gaps = []
+    cursors = set()
+    while True:
+        page = log_queries.intent(
+            "KEY", offline=True, addr=addresses[-1], before=before
+        )
+        gaps.extend(page["gaps"])
+        before = page.get("nextBefore")
+        if before is None:
+            break
+        assert before not in cursors and len(cursors) < 10
+        cursors.add(before)
+    assert gaps == [gap]
+
+
+@pytest.mark.parametrize("addr", [ADDR, None])
+def test_intent_cursor_bounds_same_millisecond_candidates_by_scope_and_bytes(
+    home, addr
+):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    ts = f"{day}T11:00:00.000Z"
+    linked = {
+        "ts": ts,
+        "event": "command.end",
+        "runId": "target",
+        "commandId": "target",
+    }
+    anchor = {
+        **linked,
+        "event": "intent.keeper",
+        "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": "h1_" + "a" * 64,
+    }
+    noise = {"ts": ts, "event": "command.end", "runId": "noise", "addr": OTHER}
+    with log.file_path("cli", day, root).open("wb") as stream:
+        stream.write(log.encode(anchor))
+        stream.write(
+            log.encode({"ts": ts, "event": "command.start"}) * log.MAX_SCAN_ROWS
+        )
+        stream.writelines(
+            log.encode({**noise, "commandId": f"command-{i}"}) for i in range(8192)
+        )
+        stream.write(log.encode(linked))
+
+    args = ("--json", "logs", "intent", "KEY", "--offline")
+    if addr:
+        args += ("--addr", addr)
+    code, output = run_cli(*args)
+    assert code == 0
+    page = json.loads(output)
+    assert page["events"] == [] and page["truncated"]
+    _, _, name = page["nextBefore"].partition(log_queries.CURSOR_STATE_SUFFIX)
+    saved = (root / ".intent-cursors" / name).read_bytes()
+    _, _, _, (wanted, _, _) = json.loads(zlib.decompress(saved))
+    assert len(wanted) == (1 if addr else 8193)
+    assert len(saved) < log_queries.MAX_CURSOR_FILE_BYTES
+
+    events = []
+    cursors = set()
+    while before := page.get("nextBefore"):
+        assert before not in cursors and len(cursors) < 8
+        cursors.add(before)
+        code, output = run_cli(*args, "--before", before)
+        assert code == 0
+        page = json.loads(output)
+        events.extend(page["events"])
+    assert events == [linked, anchor]
+
+
+@pytest.mark.parametrize("case", ["run", "scoped_run", "conflicting_invocation"])
+def test_intent_cursor_preserves_progress_when_reloading_many_anchors(home, case):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    row = {"ts": f"{day}T11:00:00.000Z", "surface": "cli"}
+    anchor = {
+        **row,
+        "event": "intent.keeper",
+        "runId": "target",
+        "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": "h1_" + "a" * 64,
+    }
+    gap = {**row, "event": "log.dropped", "runId": "target", "count": 1}
+    filler = log.encode({**row, "event": "command.start", "padding": "x" * 14000})
+    addresses = [ADDR if case == "run" else f"0x{seq:040x}" for seq in range(760)]
+    linked = (
+        {**gap, "event": "command.end", "commandId": "target"}
+        if case == "conflicting_invocation"
+        else gap
+    )
+    with log.file_path("cli", day, root).open("wb") as stream:
+        stream.writelines(
+            log.encode(
+                {
+                    **anchor,
+                    "commandId": "target"
+                    if case == "conflicting_invocation"
+                    else f"command-{seq}",
+                    "addr": addr,
+                    "seq": seq,
+                    "padding": "x" * 14000,
+                }
+            )
+            for seq, addr in enumerate(addresses)
+        )
+        if case != "run":
+            stream.writelines(
+                log.encode(
+                    {**anchor, "addr": addr, "runId": "recent", "seq": 760 + seq}
+                )
+                for seq, addr in enumerate(addresses)
+            )
+        stream.write(filler * (18 * 1024 * 1024 // len(filler)))
+        stream.write(log.encode(linked))
+        stream.write(log.encode({**anchor, "runId": "recent", "seq": 1520}))
+
+    before = None
+    cursors = set()
+    events, gaps = [], []
+    while True:
+        page = log_queries.intent(
+            "KEY",
+            offline=True,
+            before=before,
+            addr=addresses[-1] if case != "run" else None,
+        )
+        events.extend(line["seq"] for line in page["events"])
+        gaps.extend(page["gaps"])
+        before = page.get("nextBefore")
+        if before is None:
+            break
+        assert before not in cursors and len(cursors) < 20
+        cursors.add(before)
+    assert gaps == ([] if case == "conflicting_invocation" else [gap])
+    assert sorted(events) == ([*range(760), 1520] if case == "run" else [759, 1519])
+
+
 def test_intent_cursor_keeps_anchors_from_each_scan_window(home):
     root = home / "logs"
     root.mkdir()
@@ -3611,6 +3864,165 @@ def test_intent_cursor_rejects_changed_unread_files(home, change):
     code, output = run_cli(*args, *continuation)
     assert code == 2 and "Start a new intent log query" in output
     assert "events" not in json.loads(output)
+
+
+@pytest.mark.parametrize("before_read", [True, False])
+def test_intent_cursor_rejects_truncation_during_terminal_page(
+    home, monkeypatch, before_read
+):
+    root = home / "logs"
+    root.mkdir()
+    older = date(2026, 11, 24)
+    newer = older + timedelta(days=1)
+    row = {
+        "event": "intent.keeper",
+        "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": "h1_" + "a" * 64,
+    }
+    older_rows = [
+        log.encode({**row, "ts": f"{older}T00:00:00.000Z", "seq": seq})
+        for seq in range(74)
+    ]
+    path = log.file_path("cli", older, root)
+    path.write_bytes(b"".join(older_rows))
+    log.file_path("cli", newer, root).write_bytes(
+        b"".join(
+            log.encode({**row, "ts": f"{newer}T00:00:00.000Z", "seq": seq})
+            for seq in range(log_queries.MAX_REPORT_ROWS)
+        )
+    )
+    args = ("--json", "logs", "intent", "KEY", "--offline")
+    code, output = run_cli(*args)
+    assert code == 0
+    continuation = ("--before", json.loads(output)["nextBefore"])
+    code, output = run_cli(*args, *continuation)
+    assert code == 0 and len(json.loads(output)["events"]) == 74
+    assert "nextBefore" not in json.loads(output)
+
+    read = os.read
+    expected = path.stat()
+    truncated = False
+
+    def truncate_during_read(fd, size):
+        nonlocal truncated
+        info = os.fstat(fd)
+        if (
+            truncated
+            or size <= 1
+            or (info.st_dev, info.st_ino) != (expected.st_dev, expected.st_ino)
+        ):
+            return read(fd, size)
+        if not before_read:
+            data = read(fd, size)
+        with path.open("r+b") as stream:
+            stream.truncate(sum(map(len, older_rows[:44])))
+        truncated = True
+        return read(fd, size) if before_read else data
+
+    monkeypatch.setattr(os, "read", truncate_during_read)
+    code, output = run_cli(*args, *continuation)
+    assert truncated
+    assert code == 2 and "Start a new intent log query" in output
+    assert "events" not in json.loads(output)
+
+
+@pytest.mark.parametrize("change", ["delete", "replace"])
+def test_intent_query_rechecks_file_name_after_read(home, monkeypatch, change):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    row = {
+        "ts": f"{day}T00:00:00.000Z",
+        "event": "intent.keeper",
+        "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": "h1_" + "a" * 64,
+    }
+    path = log.file_path("cli", day, root)
+    path.write_bytes(log.encode(row))
+    replacement = root / "replacement"
+    replacement.write_bytes(log.encode({**row, "addr": OTHER}))
+    read = os.read
+    expected = path.stat()
+    changed = False
+
+    def change_during_read(fd, size):
+        nonlocal changed
+        data = read(fd, size)
+        info = os.fstat(fd)
+        if (
+            not changed
+            and size > 1
+            and (info.st_dev, info.st_ino)
+            == (
+                expected.st_dev,
+                expected.st_ino,
+            )
+        ):
+            if change == "delete":
+                path.unlink()
+            else:
+                replacement.replace(path)
+            changed = True
+        return data
+
+    monkeypatch.setattr(os, "read", change_during_read)
+    code, output = run_cli("--json", "logs", "intent", "KEY", "--offline")
+    assert changed
+    assert code == 2 and "Start a new intent log query" in output
+    assert "events" not in json.loads(output)
+
+
+def test_intent_cursor_reports_saved_anchor_read_failure(home, monkeypatch):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    linked = {
+        "ts": f"{day}T00:00:00.000Z",
+        "event": "command.end",
+        "runId": "process",
+        "commandId": "command",
+    }
+    anchor = log.encode(
+        {
+            **linked,
+            "event": "intent.keeper",
+            "intentKey": "KEY",
+            "addr": ADDR,
+            "endpointId": "h1_" + "a" * 64,
+        }
+    )
+    path = log.file_path("cli", day, root)
+    path.write_bytes(log.encode(linked) * log_queries.MAX_REPORT_ROWS + anchor)
+    args = ("--json", "logs", "intent", "KEY", "--offline")
+    code, output = run_cli(*args)
+    assert code == 0
+    continuation = ("--before", json.loads(output)["nextBefore"])
+    assert json.loads(run_cli(*args, *continuation)[1])["events"] == [linked]
+
+    read = os.read
+    expected = path.stat()
+    failed = False
+
+    def fail_anchor_read(fd, size):
+        nonlocal failed
+        info = os.fstat(fd)
+        if not failed and (info.st_dev, info.st_ino, size) == (
+            expected.st_dev,
+            expected.st_ino,
+            len(anchor),
+        ):
+            failed = True
+            raise OSError(errno.EIO, "anchor read failed")
+        return read(fd, size)
+
+    monkeypatch.setattr(os, "read", fail_anchor_read)
+    code, output = run_cli(*args, *continuation)
+    assert failed
+    assert code != 0 and "Retry this page" in output
+    assert "events" not in json.loads(output)
+    assert json.loads(run_cli(*args, *continuation)[1])["events"] == [linked]
 
 
 def test_intent_cursor_cache_evicts_old_states_and_refuses_oversize_reads(home):

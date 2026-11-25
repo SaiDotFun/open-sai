@@ -286,6 +286,22 @@ MAX_CURSOR_FILE_BYTES = 1024 * 1024
 MAX_CURSOR_STATE_BYTES = 8 * 1024 * 1024
 LinkPositions = dict[str, set[log.RowPosition]]
 LINK_TAG = re.compile(r"[0-9a-f]{16}")
+LINK_REF = re.compile(r"[0-9a-f]{16}(?:[0-9a-f]{16})?")
+
+
+@dataclass
+class _LinkSearch:
+    wanted: set[str]
+    settled: set[str]
+    forgotten: bool = False
+
+
+def _narrow_query() -> SaiError:
+    return SaiError(
+        "Intent log continuation exceeds the cache limit. Start a narrower intent log query with --before or --addr.",
+        Code.INVALID_REQUEST,
+        exit_code=ExitCode.USAGE,
+    )
 
 
 def _cursor_directories(
@@ -368,17 +384,8 @@ def _prune_cursor_states(opened: log.LogDir, keep: str, oldest: str) -> None:
 
 
 def _write_cursor_state(
-    root: Path | None, raw: bytes, snapshot: log.FileSnapshot
+    root: Path | None, data: bytes, snapshot: log.FileSnapshot
 ) -> str:
-    if len(raw) > MAX_CURSOR_STATE_BYTES:
-        raise SaiError(
-            "Intent log continuation exceeds the cache limit.", Code.INTERNAL_ERROR
-        )
-    data = zlib.compress(raw)
-    if len(data) > MAX_CURSOR_FILE_BYTES:
-        raise SaiError(
-            "Intent log continuation exceeds the cache limit.", Code.INTERNAL_ERROR
-        )
     name = f"{max(snapshot)[0].isoformat()}_{hashlib.sha256(data).hexdigest()}"
     for opened in _cursor_directories(root, create=True):
         with opened:
@@ -397,7 +404,9 @@ def _write_cursor_state(
 def _intent_cursor(
     value: str | None,
     root: Path | None,
-) -> tuple[_Cursor, list[log.RowPosition], log.FileSnapshot | None, LinkPositions]:
+) -> tuple[
+    _Cursor, list[log.RowPosition], log.FileSnapshot | None, LinkPositions, _LinkSearch
+]:
     base, separator, payload = (value or "").partition(CURSOR_STATE_SUFFIX)
     if not separator:
         if "~s~" in base or "~i~" in base:
@@ -405,14 +414,28 @@ def _intent_cursor(
         cursor = _Cursor.parse(value)
         if cursor.position is not None:
             raise log.stale_snapshot()
-        return cursor, [], None, {}
+        return cursor, [], None, {}, _LinkSearch(set(), set())
     cursor = _Cursor.parse(base)
     try:
         if cursor.position is None:
             raise ValueError
-        items, files, tagged = json.loads(_read_cursor_state(root, payload))
+        items, files, tagged, *extra = json.loads(_read_cursor_state(root, payload))
         if not all(isinstance(value, list) for value in (items, files, tagged)):
             raise TypeError
+        search = _LinkSearch(set(), set())
+        if extra:
+            (state,) = extra
+            wanted, settled, forgotten = state
+            if type(forgotten) is not bool or any(
+                not isinstance(tags, list)
+                or any(
+                    not isinstance(tag, str) or LINK_TAG.fullmatch(tag) is None
+                    for tag in tags
+                )
+                for tags in (wanted, settled)
+            ):
+                raise ValueError
+            search = _LinkSearch(set(wanted), set(settled), forgotten)
 
         def position(item: Any) -> log.RowPosition:
             if (
@@ -451,11 +474,11 @@ def _intent_cursor(
                 not isinstance(entry, list)
                 or len(entry) != 5
                 or not isinstance(entry[0], str)
-                or LINK_TAG.fullmatch(entry[0]) is None
+                or LINK_REF.fullmatch(entry[0]) is None
             ):
                 raise ValueError
             links[entry[0]].add(position(entry[1:]))
-        return cursor, positions, snapshot, links
+        return cursor, positions, snapshot, links, search
     except (TypeError, ValueError, OverflowError, RecursionError, zlib.error):
         raise SaiError(
             "Pass a log cursor or a UTC timestamp to --before.",
@@ -469,37 +492,66 @@ def _save_intent_cursor(
     positions: list[log.RowPosition],
     snapshot: log.FileSnapshot,
     links: LinkPositions,
+    search: _LinkSearch,
     root: Path | None,
+    *,
+    required_tags: set[str],
 ) -> None:
     if base := report.get("nextBefore"):
+        if (
+            sum(ref.size for ref in positions) > log.MAX_SCAN_BYTES // 2
+            or len(positions) > log.MAX_SCAN_ROWS // 2
+            or len({(ref.day, ref.slot) for ref in positions}) > log.MAX_SCAN_FILES // 2
+        ):
+            raise _narrow_query()
 
         def fields(row: log.RowPosition) -> tuple[int, int, int, int]:
             return row.day.toordinal(), row.slot, row.offset, row.size
 
-        raw = json.dumps(
+        files = [
             (
-                list(map(fields, positions)),
-                [
-                    (
-                        day.toordinal(),
-                        slot,
-                        extent.size,
-                        extent.device,
-                        extent.inode,
-                        extent.modified,
-                    )
-                    for (day, slot), extent in sorted(snapshot.items())
-                ],
-                [
-                    (tag, *fields(row))
-                    for tag, refs in links.items()
-                    for row in sorted(refs)
-                ],
-            ),
-            separators=(",", ":"),
-        ).encode()
+                day.toordinal(),
+                slot,
+                extent.size,
+                extent.device,
+                extent.inode,
+                extent.modified,
+            )
+            for (day, slot), extent in sorted(snapshot.items())
+        ]
+
+        def pack(refs: LinkPositions) -> bytes | None:
+            raw = json.dumps(
+                (
+                    list(map(fields, positions)),
+                    files,
+                    [
+                        (tag, *fields(row))
+                        for tag, rows in sorted(refs.items())
+                        for row in sorted(rows)
+                    ],
+                    (sorted(search.wanted), sorted(search.settled), search.forgotten),
+                ),
+                separators=(",", ":"),
+            ).encode()
+            if len(raw) > MAX_CURSOR_STATE_BYTES:
+                return None
+            data = zlib.compress(raw)
+            return data if len(data) <= MAX_CURSOR_FILE_BYTES else None
+
+        data = pack(links)
+        if data is None:
+            required = {
+                tag: refs for tag, refs in links.items() if tag[:16] in required_tags
+            }
+            if len(required) < len(links):
+                # Future pages can look up evicted links from the snapshot.
+                search.forgotten = True
+                data = pack(required)
+        if data is None:
+            raise _narrow_query()
         report["nextBefore"] = (
-            base + CURSOR_STATE_SUFFIX + _write_cursor_state(root, raw, snapshot)
+            base + CURSOR_STATE_SUFFIX + _write_cursor_state(root, data, snapshot)
         )
 
 
@@ -526,6 +578,41 @@ def _link_tag(kind: str, value: str | tuple[str, str, str]) -> str:
     return hashlib.blake2s(
         json.dumps((kind, value)).encode(), digest_size=8
     ).hexdigest()
+
+
+def _run_scope_tag(tag: str, scope: Scope) -> str:
+    return tag + _link_tag("scope", (*scope, ""))
+
+
+def _conflicting_invocation_tag(tag: str) -> str:
+    return tag + "0000000000000000"
+
+
+def _matches_link_scope(line: LogLine, addr: str | None, identity: str | None) -> bool:
+    endpoint_id = line.get("endpointId")
+    return (addr is None or _address(line) in (None, addr)) and (
+        identity is None
+        or (
+            endpoint_id in (None, identity)
+            and (line.get("endpoint") is None or endpoint_id == identity)
+        )
+    )
+
+
+def _candidate_tag(
+    line: LogLine, key: str, addr: str | None, identity: str | None
+) -> str | None:
+    if line.get("event") == "log.dropped":
+        run = _id(line, "runId")
+        return _link_tag("run", run) if run else None
+    if (
+        (not _has_intent(line, key) or _scope(line) is None)
+        and _matches_link_scope(line, addr, identity)
+        and (match := _invocation(line)) is not None
+        and line.get("intentKey") in (None, key)
+    ):
+        return _link_tag("invocation", match)
+    return None
 
 
 def _export(line: LogLine, tokens: tuple[str, ...]) -> LogLine:
@@ -640,7 +727,7 @@ def intent(
     if addr is not None and not keeper.is_address(addr):
         raise SaiError("Pass a 0x-prefixed EVM address.", Code.INVALID_REQUEST)
     chosen_addr = addr.lower() if addr else None
-    cursor, positions, snapshot, links = _intent_cursor(before, root)
+    cursor, positions, snapshot, links, search = _intent_cursor(before, root)
     log.flush(1.0)
     if snapshot is None:
         snapshot = log.snapshot_files(root)
@@ -694,7 +781,11 @@ def intent(
             for position, line in following:
                 remember_anchor(position, line)
             scan.truncated |= truncated
-        pending = set().union(*links.values()) - checked if links else set()
+        pending = (
+            set().union(*links.values()) - checked
+            if links and cursor.replay is None
+            else set()
+        )
         # Leave part of the same budget for links the selected rows need.
         reserved = log.ScanBudget(
             min(sum(ref.size for ref in pending), budget.bytes_left // 2),
@@ -716,19 +807,18 @@ def intent(
             )
             if (ts := _timestamp(line)) is not None
         ]
-        if not rows and scan.resume == cursor.position:
-            scan.resume = None
     complete_scan = not scan.truncated
     anchors = sorted((line for _, line in evidence.values()), key=log.event_order)
     identity = (log.endpoint_id(endpoint, root) or "") if endpoint else None
     scope, ambiguous = _select_scope(anchors, chosen_addr, identity)
+    link_addr, link_identity = scope or (chosen_addr, identity)
     direct = [line for line in anchors if scope is not None and _scope(line) == scope]
     invocations = {match for line in direct if (match := _invocation(line))}
     conflicting = {
         match
         for line in anchors
         if _scope(line) not in (None, scope)
-        and (match := _invocation(line)) in invocations
+        and (match := _invocation(line)) is not None
     }
     report: LogLine = {
         "intentKey": key if scope else None,
@@ -783,12 +873,53 @@ def intent(
     report["txHash"] = keeper.request_hash(log.clean(request_hash))[0]
     matched_runs = {_id(line, "runId") for line in direct} - {None}
 
-    def resolve_link(tag: str) -> bool:
+    def resolve_link(
+        tag: str,
+        *,
+        run: str | None = None,
+        invocation: tuple[str, str, str] | None = None,
+    ) -> bool:
         pending = links.get(tag, set()) - checked
-        previous, truncated = log.read_rows_at(root, list(pending), snapshot, budget)
+        if run and scope is not None:
+            pending.update(links.get(_run_scope_tag(tag, scope), set()) - checked)
+        if invocation is not None:
+            pending.update(links.get(_conflicting_invocation_tag(tag), set()) - checked)
+
+        def decisive(anchor: LogLine) -> bool:
+            if not is_anchor(anchor) or (anchor_scope := _scope(anchor)) is None:
+                return False
+            if run:
+                return anchor_scope == scope and _id(anchor, "runId") == run
+            return anchor_scope != scope and _invocation(anchor) == invocation
+
+        previous, truncated = log.read_rows_at(
+            root, list(pending), snapshot, budget, until=decisive
+        )
         if truncated:
+            # Keep unread references and one verified row for each distinct
+            # relationship. Duplicate proofs need no further reads on retry.
+            representatives = {}
+            visited = set()
+            for position, anchor in previous:
+                visited.add(position)
+                if is_anchor(anchor):
+                    if (
+                        run
+                        and (anchor_scope := _scope(anchor)) is not None
+                        and _id(anchor, "runId") == run
+                    ):
+                        links.setdefault(_run_scope_tag(tag, anchor_scope), set()).add(
+                            position
+                        )
+                        continue
+                    relation = (
+                        _scope(anchor),
+                        _id(anchor, "runId") if run else _invocation(anchor),
+                    )
+                    representatives.setdefault(relation, position)
+            links[tag] = links.get(tag, set()) - visited | set(representatives.values())
             return False
-        checked.update(pending)
+        checked.update(position for position, _ in previous)
         for position, anchor in previous:
             if not is_anchor(anchor):
                 continue
@@ -806,36 +937,66 @@ def intent(
     page = _PageReport(report)
     last = None
     stop = None
+    replay = cursor.replay
+    search_from: log.ScanPosition | None = None
+    can_defer = scan.resume is not None or search.forgotten
+
+    def defer(position: log.ScanPosition, tag: str, index: int) -> bool:
+        nonlocal replay, search_from
+        if not can_defer or tag in search.settled:
+            return False
+        candidates = {
+            candidate
+            for _, _, row in rows[index:]
+            if (candidate := _candidate_tag(row, key, chosen_addr, identity))
+            is not None
+        } | {tag}
+        search.settled.intersection_update(candidates)
+        search.wanted = candidates - search.settled
+        replay = position
+        # Once speculative links were evicted, the anchor may be in a
+        # window already passed by the output cursor.
+        if search.forgotten:
+            search_from = log.ScanPosition(max(snapshot)[0])
+        return True
+
     unattributed = []
-    for position, ts, line in rows:
+    for index, (position, ts, line) in enumerate(rows if replay is None else ()):
         if line.get("event") == "log.dropped":
             run_id = _id(line, "runId")
             if (
                 scope is not None
                 and run_id
                 and run_id not in matched_runs
-                and not resolve_link(_link_tag("run", run_id))
+                and not resolve_link(_link_tag("run", run_id), run=run_id)
             ):
                 stop = position
                 break
             if run_id not in matched_runs:
+                if run_id and defer(position, _link_tag("run", run_id), index):
+                    break
                 unattributed.append(line)
                 continue
             field = "gaps"
         elif scope is not None and _has_intent(line, key) and _scope(line) == scope:
             field = "events"
         elif (
-            scope is not None
-            and (match := _invocation(line)) is not None
+            (match := _invocation(line)) is not None
             and line.get("intentKey") in (None, key)
-            and _address(line) in (None, scope[0])
-            and (line.get("endpoint") is None or line.get("endpointId") == scope[1])
-            and line.get("endpointId") in (None, scope[1])
+            and _matches_link_scope(line, link_addr, link_identity)
         ):
-            if not resolve_link(_link_tag("invocation", match)):
+            if match in conflicting:
+                continue
+            if scope is not None and not resolve_link(
+                _link_tag("invocation", match), invocation=match
+            ):
                 stop = position
                 break
-            if match not in invocations or match in conflicting:
+            if match in conflicting:
+                continue
+            if scope is None or match not in invocations:
+                if defer(position, _link_tag("invocation", match), index):
+                    break
                 continue
             field = "events"
         else:
@@ -851,37 +1012,40 @@ def intent(
         scan.truncated |= any(
             not page.add("unattributedGaps", line) for line in unattributed[:8]
         )
-    if stop is not None and stop == cursor.position and last is None:
-        # The first unread row needs more context than this page can verify.
-        scan.truncated = True
-        scan.resume = stop = None
-    page.finish(scan, cursor, last, stop)
+    searching = replay is not None
+    search_tags = search.wanted.copy()
+    if searching and complete_scan and search_from is None:
+        # The search has reached the end of the snapshot. Resume output at
+        # the first withheld row with the anchors found across all windows.
+        stop, replay = replay, None
+        search.settled.update(search.wanted)
+        search.wanted.clear()
+    if search_from is not None:
+        stop = search_from
+    page.finish(scan, cursor, last, stop, replay=replay)
     if frontier := stop or scan.resume:
         # Scope evidence can be deeper than the next page's scan. Links to
         # unread anchors are only needed when the scan already saw related rows.
         remaining_rows = rows
-        if complete_scan and stop is not None:
+        if complete_scan and stop is not None and not searching:
             first_unread = next(
                 index for index, (position, _, _) in enumerate(rows) if position == stop
             )
             remaining_rows = rows[first_unread:]
-        related_invocations = {
-            match
+        needed = {
+            tag
             for _, _, line in remaining_rows
-            if (not _has_intent(line, key) or _scope(line) is None)
-            and (match := _invocation(line)) is not None
+            if (tag := _candidate_tag(line, key, chosen_addr, identity)) is not None
         }
-        related_runs = {
-            _id(line, "runId")
-            for _, _, line in remaining_rows
-            if line.get("event") == "log.dropped"
-        }
-        if complete_scan:
+        if complete_scan and not searching:
             # The entire unread range was visible. Drop links it cannot use.
-            needed = {_link_tag("invocation", match) for match in related_invocations}
-            needed.update(_link_tag("run", run) for run in related_runs if run)
-            links = {tag: refs for tag, refs in links.items() if tag in needed}
+            links = {
+                tag: refs
+                for tag, refs in links.items()
+                if tag[:16] in needed | search.settled
+            }
         summaries: dict[tuple[Any, ...], tuple[log.RowPosition, LogLine]] = {}
+        proofs: set[tuple[str, Scope]] = set()
         for group, (position, line) in evidence.items():
             authority = (group[0], *group[3:])
             previous = summaries.get(authority)
@@ -894,22 +1058,50 @@ def intent(
                     or position.offset < frontier.offsets[position.slot]
                 )
             )
-            if (match := _invocation(line)) and (
-                (not unread and (not complete_scan or match in related_invocations))
-                or (not complete_scan and match in related_invocations)
-            ):
-                links.setdefault(_link_tag("invocation", match), set()).add(position)
-            if (run_id := _id(line, "runId")) and (
-                (not unread and (not complete_scan or run_id in related_runs))
-                or (not complete_scan and run_id in related_runs)
-            ):
-                links.setdefault(_link_tag("run", run_id), set()).add(position)
+            if anchor_scope := _scope(line):
+                matches_query = _matches_link_scope(line, chosen_addr, identity)
+                for kind, value in (
+                    ("invocation", _invocation(line)),
+                    ("run", _id(line, "runId")),
+                ):
+                    if value is None:
+                        continue
+                    if kind == "run" and not matches_query:
+                        continue
+                    tag = _link_tag(kind, value)
+                    proof = tag, anchor_scope
+                    if searching:
+                        retain = tag in search_tags or (
+                            cursor.replay is None
+                            and not search.forgotten
+                            and not unread
+                        )
+                    else:
+                        retain = (
+                            tag in needed and (not unread or not complete_scan)
+                        ) or (not complete_scan and not unread and not search.forgotten)
+                    if retain and proof not in proofs:
+                        proofs.add(proof)
+                        ref_tag = tag
+                        if kind == "run":
+                            ref_tag = _run_scope_tag(tag, anchor_scope)
+                        elif not matches_query:
+                            # One incompatible scope suffices to disqualify
+                            # this invocation for the requested scope.
+                            ref_tag = _conflicting_invocation_tag(tag)
+                            if ref_tag in links:
+                                continue
+                        links.setdefault(ref_tag, set()).add(position)
         _save_intent_cursor(
             report,
             [position for position, _ in summaries.values()],
             snapshot,
             links,
+            search,
             root,
+            required_tags=search_tags
+            | search.settled
+            | (needed if not searching else set()),
         )
     if report.get("truncated") and "nextBefore" not in report:
         report["more"] = "Inspect the retained files from sai logs path."

@@ -290,22 +290,6 @@ signature = "239418fc6b03abbc915c3b34c45a8dad8d9a15812487eb6dee32b3e0e616a5a4"
 owner = "#171"
 signature = "0793bbb2b4b7cd7b1a4da3a694625621c770447bed6ef14d2840069f3ace9bec"
 
-[gap."cli:logs intent"]
-owner = "#126"
-signature = "eb3616ea18827a78b76b245af4136b46e433c95369f30cafa29b314f36269d63"
-
-[gap."cli:logs run"]
-owner = "#126"
-signature = "eb3616ea18827a78b76b245af4136b46e433c95369f30cafa29b314f36269d63"
-
-[gap."cli:logs stats"]
-owner = "#126"
-signature = "eb3616ea18827a78b76b245af4136b46e433c95369f30cafa29b314f36269d63"
-
-[gap."cli:skill install"]
-owner = "#126"
-signature = "8caa35d02c69de313a00a6e21cf0b861dd1796702f1887716d0929af3584f53e"
-
 [gap."mcp:account_balances"]
 owner = "#175"
 signature = "a534a33ee3dd54f0890afebe1bbe4ed85aa1ffb43409fc828c3fefdf5aae24d4"

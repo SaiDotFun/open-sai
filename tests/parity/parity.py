@@ -92,6 +92,12 @@ class Case:
     unset: list[str] | None = None
     wire: list[str] | None = None
     state: dict[str, Any] | None = None
+    output: dict[str, Any] | None = None
+    retry_expect: int | None = None
+    mcp_calls: list[dict[str, Any]] | None = None
+    rust: dict[str, Any] | None = None
+    rust_early_position_reads: int = 0
+    accepted_difference: str | None = None
     client_seed: str | None = None
     accepted_divergence: str | None = None
     absent_log_text: list[str] | None = None
@@ -103,6 +109,19 @@ class Case:
     @property
     def command(self) -> str:
         return " ".join(command_path(python_cli, self.args)) or self.args[0]
+
+    def rust_case(self) -> Case:
+        wire = list(self.wire or [])
+        if self.position_case:
+            # Rust checks the position owner before its first LCD request.
+            for index in range(len(wire) - 2):
+                if wire[index : index + 3] == ["oneClickTrading", "node_info", "trade"]:
+                    wire[index + 1 : index + 3] = ["trade", "node_info"]
+        return replace(self, **{"wire": wire, **(self.rust or {})})
+
+    @property
+    def position_case(self) -> bool:
+        return self.name.startswith(("trade-margin", "trade-partial-close"))
 
 
 @dataclass(frozen=True)
@@ -237,19 +256,31 @@ def mcp_exchange(
                 requests = [
                     (request, None, False) for request in handshake(case.mcp_protocol)
                 ]
-                calls = CALLS[case.mcp_profile]
-                if probe_deferred_trade:
-                    requests.append(
-                        (
-                            DEFERRED_TRADE_PROBE.request(3 + len(calls), endpoints),
-                            None,
-                            True,
+                if case.mcp_calls is None:
+                    calls = CALLS[case.mcp_profile]
+                    if probe_deferred_trade:
+                        requests.append(
+                            (
+                                DEFERRED_TRADE_PROBE.request(3 + len(calls), endpoints),
+                                None,
+                                True,
+                            )
                         )
+                    requests.extend(
+                        (call.request(id_, endpoints), call.session, False)
+                        for id_, call in enumerate(calls, 3)
                     )
-                requests.extend(
-                    (call.request(id_, endpoints), call.session, False)
-                    for id_, call in enumerate(calls, 3)
-                )
+                else:
+                    # Position cases assert their tool results directly.
+                    requests.pop()  # tools/list
+                    requests.extend(
+                        (
+                            {"id": id_, "method": "tools/call", "params": call},
+                            None,
+                            False,
+                        )
+                        for id_, call in enumerate(case.mcp_calls, 2)
+                    )
                 for request, session, probe in requests:
                     if session is not None:
                         write_seed(
@@ -301,6 +332,20 @@ def mcp_exchange(
         )
 
 
+ABSENT = object()
+
+
+def field_matches(actual: Any, keys: str, expected: Any) -> bool:
+    for key in keys.split(".") if keys else ():
+        if isinstance(actual, list) and key.isdecimal() and int(key) < len(actual):
+            actual = actual[int(key)]
+        else:
+            actual = actual.get(key, ABSENT) if isinstance(actual, dict) else ABSENT
+    if expected == "<absent>":
+        return actual is ABSENT
+    return first_difference(actual, expected, keys) is None
+
+
 def check_deferred_trade_probe(result: dict[str, Any]) -> None:
     blocks = result.get("content")
     if (
@@ -324,8 +369,7 @@ def state_differences(state: dict[str, Any], files: dict[str, Entry]) -> list[st
     differences = []
     for selector, expected in state.items():
         name, _, keys = selector.partition("#")
-        absent = object()
-        actual: Any = absent
+        actual: Any = ABSENT
         if entry := files.get(name):
             if keys == "@mode":
                 if entry.mode == expected:
@@ -333,17 +377,7 @@ def state_differences(state: dict[str, Any], files: dict[str, Entry]) -> list[st
                 differences.append(f"Persisted mode differs from expectation at {name}")
                 continue
             actual = entry.data if keys else entry.kind
-        for key in keys.split(".") if keys else ():
-            if isinstance(actual, list) and key.isdecimal() and int(key) < len(actual):
-                actual = actual[int(key)]
-            else:
-                actual = actual.get(key, absent) if isinstance(actual, dict) else absent
-        mismatch = (
-            actual is not absent
-            if expected == "<absent>"
-            else first_difference(actual, expected, selector)
-        )
-        if mismatch:
+        if not field_matches(actual, keys, expected):
             differences.append(
                 f"Persisted state differs from expectation at {selector}"
             )
@@ -462,6 +496,12 @@ def observe(
         )
     else:
         result = invoke(binary, args, home, env)
+        if case.retry_expect is not None:
+            contender = invoke(binary, args, home, env)
+            if contender.returncode != case.retry_expect:
+                raise ValueError(
+                    f"Expected retry exit {case.retry_expect}, got {contender.returncode}"
+                )
     ended_at = time.time()
     for error in endpoints.errors:
         check_failed(error)
@@ -496,6 +536,10 @@ def observe(
         ended_at=ended_at,
         fixture_values=fixture_values,
     )
+    admission_key = endpoints.admission.key
+    expected_id = (
+        normalize.identity("intentKey", admission_key) if admission_key else None
+    )
     if case.absent_log_text:
         for path in (home / "sai" / "logs").glob("*.jsonl"):
             text = path.read_text(encoding="utf-8")
@@ -527,6 +571,8 @@ def observe(
             state[f"{filename}#{entry}.args"] = ["mcp", "serve"]
         else:
             state[f"{filename}#{entry}"] = "<absent>"
+    if expected_id is not None:
+        state[f"{LEDGER}#tables.intents.rows.0.id"] = expected_id
     for mismatch in state_differences(state, files):
         check_failed(mismatch)
     display = result.stdout
@@ -539,7 +585,7 @@ def observe(
         if contender:
             output = {
                 "first": output,
-                "contender": stdout(
+                "contender" if concurrent else "retry": stdout(
                     contender.stdout, case.mode, case.command, normalize
                 ),
             }
@@ -549,12 +595,15 @@ def observe(
         raise ValueError(
             f"Invalid {case.mode} stdout (exit {result.returncode})"
         ) from None
+    for keys, expected in (case.output or {}).items():
+        if not field_matches(output, keys, expected):
+            check_failed(f"Stdout differs from expectation at {keys}")
     if case.overview_expected:
         try:
             check_overview_fields(case.overview_expected, output)
         except ValueError as exc:
             check_failed(str(exc))
-    if case.mode == "mcp":
+    if case.mode == "mcp" and case.mcp_calls is None:
         mcp_tools(output)
         try:
             check_mcp_calls(output, case.mcp_profile)
@@ -564,8 +613,9 @@ def observe(
     if case.accepted_divergence == "uninstall-read-only":
         check_read_only_uninstall(case, result.returncode, output, stderr, candidate)
     if contender:
+        followup = "contender" if concurrent else "retry"
         stderr += tuple(
-            f"contender {category}" for category in stderr_category(contender.stderr)
+            f"{followup} {category}" for category in stderr_category(contender.stderr)
         )
     exact = case.exact_output or case.command.split()[0] in {
         "market",
@@ -733,8 +783,12 @@ def mcp_evidence(
             evidence.setdefault(tool, []).extend(fields)
 
     prefix = case.name
-    left_tools = mcp_tools(reference.output) if reference else {}
-    right_tools = mcp_tools(candidate.output) if candidate else {}
+    left_tools = (
+        mcp_tools(reference.output) if reference and case.mcp_calls is None else {}
+    )
+    right_tools = (
+        mcp_tools(candidate.output) if candidate and case.mcp_calls is None else {}
+    )
     for tool in left_tools.keys() | right_tools.keys():
         record(
             tool,
@@ -752,13 +806,46 @@ def mcp_evidence(
         if candidate
         else {}
     )
-    for id_, call in enumerate(CALLS[case.mcp_profile], 3):
+    if case.mcp_calls is None:
+        names = enumerate((call.tool for call in CALLS[case.mcp_profile]), 3)
+    else:
+        names = enumerate((call["name"] for call in case.mcp_calls), 2)
+    for id_, name in names:
         record(
-            call.tool,
+            name,
             differing_paths(
                 left_calls.get(id_), right_calls.get(id_), f"{prefix}.call[{id_}]"
             ),
         )
+
+
+def matches_early_position_reads(
+    reference: Observation, candidate: Observation, expected_reads: int
+) -> bool:
+    name = "logs/cli.jsonl"
+    entry = candidate.files.get(name)
+    if entry is None:
+        return False
+    remaining = []
+    reads = 0
+    for event in entry.data:
+        sequence = event.get("seq")
+        if type(sequence) is not int:
+            return False
+        if (event.get("event"), event.get("operation"), event.get("status")) == (
+            "keeper.request",
+            "position",
+            "ok",
+        ):
+            if not remaining or sequence != remaining[-1]["seq"] + reads + 1:
+                return False
+            reads += 1
+        else:
+            remaining.append({**event, "seq": sequence - reads})
+    if reads != expected_reads:
+        return False
+    files = {**candidate.files, name: replace(entry, data=remaining)}
+    return not differences(reference, replace(candidate, files=files))
 
 
 def safe_observe(
@@ -878,6 +965,64 @@ def project_reference_lcd_origin(output: dict[str, Any]) -> None:
         )
 
 
+def project_reference_log_privacy(
+    reference: Observation, candidate: Observation
+) -> None:
+    """Accept placeholder values while comparing log shape and public fields."""
+    for name, reference_file in reference.files.items():
+        if not name.startswith("logs/") or not name.endswith(".jsonl"):
+            continue
+        candidate_file = candidate.files.get(name)
+        if candidate_file is None or len(reference_file.data) != len(
+            candidate_file.data
+        ):
+            continue
+        for old, new in zip(reference_file.data, candidate_file.data, strict=True):
+            if old.get("event") != new.get("event"):
+                continue
+            old_argv, new_argv = old.get("argv"), new.get("argv")
+            if (
+                isinstance(old_argv, list)
+                and isinstance(new_argv, list)
+                and len(old_argv) == len(new_argv)
+            ):
+                for index, (before, after) in enumerate(
+                    zip(old_argv, new_argv, strict=True)
+                ):
+                    if after == "[redacted]" or (
+                        isinstance(after, str)
+                        and isinstance(before, str)
+                        and after.endswith("=[redacted]")
+                        and before.startswith(after.removesuffix("[redacted]"))
+                    ):
+                        old_argv[index] = after
+            for field in ("error", "errorMsg", "errorMessage"):
+                if field in old and new.get(field) == "[redacted]":
+                    old[field] = "[redacted]"
+            if old.get("event") == "mcp.tool_call":
+                old_args, new_args = old.get("arguments"), new.get("arguments")
+                if isinstance(old_args, dict) and isinstance(new_args, dict):
+                    for key in old_args.keys() & new_args.keys():
+                        if new_args[key] == "[redacted]":
+                            old_args[key] = "[redacted]"
+
+
+def project_reference_rejected_scope(reference: Observation) -> Observation:
+    # The usage envelope remains comparable. Only the fixed error line differs.
+    if reference.raw is None:
+        return reference
+    stdout_bytes, stderr = reference.raw
+    before, separator, message = stderr.rpartition(b"\nError: ")
+    if not separator or not message.startswith(b"Invalid value for '--scope': "):
+        return reference
+    stderr = (
+        before
+        + separator
+        + b"Invalid value for '--scope': expected one of 'user', 'project', 'local'.\n"
+    )
+    return replace(reference, raw=(stdout_bytes, stderr))
+
+
 def project_reference_doctor_keeper_log(left: Observation, right: Observation) -> None:
     """Allow the existing omission of command context on Rust's Keeper probe."""
     name = "logs/cli.jsonl"
@@ -904,6 +1049,8 @@ def run_case(
     cutover: bool = False,
     tool_evidence: dict[str, list[str]] | None = None,
 ) -> tuple[list[str], dict[str, str], str | None]:
+    rust = candidate is not reference
+    candidate_case = case.rust_case() if rust else case
     with (
         tempfile.TemporaryDirectory(prefix="sai-parity-") as temp,
         loopback(case.server) as endpoints,
@@ -911,23 +1058,21 @@ def run_case(
         left, left_error = safe_observe(
             case, reference, Path(temp) / "reference", endpoints, cutover=cutover
         )
-        candidate_case = (
-            replace(case, wire=case.mcp_checkout_wire)
-            if candidate != reference and case.mcp_checkout_wire is not None
-            else case
-        )
+        if rust and case.mcp_checkout_wire is not None:
+            candidate_case = replace(candidate_case, wire=case.mcp_checkout_wire)
         right, right_error = safe_observe(
             candidate_case,
             candidate,
             Path(temp) / "candidate",
             endpoints,
-            candidate=candidate != reference,
+            candidate=rust,
             cutover=cutover,
         )
     if case.mode == "mcp" and tool_evidence is not None:
         mcp_evidence(case, left, right, tool_evidence)
     tools = {}
-    if case.mode == "mcp" and left is not None:
+    inventory_case = case.mode == "mcp" and case.mcp_calls is None
+    if inventory_case and left is not None:
         expected = mcp_tools(left.output)
         actual = mcp_tools(right.output) if right is not None else {}
         for name in sorted(expected.keys() | actual.keys()):
@@ -957,6 +1102,10 @@ def run_case(
     reference_exit = left.exit_code
     if candidate != reference and case.accepted_divergence == "lcd-origin-only":
         project_reference_lcd_origin(left.output)
+    if rust and not cutover:
+        project_reference_log_privacy(left, right)
+        if case.name in {"mcp-install-invalid-scope", "mcp-install-empty-scope"}:
+            left = project_reference_rejected_scope(left)
     if (
         candidate != reference
         and case.accepted_divergence == "doctor-keeper-log-context"
@@ -1011,21 +1160,48 @@ def run_case(
             left, exit_code=right.exit_code, output=right.output, stderr=right.stderr
         )
     expected = None
-    if case.mode == "mcp" and reference != candidate and not cutover:
-        expected = expect_native_mcp_info(
-            left.output,
-            allow_deferred_trade=case.mcp_deferred_trade_exception,
-        )
-        validation = expect_native_mcp_validation(left.output, case.mcp_profile)
-        expected = (
-            ", ".join(reason for reason in (expected, validation) if reason) or None
-        )
-    diffs = cutover_differences(left, right) if cutover else differences(left, right)
+    if cutover:
+        diffs = cutover_differences(left, right)
+    else:
+        if rust and case.position_case:
+            project_position_estimates(left.output)
+        if rust and case.accepted_difference and case.mode != "mcp":
+            diffs = []
+            if right.exit_code != candidate_case.expect:
+                diffs.append(
+                    f"expected candidate exit {candidate_case.expect}, got {right.exit_code}"
+                )
+            if left.stderr != right.stderr:
+                diffs.append("stderr differs")
+        else:
+            diffs = differences(left, right)
+        expected = case.accepted_difference if rust else None
+        if (
+            rust
+            and diffs
+            and case.rust_early_position_reads
+            and matches_early_position_reads(
+                left, right, case.rust_early_position_reads
+            )
+        ):
+            diffs = []
+            expected = "Rust checks Keeper ownership before reading the LCD network."
+
+        if inventory_case and rust:
+            expected = expect_native_mcp_info(
+                left.output,
+                allow_deferred_trade=case.mcp_deferred_trade_exception,
+            )
+            validation = expect_native_mcp_validation(left.output, case.mcp_profile)
+            expected = (
+                ", ".join(reason for reason in (expected, validation) if reason) or None
+            )
+            diffs = differences(left, right)
     if reference_exit != case.expect:
         diffs.insert(0, f"expected reference exit {case.expect}, got {reference_exit}")
     if (case.mode in {"mcp", "jsonl"} or case.expect == 0) and left.output == "":
         diffs.insert(0, "expected reference JSON output")
-    if case.mode == "mcp":
+    if inventory_case:
         for call in CALLS[case.mcp_profile]:
             if call.expected == "ok" and not diffs:
                 tools[call.tool] = "PASS"
@@ -1058,6 +1234,18 @@ def release_commands(reference: list[str]) -> set[str]:
     ):
         raise ValueError("Invalid release command inventory")
     return set(names)
+
+
+def project_position_estimates(value: Any) -> None:
+    """Compare position quotes independently of Python's newer read-only estimates."""
+    if isinstance(value, list):
+        for item in value:
+            project_position_estimates(item)
+    elif isinstance(value, dict):
+        if value.get("dryRun") and "positionRoute" in value:
+            value.pop("estimates", None)
+        for item in value.values():
+            project_position_estimates(item)
 
 
 def row(command: str, status: str, detail: str = "") -> None:
@@ -1098,7 +1286,9 @@ def main() -> int:
         "--case", action="append", help="Run matching case IDs (glob, repeatable)"
     )
     parser.add_argument(
-        "--reference", help="Use this Python sai executable for every selected case"
+        "--reference",
+        "--python-reference",
+        help="Use this Python sai executable for every selected case",
     )
     parser.add_argument(
         "--cutover",
@@ -1125,7 +1315,8 @@ def main() -> int:
         parser.error(SQLITE_SCHEMA_REQUIREMENT)
     try:
         enter_loopback()
-        if args.reference is None:
+        configured_reference = args.reference or os.environ.get("SAI_PARITY_PYTHON")
+        if configured_reference is None:
             reference = [
                 resolve_uv(),
                 "run",
@@ -1135,7 +1326,7 @@ def main() -> int:
                 "--offline",
                 "sai",
             ]
-        elif executable := shutil.which(args.reference):
+        elif executable := shutil.which(configured_reference):
             reference = [str(Path(executable).absolute())]
         else:
             parser.error("--reference must name an executable Python sai")

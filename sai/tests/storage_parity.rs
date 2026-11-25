@@ -281,16 +281,11 @@ fn invalid_settings_diagnostics_omit_supplied_values() {
 fn invalid_settings_match_python_for_local_commands() {
     let home = tempdir().unwrap();
     let config = home.path().join("config.toml");
-    for invalid in [
-        "[lcd]\nendpoint = false\n",
-        "[update]\nauto = 'off'\n",
-        "[keeper]\nws_endpoint = 'http://localhost'\n",
+    for (invalid, code) in [
+        ("[lcd]\nendpoint = false\n", 2),
+        ("[update]\nauto = 'off'\n", 1),
+        ("[keeper]\nws_endpoint = 'http://localhost'\n", 2),
     ] {
-        let code = if invalid.starts_with("[update]") {
-            1
-        } else {
-            2
-        };
         fs::write(&config, invalid).unwrap();
         parity(home.path(), &["--json", "auth", "list"], code);
         parity(home.path(), &["--json", "auth", "status"], code);

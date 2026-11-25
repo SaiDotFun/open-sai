@@ -29,10 +29,10 @@ pytestmark = [
 
 
 def run_driver(
-    case: str, env: dict[str, str], *args: str
+    case: str, env: dict[str, str], *options: str
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(HERE / "parity.py"), "--case", case, *args],
+        [sys.executable, str(HERE / "parity.py"), "--case", case, *options],
         cwd=ROOT,
         env=env,
         capture_output=True,
@@ -115,6 +115,19 @@ def test_wrong_candidate_fails(
     assert message in run.stdout
 
 
+def test_driver_invokes_the_explicit_python_reference(tmp_path: Path) -> None:
+    reference = tmp_path / "python-sai"
+    reference.write_text(
+        f"#!{sys.executable}\nraise SystemExit(37)\n", encoding="utf-8"
+    )
+    reference.chmod(0o700)
+    env = dict(os.environ)
+    env.pop("SAI_PARITY_BIN", None)
+    run = run_driver("version", env, "--python-reference", str(reference))
+    assert run.returncode == 1, run.stdout + run.stderr
+    assert "expected reference exit 0, got 37" in run.stdout
+
+
 def test_equivalent_candidate_passes(tmp_path: Path) -> None:
     run = run_mutant(tmp_path, "history-format", "account-history")
     assert run.returncode == 0, run.stdout + run.stderr
@@ -143,6 +156,15 @@ def test_explicit_reference_takes_precedence_over_lane_pin(tmp_path: Path) -> No
 
     assert run.returncode == 1, run.stdout + run.stderr
     assert "reference Persisted state differs from expectation at trader" in run.stdout
+
+
+def test_stale_index_rejects_changed_error_code(tmp_path: Path) -> None:
+    mutant = write_mutant(tmp_path, "stale-index-code")
+    env = {**os.environ, "SAI_PARITY_PYTHON": str(mutant)}
+    env.pop("SAI_PARITY_BIN", None)
+    run = run_driver("trade-partial-close-index-lag-before-minimum", env)
+    assert run.returncode == 1, run.stdout + run.stderr
+    assert "reference Stdout differs from expectation at error.code" in run.stdout
 
 
 def test_reference_uses_real_uv_with_home_dependent_shim(tmp_path: Path) -> None:

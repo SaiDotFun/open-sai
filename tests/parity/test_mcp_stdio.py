@@ -475,7 +475,7 @@ def test_rejected_arguments_are_logged_as_metadata(
         "trade_close",
     ]
     string_metadata = {"type": "string", "length": len(credential)}
-    assert calls[0]["arguments"] == {"trade_id": string_metadata, "addr": ADDRESS}
+    assert calls[0]["arguments"] == {"trade_id": string_metadata, "addr": "[redacted]"}
     assert calls[0]["unknownArguments"] == 1
     assert calls[0]["unknownArgumentMetadata"] == [{"type": "object", "length": 1}]
     assert calls[1]["arguments"] == {"trade_id": {"type": "number", "length": 1}}
@@ -518,7 +518,7 @@ def test_session_lookup_refusals_omit_submitted_addresses(
     results = [event for event in events if event["event"] == "mcp.tool_result"]
     assert len(results) == len(TRADE_TOOLS)
     assert {result["tool"] for result in results} == set(TRADE_TOOLS)
-    assert all(result["error"] == error for result in results)
+    assert all(result["error"] == "[redacted]" for result in results)
     assert all(result["code"] == "SESSION_UNAVAILABLE" for result in results)
 
 
