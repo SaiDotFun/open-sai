@@ -41,19 +41,11 @@ modes. The dry-run case compares each CLI with and without `--wait`.
 
 The TP/SL and leverage wait cases use Python main at
 `20493c984e3398756365ea1a2b8786a7a0115a11`. They check the request and
-execution blocks, admission and chain failure codes, the pinned 30-second
-deadline, and intent-key recovery after Ctrl-C.
-
-The current Python trade `--wait` budget is 60 seconds. Rust trade `--wait`
-allows 30 seconds, so Rust can exit 5 with `OUTCOME_UNKNOWN` while Python
-is still polling the same intent. The pinned Python comparison uses the old
-30-second budget. The current Python test covers success after simulated
-second 30 and timeout at second 60.
-
-This is an open native cutover gap. The Rust trade CLI owns the follow-up.
-[PR #200](https://github.com/SaiDotFun/open-sai/pull/200) owns the trade
-caller in `sai/src/trade.rs`. That caller shares its timeout constant with
-standalone `sai intent wait`, so the follow-up needs a trade-specific budget.
+execution blocks, admission and chain failure codes, and intent-key recovery
+after Ctrl-C. The deadline cases exercise the pin's 30-second budget and
+Rust's 60-second budget. They also check that Rust reports a leverage
+execution first visible after 33 seconds. Current Python trade `--wait`
+also uses 60 seconds and tests the late result with a simulated clock.
 
 ```sh
 SAI_PARITY_WAIT_PYTHON=/absolute/path/to/pinned/.venv/bin/sai \
