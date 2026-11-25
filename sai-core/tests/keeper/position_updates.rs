@@ -360,7 +360,7 @@ async fn close_preview_requires_verified_ownership_to_issue_a_digest() {
 }
 
 #[tokio::test]
-async fn close_preview_withholds_digest_when_the_height_check_returns_a_different_index() {
+async fn close_preview_checks_the_index_even_without_a_block_height() {
     for (latest_index, verified) in [(8, false), (7, true)] {
         let server = PositionServer::start(ACCOUNT, ACCOUNT);
         // Neither response serves a block height. Only a conflicting index
@@ -390,12 +390,15 @@ async fn close_preview_withholds_digest_when_the_height_check_returns_a_differen
             ]
         );
         assert_eq!(output["estimates"]["fees"]["status"], "unavailable");
+        assert!(output.get("previewDigest").is_none());
         if verified {
-            assert!(output["previewDigest"].is_string());
+            assert_eq!(
+                output["estimates"]["execution"]["code"],
+                "OraclePublicationTimeUnknown"
+            );
             assert_eq!(output["positionRoute"]["contractAddress"], CONTRACT);
             assert!(output.get("positionOwnerVerified").is_none());
         } else {
-            assert!(output.get("previewDigest").is_none());
             assert!(output.get("positionRoute").is_none());
             assert_eq!(output["positionOwnerVerified"], false);
         }
