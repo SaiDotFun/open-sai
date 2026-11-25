@@ -39,6 +39,7 @@ from test_intent_wait import (
     indexed,
     intent,
     ledger_state,
+    without_legacy_fill_placeholders,
 )
 
 OPEN = (
@@ -566,9 +567,12 @@ def test_trade_wait(
                     submission = item["variables"]["input"]
                     stamp = submission["intent"].pop("tsIntentInit")
                     assert submission["lifecycle"].pop("tsLifecycleStep") == stamp
+            stdout = result.stdout
+            if index == 0 and case.outcome == "filled":
+                stdout = without_legacy_fill_placeholders(stdout)
             documents.append(
                 (
-                    result.stdout.replace(key.encode(), b"<intent>"),
+                    stdout.replace(key.encode(), b"<intent>"),
                     normalized([wire, ledger], key),
                 )
             )
