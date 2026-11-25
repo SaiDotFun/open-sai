@@ -201,15 +201,16 @@ stored session without a prompt, never asks for the token, and never returns
 it.
 
 An MCP preview for a connected account names that account in `addr`.
-While signed out, `preview_open` without an `addr` can return `addr: null`
-and a `previewDigest`. Treat that preview as informational. After sign-in,
-preview again for the connected account before asking for confirmation.
+While signed out, `preview_open` without an `addr` returns estimates with
+`confirmationStatus: "informational"` and omits `previewDigest`. After
+sign-in, preview again for the connected account before asking for confirmation.
 Pass that preview's `previewDigest` as `preview_digest` in the trade call.
 Before submitting, the server rebuilds the trade and checks the confirmed
 terms listed below.
 If the trade returns `PREVIEW_MISMATCH` or `PRICE_MOVED`, it has submitted
-nothing. Use the returned `preview` when present. If it is missing, obtain a
-new preview before asking for confirmation again.
+nothing. Use the returned `preview` for confirmation if it has a
+`previewDigest`. Otherwise, check the reported cause and request a fresh
+preview before asking for confirmation.
 
 - Every trade digest binds the signed-in account, the trade's arguments,
   the verified chain ID, and the Perp contract address.
