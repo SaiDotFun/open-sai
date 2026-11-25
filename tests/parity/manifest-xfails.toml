@@ -3,12 +3,12 @@
 
 [gap."case:account-overview-deadline"]
 owner = "M2-unassigned"
-signature = "0c036dfad38fdaaca69cc2e178c3562ba38efd7f9c1ac56c6adfa528c3d0efdc"
+signature = "4056dc76f7e45bb951fca0eb8ec54b5c52f2f1dfe35b9f77063e5d37e2a2c935"
 title = "Record the release account overview deadline and section error differences"
 
 [gap."case:account-overview-expiry"]
 owner = "M2-unassigned"
-signature = "303a3d96c9ee297c5ac30276a0b11ad57d56212b97f702b932b4efde3e381506"
+signature = "f66bb7b1230c700104442120b0198859ce2df7bb51813099e3fbb0e5a8099363"
 title = "Record the release account overview renewal guidance differences"
 
 [gap."case:account-overview-expiry-text"]
@@ -18,7 +18,7 @@ title = "Record the release account overview renewal guidance differences"
 
 [gap."case:account-overview-pnl-total"]
 owner = "M2-unassigned"
-signature = "f11df24d79758595179bd6fcbe06bb4b71ac50da8612ab21fde40cf076203547"
+signature = "95ad27e2dd5305a4ed6b9424a15b345decbbdc5038606e0ac1a7fd1feedf0631"
 title = "Record the release account overview PnL total difference"
 
 [gap."case:auth-import-rejected-operand-json"]
@@ -60,11 +60,11 @@ title = "Match auth use session lock permissions and command events"
 
 [gap."case:auth-use-invalid-expiry-json"]
 owner = "#171"
-signature = "b76e63f0ab4657e901fb729f488e136ea1a945bae31f2ea8422f206485eafc6c"
+signature = "4b2b7753c96fb3ae4f6aa5f79f0b5fbfc372ae4b2f0f0aca4e2137fa8dbe05eb"
 
 [gap."case:auth-use-invalid-expiry-text"]
 owner = "#171"
-signature = "ac432e70347f37eea669951de611c616cf56d51896bd369ed8e4a7a5557c702c"
+signature = "5219af5b19ddc2160975b3fdcad6f0369df5e397ce7c2b0d57bf68c5bb2e0264"
 
 [gap."case:config-get-default"]
 owner = "#126"
@@ -109,17 +109,18 @@ signature = "2f9cc8eb3151672f0ecfc3ea6e8d18ab1d8264a77ed527efad6214069b7eafc3"
 
 [gap."case:doctor-keeper-error-codes"]
 owner = "M2-unassigned"
-signature = "ce233dbed168897c27d3ecc60ec1cd734256c35965ee47b31fad0f348ed2fc44"
+signature = "0a9d1d5e4d2458bd68f59fe4dbb1e49155a7aec634745d9a21ddf4e369738287"
 title = "Match v0.1.2 Doctor LCD endpoint display"
 
 [gap."case:doctor-lcd-unreachable"]
 owner = "M2-unassigned"
-signature = "409893b4104b6276b097cf12c3dc8d518228d4a3c117f1e69684a4f39b893b15"
+signature = "d44d2129607d3ce6252613acb3a1a36daf26cc76fa9468679fa38875e05499f1"
 title = "Track the intentional redaction in Doctor LCD diagnostics"
 
 [gap."case:doctor-mcp-verification-failure"]
-owner = "#153"
-signature = "15a3ca50c516070449d17848e7c43cab5a09ac569b34de75c22f2e4b43ed30d0"
+owner = "M2-unassigned"
+signature = "e9bd768a9ee2a79056197be180fcb2e4949063a5fa6d8f1606b2c98e26868cb8"
+title = "Track the intentional v0.1.2 Codex repair rollback difference"
 
 [gap."case:doctor-near-expiry"]
 owner = "M2-unassigned"
@@ -128,27 +129,27 @@ title = "Match the Doctor guidance for near-expiry sessions"
 
 [gap."case:doctor-network"]
 owner = "M2-unassigned"
-signature = "13297a1790aec07d6c9a92e92ea57134db359ba95bdb2c435e5bf652399629b1"
+signature = "dcb63e9db52ba958b18cf8fda14fa07243940d531eb9873e358e883c7f41b47f"
 title = "Match v0.1.2 Doctor LCD endpoint display"
 
 [gap."case:doctor-network-with-logging"]
 owner = "M2-unassigned"
-signature = "13297a1790aec07d6c9a92e92ea57134db359ba95bdb2c435e5bf652399629b1"
+signature = "dcb63e9db52ba958b18cf8fda14fa07243940d531eb9873e358e883c7f41b47f"
 title = "Match v0.1.2 Doctor LCD endpoint display"
 
 [gap."case:doctor-reconcile-absent-intent"]
 owner = "M2-unassigned"
-signature = "13297a1790aec07d6c9a92e92ea57134db359ba95bdb2c435e5bf652399629b1"
+signature = "dcb63e9db52ba958b18cf8fda14fa07243940d531eb9873e358e883c7f41b47f"
 title = "Match v0.1.2 Doctor LCD endpoint display"
 
 [gap."case:doctor-ws-no-subprotocol"]
 owner = "M2-unassigned"
-signature = "13297a1790aec07d6c9a92e92ea57134db359ba95bdb2c435e5bf652399629b1"
+signature = "dcb63e9db52ba958b18cf8fda14fa07243940d531eb9873e358e883c7f41b47f"
 title = "Match v0.1.2 Doctor LCD endpoint display"
 
 [gap."case:doctor-ws-timeout"]
 owner = "M2-unassigned"
-signature = "ce233dbed168897c27d3ecc60ec1cd734256c35965ee47b31fad0f348ed2fc44"
+signature = "0a9d1d5e4d2458bd68f59fe4dbb1e49155a7aec634745d9a21ddf4e369738287"
 title = "Match v0.1.2 Doctor LCD endpoint display"
 
 [gap."case:help"]
@@ -174,7 +175,7 @@ signature = "0e53f7d487179beabc40dc517c609b00d99055f42d1d3565cb949413332116e2"
 
 [gap."case:logs-path"]
 owner = "#126"
-signature = "bb89605f0bbae4594bc5655445c24e450b80443bf287efa53eb40ed7aa590498"
+signature = "41672ca891a25a8af1a66fc2bc73d14eba61c0bf20d5bbf4bc767586c27544c4"
 
 [gap."case:logs-tail"]
 owner = "#126"
@@ -182,47 +183,47 @@ signature = "ccd73a3db71df1ce6a937cc8e9d090f9656ef6d3aa60f9acbb5bdf41c1b91942"
 
 [gap."case:mcp-account-intent-reads"]
 owner = "#175"
-signature = "e878b396ea8463942048a024517a12e242e548d07aa122dc0cf909dfc7b18661"
+signature = "92724c972407fc03d48183f4767b597ac49dc47ced8268341c52763c8ba20195"
 
 [gap."case:mcp-argument-validation"]
 owner = "#175"
-signature = "e878b396ea8463942048a024517a12e242e548d07aa122dc0cf909dfc7b18661"
+signature = "bac39586e5f519c7a4da99f5a66fb08a599b1c6569d511fd0f8501fca9aaed4d"
 
 [gap."case:mcp-info-public-endpoints"]
 owner = "#175"
-signature = "de61804e6499996aae79b9bfeb138871fdac6af09076f37348a3539fdc904daa"
+signature = "937a0290570357d9e9fe9105d8adc602a2a1b21bc79ebe6add96d7a63df1954b"
 
 [gap."case:mcp-initialize-legacy"]
 owner = "#175"
-signature = "e878b396ea8463942048a024517a12e242e548d07aa122dc0cf909dfc7b18661"
+signature = "92724c972407fc03d48183f4767b597ac49dc47ced8268341c52763c8ba20195"
 
 [gap."case:mcp-initialize-newer"]
 owner = "#175"
-signature = "e878b396ea8463942048a024517a12e242e548d07aa122dc0cf909dfc7b18661"
+signature = "92724c972407fc03d48183f4767b597ac49dc47ced8268341c52763c8ba20195"
 
 [gap."case:mcp-keeper-errors"]
 owner = "#175"
-signature = "e878b396ea8463942048a024517a12e242e548d07aa122dc0cf909dfc7b18661"
+signature = "92724c972407fc03d48183f4767b597ac49dc47ced8268341c52763c8ba20195"
 
 [gap."case:mcp-market-number-spelling"]
 owner = "#175"
-signature = "e878b396ea8463942048a024517a12e242e548d07aa122dc0cf909dfc7b18661"
+signature = "92724c972407fc03d48183f4767b597ac49dc47ced8268341c52763c8ba20195"
 
 [gap."case:mcp-session-refusals"]
 owner = "#175"
-signature = "e878b396ea8463942048a024517a12e242e548d07aa122dc0cf909dfc7b18661"
+signature = "92724c972407fc03d48183f4767b597ac49dc47ced8268341c52763c8ba20195"
 
 [gap."case:mcp-session-reloads"]
 owner = "#175"
-signature = "1e0cf326a4f9c17d7e0af2b83fad9595fbddd6f53098179922be610e188414f1"
+signature = "54ce23267e743759836fd1e139083ab1fd4369b55c58697fa3c0a86dccc74b1e"
 
 [gap."case:mcp-stream-error"]
 owner = "#175"
-signature = "e878b396ea8463942048a024517a12e242e548d07aa122dc0cf909dfc7b18661"
+signature = "92724c972407fc03d48183f4767b597ac49dc47ced8268341c52763c8ba20195"
 
 [gap."case:mcp-tool-inventory"]
 owner = "#175"
-signature = "a16e133ef45f05b08185c4000d8f1c03c9f756599f554a6728d579e2b74f8e84"
+signature = "822a267122ff6e64021d287efc3c56bbd7e129fe637f510c1a9485fd73c26416"
 
 [gap."case:skill-flag"]
 owner = "#126"
@@ -230,15 +231,15 @@ signature = "8843746f3f2706438fd9e48f3d11885ec5e8adac88d63950f4215cf36551ed61"
 
 [gap."case:skill-page"]
 owner = "#126"
-signature = "014aea5f60d5b271a7d0bd5e1036337ab64326edc1eb741e99934d8981fae093"
+signature = "605ecbc9f9ed5d3574439fd44e34b9d7e42258b1cf5c8d2a33c7ca2cc87243ac"
 
 [gap."case:skill-show"]
 owner = "#126"
-signature = "f3d21c6e13aeac092dc03a327dfa03ae87dc12f7e26a015f012736a123a7c619"
+signature = "868fedf4070abb5214ba0e15d273b77eb04df530c78ad890ac26987ccb5292bf"
 
 [gap."case:skill-source"]
 owner = "#126"
-signature = "1450f8cb44d75838b5996bead8a7a70da90fdd2e229a4281042bceb40a41cc13"
+signature = "6a89de891b4d45650240d63f562fc7024c07c19eb066201f5b24675590e472ea"
 
 [gap."case:trade-close"]
 owner = "#174"
@@ -246,7 +247,7 @@ signature = "866e192520eeeb1c7bc98f00573be7158e9f797c43a29d596c42d42fa157aa95"
 
 [gap."case:trade-concurrent-close"]
 owner = "#174"
-signature = "826896687848e6777e79752f8702a90474ad1d91c80522e4e22fb89012f3f125"
+signature = "f90924e0a25b54bc5dcca65818e4f69f99fe9dc8aa523355772b94afec0351e5"
 
 [gap."case:trade-leverage"]
 owner = "#173"
@@ -254,11 +255,11 @@ signature = "866e192520eeeb1c7bc98f00573be7158e9f797c43a29d596c42d42fa157aa95"
 
 [gap."case:trade-margin"]
 owner = "#118"
-signature = "b4418546a8ee7bf8389783d2500697b1daa3b70127802593cb8cad3b2ad6fd95"
+signature = "e659a3d9aa1f2fe43b0dedf5f76ff7f4e781ecffdddf0f91605d9e095b41efc6"
 
 [gap."case:trade-partial-close"]
 owner = "#118"
-signature = "22d0f67abcbf5a12fb771c39b9e9f052dd9373ae9934a3dc85480144042a9c11"
+signature = "d25ffce6d773ea478f96d0cc8fe7818c9b4e3fe7bd69ba7e2b05ebaea7f87872"
 
 [gap."case:trade-tpsl"]
 owner = "#173"
@@ -266,7 +267,7 @@ signature = "866e192520eeeb1c7bc98f00573be7158e9f797c43a29d596c42d42fa157aa95"
 
 [gap."case:update-check"]
 owner = "#121"
-signature = "6955207ab89afcb509316f00d62020106e4fbe0c6615c35bcac4cf3fab43c55b"
+signature = "e3637d2978439a9ab0fd714b281f1dc5722875bc737a7042918e41e369f69f5f"
 
 [gap."case:version"]
 owner = "M2-unassigned"
@@ -311,11 +312,11 @@ signature = "8caa35d02c69de313a00a6e21cf0b861dd1796702f1887716d0929af3584f53e"
 
 [gap."mcp:account_balances"]
 owner = "#175"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+signature = "a534a33ee3dd54f0890afebe1bbe4ed85aa1ffb43409fc828c3fefdf5aae24d4"
 
 [gap."mcp:account_history"]
 owner = "#175"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+signature = "9526d23fb97e4cccc11c03e59a238479fa1d7b0a846f7d45e2095392ac4f6335"
 
 [gap."mcp:account_overview"]
 owner = "#175"
@@ -323,7 +324,7 @@ signature = "5a1e10d6f6e33efd0459f860c925653039742c07585165607f915cd67477c3aa"
 
 [gap."mcp:account_positions"]
 owner = "#175"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+signature = "627ec1967f78d9f24a2028dd08001fd253144edc41da23440a14ddbb7e0fb709"
 
 [gap."mcp:auth_list"]
 owner = "#196"
@@ -339,11 +340,11 @@ signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
 
 [gap."mcp:intent_local"]
 owner = "#175"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+signature = "d0a0655fd717631b7e3407bdbe346911ff9b9562b3fabe050982581cc1816c9f"
 
 [gap."mcp:intent_status"]
 owner = "#175"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+signature = "f796d5fd0e7d5c0c32766ed61c1802a6fec907517ed4e9bc7f5f6758c32e25ad"
 
 [gap."mcp:intent_wait"]
 owner = "#196"
@@ -355,15 +356,15 @@ signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
 
 [gap."mcp:market_list"]
 owner = "#175"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+signature = "4784a3c2b6e2c5e75fca0a3324b6c32fb1dd8cb377e2468d45c2030a9018a145"
 
 [gap."mcp:market_prices"]
 owner = "#175"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+signature = "e9d90a01fe5de7ff68ee44469cdd73ddee16d7f0aae1da13c03d208619b158ab"
 
 [gap."mcp:mcp_info"]
 owner = "M2-unassigned"
-signature = "f35b315aeb2925214e680bb338c7cb2bd308ffd56c4e61290bc826a3123bda67"
+signature = "c5d0bb8d14a856a6ec93fc917f5608d186d118bf18daf21993292548fc3f2165"
 title = "Track v0.1.2 mcp_info endpoint, availability, and inventory differences"
 
 [gap."mcp:preview_close"]
@@ -380,7 +381,7 @@ signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
 
 [gap."mcp:preview_open"]
 owner = "#176"
-signature = "08c6746758a3e2852f4501d901ec1365b8d0d0b41eff2176503f7c1cab2d9a7f"
+signature = "0e88e016d1e8f408cab7515e2aa6f8b483bb5d81164b63e254938afad42cc0d6"
 
 [gap."mcp:preview_partial_close"]
 owner = "#176"
@@ -404,7 +405,7 @@ signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
 
 [gap."mcp:trade_open"]
 owner = "#176"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+signature = "f752a3a7c2e5f05631ccbe357c47b1b25c49a9031a0328a86d7c3aff4fe40622"
 
 [gap."mcp:trade_partial_close"]
 owner = "#176"
