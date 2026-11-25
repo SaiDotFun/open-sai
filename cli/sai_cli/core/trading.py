@@ -579,6 +579,7 @@ def change_margin(
     The amount is a quote, not a cap. Before submitting, a second snapshot
     must match the first, or the change is refused for review.
     """
+    delta = margin.margin_amount_usdc(amount)
     addr = get_session()["evmAddress"]
 
     def build_preview() -> PositionPreview:
@@ -593,7 +594,7 @@ def change_margin(
             None,
             state.market,
             direction,
-            amount,
+            delta,
             effective_leverage=leverage,
         )
         return (
