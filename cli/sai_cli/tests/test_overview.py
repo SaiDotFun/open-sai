@@ -116,6 +116,9 @@ def replay():
                 message = json.loads(base64.b64decode(unquote(path.rsplit("/", 1)[-1])))
                 assert self.headers["x-cosmos-block-height"] == str(RISK_BLOCK)
                 state["calls"].append(("contract", message))
+                if state.get("failedLcdQuery") in message:
+                    self.answer({"message": "not found"}, status=404)
+                    return
                 if state.get("dripQuery") in message:
                     self.drip()
                     return
@@ -1168,6 +1171,34 @@ def test_overview_reports_failed_fill_and_lcd_position_checks(
     assert error["code"] == "INCOMPLETE_DATA"
     assert ("Keeper fill check failed" in error["message"]) == (fill_check is not None)
     assert ("LCD position read failed" in error["message"]) == (lcd_trade is not None)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "get_market",
+        "get_oracle_address",
+        "get_exchange_rate_stamped",
+        "get_group",
+        "collateral",
+    ],
+)
+def test_overview_reports_downstream_lcd_risk_failures(replay, query):
+    long, _ = populate_trades(replay)
+    if query == "collateral":
+        long["perpBorrowing"]["collateralToken"] = {"id": 2, "symbol": "stNIBI"}
+        install_contract_trade(replay, long, mark=100, liquidation=50)
+    else:
+        replay["failedLcdQuery"] = query
+
+    positions = mcp(replay, addr=ADDR)["positions"]
+    assert positions["membership"]["status"] == "verified"
+    row = positions["data"]["items"][0]
+    assert row["riskStatus"] == "partial"
+    assert row["liquidationPriceQuote"] == 50
+    assert positions["data"]["unrealizedPnlUsd"] is None
+    assert positions["error"]["code"] == "INCOMPLETE_DATA"
+    assert "LCD position read failed" in positions["error"]["message"]
 
 
 @pytest.mark.parametrize("has_positions", [False, True])

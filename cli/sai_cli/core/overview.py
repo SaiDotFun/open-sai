@@ -470,7 +470,7 @@ class ContractReads:
     def __init__(self, chain: ChainRead) -> None:
         self.chain = chain
         self.timed_out = False
-        self.trade_read_failed = False
+        self.risk_read_failed = False
         self.groups: dict[str, int | None] = {}
         self.rates: dict[tuple[int, int], tuple[dict[str, Any], str] | None] = {}
         self.markets: dict[int, dict[str, Any] | None] = {}
@@ -550,7 +550,7 @@ def _contract_risk(
             raise ValueError("Invalid contract trade price")
         liquidation_quote = _number(float(liquidation))
     except CONTRACT_READ_ERRORS:
-        reads.trade_read_failed = True
+        reads.risk_read_failed = True
         return {"riskStatus": "unavailable", "riskReason": CONTRACT_RISK_ERROR}
 
     risk: dict[str, Any] = {
@@ -622,6 +622,7 @@ def _contract_risk(
         )
         expiration = reads.group_expiration(_text(contract_market["group_index"]))
         if expiration is None:
+            reads.risk_read_failed = True
             return {**risk, "riskReason": "Contract oracle staleness limit is unknown"}
         if base_at is None or (quote_id != USD_TOKEN_ID and quote_at is None):
             return {**risk, "riskReason": "Contract oracle publish time is unknown"}
@@ -660,6 +661,8 @@ def _contract_risk(
         else:
             pinned = reads.rate(collateral["id"], USD_TOKEN_ID) if scale else None
             if pinned is None or scale is None:
+                if scale is not None:
+                    reads.risk_read_failed = True
                 return {
                     **risk,
                     "riskReason": "Pinned collateral USD price is unavailable",
@@ -668,6 +671,7 @@ def _contract_risk(
             collateral_rate = collateral_oracle["rate"]
             price = _decimal(collateral_rate["base_per_quote"])
             if price <= 0:
+                reads.risk_read_failed = True
                 return {
                     **risk,
                     "riskReason": "Pinned collateral USD price is unavailable",
@@ -696,6 +700,7 @@ def _contract_risk(
             "unrealizedPnlPercent": float(pnl * 100),
         }
     except CONTRACT_READ_ERRORS:
+        reads.risk_read_failed = True
         return {**risk, "riskReason": CONTRACT_RISK_ERROR}
 
 
@@ -956,7 +961,7 @@ def _trade_sections(
                 row["riskStatus"] != "verified" for row in items
             ):
                 issues.append("An LCD deadline expired. Position risk is partial.")
-            elif contract_reads.trade_read_failed:
+            elif contract_reads.risk_read_failed:
                 issues.append("LCD position read failed. Position risk is partial.")
         if issues:
             if not complete:
