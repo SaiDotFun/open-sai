@@ -94,6 +94,7 @@ impl ServeArgs {
             writer,
             install: install::Installation::detect(),
             local_ledger_slots: Arc::new(Semaphore::new(2)),
+            trade_slots: Arc::new(Semaphore::new(2)),
             reconcile_slots: Arc::new(Semaphore::new(8)),
             wait_slots: Arc::new(Semaphore::new(stdio::MAX_IN_FLIGHT)),
         };
@@ -129,6 +130,7 @@ struct SaiMcp {
     writer: Option<Arc<LogWriter>>,
     install: install::Installation,
     local_ledger_slots: Arc<Semaphore>,
+    trade_slots: Arc<Semaphore>,
     reconcile_slots: Arc<Semaphore>,
     wait_slots: Arc<Semaphore>,
 }
@@ -729,6 +731,7 @@ mod tests {
             writer: None,
             install: install::Installation::detect(),
             local_ledger_slots: Arc::new(Semaphore::new(2)),
+            trade_slots: Arc::new(Semaphore::new(2)),
             reconcile_slots: Arc::new(Semaphore::new(8)),
             wait_slots: Arc::new(Semaphore::new(0)),
         };

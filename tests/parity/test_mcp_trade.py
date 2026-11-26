@@ -477,6 +477,38 @@ def test_mcp_close_only_limit_preview_withholds_digest_without_borrowings(
     assert quotes[0] == quotes[1]
 
 
+def test_mcp_auth_status_responds_while_previews_wait(
+    mcp_pair: tuple[Path, Path], tmp_path: Path
+) -> None:
+    for i, executable in enumerate(mcp_pair):
+        home = tmp_path / str(i)
+        with (
+            loopback("quote-concurrent-previews") as endpoints,
+            server(
+                executable, home, endpoints, seed="session", call_timeout=15
+            ) as stdio,
+        ):
+            for id_ in (2, 3):
+                stdio.send("tools/call", id_=id_, name="preview_open", arguments=OPEN)
+            try:
+                assert endpoints.admission.arrived.wait(8), (
+                    "Both previews must reach Keeper"
+                )
+                stdio.send("tools/call", id_=4, name="auth_status", arguments={})
+                reply = stdio.receive(2)
+                assert reply["id"] == 4
+                assert result(reply["result"])["addr"] == ADDRESS
+            finally:
+                endpoints.admission.release.set()
+
+            previews = [stdio.receive(stdio.call_timeout) for _ in range(2)]
+            assert {reply["id"] for reply in previews} == {2, 3}
+            assert all(result(reply["result"])["previewDigest"] for reply in previews)
+            assert not any(item.label == "recordUserIntent" for item in endpoints.wire)
+            assert not rows(home)
+            assert not endpoints.errors
+
+
 def test_mcp_open_checks_confirmation_before_building_an_intent(
     mcp_pair: tuple[Path, Path], tmp_path: Path
 ) -> None:

@@ -176,7 +176,8 @@ impl SaiMcp {
         let call_id = call_id.to_owned();
         let runtime = tokio::runtime::Handle::current();
         let (_cancel_on_drop, cancel) = tokio::sync::oneshot::channel::<()>();
-        Self::blocking_work(&self.local_ledger_slots, move || {
+        // Trades hold their slot across network reads and writes.
+        Self::blocking_work(&self.trade_slots, move || {
             let events = EventContext::new(writer.as_deref(), Surface::Mcp, Some("mcp serve"))
                 .with_tool(&name, &call_id);
             let log_storage = |event: StorageEvent<'_>| {

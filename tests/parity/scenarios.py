@@ -1199,6 +1199,15 @@ def loopback(
                             if not admission.release.wait(5):
                                 self.reject("Market session gate timed out")
                                 return
+                        if (
+                            scenario == "quote-concurrent-previews"
+                            and name == "borrowings"
+                        ):
+                            if sum(entry.label == name for entry in wire) >= 2:
+                                admission.arrived.set()
+                            if not admission.release.wait(8):
+                                self.reject("Preview gate timed out")
+                                return
                         self.reply(responses[name])
                     return
             except (ValueError, KeyError, TypeError):
