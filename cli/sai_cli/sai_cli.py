@@ -1079,13 +1079,24 @@ def history(ctx: click.Context, addr: str) -> None:
 @click.pass_context
 def balances(ctx: click.Context, addr: str, ws_endpoint: str | None) -> None:
     """Read one account balance snapshot from Keeper's subscription."""
+    flags = ctx.obj["flags"]
     if ws_endpoint is not None:
-        ctx.obj["flags"]["keeper.ws_endpoint"] = ws_endpoint
-    session_notice(ctx, ctx.obj["as_addr"])
-    resolved = settings(ctx)
-    snapshot = overview.balance_snapshot(
-        resolved, resolved.ws_endpoint, addr, notify=warn
-    )
+        flags["keeper.ws_endpoint"] = ws_endpoint
+    explicit_ws = flags["keeper.ws_endpoint"]
+    if explicit_ws is not None:
+        ws_url(ctx, explicit_ws)
+    try:
+        resolved = settings(ctx)
+    except sai_settings.InvalidSetting:
+        if explicit_ws is None:
+            raise
+        # An explicit subscription can read balances without block times.
+        resolved = None
+        endpoint = explicit_ws
+    else:
+        session_notice(ctx, ctx.obj["as_addr"])
+        endpoint = resolved.ws_endpoint
+    snapshot = overview.balance_snapshot(resolved, endpoint, addr, notify=warn)
     if ctx.obj["json"]:
         emit(ctx, snapshot)
     else:

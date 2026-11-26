@@ -1274,6 +1274,29 @@ def test_balance_subcommand_ws_flag_overrides_invalid_environment(replay, monkey
     assert (stream.BALANCES_WITH_BLOCK, {"user": ADDR}) in replay["calls"]
 
 
+def test_explicit_balance_websocket_works_without_valid_lcd(replay, monkeypatch):
+    config = replay["config"]
+    monkeypatch.setenv("SAI_LCD_ENDPOINT", "not-an-lcd-url")
+    row = replay["ws"]["data"]["userBalances"][0]
+    row["lastUpdatedBlock"] = RISK_BLOCK
+    args = ["--json", "--endpoint", config.endpoint, "account", "balances", ADDR]
+    cli = CliRunner()
+
+    result = cli.invoke(main, [*args, "--ws-endpoint", config.ws_endpoint])
+    assert result.exit_code == 0, result.output
+    response = json.loads(result.stdout)
+    balance = response["data"]["userBalances"][0]
+    assert balance["amount"] == row["amount"]
+    assert balance["sourceBlock"] == RISK_BLOCK
+    assert balance["sourceAgeSeconds"] is None
+    assert balance["stale"] is None
+    assert replay["calls"] == [(stream.BALANCES_WITH_BLOCK, {"user": ADDR})]
+
+    derived = cli.invoke(main, args)
+    assert derived.exit_code == 2, derived.output
+    assert json.loads(derived.stdout)["error"]["code"] == "INVALID_REQUEST"
+
+
 def test_text_balances_show_unpriced_token_quantities(replay):
     replay["ws"] = {
         "data": {

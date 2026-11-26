@@ -216,7 +216,7 @@ def balance_stale(age_seconds: float | None) -> bool | None:
 
 
 def balance_snapshot(
-    settings: Settings, ws: str, addr: str, *, notify: Callable[[str], None]
+    settings: Settings | None, ws: str, addr: str, *, notify: Callable[[str], None]
 ) -> dict[str, Any]:
     response, connected = stream.snapshot_with_endpoint(
         ws, stream.BALANCES_WITH_BLOCK, {"user": addr}, notify=notify
@@ -225,7 +225,7 @@ def balance_snapshot(
 
     @cache
     def chain() -> ChainRead | None:
-        return _chain_read(settings)
+        return _chain_read(settings) if settings is not None else None
 
     @cache
     def lookup(height: int) -> datetime | None:
@@ -233,8 +233,10 @@ def balance_snapshot(
         return source.block_time(height) if source is not None else None
 
     # An independent or redirected WebSocket may serve another chain.
-    same_keeper = ws == stream.derive_ws(settings.endpoint) and connected == parse_uri(
-        ws
+    same_keeper = (
+        settings is not None
+        and ws == stream.derive_ws(settings.endpoint)
+        and connected == parse_uri(ws)
     )
     balance_lookup = lookup if same_keeper else None
     for row in response["data"]["userBalances"]:
