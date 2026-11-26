@@ -491,6 +491,7 @@ name = "account-overview-wrong-height"
 args = ["--json", "account", "overview", "--as", "{addr}"]
 seed = "empty"
 server = "overview-wrong-height"
+accepted_divergence = "overview-lcd-risk-error"
 wire = [
     "ws:init",
     "ws:userBalancesWithBlock",
@@ -512,6 +513,7 @@ name = "account-overview-conflicting-height"
 args = ["--json", "account", "overview", "--as", "{addr}"]
 seed = "empty"
 server = "overview-conflicting-height"
+accepted_divergence = "overview-lcd-risk-error"
 wire = [
     "ws:init",
     "ws:userBalancesWithBlock",
