@@ -11,11 +11,14 @@ import sqlite3
 import subprocess
 import time
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing, suppress
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import Any
+from unittest.mock import Mock
 from urllib.parse import unquote, urlsplit
 
 import pytest
@@ -40,6 +43,7 @@ from test_intent_wait import (
     indexed,
     intent,
     ledger_state,
+    with_timeout_warning,
 )
 from test_trade import rows
 from test_trade import run as run_trade
@@ -979,7 +983,55 @@ def test_trade_wait_interrupt_retains_reservation(
     assert documents[0] == documents[1]
 
 
-def test_position_trade_wait_times_out(
+def finish_trade_wait(
+    process: subprocess.Popen[bytes],
+    polling_started: Event,
+    *,
+    startup_timeout: float,
+    polling_timeout: float,
+    clock: Callable[[], float] = time.monotonic,
+) -> tuple[bytes, bytes]:
+    startup_deadline = clock() + startup_timeout
+    while not polling_started.is_set() and process.poll() is None:
+        remaining = startup_deadline - clock()
+        if remaining <= 0:
+            pytest.fail(
+                f"Trade did not start polling within {startup_timeout:g} seconds"
+            )
+        polling_started.wait(min(remaining, 0.1))
+    return process.communicate(timeout=polling_timeout)
+
+
+def test_trade_wait_watchdog_starts_polling_budget_after_startup() -> None:
+    elapsed = 0.0
+    process = Mock(spec=subprocess.Popen)
+    process.poll.return_value = None
+    process.communicate.return_value = (b"receipt\n", b"")
+    polling_started = Mock(spec=Event)
+    polling_started.is_set.return_value = False
+
+    def complete_startup(_timeout: float) -> bool:
+        nonlocal elapsed
+        process.communicate.assert_not_called()
+        # Startup uses more time than the polling watchdog allows.
+        elapsed = 5.0
+        polling_started.is_set.return_value = True
+        return True
+
+    polling_started.wait.side_effect = complete_startup
+    result = finish_trade_wait(
+        process,
+        polling_started,
+        startup_timeout=10,
+        polling_timeout=1,
+        clock=lambda: elapsed,
+    )
+    assert result == (b"receipt\n", b"")
+    polling_started.wait.assert_called_once()
+    process.communicate.assert_called_once_with(timeout=1)
+
+
+def test_position_trade_wait_deadlines(
     position_wait_cli_pair: tuple[CLI, CLI],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -991,10 +1043,15 @@ def test_position_trade_wait_times_out(
         args: tuple[str, ...],
         replies: deque[ReplayReply],
         requests: list[Request],
+        *,
+        native: bool,
     ) -> dict[str, Any]:
         keys: list[str] = []
         poll_times: list[float] = []
-        deadline_seconds = 30
+        polling_started = Event()
+        deadline_seconds = 60 if native else 30
+        late_success = native and args == LEVERAGE
+        execution_reported = False
 
         def admit(request: Request) -> Reply:
             key = submitted_key(request, "UPDATE_TRADE")
@@ -1002,11 +1059,15 @@ def test_position_trade_wait_times_out(
             return accepted(key, "UPDATE_TRADE")
 
         def reconcile(request: Request) -> Reply:
+            nonlocal execution_reported
             assert "authorization" not in request.headers
             wire = json.loads(request.body)
-            replies.append(reconcile)
             if wire["query"] == keeper.INTENT_HISTORY:
                 assert wire["variables"] == {"trader": ADDR, "limit": 25, "offset": 0}
+                if execution_reported:
+                    row = indexed_update("leverage_updated", keys[0], LEVERAGE)
+                    return response(history(row))
+                replies.append(reconcile)
                 return response(history())
             assert wire["query"] == keeper.WAIT_INTENTS
             assert wire["variables"] == {
@@ -1015,9 +1076,12 @@ def test_position_trade_wait_times_out(
                 "includeAction": True,
             }
             poll_times.append(time.monotonic())
+            polling_started.set()
+            execution_reported = late_success and poll_times[-1] - poll_times[0] >= 33
+            replies.append(reconcile)
             return response(
                 intent(
-                    "outcome_not_indexed",
+                    "filled" if execution_reported else "outcome_not_indexed",
                     intentKey=keys[0],
                     kind="UPDATE_TRADE",
                     body=UPDATES[args],
@@ -1036,44 +1100,69 @@ def test_position_trade_wait_times_out(
             *args,
             "--wait",
         )
-        result = subprocess.run(
+        with subprocess.Popen(
             [*cli, *command],
             env=cli_environment(home),
             cwd=home.parent,
-            capture_output=True,
-            check=False,
-            timeout=deadline_seconds + 15,
-        )
-        ended = time.monotonic()
-        assert (result.returncode, result.stderr) == (5, b"")
-        document = json.loads(result.stdout)
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) as process:
+            try:
+                stdout, stderr = finish_trade_wait(
+                    process,
+                    polling_started,
+                    startup_timeout=120,
+                    polling_timeout=deadline_seconds + 15,
+                )
+            finally:
+                if process.poll() is None:
+                    process.kill()
+        expected_exit = 0 if late_success else 5
+        assert (process.returncode, stderr) == (expected_exit, b""), stdout
+        document = json.loads(stdout)
         key = document["intentKey"]
         assert keys == [key]
         assert len(poll_times) >= 2
-        elapsed = ended - poll_times[0]
-        assert elapsed >= deadline_seconds - 1.5, elapsed
-        assert document["outcome"] == document["status"] == "unknown"
-        assert document["code"] == document["error"]["code"] == "OUTCOME_UNKNOWN"
         assert document["receipt"]["requestBlock"] is None
         assert document["receipt"]["requestTxHash"] == "a" * 64
-        assert document["receipt"]["execution"] is None
-        assert ledger_state(home) == [(key, "unknown", "pending")]
+        if late_success:
+            assert poll_times[-1] - poll_times[0] >= 33
+            assert document["outcome"] == document["status"] == "succeeded"
+            execution = document["receipt"]["execution"]
+            assert execution["block"] == FILL_BLOCK
+            assert execution["tradeChangeType"] == "leverage_updated"
+            assert ledger_state(home) == [(key, "terminal", "terminal")]
+        else:
+            assert document["outcome"] == document["status"] == "unknown"
+            assert document["code"] == document["error"]["code"] == "OUTCOME_UNKNOWN"
+            if native:
+                hint = document["hint"]
+                assert hint == document["error"]["hint"]
+                assert hint.endswith(f"intent wait {key} --addr {ADDR}")
+            assert document["receipt"]["execution"] is None
+            assert ledger_state(home) == [(key, "unknown", "pending")]
         waits = [
-            (event["event"], event.get("timeoutMs"), event.get("code"))
+            event
             for event in read_events(home, cli)
             if event.get("intentKey") == key
             and event["event"].startswith("intent.wait.")
         ]
-        assert waits == [
+        assert [
+            (event["event"], event.get("timeoutMs"), event.get("code"))
+            for event in waits
+        ] == [
             ("intent.wait.start", deadline_seconds * 1000, None),
-            ("intent.wait.end", None, "OUTCOME_UNKNOWN"),
+            ("intent.wait.end", None, None if late_success else "OUTCOME_UNKNOWN"),
         ]
-        replies.clear()
-        queue_update_preflight(replies)
-        again = invoke(cli, home, *command)
-        assert again.returncode == 1, again
-        assert json.loads(again.stdout)["error"]["intentKey"] == key
-        assert ledger_state(home) == [(key, "unknown", "pending")]
+        if not late_success:
+            duration_ms = waits[-1]["durationMs"]
+            assert duration_ms >= deadline_seconds * 1000 - 1500
+            replies.clear()
+            queue_update_preflight(replies)
+            again = invoke(cli, home, *command)
+            assert again.returncode == 1, again
+            assert json.loads(again.stdout)["error"]["intentKey"] == key
+            assert ledger_state(home) == [(key, "unknown", "pending")]
         assert not replies
         assert (
             sum(
@@ -1085,7 +1174,7 @@ def test_position_trade_wait_times_out(
         )
         return normalized(document, key)
 
-    # Both commands and runtimes exercise the real 30-second deadline concurrently.
+    # Run both runtimes concurrently. The Python pin still uses 30 seconds.
     with ExitStack() as servers, ThreadPoolExecutor(max_workers=4) as batch:
         pairs = []
         for args in POSITION_ACTIONS:
@@ -1098,12 +1187,21 @@ def test_position_trade_wait_times_out(
                 connect(home, endpoint, monkeypatch)
                 pending.append(
                     batch.submit(
-                        timed_wait, cli, home, endpoint, args, replies, requests
+                        timed_wait,
+                        cli,
+                        home,
+                        endpoint,
+                        args,
+                        replies,
+                        requests,
+                        native=index == 1,
                     )
                 )
             pairs.append(pending)
-        for pair in pairs:
-            assert pair[0].result() == pair[1].result()
+        for args, (reference, native) in zip(POSITION_ACTIONS, pairs, strict=True):
+            reference_result, native_result = reference.result(), native.result()
+            if args == TPSL:
+                assert with_timeout_warning(reference_result) == native_result
 
 
 def test_trade_wait_recovers_when_stdout_closes(
