@@ -483,7 +483,7 @@ def loopback(
     }:
         trade["id"] = 8
     status = PROTOCOL["intent_status_response"]["data"]["userIntents"][0]
-    if scenario in {"mcp-reads", "mcp-wait-final"}:
+    if scenario in {"intent-status-valid-hash", "mcp-reads", "mcp-wait-final"}:
         status = {**status, "txHash": TRADE_REQUEST_HASH}
     elif scenario == "mcp-pending-malformed-hash":
         status = {

@@ -788,8 +788,10 @@ state = { "trader/intents.sqlite3" = "file", "trader/intents.sqlite3#tables.inte
 name = "intent-status"
 args = ["--json","intent","status","{addr}","--key","{intent}"]
 seed = "ledger"
+server = "intent-status-valid-hash"
 wire = ["userIntents","intentTradeHistory"]
 state = { "trader/intents.sqlite3" = "file", "trader/intents.sqlite3#tables.intents.rows.0.status" = "terminal" }
+output = { "matchedTradeHistory.0.id" = 7, "matchedTradeHistory.1" = "<absent>" }
 
 [[case]]
 name = "intent-status-unsubmitted"
