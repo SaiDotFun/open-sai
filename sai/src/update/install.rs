@@ -41,11 +41,13 @@ pub(crate) fn mcp_repair_launcher(
     profile: &Path,
     runs_executable: impl Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
-    if let Some(install) = standalone::Standalone::discover(executable) {
+    // macOS can report the public symlink as the current executable.
+    let executable = executable.canonicalize().ok()?;
+    if let Some(install) = standalone::Standalone::discover(&executable) {
         install.owner().ok()?;
         return runs_executable(install.launcher()).then(|| install.launcher().to_owned());
     }
-    uv::Uv::shim_launcher(executable, profile)
+    uv::Uv::shim_launcher(&executable, profile)
 }
 
 impl Change {

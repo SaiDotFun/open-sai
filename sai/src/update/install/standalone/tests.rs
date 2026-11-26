@@ -10,6 +10,27 @@ use tokio::{
 use super::*;
 
 #[test]
+fn mcp_repair_discovers_standalone_from_the_public_symlink() {
+    let temp = TempDir::new().unwrap();
+    let bin = temp.path().canonicalize().unwrap();
+    let root = bin.join(ROOT);
+    let version = format!("0.2.0-{}", "a".repeat(64));
+    let selected = Path::new(&version).join("sai");
+    let executable = root.join(&selected);
+    state::private_dir(executable.parent().unwrap()).unwrap();
+    fs::write(&executable, "managed binary").unwrap();
+    symlink(selected, root.join(SELECTOR)).unwrap();
+    let launcher = bin.join("sai");
+    symlink(Path::new(ROOT).join(SELECTOR), &launcher).unwrap();
+
+    let found = super::super::mcp_repair_launcher(&launcher, &bin, |path| {
+        path.canonicalize()
+            .is_ok_and(|resolved| resolved == executable)
+    });
+    assert_eq!(found, Some(launcher));
+}
+
+#[test]
 fn recovery_rolls_back_a_first_install_without_an_old_target() {
     let temp = TempDir::new().unwrap();
     let directory = temp.path().canonicalize().unwrap();
