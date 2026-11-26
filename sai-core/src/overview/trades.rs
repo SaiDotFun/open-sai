@@ -18,7 +18,8 @@ use crate::{
 use super::{
     Object, Overview, PAGINATION_ERROR, Stamp,
     chain::{ContractReads, membership},
-    error_value, failed, incomplete, instant, invalid, iso, merge, now, number, success, variables,
+    error_value, failed, incomplete, instant, invalid, iso, merge, now, number, success,
+    valid_base_units, valid_block, variables,
 };
 
 const USD_TOKEN: u64 = 0;
@@ -72,7 +73,7 @@ pub(super) async fn read(view: &Overview<'_>) -> TradeSections {
         }
     };
     let snapshot_fetched = now();
-    let unindexed_fill = fill_awaits_indexing(view).await;
+    let fill_check = fill_awaits_indexing(view).await;
     let mut prices = if snapshot.rows.is_empty() {
         Ok((Prices::new(), None))
     } else {
@@ -94,7 +95,7 @@ pub(super) async fn read(view: &Overview<'_>) -> TradeSections {
         .map(|row| row["id"].as_u64().expect("scan validated IDs"))
         .collect();
     let membership = membership(chain, view.addr, indexed).await;
-    let membership_complete = membership["status"] == "verified" && !unindexed_fill;
+    let membership_complete = membership["status"] == "verified" && matches!(fill_check, Ok(false));
     let mut reads = chain.map(ContractReads::new);
     let quotes = prices.as_ref().map(|(prices, _)| prices).ok();
 
@@ -109,29 +110,35 @@ pub(super) async fn read(view: &Overview<'_>) -> TradeSections {
     .await;
     let mut orders = read_rows(view, &snapshot.rows, quotes, None, snapshot_fetched, false).await;
     positions["membership"] = membership;
-    for section in [&mut positions, &mut orders] {
-        if section.get("data").is_some() && !snapshot.complete {
-            section["error"] = error_value(incomplete(PAGINATION_ERROR));
-        }
+    if orders.get("data").is_some() && !snapshot.complete {
+        orders["error"] = error_value(incomplete(PAGINATION_ERROR));
     }
     if let Some(items) = positions.get_mut("data").map(Value::take) {
         let rows = items.as_array().expect("positions list");
-        if snapshot.complete && !membership_complete {
-            let reason = if unindexed_fill {
+        let mut issues = Vec::new();
+        if !snapshot.complete {
+            issues.push(PAGINATION_ERROR);
+        }
+        if fill_check.is_err() {
+            issues.push("Keeper fill check failed. Positions may be incomplete.");
+        } else if snapshot.complete && !membership_complete {
+            issues.push(if matches!(fill_check, Ok(true)) {
                 "Keeper reports a fill awaiting indexing. Positions may be incomplete."
             } else if positions["membership"]["status"] == "stale" {
                 "The live position check used a stale LCD block. Positions may be incomplete."
             } else {
                 "The indexed positions could not be confirmed against the live contract list."
-            };
-            positions["error"] = error_value(incomplete(reason));
-        } else if positions.get("error").is_none()
-            && reads.as_ref().is_some_and(ContractReads::deadline_expired)
-            && rows.iter().any(|row| row["riskStatus"] != "verified")
-        {
-            positions["error"] = error_value(incomplete(
-                "An LCD deadline expired. Position risk is partial.",
-            ));
+            });
+        }
+        if let Some(reads) = reads {
+            if reads.deadline_expired() && rows.iter().any(|row| row["riskStatus"] != "verified") {
+                issues.push("An LCD deadline expired. Position risk is partial.");
+            } else if reads.risk_read_failed {
+                issues.push("LCD position read failed. Position risk is partial.");
+            }
+        }
+        if !issues.is_empty() {
+            positions["error"] = error_value(incomplete(issues.join(" ")));
         }
         let total = if snapshot.complete && membership_complete {
             total_pnl(rows)
@@ -174,23 +181,34 @@ fn total_pnl(rows: &[Value]) -> Option<f64> {
     })
 }
 
-async fn fill_awaits_indexing(view: &Overview<'_>) -> bool {
-    view.keeper
+async fn fill_awaits_indexing(view: &Overview<'_>) -> Result<bool, crate::errors::SaiError> {
+    let data = view
+        .keeper
         .read_until(
             keeper::INTENTS,
             variables(json!({"user": view.addr})),
             Duration::from_secs(3),
             std::future::pending(),
         )
-        .await
-        .ok()
-        .and_then(|data| {
-            Some(data.get("userIntents")?.as_array()?.iter().any(|row| {
-                row["errorCode"] == reconcile::OUTCOME_NOT_INDEXED
-                    && reconcile::classify_outcome(row) == Outcome::Pending
-            }))
+        .await?;
+    let rows = data
+        .get("userIntents")
+        .and_then(Value::as_array)
+        .filter(|rows| {
+            rows.iter().all(|row| {
+                row["kind"].is_string()
+                    && row["execActor"].is_string()
+                    && row["lifecycleStep"].is_string()
+                    && row
+                        .get("errorCode")
+                        .is_some_and(|code| code.is_null() || code.is_string())
+            })
         })
-        .unwrap_or(false)
+        .ok_or_else(invalid)?;
+    Ok(rows.iter().any(|row| {
+        row["errorCode"] == reconcile::OUTCOME_NOT_INDEXED
+            && reconcile::classify_outcome(row) == Outcome::Pending
+    }))
 }
 
 fn parse_prices(data: &Object) -> Option<Prices> {
@@ -201,24 +219,29 @@ fn parse_prices(data: &Object) -> Option<Prices> {
             continue;
         }
         let token = row.get("token")?;
+        let block = row.get("lastUpdatedBlock")?;
+        if !block.is_object() || !valid_block(&block["block"], &block["block_ts"]) {
+            return None;
+        }
         prices.insert(
             token["id"].as_u64()?,
             Price {
                 usd,
-                block: row.get("lastUpdatedBlock")?.clone(),
-                token: token_name(token)?.clone(),
+                block: block.clone(),
+                token: json!(token_name(token)?),
             },
         );
     }
     Some(prices)
 }
 
-fn token_name(token: &Value) -> Option<&Value> {
+fn token_name(token: &Value) -> Option<&str> {
     let symbol = token.get("symbol")?;
-    if keeper::truthy(symbol) {
-        Some(symbol)
-    } else {
-        token.get("name")
+    match symbol {
+        Value::Null => token["name"].as_str(),
+        Value::String(symbol) if symbol.is_empty() => token["name"].as_str(),
+        Value::String(symbol) => Some(symbol),
+        _ => None,
     }
 }
 
@@ -311,6 +334,9 @@ async fn read_rows(
         else {
             return failed(invalid());
         };
+        if !valid_block(&block["block"], &block["block_ts"]) {
+            return failed(invalid());
+        }
         let stamp = instant(&row["fetchedAt"]).expect("page time");
         item["fetchedAt"] = row["fetchedAt"].clone();
         merge(
@@ -329,7 +355,7 @@ fn trade_row(trade: &Object, prices: Option<&Prices>) -> Option<Value> {
     let quote = market.get("quoteToken")?;
     let collateral_id = collateral["id"].as_u64()?;
     let quote_id = quote["id"].as_u64()?;
-    let symbol = collateral.get("symbol")?;
+    let symbol = collateral["symbol"].as_str()?;
     let price = |id: u64| {
         if id == USD_TOKEN {
             Some(BigDecimal::from(1))
@@ -344,6 +370,9 @@ fn trade_row(trade: &Object, prices: Option<&Prices>) -> Option<Value> {
     } else {
         None
     };
+    if !valid_base_units(&trade["collateralAmount"]) {
+        return None;
+    }
     let amount = decimal(&trade["collateralAmount"])?;
     let leverage = decimal(&trade["leverage"])?;
     let quote_usd = price(quote_id);
@@ -352,9 +381,9 @@ fn trade_row(trade: &Object, prices: Option<&Prices>) -> Option<Value> {
     let sl = level(trade.get("sl")?)?;
     let mut row = json!({
         "id": trade["id"],
-        "marketId": market.get("marketId")?,
-        "market": market.get("baseToken")?.get("symbol")?,
-        "side": if keeper::truthy(trade.get("isLong")?) { "long" } else { "short" },
+        "marketId": market["marketId"].as_u64()?,
+        "market": market["baseToken"]["symbol"].as_str()?,
+        "side": if trade["isLong"].as_bool()? { "long" } else { "short" },
         "collateralToken": symbol,
         "collateralTokenId": collateral_id,
         "collateralBaseUnits": trade["collateralAmount"],

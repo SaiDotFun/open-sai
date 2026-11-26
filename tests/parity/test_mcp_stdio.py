@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import select
@@ -17,8 +19,20 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from compare import Normalize, mask_overview_stdout, overview_clocks
 from mcp_cases import REJECTED_AUTH_ADDRESS, TRADE_TOOLS
-from scenarios import ADDRESS, INTENT, Endpoints, child_env, loopback, seed_home
+from overview_scenarios import HEX_MARKER, PRIVATE_URL, RELATIVE_URL, SESSION_MARKER
+from scenarios import (
+    ADDRESS,
+    INTENT,
+    OTHER_ADDRESS,
+    Endpoints,
+    child_env,
+    loopback,
+    seed_home,
+    session_fixture,
+    write_seed,
+)
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="Uses POSIX stdio pipes")
 
@@ -31,10 +45,23 @@ def native() -> Path:
     return Path(executable).absolute()
 
 
+@pytest.fixture
+def python_v013() -> Path:
+    reference = os.getenv("SAI_MCP_PARITY_V013_PYTHON")
+    if reference is None:
+        pytest.skip("set SAI_MCP_PARITY_V013_PYTHON to sai from Python v0.1.3")
+    executable = shutil.which(reference)
+    assert executable, "SAI_MCP_PARITY_V013_PYTHON must name an executable"
+    return Path(executable).absolute()
+
+
 class Stdio:
-    def __init__(self, proc: subprocess.Popen[bytes]):
+    initialize_result: dict[str, Any]
+
+    def __init__(self, proc: subprocess.Popen[bytes], receive_timeout: float):
         self.proc = proc
         self.pending = bytearray()
+        self.receive_timeout = receive_timeout
 
     def write(self, raw: bytes) -> None:
         assert self.proc.stdin is not None
@@ -49,9 +76,11 @@ class Stdio:
             request["params"] = params
         self.write(json.dumps(request).encode())
 
-    def receive(self, timeout: float = 3) -> dict[str, Any]:
+    def receive(self, timeout: float | None = None) -> dict[str, Any]:
         assert self.proc.stdout is not None
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + (
+            self.receive_timeout if timeout is None else timeout
+        )
         while b"\n" not in self.pending:
             ready, _, _ = select.select(
                 [self.proc.stdout], [], [], max(0, deadline - time.monotonic())
@@ -81,6 +110,7 @@ def server(
     *,
     seed: str = "empty",
     logs: bool = False,
+    receive_timeout: float = 3,
 ) -> Iterator[Stdio]:
     seed_home(home, endpoints, seed)
     env = {**child_env(home, endpoints), "SAI_LOG": "1" if logs else "0"}
@@ -93,7 +123,7 @@ def server(
         stderr=subprocess.PIPE,
     ) as child:
         try:
-            stdio = Stdio(child)
+            stdio = Stdio(child, receive_timeout)
             stdio.send(
                 "initialize",
                 id_=1,
@@ -101,7 +131,9 @@ def server(
                 capabilities={},
                 clientInfo={"name": "sai-regression", "version": "1"},
             )
-            assert stdio.receive()["id"] == 1
+            initialized = stdio.receive()
+            assert initialized["id"] == 1
+            stdio.initialize_result = initialized["result"]
             stdio.send("notifications/initialized")
             yield stdio
         finally:
@@ -411,7 +443,14 @@ def test_audit_boolean_coercion(native: Path, tmp_path: Path, offline: object) -
     ):
         result = stdio.call(2, "logs_intent", key="fixture", offline=offline)
         assert result["isError"] is False
-        assert json.loads(result["content"][0]["text"])["code"] == "NOT_IMPLEMENTED"
+        assert json.loads(result["content"][0]["text"]) == {
+            "intentKey": None,
+            "events": [],
+            "gaps": [],
+            "keeper": None,
+            "txHash": None,
+        }
+        assert not endpoints.wire
         refused = stdio.call(3, "logs_intent", key="fixture", offline=" True ")
         assert refused["isError"] is True
         assert refused["content"][0]["text"] == "Argument 'offline' must be a boolean."
@@ -765,27 +804,413 @@ def test_stdout_failure_ends_session_with_stdin_open(
         stdio.proc.wait(timeout=3)
 
 
-@pytest.mark.parametrize(
-    ("tool", "arguments"),
-    [
-        ("account_overview", {"addr": ADDRESS}),
-        ("logs_intent", {"key": INTENT, "offline": True}),
-        ("logs_intent", {"key": INTENT, "offline": False}),
-    ],
-)
-def test_deferred_read_tools_accept_valid_arguments_without_requests(
-    native: Path, tmp_path: Path, tool: str, arguments: dict[str, Any]
+def tool_text(result: dict[str, Any]) -> str:
+    assert result["isError"] is False
+    assert len(result["content"]) == 1
+    block = result["content"][0]
+    assert block["type"] == "text"
+    text = block["text"]
+    assert isinstance(text, str)
+    assert result["structuredContent"] == {"result": text}
+    return text
+
+
+def test_overview_v013_partial_response_and_session_reload(
+    native: Path, python_v013: Path, tmp_path: Path
+) -> None:
+    transcripts = []
+    with loopback("overview-partial", overview_delay=3.2) as endpoints:
+        for index, executable in enumerate((native, python_v013)):
+            home = tmp_path / str(index)
+            with server(executable, home, endpoints, receive_timeout=20) as stdio:
+                initialize = stdio.initialize_result
+                assert initialize["serverInfo"].pop("version")
+                stdio.send("tools/list", id_=2)
+                [schema] = [
+                    tool
+                    for tool in stdio.receive()["result"]["tools"]
+                    if tool["name"] == "account_overview"
+                ]
+                missing = tool_text(stdio.call(3, "account_overview"))
+                assert json.loads(missing)["code"] == "SESSION_UNAVAILABLE"
+
+                expired = session_fixture(endpoints, "expired")
+                write_seed(home, endpoints, [expired])
+                started = time.time()
+                partial = tool_text(stdio.call(4, "account_overview"))
+                value = json.loads(partial)
+                assert value["addr"] == ADDRESS
+                assert value["addrSource"] == "session"
+                assert value["session"]["data"]["expired"] is True
+                assert value["positions"]["data"]["items"]
+                assert value["queuedMarketOrders"]["error"]["code"] == "KEEPER_ERROR"
+                assert value["prices"]["error"]["code"] == "KEEPER_ERROR"
+                overview_clocks(
+                    value, Normalize(home, started_at=started, ended_at=time.time())
+                )
+
+                other = {
+                    **session_fixture(endpoints, "other-endpoint"),
+                    "evmAddress": OTHER_ADDRESS,
+                }
+                write_seed(home, endpoints, [expired, other])
+                switched = tool_text(stdio.call(5, "account_overview"))
+                assert json.loads(switched)["code"] == "SESSION_UNAVAILABLE"
+                assert not (home / "sai/trader/intents.sqlite3").exists()
+                transcripts.append(
+                    (
+                        initialize,
+                        schema,
+                        missing,
+                        mask_overview_stdout(partial, "json"),
+                        switched,
+                    )
+                )
+            assert not endpoints.errors
+            assert [request.label for request in endpoints.wire] == [
+                "ws:init",
+                "ws:userBalancesWithBlock",
+                "overviewTrades",
+                "userIntents",
+                "tokenPricesUsd",
+                "oneClickTrading",
+                "lcd:latest",
+                "get_base_size_seed_status",
+                "live_trades_by_user",
+                "get_trade",
+                "get_market",
+                "get_oracle_address",
+                "get_exchange_rate_stamped",
+                "get_group",
+                "get_trade",
+                "get_market",
+                "get_exchange_rate_stamped",
+                "pendingMarketOrders",
+            ]
+            endpoints.wire.clear()
+    assert transcripts[0] == transcripts[1]
+
+
+@pytest.mark.parametrize("source", ["argument", "session"])
+def test_overview_rejects_non_evm_address(
+    native: Path, tmp_path: Path, source: str
+) -> None:
+    home = tmp_path / "home"
+    with (
+        loopback("overview-full") as endpoints,
+        server(native, home, endpoints, receive_timeout=20) as stdio,
+    ):
+        if source == "session":
+            write_seed(
+                home,
+                endpoints,
+                [{**session_fixture(endpoints, "session"), "evmAddress": PRIVATE_URL}],
+            )
+        arguments = {"addr": PRIVATE_URL} if source == "argument" else {}
+        text = tool_text(stdio.call(2, "account_overview", **arguments))
+        assert not endpoints.wire, "overview sent an invalid address upstream"
+        assert PRIVATE_URL not in text
+        expected = "INVALID_REQUEST" if source == "argument" else "SESSION_UNAVAILABLE"
+        assert json.loads(text)["code"] == expected
+
+
+def test_overview_rejects_malformed_fields_and_scrubs_text(
+    native: Path, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    with (
+        loopback("overview-tainted") as endpoints,
+        server(native, home, endpoints, receive_timeout=20) as stdio,
+    ):
+        write_seed(
+            home,
+            endpoints,
+            [{**session_fixture(endpoints, "session"), "token": SESSION_MARKER}],
+        )
+        text = tool_text(stdio.call(2, "account_overview"))
+        assert PRIVATE_URL not in text, "overview returned an upstream URL"
+        assert RELATIVE_URL not in text, "overview returned a scheme-relative URL"
+        assert SESSION_MARKER not in text, "overview returned a stored credential"
+        assert HEX_MARKER not in text, "overview returned a key-shaped display field"
+        report = json.loads(text)
+        assert report["balances"]["error"]["code"] == "INCOMPLETE_DATA"
+        assert report["queuedMarketOrders"]["error"]["code"] == "INCOMPLETE_DATA"
+        assert len(report["positions"]["data"]["items"]) == 2
+        assert not endpoints.errors
+
+
+def test_overview_balance_snapshot_deadline_survives_pings(
+    native: Path, tmp_path: Path
 ) -> None:
     with (
-        loopback("normal") as endpoints,
-        server(native, tmp_path / "home", endpoints, seed="session") as stdio,
+        loopback("overview-balance-pings") as endpoints,
+        server(native, tmp_path / "home", endpoints, receive_timeout=26) as stdio,
     ):
-        result = stdio.call(2, tool, **arguments)
-        assert result["isError"] is False
-        text = result["content"][0]["text"]
-        assert result["structuredContent"] == {"result": text}
-        assert json.loads(text)["code"] == "NOT_IMPLEMENTED"
+        report = json.loads(tool_text(stdio.call(2, "account_overview", addr=ADDRESS)))
+        assert report["balances"]["error"]["code"] == "STREAM_ERROR"
+        assert report["positions"]["data"]["items"]
+        assert sum(request.label == "ws:pong" for request in endpoints.wire) >= 2
+        assert not endpoints.errors
+
+
+def assert_queued_order_shapes(section: dict[str, Any]) -> None:
+    assert [(row["action"], row["collateralBaseUnits"]) for row in section["data"]] == [
+        ("open", 5_000_000),
+        ("close", None),
+        ("increase", 42),
+        ("decrease", None),
+        ("update_leverage", None),
+    ]
+
+
+def test_overview_v013_valid_queued_order_shapes(
+    native: Path, python_v013: Path, tmp_path: Path
+) -> None:
+    for executable, label in ((python_v013, "python"), (native, "rust")):
+        with (
+            loopback("overview-queue-valid") as endpoints,
+            server(
+                executable, tmp_path / label, endpoints, receive_timeout=20
+            ) as stdio,
+        ):
+            section = json.loads(
+                tool_text(stdio.call(2, "account_overview", addr=ADDRESS))
+            )["queuedMarketOrders"]
+            assert_queued_order_shapes(section)
+            assert "error" not in section
+            assert not endpoints.errors
+
+
+def test_overview_keeps_valid_queued_orders(native: Path, tmp_path: Path) -> None:
+    with (
+        loopback("overview-queue-mixed") as endpoints,
+        server(native, tmp_path / "home", endpoints, receive_timeout=20) as stdio,
+    ):
+        text = tool_text(stdio.call(2, "account_overview", addr=ADDRESS))
+        assert PRIVATE_URL not in text
+        section = json.loads(text)["queuedMarketOrders"]
+        assert_queued_order_shapes(section)
+        assert section["error"]["code"] == "INCOMPLETE_DATA"
+        assert not endpoints.errors
+
+
+def test_overview_queue_offsets_include_invalid_rows(
+    native: Path, tmp_path: Path
+) -> None:
+    with (
+        loopback("overview-queue-paged") as endpoints,
+        server(native, tmp_path / "home", endpoints, receive_timeout=20) as stdio,
+    ):
+        result = json.loads(tool_text(stdio.call(2, "account_overview", addr=ADDRESS)))
+        section = result["queuedMarketOrders"]
+        assert [row["sequence"] for row in section["data"]] == [
+            400,
+            *range(501, 599),
+            401,
+            402,
+            403,
+            404,
+        ]
+        assert section["error"]["code"] == "INCOMPLETE_DATA"
+        assert [
+            item.variables["offset"]
+            for item in endpoints.wire
+            if item.label == "pendingMarketOrders"
+        ] == [0, 100, 0, 100]
+        assert not endpoints.errors
+
+
+@pytest.mark.parametrize(
+    ("scenario", "items", "fill_failed", "lcd_failed"),
+    [
+        ("overview-fill-check-fails", 0, True, False),
+        ("overview-fill-check-malformed", 0, True, False),
+        ("overview-lcd-fails", 2, False, True),
+        ("overview-lcd-malformed", 2, False, True),
+        ("overview-lcd-market-height", 2, False, True),
+        ("overview-fill-and-lcd-fail", 2, True, True),
+    ],
+)
+def test_overview_surfaces_failed_position_checks(
+    native: Path,
+    tmp_path: Path,
+    scenario: str,
+    items: int,
+    fill_failed: bool,
+    lcd_failed: bool,
+) -> None:
+    with (
+        loopback(scenario) as endpoints,
+        server(native, tmp_path / "home", endpoints, receive_timeout=20) as stdio,
+    ):
+        report = json.loads(tool_text(stdio.call(2, "account_overview", addr=ADDRESS)))
+        positions = report["positions"]
+        assert positions["membership"]["status"] == "verified"
+        assert len(positions["data"]["items"]) == items
+        assert positions["data"]["unrealizedPnlUsd"] is None
+        error = positions["error"]
+        assert error["code"] == "INCOMPLETE_DATA"
+        assert ("Keeper fill check failed" in error["message"]) == fill_failed
+        assert ("LCD position read failed" in error["message"]) == lcd_failed
+        if items:
+            assert positions["data"]["items"][1]["riskStatus"] == "verified"
+        assert not endpoints.errors
+
+
+def write_intent_trail(home: Path, endpoints: Endpoints, count: int) -> dict[str, Any]:
+    stamp = "2026-11-19T12:00:00.000Z"
+    logs = home / "sai/logs"
+    logs.mkdir(mode=0o700, exist_ok=True)
+    key = bytes(32)
+    profile_key = logs / ".endpoint-key"
+    profile_key.write_bytes(key)
+    profile_key.chmod(0o600)
+    digest = hashlib.sha256(f"{endpoints.keeper}?".encode()).digest()
+    row = {
+        "schema": 2,
+        "ts": stamp,
+        "level": "info",
+        "event": "intent.status",
+        "runId": "fixture-run",
+        "seq": 1,
+        "surface": "cli",
+        "intentKey": INTENT,
+        "addr": ADDRESS,
+        "endpointId": "h1_" + hmac.digest(key, digest, "sha256").hex(),
+        "status": "pending",
+    }
+    trail = logs / f"cli-{stamp[:10]}.jsonl"
+    trail.write_text(
+        "".join(json.dumps({**row, "seq": seq}) + "\n" for seq in range(1, count + 1))
+    )
+    trail.chmod(0o600)
+    return row
+
+
+@pytest.mark.parametrize(
+    "embedded_address", [PRIVATE_URL, OTHER_ADDRESS], ids=["malformed", "wrong-account"]
+)
+def test_logs_intent_rejects_invalid_active_identity(
+    native: Path, tmp_path: Path, embedded_address: str
+) -> None:
+    home = tmp_path / "home"
+    with (
+        loopback("normal") as endpoints,
+        server(native, home, endpoints) as stdio,
+    ):
+        write_seed(
+            home,
+            endpoints,
+            [session_fixture(endpoints, "session")],
+            embedded_address=embedded_address,
+        )
+        text = tool_text(stdio.call(2, "logs_intent", key=INTENT))
+        assert not endpoints.wire, "an invalid active identity reached Keeper"
+        assert embedded_address not in text
+        assert json.loads(text)["keeperError"]["code"] == "INVALID_REQUEST"
+        explicit = json.loads(
+            tool_text(stdio.call(3, "logs_intent", key=INTENT, addr=ADDRESS))
+        )
+        assert explicit["keeper"]["evmAddress"] == ADDRESS
+        assert [request.label for request in endpoints.wire] == ["userIntents"]
+
+
+def test_overview_rejects_mismatched_session_metadata(
+    native: Path, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    with (
+        loopback("overview-full") as endpoints,
+        server(native, home, endpoints, receive_timeout=20) as stdio,
+    ):
+        write_seed(
+            home,
+            endpoints,
+            [session_fixture(endpoints, "expired")],
+            embedded_address=OTHER_ADDRESS,
+        )
+        result = json.loads(tool_text(stdio.call(2, "account_overview", addr=ADDRESS)))
+        assert result["addr"] == ADDRESS
+        assert result["positions"]["data"]["items"]
+        assert result["session"]["error"]["code"] == "INCOMPLETE_DATA"
+        assert "data" not in result["session"]
+        assert not endpoints.errors
+
+
+def test_logs_intent_v013_cursor_after_upgrade(
+    native: Path, python_v013: Path, tmp_path: Path
+) -> None:
+    python_home = tmp_path / "python"
+    rust_home = tmp_path / "rust"
+    with loopback("normal") as endpoints:
+        with server(python_v013, python_home, endpoints, receive_timeout=15) as python:
+            write_intent_trail(python_home, endpoints, 129)
+            result = json.loads(
+                tool_text(python.call(2, "logs_intent", key=INTENT, offline=True))
+            )
+            assert result["truncated"] is True
+            cursor = result["nextBefore"]
+            assert "~s2~" in cursor
+        with server(native, rust_home, endpoints) as rust:
+            shutil.copytree(
+                python_home / "sai/logs", rust_home / "sai/logs", dirs_exist_ok=True
+            )
+            result = json.loads(
+                tool_text(
+                    rust.call(2, "logs_intent", key=INTENT, offline=True, before=cursor)
+                )
+            )
+            assert result == {
+                "error": "This cursor was issued by Python Sai. Start a new intent log query without a cursor.",
+                "code": "INVALID_REQUEST",
+            }
+            restarted = json.loads(
+                tool_text(rust.call(3, "logs_intent", key=INTENT, offline=True))
+            )
+            assert restarted["events"]
         assert not endpoints.wire
+
+
+def test_logs_intent_v013_offline_and_live(
+    native: Path, python_v013: Path, tmp_path: Path
+) -> None:
+    transcripts = []
+    with loopback("normal") as endpoints:
+        for index, executable in enumerate((python_v013, native)):
+            home = tmp_path / str(index)
+            with server(executable, home, endpoints, seed="session") as stdio:
+                stdio.send("tools/list", id_=2)
+                [schema] = [
+                    tool
+                    for tool in stdio.receive()["result"]["tools"]
+                    if tool["name"] == "logs_intent"
+                ]
+                row = write_intent_trail(home, endpoints, 1)
+
+                offline = tool_text(
+                    stdio.call(
+                        3,
+                        "logs_intent",
+                        key=INTENT,
+                        offline=True,
+                        before="2026-11-20T00:00:00Z",
+                    )
+                )
+                assert json.loads(offline)["events"] == [row]
+                assert json.loads(offline)["keeper"] is None
+                assert not endpoints.wire
+                live = tool_text(stdio.call(4, "logs_intent", key=INTENT))
+                report = json.loads(live)
+                assert report["events"] == [row]
+                assert report["keeper"]["evmAddress"] == ADDRESS
+                rejected = tool_text(stdio.call(5, "logs_intent", key="bad key"))
+                assert json.loads(rejected)["code"] == "INVALID_REQUEST"
+                transcripts.append((schema, offline, live, rejected))
+            assert not endpoints.errors
+            assert [request.label for request in endpoints.wire] == ["userIntents"]
+            assert not (home / "sai/trader/intents.sqlite3").exists()
+            endpoints.wire.clear()
+    assert transcripts[0] == transcripts[1]
 
 
 def test_auth_switch_keeps_rejected_arguments_private(
