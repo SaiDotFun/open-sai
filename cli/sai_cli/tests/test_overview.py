@@ -18,6 +18,7 @@ from urllib.parse import unquote, urlsplit
 
 import pytest
 from click.testing import CliRunner
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import TextContent
 from sai_cli.core import keeper, overview, reconcile, settings, storage, stream
 from sai_cli.mcp_server.server import create_server
@@ -66,6 +67,7 @@ def replay():
         "contractMarkets": {},
         "expiration": 300,
         "lcdDisconnected": threading.Event(),
+        "queuedRequestHash": "A" * 64,
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -114,6 +116,9 @@ def replay():
                 message = json.loads(base64.b64decode(unquote(path.rsplit("/", 1)[-1])))
                 assert self.headers["x-cosmos-block-height"] == str(RISK_BLOCK)
                 state["calls"].append(("contract", message))
+                if state.get("failedLcdQuery") in message:
+                    self.answer({"message": "not found"}, status=404)
+                    return
                 if state.get("dripQuery") in message:
                     self.drip()
                     return
@@ -287,13 +292,13 @@ def test_market_prices_reports_missing_block_times_as_null(replay):
     assert decode_mcp(asyncio.run(server.call_tool("market_prices", {}))) == decoded
 
 
-def save_session(replay: dict[str, Any], addr: str = ADDR):
+def save_session(replay: dict[str, Any], addr: str = ADDR, *, token: str | None = None):
     now = datetime.now(UTC)
     issued = (now - timedelta(days=28)).timestamp()
     part = base64.urlsafe_b64encode(json.dumps({"iat": issued}).encode()).decode()
     storage.save_session(
         {
-            "token": f"test.{part}.signature",
+            "token": token if token is not None else f"test.{part}.signature",
             "evmAddress": addr,
             "expiresAt": (now + timedelta(hours=48)).isoformat(),
             "keyName": "fixture",
@@ -483,7 +488,10 @@ def populate_trades(replay: dict[str, Any]):
                         "collateralAmount": 5_000_000,
                         "orderReqBlock": 41148706,
                         "orderReqBlockTs": BLOCK_TIME,
-                        "orderReqTxHash": "SYNTHETIC_COSMOS_REQUEST",
+                        # Release parity reuses this helper with the original hash.
+                        "orderReqTxHash": replay.get(
+                            "queuedRequestHash", "SYNTHETIC_COSMOS_REQUEST"
+                        ),
                         "orderReqEvmTxHash": None,
                     },
                 ]
@@ -565,7 +573,7 @@ def test_open_positions_limits_stops_and_next_oracle_orders(replay):
         "Open Positions",
         "Pending Limit and Stop Orders",
         "Queued Market Orders",
-        "SYNTHETIC_COSMOS_REQUEST",
+        "A" * 64,
         "BTC",
         "ARB",
         "12.5%",
@@ -615,11 +623,264 @@ def test_a_failed_read_preserves_other_sections(replay, failure):
     assert result["queuedMarketOrders"]["data"][0]["sequence"] == 400
 
 
+@pytest.mark.parametrize("paginated", [False, True])
+def test_queued_orders_keep_valid_actions_beside_invalid_rows(replay, paginated):
+    populate_trades(replay)
+    order = replay["http"][keeper.PENDING_MARKET_ORDERS]["data"]["perp"][
+        "marketOrders"
+    ][0]
+    actions = ["open", "close", "increase", "decrease", "update_leverage"]
+    valid = [
+        {
+            **order,
+            "sequence": index,
+            "side": action,
+            "collateralAmount": order["collateralAmount"]
+            if action in {"open", "increase"}
+            else None,
+        }
+        for index, action in enumerate(actions)
+    ]
+    rows = [*valid[:2], {"sequence": "invalid"}, *valid[2:]]
+    if paginated:
+        rows = rows[:3] + [None] * 97 + rows[3:]
+
+    def orders(variables):
+        offset = variables["offset"]
+        return {
+            "data": {
+                "perp": {"marketOrders": rows[offset : offset + variables["limit"]]}
+            }
+        }
+
+    replay["http"][keeper.PENDING_MARKET_ORDERS] = orders
+    queued = mcp(replay, addr=ADDR)["queuedMarketOrders"]
+
+    assert [row["action"] for row in queued["data"]] == actions
+    assert [row["collateralBaseUnits"] for row in queued["data"]] == [
+        row["collateralAmount"] for row in valid
+    ]
+    assert queued["error"]["code"] == "INCOMPLETE_DATA"
+    assert "Invalid rows were omitted" in queued["error"]["message"]
+    assert "paginated list could not be confirmed" not in queued["error"]["message"]
+    assert [
+        variables["offset"]
+        for query, variables in replay["calls"]
+        if query == keeper.PENDING_MARKET_ORDERS
+    ] == ([0, 100, 0, 100] if paginated else [0])
+
+
+def test_overview_keeps_positions_with_null_token_symbols(replay):
+    long, short = populate_trades(replay)
+    long["perpBorrowing"]["baseToken"]["symbol"] = None
+    short["perpBorrowing"]["collateralToken"]["symbol"] = None
+
+    positions = mcp(replay, addr=ADDR)["positions"]
+    long_row, short_row = positions["data"]["items"]
+    assert long_row["market"] is None
+    assert long_row["marketId"] == long["perpBorrowing"]["marketId"]
+    assert long_row["riskStatus"] == "verified"
+    assert short_row["collateralToken"] is None
+    assert short_row["collateralBaseUnits"] == short["collateralAmount"]
+    assert short_row["collateralUsd"] is None
+    assert short_row["riskStatus"] == "partial"
+    assert positions["data"]["unrealizedPnlUsd"] is None
+
+
 def test_no_default_account_gives_an_address_hint(replay):
     result = cli(replay, "account", "overview")
     assert result.exit_code != 0 and "--as ADDR" in result.output
     assert mcp(replay)["code"] == "SESSION_UNAVAILABLE"
     assert replay["calls"] == []
+
+
+@pytest.mark.parametrize("source", ["argument", "global", "empty", "session"])
+def test_overview_rejects_invalid_addresses_before_reading(replay, source):
+    invalid = "https://overview-fixture.invalid/address"
+    if source == "session":
+        save_session(replay, addr=invalid)
+        args, mcp_args = [], {}
+    elif source == "global":
+        args, mcp_args = ["--as", invalid], {"addr": invalid}
+    else:
+        addr = "" if source == "empty" else invalid
+        args, mcp_args = [], {"addr": addr}
+
+    command = [*args, "account", "overview"]
+    if source in {"argument", "empty"}:
+        command += ["--as", mcp_args["addr"]]
+    code = "SESSION_UNAVAILABLE" if source == "session" else "INVALID_REQUEST"
+    result = cli(replay, "--json", *command)
+    response = mcp(replay, **mcp_args)
+
+    assert replay["calls"] == []
+    assert result.exit_code != 0
+    assert json.loads(result.output)["error"]["code"] == code
+    assert response["code"] == code
+    assert invalid not in result.output
+    assert invalid not in json.dumps(response)
+    server = create_server(replay["config"])
+    assert server.loggable("account_overview", mcp_args) == ({}, 0)
+
+
+def test_explicit_overview_ignores_session_for_a_different_address(replay):
+    save_session(replay, addr=OTHER)
+    accounts = storage.load_accounts()
+    accounts["sessions"][ADDR] = accounts["sessions"].pop(OTHER)
+    accounts["active"] = ADDR
+    storage._save_accounts(accounts)
+
+    result = cli(replay, "account", "overview", "--json", "--as", ADDR)
+    assert result.exit_code == 0, result.output
+    for report in (json.loads(result.stdout), mcp(replay, addr=ADDR)):
+        assert report["addr"] == ADDR
+        assert report["balances"]["data"]["balance"]["usd"] == 150.813685
+        assert report["session"]["error"]["code"] == "INCOMPLETE_DATA"
+        assert "data" not in report["session"]
+        assert OTHER not in json.dumps(report)
+    assert [
+        args["user"]
+        for query, args in replay["calls"]
+        if query == stream.BALANCES_WITH_BLOCK
+    ] == [ADDR, ADDR]
+
+
+def test_mcp_overview_rejects_a_non_string_address_before_reading(replay):
+    invalid = {"value": "synthetic-overview-address"}
+    server = create_server(replay["config"])
+    with pytest.raises(ToolError) as caught:
+        asyncio.run(server.call_tool("account_overview", {"addr": invalid}))
+
+    assert replay["calls"] == []
+    assert invalid["value"] not in str(caught.value)
+    assert str(caught.value) == "Argument 'addr' must be a string or null."
+    assert server.loggable("account_overview", {"addr": invalid}) == ({}, 0)
+
+
+def test_overview_validates_keeper_fields_and_cleans_display_text(replay):
+    long, short = populate_trades(replay)
+    url = "https://overview-fixture.invalid/private"
+    relative_url = "//overview-fixture.invalid/relative"
+    token = "synthetic-overview-session-marker"
+    hex_text = "D" * 64
+    save_session(replay, token=token)
+    replay["ws"]["data"]["userBalances"][-1]["lastUpdatedBlock"] = {"url": url}
+    queued = replay["http"][keeper.PENDING_MARKET_ORDERS]["data"]["perp"][
+        "marketOrders"
+    ]
+    queued[0]["orderReqTxHash"] = url
+    long["perpBorrowing"]["baseToken"]["symbol"] = token
+    long["perpBorrowing"]["quoteToken"].update(symbol=None, name=hex_text)
+    short["perpBorrowing"]["baseToken"]["symbol"] = relative_url
+
+    result = cli(replay, "--json", "account", "overview")
+    assert result.exit_code == 0, result.output
+    for report in (json.loads(result.stdout), mcp(replay)):
+        assert report["balances"]["error"]["code"] == "INCOMPLETE_DATA"
+        assert report["queuedMarketOrders"]["error"]["code"] == "INCOMPLETE_DATA"
+        positions = report["positions"]["data"]["items"]
+        assert len(positions) == 2
+        assert positions[0]["market"] is None
+        assert positions[0]["quoteToken"] is None
+        assert positions[1]["market"] is None
+        assert all(
+            text not in json.dumps(report)
+            for text in (url, relative_url, token, hex_text)
+        )
+
+
+def test_testnet_overview_prices_usdc_without_a_keeper_oracle_quote(replay):
+    long, short = populate_trades(replay)
+    chain = "nibiru-testnet-2"
+    replay["lcdChain"] = chain
+    replay["http"][keeper.ROUTE]["data"]["oneClickTrading"]["chainId"] = chain
+    replay["http"][keeper.PRICES]["data"]["oracle"]["tokenPricesUsd"] = []
+    long["perpBorrowing"]["baseToken"]["id"] = 4
+    for trade, mark, liquidation in ((long, 100, 50), (short, 10, 15)):
+        trade["perpBorrowing"]["collateralToken"] = {"id": 3, "symbol": "USDC"}
+        install_contract_trade(replay, trade, mark=mark, liquidation=liquidation)
+
+    report = mcp(replay, addr=ADDR)
+    positions = report["positions"]["data"]
+    assert positions["unrealizedPnlUsd"] == 7
+    assert [row["collateralUsd"] for row in positions["items"]] == [12, 10]
+    assert [row["collateralUsd"] for row in report["pendingOrders"]["data"]] == [12, 10]
+    assert report["prices"]["data"] == []
+    assert "error" not in report["prices"]
+
+
+@pytest.mark.parametrize(
+    ("symbol", "token_id", "market_id"),
+    [("HYPE", 44, 43), ("XAU", 77, 1018), ("ABC-1/USD", 99, 99)],
+)
+def test_overview_displays_keeper_market_symbols(replay, symbol, token_id, market_id):
+    long, _ = populate_trades(replay)
+    market = long["perpBorrowing"]
+    market.update(marketId=market_id, baseToken={"id": token_id, "symbol": symbol})
+    install_contract_trade(replay, long, mark=100, liquidation=50)
+
+    report = mcp(replay, addr=ADDR)
+    row = report["positions"]["data"]["items"][0]
+    assert row["market"] == symbol
+    assert row["marketId"] == market_id
+    result = cli(replay, "account", "overview", "--as", ADDR)
+    assert result.exit_code == 0, result.output
+    assert symbol in result.stdout
+
+
+def test_overview_uses_ids_for_invalid_keeper_labels(replay):
+    long, _ = populate_trades(replay)
+    market = long["perpBorrowing"]
+    marker = "SyntheticFixtureLabel"
+    market["baseToken"]["symbol"] = marker
+    market["quoteToken"].update(symbol=None, name=f"Fixture label {marker}")
+    market["collateralToken"] = {"id": 2, "symbol": marker}
+    rows = replay["http"][keeper.PRICES]["data"]["oracle"]["tokenPricesUsd"]
+    next(row for row in rows if row["token"]["id"] == 2)["token"]["symbol"] = marker
+    install_contract_trade(replay, long, mark=100, liquidation=50)
+
+    result = cli(replay, "account", "overview", "--json", "--as", ADDR)
+    assert result.exit_code == 0, result.output
+    for report in (json.loads(result.stdout), mcp(replay, addr=ADDR)):
+        first, second = report["positions"]["data"]["items"]
+        assert marker not in json.dumps(report)
+        assert (
+            first["market"] is first["collateralToken"] is first["quoteToken"] is None
+        )
+        assert (
+            first["marketId"],
+            first["collateralTokenId"],
+            first["quoteTokenId"],
+        ) == (0, 2, 0)
+        assert second["market"] == "ARB"
+        assert [(row["tokenId"], row["token"]) for row in report["prices"]["data"]] == [
+            (2, None)
+        ]
+
+
+@pytest.mark.parametrize("invalid_field", ["trade_side", "price_block", "lcd_stamp"])
+def test_overview_checks_field_types_before_use(replay, invalid_field):
+    long, _ = populate_trades(replay)
+    if invalid_field == "trade_side":
+        long["isLong"] = "false"
+    elif invalid_field == "price_block":
+        row = replay["http"][keeper.PRICES]["data"]["oracle"]["tokenPricesUsd"][0]
+        row["lastUpdatedBlock"]["block"] = True
+    else:
+        base = long["perpBorrowing"]["baseToken"]["id"]
+        rate = replay["oracleRates"][base, 0]
+        rate["base"]["price_block"] = True
+
+    report = mcp(replay, addr=ADDR)
+    if invalid_field == "trade_side":
+        assert report["positions"]["error"]["code"] == "INCOMPLETE_DATA"
+        assert "data" not in report["positions"]
+    elif invalid_field == "price_block":
+        assert report["prices"]["error"]["code"] == "INCOMPLETE_DATA"
+    else:
+        position = report["positions"]["data"]["items"][0]
+        assert position["markSource"]["sourceBlock"] is None
+        assert position["riskStatus"] == "verified"
 
 
 def test_contract_threshold_reports_crossing_even_when_keeper_estimate_does_not(replay):
@@ -938,6 +1199,23 @@ def test_legacy_collateral_uses_the_pinned_oracle_price_for_pnl(replay):
     assert row["collateralPriceSource"]["queryBlock"] == RISK_BLOCK
 
 
+def test_overview_requires_collateral_price_publish_time(replay):
+    long, _ = populate_trades(replay)
+    long["perpBorrowing"]["collateralToken"] = {"id": 2, "symbol": "stNIBI"}
+    install_contract_trade(replay, long, mark=100, liquidation=50)
+    install_oracle_quote(replay, 2, 0, mark="0.04")
+    replay["oracleRates"][2, 0]["rate"]["base_last_update_time"] = None
+
+    positions = mcp(replay, addr=ADDR)["positions"]
+    row = positions["data"]["items"][0]
+    assert positions["membership"]["status"] == "verified"
+    assert row["riskStatus"] == "partial"
+    assert row["riskReason"] == "Collateral oracle publish time is unknown"
+    assert row["markPriceUsd"] == 100
+    assert row["unrealizedPnlUsd"] is None
+    assert positions["data"]["unrealizedPnlUsd"] is None
+
+
 @pytest.mark.parametrize("gap", ["keeper", "contract", "index_seeding"])
 def test_unconfirmed_empty_position_list_has_no_total(replay, gap):
     if gap == "keeper":
@@ -962,6 +1240,73 @@ def test_unconfirmed_empty_position_list_has_no_total(replay, gap):
     assert snapshot["data"]["items"] == []
     assert snapshot["data"]["unrealizedPnlUsd"] is None
     assert snapshot["error"]["code"] == "INCOMPLETE_DATA"
+
+
+@pytest.mark.parametrize(
+    ("fill_check", "lcd_trade"),
+    [
+        ("error", None),
+        ("malformed", None),
+        (None, "missing"),
+        (None, "malformed"),
+        ("error", "missing"),
+    ],
+)
+def test_overview_reports_failed_fill_and_lcd_position_checks(
+    replay, fill_check, lcd_trade
+):
+    if fill_check == "error":
+        replay["http"][keeper.INTENTS] = {"errors": [{"message": "fill check failed"}]}
+    elif fill_check == "malformed":
+        replay["http"][keeper.INTENTS] = {"data": {"userIntents": [{}]}}
+    if lcd_trade is not None:
+        populate_trades(replay)
+        replay["liveTradeIds"] = [0, 1]
+        if lcd_trade == "missing":
+            del replay["contractTrades"][0]
+        else:
+            replay["contractTrades"][0] = {"trade": {}}
+
+    positions = mcp(replay, addr=ADDR)["positions"]
+    assert positions["membership"]["status"] == "verified"
+    assert positions["data"]["unrealizedPnlUsd"] is None
+    items = positions["data"]["items"]
+    if lcd_trade is None:
+        assert items == []
+    else:
+        assert [row["riskStatus"] for row in items] == ["unavailable", "verified"]
+    error = positions["error"]
+    assert error["code"] == "INCOMPLETE_DATA"
+    assert ("Keeper fill check failed" in error["message"]) == (fill_check is not None)
+    assert ("LCD position read failed" in error["message"]) == (lcd_trade is not None)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "get_market",
+        "get_oracle_address",
+        "get_exchange_rate_stamped",
+        "get_group",
+        "collateral",
+    ],
+)
+def test_overview_reports_downstream_lcd_risk_failures(replay, query):
+    long, _ = populate_trades(replay)
+    if query == "collateral":
+        long["perpBorrowing"]["collateralToken"] = {"id": 2, "symbol": "stNIBI"}
+        install_contract_trade(replay, long, mark=100, liquidation=50)
+    else:
+        replay["failedLcdQuery"] = query
+
+    positions = mcp(replay, addr=ADDR)["positions"]
+    assert positions["membership"]["status"] == "verified"
+    row = positions["data"]["items"][0]
+    assert row["riskStatus"] == "partial"
+    assert row["liquidationPriceQuote"] == 50
+    assert positions["data"]["unrealizedPnlUsd"] is None
+    assert positions["error"]["code"] == "INCOMPLETE_DATA"
+    assert "LCD position read failed" in positions["error"]["message"]
 
 
 @pytest.mark.parametrize("has_positions", [False, True])

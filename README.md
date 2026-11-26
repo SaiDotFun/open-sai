@@ -381,3 +381,98 @@ also adopts and stops orphaned helpers that started a separate session.
 Run `python3 scripts/release-rehearsal.py --self-test` for the local script
 checks. Add `--verbose` to a rehearsal to keep child output in a private
 scratch log. The script prints the log path and removes the temporary home.
+
+### Rehearse the Native Cutover and Rollback
+
+Run this rehearsal manually on Linux before publishing a native candidate.
+It uses real Claude Code, Codex, and Cursor installations. The hosted
+Native Distribution jobs provision uv and Sai and run the automated archive
+smoke tests against Python 0.1.1. They do not provision the three clients
+needed for the populated 0.1.3 profile rehearsal.
+
+Use Python 3.11 or later and put `uv`, `claude`, `codex`, and
+`cursor-agent` on `PATH`. Codex must support `codex app-server`. The host
+must support the loopback-only network namespace described above.
+
+To reproduce the reported native 0.2.4 candidate, export its source revision
+into a scratch directory and set the test version in its package metadata.
+The commands below keep the version changes out of the checkout. Use the
+revision under review when rehearsing a different candidate.
+
+```bash
+cutover="$PWD/dist/cutover"
+native_src="$cutover/native-src"
+native_ref=ccffb46ab2b5a7084cc6ce41cc6a1be6c81900b6
+target="$(rustc -vV | sed -n 's/^host: //p')"
+mkdir -p "$native_src"
+git archive "$native_ref" | tar -x -C "$native_src"
+python3 - "$native_src" <<'PYTHON'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1])
+for filename in ("Cargo.toml", "shim/pyproject.toml"):
+    path = source / filename
+    text = path.read_text()
+    old = 'version = "0.1.2"'
+    assert text.count(old) == 1
+    path.write_text(text.replace(old, 'version = "0.2.4"'))
+
+lock = source / "Cargo.lock"
+text = lock.read_text()
+for package in ("sai", "sai-core"):
+    old = f'name = "{package}"\nversion = "0.1.2"'
+    assert text.count(old) == 1
+    text = text.replace(old, f'name = "{package}"\nversion = "0.2.4"')
+lock.write_text(text)
+PYTHON
+cargo build --locked --bin sai --manifest-path "$native_src/Cargo.toml" \
+  --target-dir "$native_src/target"
+strip --strip-debug "$native_src/target/debug/sai"
+python3 "$native_src/scripts/native-dist.py" archive \
+  "$native_src/target/debug/sai" "$cutover/native" --target "$target"
+python3 "$native_src/scripts/native-dist.py" rehearsal-wheel "$cutover/native"
+sha256sum "$cutover/native/sai-0.2.4-$target.tar.gz"
+```
+
+The loopback shim must match the archive's version. Record the source
+revision and archive digest with the rehearsal output. Download the baseline
+wheel and build the full Python bridge from the checkout under review.
+Prepare uv's dependency cache as a separate step with network access.
+Use the same Python interpreter and cache for the rehearsal.
+
+```bash
+gh release download sai-cli/v0.1.3 --repo SaiDotFun/open-sai \
+  --pattern '*.whl' --pattern SHA256SUMS --dir "$cutover/published"
+python3 scripts/build-bridge.py --version 0.1.4 --out-dir "$cutover/bridge"
+export UV_CACHE_DIR="$cutover/uv-cache"
+for wheel in "$cutover/published/"*.whl "$cutover/bridge/"*.whl; do
+  uv --no-config pip install --python "$(command -v python3)" \
+    --default-index https://pypi.org/simple --only-binary :all: \
+    --target "$cutover/prefetch" "$wheel"
+done
+```
+
+Run the rehearsal with that cache. All installs, CLI commands, and MCP
+checks run in the loopback-only namespace with uv offline. The rehearsal
+exits if the namespace is unavailable or the offline install fails.
+When `UV_CACHE_DIR` is unset, it uses the host's default uv cache.
+
+```bash
+python3 scripts/release-rehearsal.py --verbose \
+  --published-assets "$cutover/published" \
+  --bridge-wheel "$cutover/bridge/sai_cli-0.1.4-py3-none-any.whl" \
+  --native-archive "$cutover/native/sai-0.2.4-$target.tar.gz" \
+  "$cutover/native/sai_cli-0.2.4-py3-none-any.whl"
+```
+
+The script installs the published wheel with uv, updates to the bridge
+and then to the native shim, and rolls back using the native updater.
+The same uv launcher and temporary profile are used throughout.
+
+The rehearsal checks the selected account, saved config, pending open,
+retained logs, and MCP registrations. It starts Sai through Claude Code,
+Codex, and Cursor, and checks stale registrations during cutover and
+rollback. The loopback Keeper drops the first acknowledgement and reports the
+open as pending. A retry must reference that intent and leave the submission
+count at one. The script reports failed checks and exits nonzero.

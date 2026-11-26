@@ -53,6 +53,21 @@ CLOSE = ("trade", "close", "7")
 CANCEL = ("trade", "cancel", "7")
 CANCEL_READS = ["oneClickTrading", "node_info", "get_trade_raw"]
 CLOSE_READS = ["trade", *CANCEL_READS]
+CLOSE_ESTIMATE_READS = [
+    "borrowing",
+    "get_exchange_balance",
+    "get_trade_raw",
+    "get_perp_prices",
+]
+OPEN_ESTIMATE_READS = [
+    "oneClickTrading",
+    "node_info",
+    "get_market",
+    "get_group",
+    "get_pair_custom_max_leverage",
+    "get_fees",
+    "get_collateral_price",
+]
 
 
 @pytest.fixture
@@ -197,6 +212,7 @@ def test_numeric_keeper_price_rounds_to_even(
             assert code == 0
             assert [request.label for request in endpoints.wire] == [
                 "borrowings",
+                *([] if index == 0 else OPEN_ESTIMATE_READS),
                 "recordUserIntent",
             ]
             body = endpoints.wire[-1].variables["input"]["intent"]["body"]
@@ -246,6 +262,7 @@ def test_python_reads_rust_trade_events_offline(
         assert report["txHash"] == TRADE_REQUEST_HASH.lower()
         assert [request.label for request in endpoints.wire] == [
             *CLOSE_READS,
+            *CLOSE_ESTIMATE_READS,
             "recordUserIntent",
         ]
         events = {event["event"]: event for event in report["events"]}
@@ -288,6 +305,7 @@ def test_python_reads_rust_reconciliation_evidence_offline(
         }
         assert [request.label for request in endpoints.wire] == [
             *CLOSE_READS,
+            *CLOSE_ESTIMATE_READS,
             "recordUserIntent",
             "userIntents",
         ]
@@ -478,6 +496,7 @@ def test_position_trade_preserves_lcd_query(
             assert (code, output.get("status"), stderr) == (0, "accepted", "")
             assert [request.label for request in endpoints.wire] == [
                 *(CANCEL_READS if cancel else CLOSE_READS),
+                *(CLOSE_ESTIMATE_READS if not cancel and index == 1 else []),
                 "recordUserIntent",
             ]
             assert not endpoints.errors
@@ -788,10 +807,16 @@ def test_trade_submission(
             )
             assert exit_status == exit_code
             assert not endpoints.errors
-            assert [request.label for request in endpoints.wire] == (
-                (["borrowings"] if markets else CANCEL_READS if cancel else CLOSE_READS)
-                + ["recordUserIntent"]
-            )
+            if markets:
+                reads = ["borrowings", *([] if index == 0 else OPEN_ESTIMATE_READS)]
+            elif close and index == 1:
+                reads = CLOSE_READS + CLOSE_ESTIMATE_READS
+            else:
+                reads = CANCEL_READS if cancel else CLOSE_READS
+            assert [request.label for request in endpoints.wire] == [
+                *reads,
+                "recordUserIntent",
+            ]
             variables = endpoints.wire[-1].variables
             envelope = variables["input"]
             key = envelope["intentKey"]
@@ -842,7 +867,10 @@ def test_trade_submission(
             else:
                 assert output["error"]["intentKey"] == key
                 assert output["error"]["code"] == code
-            keeper_reads = 2 if close else int(markets or cancel)
+            keeper_reads = sum(
+                label in {"borrowing", "borrowings", "oneClickTrading", "trade"}
+                for label in reads
+            )
             expected_events = [("keeper.request", "ok")] * keeper_reads
             expected_events.extend(
                 [
@@ -893,7 +921,7 @@ def test_open_retry_preserves_first_reservation(
             assert error["error"]["code"] == "RECENT_OPEN_PENDING"
             assert error["error"]["intentKey"] == key
             assert len(rows(home)) == 1
-            assert len(endpoints.wire) == 1
+            assert sum(r.label == "recordUserIntent" for r in endpoints.wire) == 1
             observations.append(
                 (json.dumps(error, sort_keys=True).replace(key, "<intent>"), stderr)
             )
@@ -905,7 +933,7 @@ def test_open_retry_preserves_first_reservation(
                 (*args, "--allow-concurrent-open"),
                 python=index == 0,
             )
-            assert len(endpoints.wire) == 2
+            assert sum(r.label == "recordUserIntent" for r in endpoints.wire) == 2
             assert len(rows(home)) == 2
             assert not endpoints.errors
     assert observations[0] == observations[1]
@@ -1014,6 +1042,7 @@ def test_concurrent_close_sends_once(
     current_trade_pair: tuple[CLI, CLI], tmp_path: Path
 ) -> None:
     for index, cli in enumerate(current_trade_pair):
+        reads = CLOSE_READS + (CLOSE_ESTIMATE_READS if index == 1 else [])
         with loopback("concurrent-close") as endpoints, ThreadPoolExecutor() as tasks:
             home = tmp_path / str(index)
             seed_home(home, endpoints, "session")
@@ -1037,9 +1066,9 @@ def test_concurrent_close_sends_once(
                     "",
                 )
                 assert [entry.label for entry in endpoints.wire] == [
-                    *CLOSE_READS,
+                    *reads,
                     "recordUserIntent",
-                    *CLOSE_READS,
+                    *reads,
                 ]
             finally:
                 endpoints.admission.release.set()
@@ -1051,9 +1080,9 @@ def test_concurrent_close_sends_once(
                 "",
             )
             assert [entry.label for entry in endpoints.wire] == [
-                *CLOSE_READS,
+                *reads,
                 "recordUserIntent",
-                *CLOSE_READS,
+                *reads,
             ]
             assert [row[2] for row in rows(home)] == ["accepted"]
             assert not endpoints.errors
@@ -1124,10 +1153,11 @@ def test_interrupt_after_dispatch_reports_reserved_key(
             ) == 1
             assert not endpoints.errors
             if scenario == "concurrent-close":
+                reads = CLOSE_READS + (CLOSE_ESTIMATE_READS if index == 1 else [])
                 assert [entry.label for entry in endpoints.wire] == [
-                    *CLOSE_READS,
+                    *reads,
                     "recordUserIntent",
-                    *CLOSE_READS,
+                    *reads,
                 ]
 
 
@@ -1154,7 +1184,11 @@ def test_mixed_clients_reconcile_a_post_dispatch_timeout(
         assert code == 1
         assert result["error"]["code"] == "RECENT_OPEN_PENDING"
         assert result["error"]["intentKey"] == key
-        assert [request.label for request in endpoints.wire] == ["recordUserIntent"]
+        assert [
+            request.label
+            for request in endpoints.wire
+            if request.label in {"recordUserIntent", "userIntents"}
+        ] == ["recordUserIntent"]
 
         code, _, _ = run(
             peer,
@@ -1166,7 +1200,11 @@ def test_mixed_clients_reconcile_a_post_dispatch_timeout(
         assert code == 0
         assert [row[2] for row in rows(home)] == ["terminal"]
         assert run(sender, home, endpoints, args, python=first == 0)[0] == 0
-        assert [request.label for request in endpoints.wire] == [
+        assert [
+            request.label
+            for request in endpoints.wire
+            if request.label in {"recordUserIntent", "userIntents"}
+        ] == [
             "recordUserIntent",
             "userIntents",
             "recordUserIntent",
