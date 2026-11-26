@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import socket
 import sqlite3
@@ -31,6 +32,7 @@ from scenarios import (
 )
 
 CLI = tuple[str, ...]
+OBSERVED_AT = re.compile(rb'"observedAt": "\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z"')
 OPEN = (
     "trade",
     "open",
@@ -101,6 +103,7 @@ def current_trade_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
         ((*OPEN, "--type", "limit"), "quote-trigger-fee", True),
         ((*OPEN, "--type", "stop"), "quote-trigger-fee", True),
         (OPEN, "quote-close-only", False),
+        (CLOSE, "quote-close", True),
         (CLOSE, "quote-queued", True),
         (CLOSE, "quote-no-publication", False),
         ((*CLOSE, "--cancel-order"), "pending-order", True),
@@ -124,6 +127,7 @@ def current_trade_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
         "stop",
         "rejected-open",
         "close",
+        "close-queued",
         "close-unknown-oracle",
         "pending-cancel",
         "tpsl",
@@ -132,7 +136,7 @@ def current_trade_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
         "partial-close",
     ],
 )
-def test_cli_dry_run_digest_matches_python_main(
+def test_cli_dry_run_matches_python_main(
     cli_pair: tuple[CLI, CLI],
     tmp_path: Path,
     args: CLI,
@@ -140,7 +144,7 @@ def test_cli_dry_run_digest_matches_python_main(
     confirmable: bool,
 ) -> None:
     reference = str(Path(sys.executable).with_name("sai"))
-    confirmations = []
+    previews = []
     for index, cli in enumerate(((reference,), cli_pair[1])):
         with loopback(scenario) as endpoints:
             home = tmp_path / str(index)
@@ -154,10 +158,12 @@ def test_cli_dry_run_digest_matches_python_main(
                 assert digest == preview_digest(preview)
             else:
                 assert digest is None
-            confirmations.append((preview["positionRoute"], digest))
+            assert preview["positionRoute"]
+            canonical = json.dumps(preview, sort_keys=True).encode()
+            previews.append(OBSERVED_AT.sub(b'"observedAt": "<time>"', canonical))
             assert not endpoints.errors
             assert not rows(home)
-    assert confirmations[0] == confirmations[1]
+    assert previews[0] == previews[1]
 
 
 def run(
