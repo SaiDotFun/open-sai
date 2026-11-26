@@ -1141,8 +1141,10 @@ impl InstallArgs {
         if explicit_separator && self.server_argv.is_empty() {
             return Err(SaiError::usage("Give the server command after `--`."));
         }
-        if let Some(launcher) = self.server_argv.first()
-            && (launcher.starts_with('-') || launcher.contains('=') || which(launcher).is_none())
+        if self
+            .server_argv
+            .first()
+            .is_some_and(|launcher| which(launcher).is_none())
         {
             return Err(SaiError::usage(
                 "Give an existing executable as the server launcher after `--`.",

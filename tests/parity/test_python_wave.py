@@ -517,10 +517,6 @@ def test_mcp_install_rejects_explicit_launcher_before_reporting(
     _, rust = wave_clis
     overrides = {"PATH": os.defpath}
     seed_clients(tmp_path, overrides, "empty")
-    if launcher.startswith(("OPENAI_API_KEY=", "-synthetic")):
-        executable = tmp_path / "bin" / launcher
-        executable.write_text("#!/bin/sh\nexit 0\n")
-        executable.chmod(0o700)
 
     for options in (("claude", "--dry-run"), ("--dry-run",), ("claude",)):
         result = run_cli(
@@ -560,6 +556,53 @@ def test_mcp_install_rejects_explicit_launcher_before_reporting(
     assert not text.stdout
     assert "synthetic-private" not in text.stderr
     assert "existing executable" in text.stderr
+
+
+@pytest.mark.parametrize(
+    "relative", ["slot=staging/launcher", "bin/-launcher", "bin/slot=staging"]
+)
+def test_mcp_install_accepts_resolved_explicit_launcher(
+    wave_clis: tuple[str, str], tmp_path: Path, relative: str
+) -> None:
+    _, rust = wave_clis
+    overrides = {"PATH": os.defpath}
+    seed_clients(tmp_path, overrides, "empty")
+    executable = tmp_path / relative
+    executable.parent.mkdir(exist_ok=True)
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    launcher = (
+        executable.name if executable.parent == tmp_path / "bin" else str(executable)
+    )
+    path = tmp_path / ".cursor/mcp.json"
+    for options in (("--dry-run",), ()):
+        result = run_cli(
+            rust,
+            tmp_path,
+            "--json",
+            "mcp",
+            "install",
+            "cursor",
+            *options,
+            "--",
+            launcher,
+            "mcp",
+            "serve",
+            overrides=overrides,
+        )
+        assert result.returncode == 0
+        [report] = json.loads(result.stdout)["results"]
+        assert report["command"] == [
+            launcher,
+            "<argument hidden 1 of 2>",
+            "<argument hidden 2 of 2>",
+        ]
+        if options:
+            assert not path.exists()
+        else:
+            entry = json.loads(path.read_text())["mcpServers"]["sai"]
+            assert entry["command"] == launcher
+            assert entry["args"] == ["mcp", "serve"]
 
 
 @pytest.mark.parametrize(
