@@ -429,10 +429,6 @@ def missing_absolute_launcher(command: str) -> bool:
     return os.path.isabs(command) and shutil.which(command) is None
 
 
-def plain_launcher(command: str) -> bool:
-    return bool(command) and not command.startswith("-") and "=" not in command
-
-
 def hidden_arguments(count: int) -> list[str]:
     return [f"<argument hidden {index} of {count}>" for index in range(1, count + 1)]
 

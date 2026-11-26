@@ -2105,7 +2105,6 @@ def test_install_refuses_invalid_launcher_before_reporting(
     marker = "fixture-launcher"
     if kind in {"assignment", "option"}:
         launcher = f"MODE={marker}" if kind == "assignment" else f"-{marker}"
-        write_exe(root / launcher, "")
     elif kind == "missing":
         launcher = marker
     else:
@@ -2127,6 +2126,27 @@ def test_install_refuses_invalid_launcher_before_reporting(
     assert marker not in text.stderr
     assert not (root / ".claude.json").exists()
     assert not (root / "argv.log").exists()
+
+
+@pytest.mark.parametrize(
+    "name", ["slot=staging/launcher", "MODE=fixture-launcher", "-fixture-launcher"]
+)
+def test_install_accepts_resolvable_launcher_with_assignment_or_dash(
+    install_preview: Path, name: str
+) -> None:
+    root = install_preview.parent
+    path = root / name
+    path.parent.mkdir(exist_ok=True)
+    write_exe(path, "")
+    launcher = str(path) if "/" in name else name
+    args = ["mcp", "serve"]
+
+    result = invoke("mcp", "install", "cursor", "--", launcher, *args)
+
+    assert result.exit_code == 0, result.output
+    config = json.loads((root / ".cursor/mcp.json").read_text())
+    entry = config["mcpServers"]["sai"]
+    assert (entry["command"], entry["args"]) == (launcher, args)
 
 
 @pytest.mark.parametrize(

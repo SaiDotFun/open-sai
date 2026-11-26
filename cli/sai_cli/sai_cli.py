@@ -2262,12 +2262,10 @@ def mcp_install_command(
     without a terminal, this lists detected clients and changes nothing.
     """
     server_argv = ctx.meta.get("server_argv")
-    if server_argv:
-        launcher = server_argv[0]
-        if not mcp_install.plain_launcher(launcher) or shutil.which(launcher) is None:
-            raise click.UsageError(
-                "Give an existing executable as the server launcher after `--`.", ctx
-            )
+    if server_argv and shutil.which(server_argv[0]) is None:
+        raise click.UsageError(
+            "Give an existing executable as the server launcher after `--`.", ctx
+        )
     names = chosen_clients((*clients, *client_options))
     if reset_args and repair_existing is None:
         raise click.UsageError("--reset-args requires --repair-existing.")
