@@ -1367,7 +1367,7 @@ impl Clients {
         if client == Client::Claude
             && let Some(entry) = existing
         {
-            self.report_different_claude(entry, target, result);
+            self.report_different_claude(entry, target, dry, result);
             return Ok(());
         }
         let action = if existing.is_some() {
@@ -1431,6 +1431,7 @@ impl Clients {
         &self,
         entry: &Registration,
         target: &Target,
+        dry: bool,
         result: &mut RegistrationResult,
     ) {
         let scope = entry.scope.name();
@@ -1471,7 +1472,7 @@ impl Clients {
         } else if !entry.extra.is_empty() {
             fix.push_str(" Edit the differing fields in Claude Code or its config. Keep the saved working directory and any custom settings you still need.");
         } else {
-            Self::claude_replacement_hint(entry, target, args, &label, &mut fix);
+            Self::claude_replacement_hint(entry, target, args, &label, dry, &mut fix);
         }
         result
             .report
@@ -1490,6 +1491,7 @@ impl Clients {
         target: &Target,
         args: &[String],
         label: &str,
+        dry: bool,
         fix: &mut String,
     ) {
         const ARG: &str = "<original-argument>";
@@ -1507,7 +1509,10 @@ impl Clients {
             let profile = if entry.invalid_profile {
                 None
             } else if entry.profile.is_none() || entry.profile == target.profile {
-                target.profile.as_deref()
+                target
+                    .profile
+                    .as_deref()
+                    .map(|profile| if dry { PROFILE } else { profile })
             } else {
                 Some(PROFILE)
             };

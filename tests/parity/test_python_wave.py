@@ -897,6 +897,43 @@ def test_mcp_install_reports_claude_extra_fields(
                 assert "claude mcp add" not in report["fix"]
 
 
+@pytest.mark.parametrize("flags", [(), ("--json",)], ids=["text", "json"])
+def test_mcp_install_dry_run_masks_profile_in_claude_repair_hint(
+    wave_clis: tuple[str, str], tmp_path: Path, flags: tuple[str, ...]
+) -> None:
+    _, rust = wave_clis
+    overrides = {"PATH": os.defpath}
+    seed_clients(tmp_path, overrides, "current")
+    config = tmp_path / ".claude.json"
+    data = json.loads(config.read_text())
+    entry = data["mcpServers"]["sai"]
+    profile = str(tmp_path / "private-profile")
+    entry["env"]["SAI_HOME"] = profile
+    overrides["SAI_HOME"] = profile
+    entry["args"] = ["mcp", "serve", "--endpoint", "https://fixture.invalid/api"]
+    config.write_text(json.dumps(data))
+    original = config.read_bytes()
+    for options in (("--dry-run",), ()):
+        result = run_cli(
+            rust,
+            tmp_path,
+            *flags,
+            "mcp",
+            "install",
+            "claude",
+            *options,
+            overrides=overrides,
+        )
+        assert result.returncode == 1
+        output = result.stdout + result.stderr
+        if options:
+            assert profile not in output
+            assert "--env=SAI_HOME=<original-SAI_HOME>" in output
+        else:
+            assert f"--env=SAI_HOME={profile}" in output
+        assert config.read_bytes() == original
+
+
 @pytest.mark.parametrize("scope", ["user", "local"])
 def test_claude_install_uses_checkout_key_for_disablement(
     wave_clis: tuple[str, str], tmp_path: Path, scope: str
