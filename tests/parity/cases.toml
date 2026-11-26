@@ -1378,6 +1378,7 @@ state = { "clients/.codex/config.toml#@mode" = 384, "clients/.cursor/mcp.json#@m
 [[case]]
 name = "mcp-install-legacy"
 args = ["--json", "mcp", "install", "--all"]
+accepted_divergence = "launcher-argument-report"
 client_seed = "legacy"
 state = { "clients/.claude.json#changed" = false, "clients/.codex/config.toml#changed" = false, "clients/.cursor/mcp.json#changed" = false }
 

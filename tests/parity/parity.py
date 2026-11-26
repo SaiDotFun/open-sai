@@ -1175,7 +1175,11 @@ def run_case(
         and isinstance(right.output, dict)
     ):
         # Rust may still show the exact fixture command before both CLIs use placeholders.
-        command = case.args[case.args.index("--") + 1 :]
+        command = (
+            ["<HOME>/bin/sai", "mcp", "serve"]
+            if case.name == "mcp-install-legacy"
+            else case.args[case.args.index("--") + 1 :]
+        )
         launcher, *args = command
         for row in right.output.get("results", []):
             if row.get("command") == command:

@@ -2255,6 +2255,9 @@ def test_dry_run_displays_launcher_and_argument_placeholders(
     installed = invoke(*prefix, "--", *command)
 
     assert installed.exit_code == 0, installed.output
+    [row] = payload(installed)["results"]
+    assert row["command"] == shown
+    assert row["argv"][0][-len(shown) :] == shown
     entry = json.loads(config.read_text())["mcpServers"]["sai"]
     assert entry["command"] == launcher
     assert entry["args"] == args
@@ -2289,6 +2292,36 @@ def test_dry_run_hides_arguments_of_a_matching_legacy_entry(
     assert row["name"] == OLD_COMMAND
     assert row["action"] == "unchanged"
     assert row["command"] == shown
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_noninteractive_install_listing_hides_matching_cursor_arguments(
+    install_preview: Path, json_output: bool
+) -> None:
+    root = install_preview.parent
+    launcher = write_exe(root / "sh", "")
+    script = "APP_MODE='fixture-wrapper-value' exec sai mcp serve"
+    command = [str(launcher), "-c", script]
+    config = root / ".cursor/mcp.json"
+    config.parent.mkdir()
+    entry = claude_entry(command, {"SAI_HOME": str(root / "sai-home")})
+    original = json.dumps({"mcpServers": {"sai": entry}})
+    config.write_text(original)
+
+    flags = ["--json"] if json_output else []
+    result = CliRunner().invoke(main, [*flags, "mcp", "install", "--", *command])
+
+    assert result.exit_code == 0, result.output
+    assert "fixture-wrapper-value" not in result.output
+    report = payload(result)
+    shown = [str(launcher), "<argument hidden 1 of 2>", "<argument hidden 2 of 2>"]
+    assert report["command"] == shown
+    cursor = next(row for row in report["clients"] if row["client"] == "cursor")
+    assert cursor["current"]
+    assert cursor["registeredCommand"] == shown
+    assert cursor["registrations"]
+    assert all(reg["command"] == shown for reg in cursor["registrations"])
+    assert config.read_text() == original
 
 
 @pytest.mark.parametrize(
@@ -2431,7 +2464,11 @@ def test_argv_after_dash_overrides_the_sai_on_path(env: Env):
     assert env.calls() == [
         ["mcp", "add", "--scope", "user", "sai", "--", *dev],
     ]
-    assert payload(result)["results"][0]["command"] == dev
+    [row] = payload(result)["results"]
+    assert row["command"] == [
+        "uv",
+        *(f"<argument hidden {i} of 6>" for i in range(1, 7)),
+    ]
 
 
 def test_install_warns_about_a_different_install(env: Env, monkeypatch):
