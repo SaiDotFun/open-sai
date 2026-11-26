@@ -298,6 +298,7 @@ fn wait_output(
         .expect("receipt intent key")
         .to_owned();
     if !recovered && outcome == wait::Outcome::Unknown {
+        body["message"] = json!("The intent outcome is still unknown. Do not resubmit.");
         let mut args = vec!["intent", "wait", &key];
         if let Some(addr) = body["addr"].as_str().filter(|addr| !addr.is_empty()) {
             args.extend(["--addr", addr]);

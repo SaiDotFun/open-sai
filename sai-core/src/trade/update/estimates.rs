@@ -8,10 +8,7 @@ use crate::trade::{
     actions::invalid,
     confirmation::{plain_decimal, positive_decimal},
     estimates::{market_rejection, oracle_publication_time},
-    position::{
-        Lcd, PositionRoute, Snapshot, SnapshotError, contract_decimal, number_text,
-        position_mismatch,
-    },
+    position::{Lcd, PositionRoute, Snapshot, SnapshotError, contract_decimal, number_text},
 };
 
 const SCALE: u128 = 10u128.pow(18);
@@ -252,7 +249,6 @@ impl Trading<'_> {
         id: &Value,
         verified: Option<(PositionRoute, Option<Value>)>,
         indexed: Value,
-        require_unchanged: bool,
     ) -> Result<(), SaiError> {
         let target = preview.intent.body["requestedLeverage"].as_str();
         let unavailable = if target.is_some() {
@@ -289,9 +285,6 @@ impl Trading<'_> {
                 match quote.await {
                     Ok(result) => result.unwrap_or_else(unavailable),
                     Err(SnapshotError::Owner(message)) => return Err(invalid(message)),
-                    Err(SnapshotError::CollateralMismatch) if require_unchanged => {
-                        return Err(position_mismatch());
-                    }
                     Err(
                         SnapshotError::CollateralMismatch
                         | SnapshotError::IndexMismatch

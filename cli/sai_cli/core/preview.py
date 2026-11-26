@@ -233,10 +233,15 @@ def read_collateral_price(lcd: str, contract: str, token: str) -> dict[str, Any]
 
 
 def contract_market(
-    lcd: str, contract: str, market: str, *, height: str | None = None
+    lcd: str,
+    contract: str,
+    market: str,
+    *,
+    height: str | None = None,
+    fresh: bool = False,
 ) -> dict[str, Any]:
     pair = margin.smart_value(
-        lcd, contract, {"get_market": {"index": market}}, height=height
+        lcd, contract, {"get_market": {"index": market}}, height=height, fresh=fresh
     )
     if not isinstance(pair, dict):
         raise TypeError("Perp market is unavailable")
@@ -278,6 +283,7 @@ def open_estimates(
     market_reference: dict[str, Any] | None,
     *,
     market_bound: bool,
+    fresh_market: bool = False,
 ) -> dict[str, Any]:
     order_type, long = body["orderType"], body["side"] == "long"
     reference = market_reference
@@ -295,7 +301,9 @@ def open_estimates(
     liq = unavailable("An entry price and opening fee estimate are required.")
     if lcd and contract:
         try:
-            pair = contract_market(lcd, contract, body["market"]["marketIndex"])
+            pair = contract_market(
+                lcd, contract, body["market"]["marketIndex"], fresh=fresh_market
+            )
             if refusal := market_open_rejection(
                 pair, market_order=order_type == "market"
             ):
