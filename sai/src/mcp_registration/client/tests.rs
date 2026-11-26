@@ -1,6 +1,21 @@
+use std::cell::RefCell;
+
 use serde_json::json;
 
 use super::*;
+
+thread_local! {
+    pub(in crate::mcp_registration) static SAVE_BEFORE_PUBLISH: RefCell<Option<(PathBuf, PathBuf)>> =
+        const { RefCell::new(None) };
+}
+
+pub(super) fn publish_fixture_save(destination: &Path) {
+    SAVE_BEFORE_PUBLISH.with_borrow_mut(|save| {
+        if let Some((staged, destination)) = save.take_if(|(_, path)| path == destination) {
+            fs::rename(staged, destination).unwrap();
+        }
+    });
+}
 
 #[test]
 fn cursor_verification_leaves_concurrent_launcher_and_args_changes_intact() {

@@ -371,7 +371,7 @@ fn reported_target(override_argv: Vec<String>, home: &Path) -> ClientResult<Targ
     Ok(target)
 }
 
-fn doctor_target(home: &Path) -> Option<Target> {
+fn doctor_target(home: &Path, profile_dir: &Path) -> Option<Target> {
     use std::os::unix::fs::MetadataExt;
 
     let executable = env::current_exe().ok()?;
@@ -387,17 +387,21 @@ fn doctor_target(home: &Path) -> Option<Target> {
     #[cfg(not(target_os = "linux"))]
     let running = executable.metadata().ok()?;
 
+    let runs_executable = |path: &Path| {
+        path.metadata()
+            .is_ok_and(|meta| meta.dev() == running.dev() && meta.ino() == running.ino())
+    };
+    let usable = |path: &Path| {
+        path.is_absolute() && !in_uv_cache(path, home) && path.to_str().and_then(which).is_some()
+    };
     let path = env::var_os("PATH").unwrap_or_default();
-    let launchers = std::iter::once(home.join(".local/bin/sai"))
-        .chain(env::split_paths(&path).map(|dir| absolute(&dir).join("sai")));
-    let launcher = launchers.into_iter().find(|launcher| {
-        launcher.is_absolute()
-            && !in_uv_cache(launcher, home)
-            && launcher.to_str().and_then(which).is_some()
-            && launcher
-                .metadata()
-                .is_ok_and(|meta| meta.dev() == running.dev() && meta.ino() == running.ino())
-    })?;
+    let launcher = crate::update::mcp_repair_launcher(&executable, profile_dir, runs_executable)
+        .filter(|path| usable(path))
+        .or_else(|| {
+            std::iter::once(home.join(".local/bin/sai"))
+                .chain(env::split_paths(&path).map(|dir| absolute(&dir).join("sai")))
+                .find(|launcher| usable(launcher) && runs_executable(launcher))
+        })?;
     Some(Target::generated(
         launcher.into_os_string().into_string().ok()?,
         profile(home),
@@ -693,32 +697,54 @@ impl RegistrationCheck {
 }
 
 pub(crate) fn check_registrations(
+    profile_dir: &Path,
     fix: bool,
     timeout: Duration,
     profile_override: Option<&OsStr>,
 ) -> ClientResult<Vec<RegistrationCheck>> {
     let clients = Clients::open()?;
-    let target = doctor_target(&clients.home);
+    let target = doctor_target(&clients.home, profile_dir);
     let expected_profile = match profile_override {
         Some(value) => profile_value(&clients.home, value),
         None => profile(&clients.home),
     };
-    Ok(clients.check_all(target.as_ref(), fix, Some(&expected_profile), timeout))
+    Ok(clients.check_all(target.as_ref(), |_| fix, Some(&expected_profile), timeout))
 }
 
 impl Clients {
     fn check_all(
         &self,
         target: Option<&Target>,
-        fix: bool,
+        may_repair: impl Fn(Client) -> bool,
         expected_profile: Option<&Option<String>>,
         timeout: Duration,
     ) -> Vec<RegistrationCheck> {
         let deadline = Instant::now() + timeout;
+        let user_only = Self {
+            home: self.home.clone(),
+            cwd: None,
+        };
         CLIENTS
             .into_iter()
             .filter(|client| client.detected(&self.home).is_some())
-            .map(|client| self.check(client, target, expected_profile, fix, deadline))
+            .map(|client| {
+                let clients = match (client, self.cwd.as_deref()) {
+                    (Client::Cursor, Some(cwd))
+                        if resolved(&client.path(Scope::Project, &self.home, cwd))
+                            == resolved(&client.path(Scope::User, &self.home, cwd)) =>
+                    {
+                        &user_only
+                    }
+                    _ => self,
+                };
+                clients.check(
+                    client,
+                    target,
+                    expected_profile,
+                    may_repair(client),
+                    deadline,
+                )
+            })
             .collect()
     }
 

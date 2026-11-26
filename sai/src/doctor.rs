@@ -199,7 +199,7 @@ impl DoctorArgs {
         checks.push(timed(|| files::logs_check(env, fix_profile, log_settings)));
 
         let started = Instant::now();
-        match mcp::check_registrations(fix, DEADLINE, self.mcp_profile.as_deref()) {
+        match mcp::check_registrations(&env.home, fix, DEADLINE, self.mcp_profile.as_deref()) {
             Ok(results) => checks.extend(results.into_iter().map(|report| {
                 let mut check = Check::new(
                     format!("mcp.{}", report.client),

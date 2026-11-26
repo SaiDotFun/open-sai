@@ -15,6 +15,8 @@ use super::{Client, NAMES, Registration, Scope, Target, private_server_args, she
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(super) use tests::SAVE_BEFORE_PUBLISH;
 
 pub(super) type Result<T> = std::result::Result<T, String>;
 pub(super) const READ_ONLY_CONFIG: &str = "The client config is read-only";
@@ -862,6 +864,8 @@ fn replace_if_current(
     {
         return Ok(None);
     }
+    #[cfg(test)]
+    tests::publish_fixture_save(destination);
     temp.persist(destination)
         .map_err(|error| io_kind(error.error))?;
     Ok(Some(published_metadata))

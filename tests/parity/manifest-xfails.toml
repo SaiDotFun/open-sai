@@ -172,23 +172,23 @@ signature = "3e476fa3f4019263ec8af793a32071bcba49c304cd80814f359fd10cbf5a0262"
 
 [gap."case:doctor-mcp-codex-shadow"]
 owner = "#211"
-signature = "05e58b06c9507151c7e0eba401a98686a6fc3aeffb53e56bd63ce8f15e9f82f9"
+signature = "8e0f40076fd303915e61bcf357158146b6cf3177682757de55d480118e8aaa53"
 
 [gap."case:doctor-mcp-missing"]
 owner = "#211"
-signature = "9ad1bbf751a07d96a1fef3227f036ffa0b314f6a219b752be1cdfe322405b18e"
+signature = "a6036ebdb9a47a089bef599fa2f18936eaab36054ac4a860908e877975613d5f"
 
 [gap."case:doctor-mcp-retired"]
 owner = "#211"
-signature = "710b2b00fc0b4804874650721b93751b78a7e69e541ba4b257dc49b1722cdd19"
+signature = "fa9477c81aaa5dc419766117d8697abe3bb057af6e79c0b67859882b352250f9"
 
 [gap."case:doctor-mcp-uv-cache"]
 owner = "#211"
-signature = "ddca710c9ca3d11dd20b3dd1f848cfdc8b15f6b3e862e3f4ba7f50db54aa5ca4"
+signature = "98f5eca82bbfd7d499f39b817ee401474228a7a76594c6187874b27f2c348a1a"
 
 [gap."case:doctor-mcp-verification-failure"]
 owner = "#211"
-signature = "e6e38f28ba1b9240b06b0d87e3980a807ed2c00becb60655f4602ed3b1f1c0f1"
+signature = "d60510c0a0f02dfaebd822b772b66ea275e0ca90a46fcdc56416d100615870bb"
 
 [gap."case:doctor-near-expiry"]
 owner = "#211"
