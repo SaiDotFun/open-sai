@@ -24,8 +24,8 @@ signature = "0c6c09717aa97c5866132f1e0020d745530d9da7f38155739014b3c2479aa160"
 
 [gap."case:bare-help-trade-cancel"]
 owner = "#231"
-title = "Python cancel help includes digest confirmation."
-signature = "78a2271b0886994d8e6f171ca0962565fad3a96d4e2240936d0e29dd061ac31e"
+title = "Cancel help exposes the same confirmation flags in Click and Clap, with different formatting."
+signature = "6a2545d1828eec70547f4fbc6b32571e25b71a821708510e49e15021d670c64e"
 
 [gap."case:trade-open-market-symbol"]
 owner = "#231"
