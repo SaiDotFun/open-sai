@@ -3716,3 +3716,37 @@ def test_cli_margin_preview_reports_insufficient_funds_before_any_projection(
     assert "Perp requires 1.000000 USDC of additional margin" in text.stderr
     assert "The observed available balance is 0.500000 USDC" in text.stderr
     assert not position.submitted
+
+
+@pytest.mark.parametrize("queued", [False, True], ids=["immediate", "queued"])
+def test_cli_leverage_preview_reports_insufficient_funds(position_service, queued):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.available_balance = 500_000
+    position.fill_at_next_oracle_price = queued
+    save_session(f"{base_url}/query")
+    args = position_cli_args(
+        base_url, ["leverage", "7", "--leverage", "1.6", "--dry-run"]
+    )
+    cli = CliRunner()
+    machine = cli.invoke(main, args)
+    assert machine.exit_code == 0, machine.output
+    execution = json.loads(machine.stdout)["estimates"]["execution"]
+    text = cli.invoke(main, args[1:])
+    funding = (
+        "Perp requires 1.000000 USDC of additional margin. "
+        "The observed available balance is 0.500000 USDC."
+    )
+    if queued:
+        warning = f"{funding} Perp checks funding at fill."
+        assert execution["warning"] == warning
+        assert text.exit_code == 0, text.output
+        assert warning in text.stdout.splitlines()[:2]
+        assert "Estimated collateral: 4.000000 USDC" in text.stdout
+    else:
+        assert execution["code"] == "InsufficientDepositBalance"
+        assert execution["reason"] == funding
+        assert text.exit_code == ExitCode.REJECTED, text.output
+        assert text.stdout == ""
+        assert funding in text.stderr.splitlines()[0]
+    assert not position.submitted

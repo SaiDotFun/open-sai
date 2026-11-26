@@ -1327,18 +1327,26 @@ def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
     output: dict[str, Any] = {"addr": account, **result}
     if confirmation.is_confirmable(output):
         output = confirmation.with_digest(output)
-    if not ctx.obj["json"] and (collateral := output.get("collateral")):
-        if reason := estimates.rejection_reason(output.get("estimates", {})):
+    if not ctx.obj["json"]:
+        collateral = output.get("collateral")
+        trade_estimates = output.get("estimates", {})
+        execution = trade_estimates.get("execution", {})
+        if (collateral or execution.get("code") == "InsufficientDepositBalance") and (
+            reason := estimates.rejection_reason(trade_estimates)
+        ):
             raise trading.ExecutionRejected(reason, output)
+        if warning := execution.get("warning"):
+            click.echo(warning)
+        if collateral:
 
-        def value(side: str) -> str:
-            usd = collateral[f"{side}Usd"]
-            dollars = f"${usd}" if usd is not None else "USD unavailable"
-            return f"{collateral[f'{side}Usdc']} USDC ({dollars})"
+            def value(side: str) -> str:
+                usd = collateral[f"{side}Usd"]
+                dollars = f"${usd}" if usd is not None else "USD unavailable"
+                return f"{collateral[f'{side}Usdc']} USDC ({dollars})"
 
-        click.echo(f"Estimated collateral: {value('before')} → {value('after')}")
-        if output.get("warning"):
-            click.echo(output["warning"])
+            click.echo(f"Estimated collateral: {value('before')} → {value('after')}")
+            if output.get("warning"):
+                click.echo(output["warning"])
     emit(ctx, output)
 
 
