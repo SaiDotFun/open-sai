@@ -48,6 +48,7 @@ POSITION_SCENARIOS = {
     "position-after-hours",
     "position-malformed-after-hours-cap",
     "position-index-lag",
+    "position-index-lag-recovers",
     "position-wrong-chain",
     "position-foreign-trader",
     "position-foreign-contract-owner",
@@ -681,7 +682,7 @@ def loopback(
             collateral_amount="10000003", leverage="2.123456789012345678"
         )
         contracts["get_collateral_price"] = "0.987654321098765432"
-    if scenario == "position-index-lag":
+    if scenario in {"position-index-lag", "position-index-lag-recovers"}:
         contracts["get_trade_raw"]["collateral_amount"] = "10000001"
     if scenario in POSITION_SCENARIOS:
         contracts["get_trade_raw"].pop("long", None)
@@ -1100,6 +1101,20 @@ def loopback(
                                         "contractAddress": "nibi1replacement",
                                     }
                                 },
+                            }
+                        )
+                    elif (
+                        scenario == "position-index-lag-recovers"
+                        and name == "trade"
+                        and sum(entry.label == name for entry in wire) > 1
+                    ):
+                        self.reply(
+                            {
+                                "data": {
+                                    "perp": {
+                                        "trade": {**trade, "collateralAmount": 10000001}
+                                    }
+                                }
                             }
                         )
                     elif name == "trade" and scenario == "partial-preview-changed":

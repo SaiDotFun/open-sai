@@ -277,6 +277,49 @@ def test_mcp_refuses_changed_execution(
     assert replacements[0] == replacements[1]
 
 
+def test_mcp_margin_retries_stale_index(
+    mcp_pair: tuple[Path, Path], tmp_path: Path
+) -> None:
+    args = {**POSITION, "direction": "add", "amount": "1"}
+    previews = []
+    for i, executable in enumerate(mcp_pair):
+        home = tmp_path / str(i)
+        replay = TradeReplay("UPDATE_TRADE", "7")
+        with (
+            loopback("position-index-lag-recovers", trade_replay=replay) as endpoints,
+            server(
+                executable, home, endpoints, seed="session", call_timeout=15
+            ) as stdio,
+        ):
+            preview = result(stdio.call(2, "preview_margin", **args))
+            assert preview["quote"]["collateralBefore"] == "10000001"
+            assert sum(item.label == "trade" for item in endpoints.wire) == 2
+            reads = [item.label for item in endpoints.wire]
+            assert (
+                reads[: reads.index("get_exchange_balance")].count("get_trade_raw") == 2
+            )
+            confirmed = trade_args(preview, args)
+
+            refused = result(
+                stdio.call(3, "trade_margin", **args, preview_digest="wrong")
+            )
+            assert refused["code"] == "PREVIEW_MISMATCH"
+            assert refused["preview"]["previewDigest"] == preview["previewDigest"]
+            assert not replay.attempts()
+            assert not rows(home)
+
+            accepted = result(stdio.call(4, "trade_margin", **confirmed))
+            assert accepted["status"] == "accepted"
+            key = accepted["intentKey"]
+            assert replay.attempts() == {key: 1}
+            assert [row[:6] for row in rows(home)] == [
+                (key, "UPDATE_TRADE", "accepted", "7", ADDRESS, None)
+            ]
+            assert not endpoints.errors
+            previews.append(binding(preview))
+    assert previews[0] == previews[1]
+
+
 def test_mcp_partial_close_previews_remainder_below_market_minimum(
     mcp_pair: tuple[Path, Path], tmp_path: Path
 ) -> None:

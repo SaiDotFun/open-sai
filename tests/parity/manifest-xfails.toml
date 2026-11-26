@@ -539,7 +539,7 @@ signature = "2266b65d07efc78298b68211c400100eb15bf335dcdb955d32d9e04e699c0f75"
 
 [gap."case:trade-partial-close-index-lag-before-minimum"]
 owner = "#211"
-signature = "993975abd95dd189c0c4d902e92a4085e7b428029a7a2017aaa7da783e252453"
+signature = "915a42f6271c965e70b0187f19192ee60f4f4481a35c273b400ae85be0d295ac"
 
 [gap."case:trade-partial-close-invalid-id"]
 owner = "#211"

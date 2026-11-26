@@ -3,17 +3,24 @@
 mod quote;
 
 use num_bigint::BigUint;
-use std::future::{Future, pending};
+use std::{
+    future::{Future, pending},
+    time::Duration,
+};
 
 const KEEPER_OWNER_MISMATCH: &str = "Keeper position belongs to a different account";
 const CONTRACT_OWNER_MISMATCH: &str = "Contract position belongs to a different account";
 const NETWORK_MISMATCH: &str = "Keeper trading route and LCD network do not match";
+const INDEX_LAG: &str = "Indexed position differs from contract state. Retry after Keeper synchronizes. No intent was submitted.";
+const INDEX_RETRY_BUDGET: Duration = Duration::from_secs(2);
+const INDEX_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(250), Duration::from_millis(500)];
 
 use serde_json::{Map, Value, json};
+use tokio::time::{Instant, sleep, timeout_at};
 
 use crate::{
     errors::{Code, SaiError},
-    keeper::{MARKET, POSITION, ROUTE, TIMEOUT, truthy},
+    keeper::{MARKET, ROUTE, TIMEOUT, truthy},
 };
 
 use super::estimates::{PartialCloseQuote, now};
@@ -271,26 +278,9 @@ impl Trading<'_> {
         if route["enabled"] != true {
             return Err(invalid(NETWORK_MISMATCH));
         }
-        let position = self
-            .position_request(
-                POSITION,
-                variables([("trader", json!(addr)), ("id", trade_id.clone())]),
-            )
-            .await?;
-        let position = field(field(&position, "perp")?, "trade")?;
-        if !truthy(position) {
-            return Err(invalid("Position not found for this account"));
-        }
-        if !same_account(addr, position.get("trader")) {
-            return Err(invalid(KEEPER_OWNER_MISMATCH));
-        }
-        if position.get("id") != Some(trade_id) {
-            return Err(invalid("Keeper returned a different position index"));
-        }
-        if !truthy(field(position, "isOpen")?) || field(position, "tradeType")? != "trade" {
-            return Err(invalid("Open position not found"));
-        }
-        let trader = text_field(position, "trader")?;
+        let position = self.indexed_position(addr, trade_id, TIMEOUT).await?;
+        require_open_position(&position)?;
+        let trader = text_field(&position, "trader")?;
         let chain_id = route["chainId"]
             .as_str()
             .filter(|chain| !chain.is_empty())
@@ -303,7 +293,7 @@ impl Trading<'_> {
         if network != chain_id {
             return Err(SaiError::new(Code::PreviewMismatch, NETWORK_MISMATCH));
         }
-        let borrowing = field(position, "perpBorrowing")?;
+        let borrowing = field(&position, "perpBorrowing")?;
         let collateral = field(borrowing, "collateralToken")?;
         if field(collateral, "symbol")? != "USDC" {
             return Err(invalid("Only USDC positions are supported"));
@@ -328,21 +318,51 @@ impl Trading<'_> {
             return Err(invalid("Open market data is unavailable"));
         }
         let token = format!("TokenIndex({token_id})");
-        let (raw, _) = lcd
-            .position(contract, trader, trade_id, Read::Snapshot)
-            .await?;
-        require_object(&raw)?;
-        if !same_account(addr, raw.get("user")) {
-            return Err(invalid(CONTRACT_OWNER_MISMATCH));
-        }
-        if raw["user_trade_index"] != format!("UserTradeIndex({trade_id})")
-            || raw["market_index"] != format!("MarketIndex({market_id})")
-            || raw["collateral_index"] != token
-            || raw["is_open"] != true
-            || raw["trade_type"] != "trade"
-        {
-            return Err(position_mismatch());
-        }
+        let read_contract = || async {
+            let (raw, _) = lcd
+                .position(contract, trader, trade_id, Read::Snapshot)
+                .await?;
+            require_object(&raw)?;
+            if !same_account(addr, raw.get("user")) {
+                return Err(invalid(CONTRACT_OWNER_MISMATCH));
+            }
+            if raw["user_trade_index"] != format!("UserTradeIndex({trade_id})")
+                || raw["market_index"] != format!("MarketIndex({market_id})")
+                || raw["collateral_index"] != token
+                || raw["is_open"] != true
+                || raw["trade_type"] != "trade"
+            {
+                return Err(position_mismatch());
+            }
+            Ok(raw)
+        };
+        let raw = read_contract().await?;
+        let raw = if same_margin(&raw, &position)? {
+            raw
+        } else {
+            // Retry only amount or leverage drift, with both reads checked again.
+            let deadline = Instant::now() + INDEX_RETRY_BUDGET;
+            timeout_at(deadline, async {
+                for delay in INDEX_RETRY_DELAYS {
+                    if deadline.saturating_duration_since(Instant::now()) <= delay {
+                        break;
+                    }
+                    sleep(delay).await;
+                    let position = self.indexed_position(addr, trade_id, TIMEOUT).await?;
+                    require_open_position(&position)?;
+                    if field(&position, "perpBorrowing")? != borrowing {
+                        return Err(position_mismatch());
+                    }
+                    let raw = read_contract().await?;
+                    if same_margin(&raw, &position)? && Instant::now() < deadline {
+                        return Ok(raw);
+                    }
+                }
+                Err(invalid(INDEX_LAG))
+            })
+            .await
+            .unwrap_or_else(|_| Err(invalid(INDEX_LAG)))?
+        };
         let (funds, _) = lcd
             .smart(
                 contract,
@@ -356,14 +376,6 @@ impl Trading<'_> {
 
         if funds["collateral_index"] != token {
             return Err(position_mismatch());
-        }
-        if number_text(&raw["collateral_amount"])?
-            != number_text(field(position, "collateralAmount")?)?
-            || float(&raw["leverage"])? != float(field(position, "leverage")?)?
-        {
-            return Err(invalid(
-                "Indexed position differs from contract state; wait for synchronization and retry",
-            ));
         }
         Ok(Snapshot {
             raw,
@@ -385,6 +397,19 @@ impl Trading<'_> {
             .await
             .map(Value::Object)
     }
+}
+
+fn require_open_position(position: &Value) -> Result<(), SaiError> {
+    if !truthy(field(position, "isOpen")?) || field(position, "tradeType")? != "trade" {
+        return Err(invalid("Open position not found"));
+    }
+    Ok(())
+}
+
+fn same_margin(raw: &Value, position: &Value) -> Result<bool, SaiError> {
+    Ok(number_text(&raw["collateral_amount"])?
+        == number_text(field(position, "collateralAmount")?)?
+        && float(&raw["leverage"])? == float(field(position, "leverage")?)?)
 }
 
 impl PositionQuote {
