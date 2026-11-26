@@ -639,6 +639,7 @@ async fn shared_market_submit_refreshes_before_reserving() {
             "route",
             "node_info",
             "markets",
+            "market_state",
             "route",
             "node_info",
             "markets",
