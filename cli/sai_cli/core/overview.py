@@ -13,6 +13,8 @@ from functools import cache
 from threading import BoundedSemaphore
 from typing import Any
 
+from websockets.uri import WebSocketURI, parse_uri
+
 from . import keeper, margin, reconcile, session, storage, stream
 from .errors import Code, SaiError
 from .log import origin
@@ -216,7 +218,7 @@ def balance_stale(age_seconds: float | None) -> bool | None:
 def balance_snapshot(
     settings: Settings, ws: str, addr: str, *, notify: Callable[[str], None]
 ) -> dict[str, Any]:
-    response = stream.snapshot(
+    response, connected = stream.snapshot_with_endpoint(
         ws, stream.BALANCES_WITH_BLOCK, {"user": addr}, notify=notify
     )
     fetched = datetime.now(UTC).isoformat()
@@ -230,8 +232,11 @@ def balance_snapshot(
         source = chain()
         return source.block_time(height) if source is not None else None
 
-    # A separately configured WebSocket may serve another chain.
-    balance_lookup = lookup if ws == stream.derive_ws(settings.endpoint) else None
+    # An independent or redirected WebSocket may serve another chain.
+    same_keeper = ws == stream.derive_ws(settings.endpoint) and connected == parse_uri(
+        ws
+    )
+    balance_lookup = lookup if same_keeper else None
     for row in response["data"]["userBalances"]:
         stamp = _block_source(
             {"block": row.get("lastUpdatedBlock")}, fetched, balance_lookup
@@ -240,8 +245,10 @@ def balance_snapshot(
     return response
 
 
-def _balances(settings: Settings, addr: str) -> dict[str, dict[str, Any]]:
-    response = stream.snapshot(
+def _balances(
+    settings: Settings, addr: str
+) -> tuple[dict[str, dict[str, Any]], WebSocketURI | None]:
+    response, connected = stream.snapshot_with_endpoint(
         settings.ws_endpoint, stream.BALANCES_WITH_BLOCK, {"user": addr}
     )
     balances: dict[str, dict[str, Any]] = {}
@@ -252,7 +259,7 @@ def _balances(settings: Settings, addr: str) -> dict[str, dict[str, Any]]:
                 "usd": _number(row["usd_value"]),
                 "block": row.get("lastUpdatedBlock"),
             }
-    return balances
+    return balances, connected
 
 
 @dataclass
@@ -1061,8 +1068,17 @@ def account_overview(settings: Settings, addr: str | None = None) -> dict[str, A
 
     balances = _read(lambda: _balances(settings, addr))
     same_keeper = settings.ws_endpoint == stream.derive_ws(settings.endpoint)
+    balance_endpoint = origin(settings.ws_endpoint)
+    if "data" in balances:
+        balances["data"], connected = balances["data"]
+        is_requested_endpoint = connected == parse_uri(settings.ws_endpoint)
+        same_keeper = same_keeper and is_requested_endpoint
+        if connected is not None and not is_requested_endpoint:
+            scheme = "wss" if connected.secure else "ws"
+            host = f"[{connected.host}]" if ":" in connected.host else connected.host
+            balance_endpoint = origin(f"{scheme}://{host}:{connected.port}")
     balances["source"] = {
-        "endpoint": origin(settings.ws_endpoint),
+        "endpoint": balance_endpoint,
         "matchesKeeper": same_keeper,
     }
     if not same_keeper:
@@ -1073,7 +1089,6 @@ def account_overview(settings: Settings, addr: str | None = None) -> dict[str, A
     if "data" in balances:
         rows = balances["data"]
         fetched = balances["fetchedAt"]
-        # An independent WebSocket override may be served by another chain.
         balance_lookup = lookup if same_keeper else None
         if not rows:
             balances["error"] = _failure(

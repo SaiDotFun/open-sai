@@ -25,7 +25,7 @@ from sai_cli.mcp_server.server import create_server
 from sai_cli.sai_cli import main
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, RedirectResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket
 from websockets.sync.server import serve
@@ -1160,12 +1160,18 @@ def test_next_oracle_pending_intent_remains_a_local_trade_blocker(replay):
     ]
 
 
-def test_balance_commands_report_fresh_and_stale_source_blocks(replay):
+@pytest.mark.parametrize("redirected", [False, True], ids=["direct", "redirected"])
+def test_balance_commands_report_source_block_age(replay, redirected):
+    balance_endpoint = replay["config"].ws_endpoint
+
     async def query(request: Request) -> JSONResponse:
         body = await request.json()
         return JSONResponse(replay["http"][body["query"]])
 
     async def balances(ws: WebSocket) -> None:
+        if redirected:
+            await ws.send_denial_response(RedirectResponse(balance_endpoint))
+            return
         await ws.accept(subprotocol="graphql-transport-ws")
         assert await ws.receive_json() == {"type": "connection_init"}
         await ws.send_json({"type": "connection_ack"})
@@ -1205,12 +1211,21 @@ def test_balance_commands_report_fresh_and_stale_source_blocks(replay):
                     for line in human.stdout.splitlines()
                     if f"block {MARK_BLOCK}" in line
                 )
-                assert "old" in stale_row and "stale" in stale_row
+                if redirected:
+                    assert f"block {RISK_BLOCK} (age unknown)" in human.stdout
+                    assert "age unknown" in stale_row
+                else:
+                    assert "old" in stale_row and "stale" in stale_row
 
                 machine = cli(replay, "--json", "account", *command)
                 assert machine.exit_code == 0, machine.output
                 response = json.loads(machine.stdout)
                 if command[0] == "overview":
+                    if redirected:
+                        assert response["balances"]["source"] == {
+                            "endpoint": balance_endpoint.removesuffix("/query"),
+                            "matchesKeeper": False,
+                        }
                     result = response["balances"]["data"]
                     fresh, stale = result["balance"], result["credits"]
                 else:
@@ -1220,11 +1235,18 @@ def test_balance_commands_report_fresh_and_stale_source_blocks(replay):
                     }
                     fresh, stale = result[RISK_BLOCK], result[MARK_BLOCK]
                 assert fresh["sourceBlock"] == RISK_BLOCK
-                assert fresh["stale"] is False
-                assert 0 <= fresh["sourceAgeSeconds"] < overview.BALANCE_STALE_SECONDS
                 assert stale["sourceBlock"] == MARK_BLOCK
-                assert stale["stale"] is True
-                assert stale["sourceAgeSeconds"] > overview.BALANCE_STALE_SECONDS
+                if redirected:
+                    for row in (fresh, stale):
+                        assert row["stale"] is None
+                        assert row["sourceAgeSeconds"] is None
+                else:
+                    assert fresh["stale"] is False
+                    assert (
+                        0 <= fresh["sourceAgeSeconds"] < overview.BALANCE_STALE_SECONDS
+                    )
+                    assert stale["stale"] is True
+                    assert stale["sourceAgeSeconds"] > overview.BALANCE_STALE_SECONDS
         finally:
             server.should_exit = True
             thread.join(timeout=10)
