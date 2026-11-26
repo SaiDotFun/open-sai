@@ -25,7 +25,8 @@ def _source(row: dict[str, Any]) -> str:
 def _collateral(row: dict[str, Any]) -> str:
     if row["collateralUsd"] is not None:
         return _value(row["collateralUsd"])
-    return f"{row['collateralBaseUnits']} {row['collateralToken']} base units"
+    token = row["collateralToken"] or row["collateralTokenId"]
+    return f"{row['collateralBaseUnits']} {token} base units"
 
 
 def _trigger(row: dict[str, Any], prefix: str) -> str:
@@ -145,7 +146,7 @@ def show(result: dict[str, Any]) -> None:
                     if row["liquidationPriceUsd"] is None:
                         price = _value(row["liquidationPriceQuote"])
                         print(
-                            f"    Contract liquidation price {price} {row['quoteToken']}"
+                            f"    Contract liquidation price {price} {row['quoteToken'] or row['quoteTokenId']}"
                         )
                 if mark := row.get("markSource"):
                     block = (
@@ -172,7 +173,7 @@ def show(result: dict[str, Any]) -> None:
                     if "keeperLiquidationEstimatePriceQuote" in row:
                         estimate = _value(row["keeperLiquidationEstimatePriceQuote"])
                         print(
-                            f"    Keeper liquidation estimate {estimate} {row['quoteToken']}. Source time unknown."
+                            f"    Keeper liquidation estimate {estimate} {row['quoteToken'] or row['quoteTokenId']}. Source time unknown."
                         )
             print(
                 f"  Total gross unrealized PnL before fees {_value(positions['unrealizedPnlUsd'], ' USD')}"
@@ -249,7 +250,10 @@ def show(result: dict[str, Any]) -> None:
     if prices is not None:
         table(
             ["Token", "USD", "Source (Age)"],
-            [[row["token"], _value(row["usd"]), _source(row)] for row in prices],
+            [
+                [str(row["token"] or row["tokenId"]), _value(row["usd"]), _source(row)]
+                for row in prices
+            ],
         )
 
     intents = section("blockingIntents", "Local Intents Blocking Trades")
