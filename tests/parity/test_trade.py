@@ -790,7 +790,66 @@ def test_malformed_trade_numbers_are_usage_errors(
             assert not endpoints.wire
             assert not rows(home)
             results.append(outcome)
+    python_error = results[0][1]["error"]
+    option, value = args[-2:]
+    if python_error["message"] == (
+        f"Invalid value for '{option}': {value!r} is not a valid decimal."
+    ):
+        python_error["message"] = f"Invalid value for '{option}': expected a decimal."
     assert results[0] == results[1]
+
+
+@pytest.mark.parametrize(
+    ("option", "host", "flags"),
+    [
+        ("--amount", "bücher.invalid", ("--dry-run",)),
+        ("--price", "fixture.invalid", ("--preview-digest", "stale")),
+        ("--leverage", "bücher.invalid", ("--dry-run",)),
+        ("--take-profit", "bücher.invalid", ("--dry-run",)),
+        ("--stop-loss", "bücher.invalid", ("--dry-run",)),
+        ("--slippage", "bücher.invalid", ("--dry-run",)),
+    ],
+)
+@pytest.mark.parametrize("json_flags", [(), ("--json",)], ids=["text", "json"])
+def test_decimal_usage_errors_hide_rejected_value(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    option: str,
+    host: str,
+    flags: CLI,
+    json_flags: CLI,
+) -> None:
+    _, rust = cli_pair
+    key = "synthetic-decimal-argument-key"
+    value = f"https://{host}/query?api_key={key}"
+    with loopback("trade-accepted") as endpoints:
+        home = tmp_path / "home"
+        seed_home(home, endpoints, "session")
+        result = subprocess.run(
+            [*rust, *json_flags, *OPEN, option, value, *flags],
+            cwd=home,
+            env={**child_env(home, endpoints), "SAI_LOG": "1", "SAI_UPDATE_AUTO": "0"},
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 2
+        if json_flags:
+            assert result.stderr == ""
+            error = json.loads(result.stdout)["error"]
+            assert error["code"] == "INVALID_REQUEST"
+            message = error["message"]
+        else:
+            assert result.stdout == ""
+            message = result.stderr
+        assert option in message
+        assert key not in result.stdout + result.stderr
+        for log_file in (home / "sai/logs").rglob("*.jsonl"):
+            assert key not in log_file.read_text()
+        assert not endpoints.wire
+        assert not rows(home)
 
 
 @pytest.mark.parametrize(
