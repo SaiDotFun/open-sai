@@ -125,10 +125,15 @@ pub async fn snapshot(
     interrupt: impl Future<Output = SaiError>,
 ) -> Result<Value, SaiError> {
     check_endpoint(endpoint)?;
+    let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
     tokio::pin!(interrupt);
-    let mut connection = Connection::open(endpoint, subscribe, interrupt.as_mut())
-        .await
-        .map_err(balance_error)?;
+    let mut connection = time::timeout_at(
+        deadline,
+        Connection::open(endpoint, subscribe, interrupt.as_mut()),
+    )
+    .await
+    .unwrap_or(Err(Failure::Disconnected("TimeoutError")))
+    .map_err(balance_error)?;
     notify();
     let result = tokio::select! {
         biased;
@@ -136,7 +141,9 @@ pub async fn snapshot(
             connection.close().await;
             return Err(error);
         }
-        result = connection.next(Some(SNAPSHOT_TIMEOUT)) => result.map_err(balance_error),
+        result = time::timeout_at(deadline, connection.next_payload()) => {
+            result.unwrap_or(Err(Failure::Disconnected("TimeoutError"))).map_err(balance_error)
+        }
     };
     tokio::select! {
         biased;
@@ -202,7 +209,7 @@ impl Connection {
 
     async fn acknowledge(&mut self) -> Result<(), Failure> {
         self.send(json!({"type": "connection_init"})).await?;
-        let message = self.receive(None).await?;
+        let message = self.receive().await?;
         if message["type"] != "connection_ack" {
             return Err(protocol("Keeper did not acknowledge WebSocket connection"));
         }
@@ -258,8 +265,17 @@ impl Connection {
 
     /// Return each complete subscription payload in arrival order.
     pub async fn next(&mut self, timeout: Option<Duration>) -> Result<Value, Failure> {
+        match timeout {
+            Some(timeout) => time::timeout(timeout, self.next_payload())
+                .await
+                .unwrap_or(Err(Failure::Disconnected("TimeoutError"))),
+            None => self.next_payload().await,
+        }
+    }
+
+    async fn next_payload(&mut self) -> Result<Value, Failure> {
         loop {
-            let mut message = self.receive(timeout).await?;
+            let mut message = self.receive().await?;
             match message["type"].as_str() {
                 Some("ping") => self.send(json!({"type": "pong"})).await?,
                 Some("next") => {
@@ -285,14 +301,9 @@ impl Connection {
         Ok(())
     }
 
-    async fn receive(&mut self, timeout: Option<Duration>) -> Result<Value, Failure> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    async fn receive(&mut self) -> Result<Value, Failure> {
         loop {
-            let wake = deadline.map_or(self.heartbeat, |deadline| deadline.min(self.heartbeat));
-            match time::timeout_at(wake, self.socket.next()).await {
-                Err(_) if deadline.is_some_and(|deadline| Instant::now() >= deadline) => {
-                    return Err(Failure::Disconnected("TimeoutError"));
-                }
+            match time::timeout_at(self.heartbeat, self.socket.next()).await {
                 Err(_) if self.ping.is_some() => {
                     return Err(Failure::Disconnected("ConnectionClosedError"));
                 }

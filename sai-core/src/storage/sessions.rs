@@ -182,11 +182,11 @@ pub struct Accounts {
 struct StoredAccounts(#[serde(with = "Accounts")] Accounts);
 
 impl Accounts {
-    pub(crate) fn selected(&self, addr: Option<&str>) -> Option<&Session> {
+    pub(crate) fn selected(&self, addr: Option<&str>) -> Option<(&str, &Session)> {
         let key = addr.map(str::to_lowercase);
         self.sessions
-            .get(key.as_ref().or(self.active.as_ref())?)
-            .map(|session| &session.0)
+            .get_key_value(key.as_ref().or(self.active.as_ref())?)
+            .map(|(key, session)| (key.as_str(), &session.0))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&Session, bool)> {
