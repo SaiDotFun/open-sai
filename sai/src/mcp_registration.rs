@@ -1126,6 +1126,13 @@ impl InstallArgs {
         if explicit_separator && self.server_argv.is_empty() {
             return Err(SaiError::usage("Give the server command after `--`."));
         }
+        if let Some(launcher) = self.server_argv.first()
+            && (launcher.starts_with('-') || launcher.contains('=') || which(launcher).is_none())
+        {
+            return Err(SaiError::usage(
+                "Give an existing executable as the server launcher after `--`.",
+            ));
+        }
         let mut names = chosen(self.clients.into_iter().chain(self.client_options))?;
         if self.reset_args && self.repair_existing.is_none() {
             return Err(SaiError::usage("--reset-args requires --repair-existing."));
@@ -1299,10 +1306,6 @@ impl Clients {
         dry: bool,
         result: &mut RegistrationResult,
     ) -> ClientResult<()> {
-        let launcher = &target.argv[0];
-        if target.explicit() && Path::new(launcher).is_absolute() && which(launcher).is_none() {
-            return Err("The requested server launcher is missing or not executable".into());
-        }
         if client == Client::Codex {
             if scope != Scope::User {
                 return Err("Codex registers MCP servers per user only".into());

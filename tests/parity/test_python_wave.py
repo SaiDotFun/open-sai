@@ -485,15 +485,81 @@ def test_mcp_install_rejects_unusable_absolute_launcher(
             "serve",
             overrides=overrides,
         )
-        assert result.returncode == 1
-        details = json.loads(result.stdout)["error"]["details"]
-        [cursor] = details["results"]
-        assert (
-            cursor["error"]
-            == "The requested server launcher is missing or not executable"
-        )
-        assert cursor["changed"] is False
+        error = json.loads(result.stdout)["error"]
+        if index == 0:
+            assert result.returncode == 1
+            [cursor] = error["details"]["results"]
+            assert (
+                cursor["error"]
+                == "The requested server launcher is missing or not executable"
+            )
+            assert cursor["changed"] is False
+        else:
+            assert result.returncode == 2
+            assert error["code"] == "INVALID_REQUEST"
+            assert str(launcher) not in result.stdout + result.stderr
         assert (home / ".cursor/mcp.json").read_bytes() == original[".cursor/mcp.json"]
+
+
+@pytest.mark.parametrize(
+    "launcher",
+    [
+        "OPENAI_API_KEY=synthetic-private",
+        "--endpoint=https://fixture.invalid/path?value=synthetic-private",
+        "-synthetic-private",
+        "synthetic-private-missing-launcher",
+    ],
+    ids=["assignment", "endpoint-option", "dash-prefix", "missing-on-path"],
+)
+def test_mcp_install_rejects_explicit_launcher_before_reporting(
+    wave_clis: tuple[str, str], tmp_path: Path, launcher: str
+) -> None:
+    _, rust = wave_clis
+    overrides = {"PATH": os.defpath}
+    seed_clients(tmp_path, overrides, "empty")
+    if launcher.startswith(("OPENAI_API_KEY=", "-synthetic")):
+        executable = tmp_path / "bin" / launcher
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o700)
+
+    for options in (("claude", "--dry-run"), ("--dry-run",), ("claude",)):
+        result = run_cli(
+            rust,
+            tmp_path,
+            "--json",
+            "mcp",
+            "install",
+            *options,
+            "--",
+            launcher,
+            "mcp",
+            "serve",
+            overrides=overrides,
+        )
+        assert result.returncode == 2
+        assert "synthetic-private" not in result.stdout + result.stderr
+        report = json.loads(result.stdout)
+        assert set(report) == {"error"}
+        assert report["error"]["code"] == "INVALID_REQUEST"
+        assert "existing executable" in report["error"]["message"]
+        assert "details" not in report["error"]
+        assert not (tmp_path / ".claude.json").exists()
+
+    text = run_cli(
+        rust,
+        tmp_path,
+        "mcp",
+        "install",
+        "claude",
+        "--dry-run",
+        "--",
+        launcher,
+        overrides=overrides,
+    )
+    assert text.returncode == 2
+    assert not text.stdout
+    assert "synthetic-private" not in text.stderr
+    assert "existing executable" in text.stderr
 
 
 @pytest.mark.parametrize(
