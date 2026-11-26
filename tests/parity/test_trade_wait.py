@@ -273,6 +273,8 @@ def target_lcd(request: Request, *, trade_type: str = "trade") -> Reply:
     path = urlsplit(request.path).path
     assert path.startswith(SMART_QUERY)
     query = json.loads(base64.b64decode(unquote(path.removeprefix(SMART_QUERY))))
+    if query == {"get_market": {"index": "MarketIndex(1)"}}:
+        return response({"data": {"market_trading_state": "open"}})
     assert query == {"get_trade_raw": {"trader": ADDR, "index": 17}}
     return response(
         {
@@ -548,6 +550,8 @@ def test_trade_wait(
                 preflight = close_preflight(replies, rust=index == 1)
             elif case.args == OPEN:
                 replies.append(response(MARKETS))
+                if index == 1:
+                    replies.append(response({"data": {"oneClickTrading": ROUTE}}))
             if update:
                 queue_update_preflight(replies)
             replies.append(admit)
@@ -593,6 +597,11 @@ def test_trade_wait(
                 else {"path": urlsplit(request.path).path}
                 for request in requests[preflight:]
             ]
+            if case.args == OPEN and index == 1:
+                assert wire[1] == {"query": keeper.ROUTE, "variables": {}}
+                assert requests[2].path == NODE_INFO
+                assert requests[3].path.startswith(SMART_QUERY)
+                del wire[1:4]
             if case.kind == "CANCEL_PENDING_TRADE":
                 assert wire[0]["query"] == keeper.ROUTE
                 assert requests[1].path == NODE_INFO
@@ -606,7 +615,7 @@ def test_trade_wait(
                 if preflight:
                     assert requests[2].path == NODE_INFO
                     assert requests[3].path.startswith(SMART_QUERY)
-                assert all(request.body for request in requests[preflight:])
+                assert all("query" in item for item in wire)
             assert (
                 sum(item.get("query", "").startswith("mutation") for item in wire) == 1
             )
