@@ -109,14 +109,46 @@ impl Client {
     }
 }
 
+#[derive(Clone, Copy)]
+enum TargetSource {
+    Generated,
+    UserSupplied,
+    Saved,
+}
+
 #[derive(Clone)]
 struct Target {
     argv: Vec<String>,
     profile: Option<String>,
-    explicit: bool,
+    source: TargetSource,
 }
 
 impl Target {
+    fn generated(launcher: String, profile: Option<String>) -> Self {
+        Self {
+            argv: vec![launcher, "mcp".into(), "serve".into()],
+            profile,
+            source: TargetSource::Generated,
+        }
+    }
+
+    fn explicit(&self) -> bool {
+        matches!(self.source, TargetSource::UserSupplied)
+    }
+
+    fn reported_argv(&self) -> Vec<String> {
+        if matches!(self.source, TargetSource::Generated) {
+            return self.argv.clone();
+        }
+        let (launcher, args) = self.argv.split_first().expect("target has a launcher");
+        std::iter::once(launcher.clone())
+            .chain(
+                (1..=args.len())
+                    .map(|index| format!("<argument hidden {index} of {}>", args.len())),
+            )
+            .collect()
+    }
+
     fn repair(&self, args: Vec<String>, normalized: bool) -> Self {
         let launcher = if normalized {
             normalize_launcher(&self.argv[0])
@@ -126,88 +158,9 @@ impl Target {
         Self {
             argv: std::iter::once(launcher).chain(args).collect(),
             profile: None,
-            explicit: false,
+            source: TargetSource::Saved,
         }
     }
-}
-
-fn reported_argv(args: &[String]) -> Vec<String> {
-    let mut redact_next = false;
-    args.iter()
-        .map(|arg| {
-            if std::mem::take(&mut redact_next) {
-                return "[redacted]".into();
-            }
-            let assignment = arg.split_once('=');
-            let (flag, value) = assignment
-                .filter(|(flag, _)| flag.starts_with('-'))
-                .map_or((None, arg.as_str()), |(flag, value)| (Some(flag), value));
-            let name = flag.unwrap_or(arg);
-            let credential = name.starts_with('-')
-                && name.split(['-', '_', '.']).any(|part| {
-                    let part = part.to_ascii_lowercase();
-                    matches!(
-                        part.as_str(),
-                        "auth"
-                            | "authorization"
-                            | "bearer"
-                            | "cookie"
-                            | "cookies"
-                            | "credential"
-                            | "credentials"
-                            | "creds"
-                            | "header"
-                            | "headers"
-                            | "key"
-                            | "passphrase"
-                            | "passwd"
-                            | "apikey"
-                            | "accesskey"
-                            | "privatekey"
-                            | "sessionkey"
-                    ) || ["password", "secret", "token"]
-                        .iter()
-                        .any(|suffix| part.ends_with(suffix))
-                });
-            redact_next = credential && flag.is_none();
-            if credential && let Some(flag) = flag {
-                return format!("{flag}=[redacted]");
-            }
-            if ["http://", "https://", "ws://", "wss://"]
-                .iter()
-                .any(|scheme| {
-                    value
-                        .get(..scheme.len())
-                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
-                })
-            {
-                let origin = sai_core::log::origin(value);
-                if let Some(flag) = flag {
-                    return format!("{flag}={origin}");
-                }
-                return origin;
-            }
-            if let Some(flag @ ("-e" | "--env")) = flag {
-                return format!("{flag}={}", reported_assignment(value));
-            }
-            if let Some(binding) = arg.strip_prefix("-e")
-                && let Some((name, _)) = binding.split_once('=')
-                && !name.is_empty()
-                && !name.contains("://")
-            {
-                return format!("-e{}", reported_assignment(binding));
-            }
-            if flag.is_none() {
-                return reported_assignment(arg);
-            }
-            arg.clone()
-        })
-        .collect()
-}
-
-fn reported_assignment(arg: &str) -> String {
-    arg.split_once('=')
-        .map_or_else(|| arg.to_owned(), |(name, _)| format!("{name}=[redacted]"))
 }
 
 struct Registration {
@@ -283,7 +236,7 @@ impl Registration {
 
     fn report(&self, target: Option<&Target>) -> Value {
         let mut out = if let Some(target) = target.filter(|target| self.matches_command(target)) {
-            json!({"command": reported_argv(&target.argv)})
+            json!({"command": target.reported_argv()})
         } else if let Some(command) = self.argv.first() {
             let mut out = json!({"command": [basename(command)]});
             if self.argv.len() > 1 {
@@ -385,7 +338,7 @@ fn server_target(override_argv: Vec<String>, home: &Path) -> ClientResult<Target
         return Ok(Target {
             argv: override_argv,
             profile,
-            explicit: true,
+            source: TargetSource::UserSupplied,
         });
     }
     let path = which("sai").map(|path| absolute(&path)).ok_or_else(|| {
@@ -397,20 +350,15 @@ fn server_target(override_argv: Vec<String>, home: &Path) -> ClientResult<Target
             path.display()
         ));
     }
-    Ok(Target {
-        argv: vec![
-            path.to_string_lossy().into_owned(),
-            "mcp".into(),
-            "serve".into(),
-        ],
+    Ok(Target::generated(
+        path.to_string_lossy().into_owned(),
         profile,
-        explicit: false,
-    })
+    ))
 }
 
 fn reported_target(override_argv: Vec<String>, home: &Path) -> ClientResult<Target> {
     let target = server_target(override_argv, home)?;
-    if !target.explicit
+    if !target.explicit()
         && let Ok(exe) = env::current_exe()
         && resolved(Path::new(&target.argv[0])) != resolved(&exe)
     {
@@ -450,15 +398,10 @@ fn doctor_target(home: &Path) -> Option<Target> {
                 .metadata()
                 .is_ok_and(|meta| meta.dev() == running.dev() && meta.ino() == running.ino())
     })?;
-    Some(Target {
-        argv: vec![
-            launcher.into_os_string().into_string().ok()?,
-            "mcp".into(),
-            "serve".into(),
-        ],
-        profile: profile(home),
-        explicit: false,
-    })
+    Some(Target::generated(
+        launcher.into_os_string().into_string().ok()?,
+        profile(home),
+    ))
 }
 
 pub(crate) fn checkout_root(executable: &Path) -> Option<&Path> {
@@ -520,7 +463,7 @@ impl Clients {
 
     fn list(&self, target: Option<&Target>) -> Value {
         let clients = CLIENTS.map(|client| self.list_client(client, target));
-        json!({"command": target.map(|target| &target.argv), "clients": clients})
+        json!({"command": target.map(Target::reported_argv), "clients": clients})
     }
 
     fn list_client(&self, client: Client, target: Option<&Target>) -> Value {
@@ -1315,7 +1258,7 @@ impl Clients {
         dry: bool,
     ) -> RegistrationResult {
         let mut result = RegistrationResult::new(client, scope);
-        result.report["command"] = json!(reported_argv(&target.argv));
+        result.report["command"] = json!(target.reported_argv());
         if let Err(error) = self.install_one(client, scope, target, dry, &mut result) {
             result.failed(error);
         }
@@ -1331,7 +1274,7 @@ impl Clients {
         result: &mut RegistrationResult,
     ) -> ClientResult<()> {
         let launcher = &target.argv[0];
-        if target.explicit && Path::new(launcher).is_absolute() && which(launcher).is_none() {
+        if target.explicit() && Path::new(launcher).is_absolute() && which(launcher).is_none() {
             return Err("The requested server launcher is missing or not executable".into());
         }
         if client == Client::Codex {
@@ -1401,12 +1344,16 @@ impl Clients {
                 scope.name().into(),
                 NAMES[0].into(),
             ];
+            let mut reported_add = add.clone();
             if let Some(profile) = &target.profile {
                 add.push(format!("--env=SAI_HOME={profile}"));
+                reported_add.push("--env=SAI_HOME=[redacted]".into());
             }
             add.push("--".into());
             add.extend(target.argv.iter().cloned());
-            result.report["argv"] = json!([reported_argv(&add)]);
+            reported_add.push("--".into());
+            reported_add.extend(target.reported_argv());
+            result.report["argv"] = json!([reported_add]);
             step = Some(add);
         } else {
             result.report["path"] = json!(client.path(scope, &self.home, self.cwd()));
@@ -1502,7 +1449,7 @@ impl Clients {
         const ARG: &str = "<original-argument>";
         const PROFILE: &str = "<original-SAI_HOME>";
         let scope = entry.scope.name();
-        let launcher = if target.explicit {
+        let launcher = if target.explicit() {
             which("sai")
                 .map(|path| absolute(&path))
                 .or_else(|| env::current_exe().ok())
@@ -1552,7 +1499,7 @@ impl Clients {
         } else {
             fix.push_str(" Run `sai doctor` for current replacement instructions.");
         }
-        if target.explicit {
+        if target.explicit() {
             fix.push_str(" For a custom launcher, substitute your requested command after -- and use its executable in the check.");
         }
     }
@@ -1575,7 +1522,7 @@ impl Clients {
             result.failed(format!("The existing {name} registration is disabled in {}. Review MCP approvals and settings in the client.", client.name()));
         } else if let Some(issue) = stale(entry, &self.home) {
             result.failed(format!("The existing {name} registration needs repair. {}. Run `sai doctor` for repair instructions.", issue.reason));
-        } else if target.explicit && entry.argv != target.argv {
+        } else if target.explicit() && entry.argv != target.argv {
             result.failed(format!("Kept the existing {name} registration and skipped the requested server command. Edit the existing registration in the client to change it."));
         } else {
             result.report["action"] = json!("unchanged");

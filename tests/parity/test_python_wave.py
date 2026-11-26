@@ -496,102 +496,27 @@ def test_mcp_install_rejects_unusable_absolute_launcher(
         assert (home / ".cursor/mcp.json").read_bytes() == original[".cursor/mcp.json"]
 
 
-@pytest.mark.parametrize("flag_style", ["separate", "inline"])
-def test_mcp_install_dry_run_redacts_endpoint_query(
-    wave_clis: tuple[str, str], tmp_path: Path, flag_style: str
-) -> None:
-    _, rust = wave_clis
-    overrides = {"PATH": os.defpath}
-    seed_clients(tmp_path, overrides, "empty")
-    endpoint = "https://fixture.invalid/api?token=synthetic-private-query"
-    flag = (
-        ["--endpoint", endpoint]
-        if flag_style == "separate"
-        else [f"--endpoint={endpoint}"]
-    )
-    prefix = ("--json", "mcp", "install", "claude")
-    command = (str(tmp_path / "bin/sai"), "mcp", "serve", *flag)
-    planned = run_cli(
-        rust, tmp_path, *prefix, "--dry-run", "--", *command, overrides=overrides
-    )
-    assert planned.returncode == 0
-    assert "synthetic-private-query" not in planned.stdout + planned.stderr
-    [result] = json.loads(planned.stdout)["results"]
-    expected = flag[-1].replace(endpoint, "https://fixture.invalid")
-    assert result["command"][-1] == result["argv"][0][-1] == expected
-    assert not (tmp_path / ".claude.json").exists()
-    installed = run_cli(rust, tmp_path, *prefix, "--", *command, overrides=overrides)
-    assert installed.returncode == 0
-    assert "synthetic-private-query" not in installed.stdout + installed.stderr
-    entry = json.loads((tmp_path / ".claude.json").read_text())["mcpServers"]["sai"]
-    assert entry["args"] == list(command[1:])
-
-
-def test_mcp_install_redacts_custom_launcher_credentials(
-    wave_clis: tuple[str, str], tmp_path: Path
-) -> None:
-    _, rust = wave_clis
-    overrides = {"PATH": os.defpath}
-    seed_clients(tmp_path, overrides, "empty")
-    prefix = ("--json", "mcp", "install", "claude")
-    args = [
-        "--token=synthetic-token-value",
-        "--CLIENT_SECRET",
-        "synthetic-client-secret",
-        "--api-key",
-        "-synthetic-key-value",
-        "--bearer-token=https://fixture.invalid/synthetic-private",
-        "--header=Authorization: Bearer synthetic-header-value",
-        "--refreshToken",
-        "synthetic-refresh-token",
-        "--label",
-        "public-label",
-    ]
-    command = (str(tmp_path / "bin/sai"), "mcp", "serve", *args)
-    for flags in (("--dry-run",), ()):
-        run = run_cli(
-            rust, tmp_path, *prefix, *flags, "--", *command, overrides=overrides
-        )
-        assert run.returncode == 0
-        assert "synthetic-" not in run.stdout + run.stderr
-        [result] = json.loads(run.stdout)["results"]
-        public = [
-            "--token=[redacted]",
-            "--CLIENT_SECRET",
-            "[redacted]",
-            "--api-key",
-            "[redacted]",
-            "--bearer-token=[redacted]",
-            "--header=[redacted]",
-            "--refreshToken",
-            "[redacted]",
-            "--label",
-            "public-label",
-        ]
-        assert result["command"][3:] == public
-        assert result["argv"][0][-len(public) :] == public
-        if flags:
-            assert not (tmp_path / ".claude.json").exists()
-
-    entry = json.loads((tmp_path / ".claude.json").read_text())["mcpServers"]["sai"]
-    assert entry["args"] == list(command[1:])
-
-
 @pytest.mark.parametrize(
-    ("launcher_name", "operands", "reported_operands"),
+    ("launcher_name", "operands"),
     [
         (
-            "env",
+            "docker",
+            ("run", "-ieDATABASE_URL=postgresql://fixture:synthetic-private@host/db"),
+        ),
+        ("/bin/sh", ("-c", "exec curl -H 'Authorization: Bearer synthetic-private'")),
+        (
+            "/usr/bin/env",
             (
                 "SESSION_COOKIE=synthetic-private-cookie",
                 "APP_MODE=synthetic-private-mode",
+                "sai",
+                "mcp",
+                "serve",
             ),
-            ("SESSION_COOKIE=[redacted]", "APP_MODE=[redacted]"),
         ),
         (
             "docker",
             ("run", "--env=OPENAI_API_KEY=synthetic-private=key"),
-            ("run", "--env=OPENAI_API_KEY=[redacted]"),
         ),
         (
             "docker",
@@ -605,68 +530,120 @@ def test_mcp_install_redacts_custom_launcher_credentials(
                 "-eAPP.MODE=synthetic-private-mode",
                 "--env",
                 "PASSTHROUGH",
-                "-e",
-                "https://fixture.invalid/synthetic-private",
-            ),
-            (
-                "run",
-                "--env",
-                "APP_LABEL=[redacted]",
-                "-e",
-                "TERM=[redacted]",
-                "-e=REGION=[redacted]",
-                "-eAPP.MODE=[redacted]",
-                "--env",
-                "PASSTHROUGH",
-                "-e",
-                "https://fixture.invalid",
             ),
         ),
+        (
+            "sai",
+            (
+                "mcp",
+                "serve",
+                "--token=synthetic-private-token",
+                "--CLIENT_SECRET",
+                "synthetic-private-client-secret",
+                "--api-key",
+                "-synthetic-private-key",
+                "--bearer-token=https://fixture.invalid/synthetic-private",
+                "--header=Authorization: Bearer synthetic-private-header",
+                "--refreshToken",
+                "synthetic-private-refresh-token",
+                "--endpoint",
+                "https://fixture.invalid/path?value=synthetic-private",
+                "--endpoint=https://fixture.invalid/path?value=synthetic-private",
+                "--label",
+                "public-label",
+            ),
+        ),
+        ("sai", ()),
     ],
-    ids=["bare-cookie-and-generic", "inline-key", "generic-env-options"],
+    ids=[
+        "clustered-short-option",
+        "shell-command",
+        "bare-assignments",
+        "inline-env-option",
+        "generic-env-options",
+        "explicit-sai",
+        "launcher-only",
+    ],
 )
-def test_mcp_install_redacts_launcher_environment_assignments(
+def test_mcp_install_hides_every_user_launcher_argument(
     wave_clis: tuple[str, str],
     tmp_path: Path,
     launcher_name: str,
     operands: tuple[str, ...],
-    reported_operands: tuple[str, ...],
 ) -> None:
     _, rust = wave_clis
     overrides = {"PATH": os.defpath}
     seed_clients(tmp_path, overrides, "empty")
-    launcher = "/usr/bin/env"
+    launcher = launcher_name
     if launcher_name == "docker":
         docker = tmp_path / "bin/docker"
         docker.write_text("#!/bin/sh\nexit 0\n")
         docker.chmod(0o700)
         launcher = str(docker)
-    server = (str(tmp_path / "bin/sai"), "mcp", "serve")
+    if launcher_name == "sai":
+        launcher = str(tmp_path / "bin/sai")
     prefix = ("--json", "mcp", "install", "claude")
-    command = (launcher, *operands, *server)
+    command = (launcher, *operands)
+    expected = [
+        launcher,
+        *(
+            f"<argument hidden {i} of {len(operands)}>"
+            for i in range(1, len(operands) + 1)
+        ),
+    ]
+    for flags in (("--dry-run",), ()):
+        result = run_cli(
+            rust, tmp_path, *prefix, *flags, "--", *command, overrides=overrides
+        )
+        assert result.returncode == 0
+        assert "synthetic-private" not in result.stdout + result.stderr
+        [report] = json.loads(result.stdout)["results"]
+        assert report["command"] == expected
+        assert report["argv"][0][-len(expected) :] == expected
+        assert "--env=SAI_HOME=[redacted]" in report["argv"][0]
+        if flags:
+            assert not (tmp_path / ".claude.json").exists()
+
+    entry = json.loads((tmp_path / ".claude.json").read_text())["mcpServers"]["sai"]
+    assert entry["command"] == launcher
+    assert entry.get("args", []) == list(operands)
+
+
+@pytest.mark.parametrize("custom", [False, True], ids=["generated", "no-client"])
+def test_mcp_install_reports_only_generated_serve_arguments(
+    wave_clis: tuple[str, str], tmp_path: Path, custom: bool
+) -> None:
+    _, rust = wave_clis
+    overrides = {"PATH": os.defpath}
+    seed_clients(tmp_path, overrides, "empty")
+    launcher = str(tmp_path / "bin/sai")
+    args = (
+        ("--", launcher, "mcp", "serve", "synthetic-private") if custom else ("claude",)
+    )
     result = run_cli(
         rust,
         tmp_path,
-        *prefix,
+        "--json",
+        "mcp",
+        "install",
         "--dry-run",
-        "--",
-        *command,
+        *args,
         overrides=overrides,
     )
     assert result.returncode == 0
     assert "synthetic-private" not in result.stdout + result.stderr
-    [report] = json.loads(result.stdout)["results"]
-    expected = [launcher, *reported_operands, *server]
-    assert report["command"] == expected
-    assert report["argv"][0][-len(expected) :] == expected
-    assert "--env=SAI_HOME=[redacted]" in report["argv"][0]
-    assert not (tmp_path / ".claude.json").exists()
-
-    installed = run_cli(rust, tmp_path, *prefix, "--", *command, overrides=overrides)
-    assert installed.returncode == 0
-    entry = json.loads((tmp_path / ".claude.json").read_text())["mcpServers"]["sai"]
-    assert entry["command"] == launcher
-    assert entry["args"] == list(command[1:])
+    report = json.loads(result.stdout)
+    if custom:
+        assert report["command"] == [
+            launcher,
+            "<argument hidden 1 of 3>",
+            "<argument hidden 2 of 3>",
+            "<argument hidden 3 of 3>",
+        ]
+    else:
+        [report] = report["results"]
+        assert report["command"] == [launcher, "mcp", "serve"]
+        assert report["argv"][0][-3:] == [launcher, "mcp", "serve"]
 
 
 @pytest.mark.parametrize("kind", ["cwd", "remote"])

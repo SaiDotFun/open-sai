@@ -124,11 +124,7 @@ fn verified_target(launcher: &Path, home: &Path) -> Option<Target> {
         return None;
     }
     which(command)?;
-    Some(Target {
-        argv: vec![command.into(), "mcp".into(), "serve".into()],
-        profile: None,
-        explicit: false,
-    })
+    Some(Target::generated(command.into(), None))
 }
 
 #[cfg(all(test, unix))]

@@ -1175,6 +1175,16 @@ def run_case(
                         ]
                         for argv in result["argv"]
                     ]
+        if case.accepted_divergence == "launcher-argument-report":
+            for result in left.output["results"]:
+                launcher, *args = result["command"]
+                result["command"] = [
+                    launcher,
+                    *(
+                        f"<argument hidden {i} of {len(args)}>"
+                        for i in range(1, len(args) + 1)
+                    ),
+                ]
     if (
         candidate != reference
         and case.accepted_divergence == "doctor-keeper-log-context"
