@@ -71,10 +71,7 @@ class Target:
         if not dry_run or not self.explicit_command:
             return self.argv
         launcher, *args = self.argv
-        reported = [
-            f"<argument hidden {index} of {len(args)}>"
-            for index in range(1, len(args) + 1)
-        ]
+        reported = hidden_arguments(len(args))
         if Path(launcher).name in {NAME, f"{NAME}.exe"} and serves_mcp(args):
             tokens = iter(enumerate(args))
             for index, arg in tokens:
@@ -116,14 +113,27 @@ class Registration:
     stdio: bool = True
 
     def shown(self, target: Target | None, *, dry_run: bool = False) -> dict[str, Any]:
-        """Show the expected argv when the saved command matches.
+        """Describe a saved command, using placeholders for dry-run arguments.
 
         Saved launcher names, directories, and args can contain private values.
         """
-        if target is not None and self.matches_command(target):
-            return {"command": target.reported_argv(dry_run=dry_run)}
         if not self.argv:
             return {"command": []}
+        if dry_run:
+            launcher, *args = self.argv
+            path = Path(launcher)
+            if (
+                plain_launcher(launcher)
+                and plain_launcher(path.name)
+                and all(
+                    char.isalnum() or char in "._-/" or char == os.sep
+                    for char in launcher.removeprefix(path.drive)
+                )
+            ):
+                return {"command": [path.name, *hidden_arguments(len(args))]}
+            return {"command": hidden_arguments(len(self.argv))}
+        if target is not None and self.matches_command(target):
+            return {"command": target.argv}
         out: dict[str, Any] = {"command": [HIDDEN]}
         if len(self.argv) > 1:
             out["args"] = HIDDEN
@@ -429,6 +439,10 @@ def missing_absolute_launcher(command: str) -> bool:
 
 def plain_launcher(command: str) -> bool:
     return bool(command) and not command.startswith("-") and "=" not in command
+
+
+def hidden_arguments(count: int) -> list[str]:
+    return [f"<argument hidden {index} of {count}>" for index in range(1, count + 1)]
 
 
 def launcher_target(launcher: str, environ: Mapping[str, str]) -> Target:

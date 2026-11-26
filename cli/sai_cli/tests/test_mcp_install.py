@@ -2239,6 +2239,55 @@ def test_dry_run_hides_arguments_of_a_matching_legacy_entry(
     assert row["command"] == shown
 
 
+@pytest.mark.parametrize(
+    ("launcher", "name"),
+    [
+        ("sai", "sai"),
+        ("/saved/bin/wrapper", "wrapper"),
+        ("MODE=fixture-saved", None),
+        ("-fixture-saved", None),
+        ("/saved/mode=fixture-saved/wrapper", None),
+        ("sh -c /saved/fixture-saved", None),
+    ],
+    ids=["matching", "path", "assignment", "option", "path-assignment", "shell"],
+)
+def test_dry_run_lists_saved_commands_for_all_clients(
+    install_preview: Path, launcher: str, name: str | None
+) -> None:
+    root = install_preview.parent
+    write_exe(root / "sai", "")
+    write_exe(root / "codex", FAKE_CODEX)
+    (root / "codex-home").mkdir()
+    (root / ".cursor").mkdir()
+    args = ["mcp", "serve", "--endpoint", "http://127.0.0.1:8765/api?key=fixture-saved"]
+    entry = {"sai": claude_entry([launcher, *args])}
+    files = {
+        root / ".claude.json": json.dumps({"mcpServers": entry}),
+        root / "codex-home/config.toml": tomlkit.dumps({"mcp_servers": entry}),
+        root / ".cursor/mcp.json": json.dumps({"mcpServers": entry}),
+    }
+    for path, data in files.items():
+        path.write_text(data)
+
+    result = invoke("mcp", "install", "--dry-run", "--", "sai", *args)
+
+    assert result.exit_code == 0, result.output
+    assert "fixture-saved" not in result.output
+    report = payload(result)
+    assert report["command"] == ["sai", *args[:-1], "http://127.0.0.1:8765"]
+    assert {row["client"] for row in report["clients"]} == {"claude", "codex", "cursor"}
+    hidden = len(args) + (name is None)
+    shown = [
+        *([name] if name is not None else []),
+        *(f"<argument hidden {i} of {hidden}>" for i in range(1, hidden + 1)),
+    ]
+    for row in report["clients"]:
+        assert row["registeredCommand"] == shown
+        assert row["registrations"]
+        assert all(reg["command"] == shown for reg in row["registrations"])
+    assert {path: path.read_text() for path in files} == files
+
+
 def test_cursor_keeps_other_servers_and_the_file_mode(env: Env):
     path = env.cursor_path()
     path.parent.mkdir()
