@@ -591,10 +591,9 @@ pub fn run(
 
 fn check_ascii_decimals(fields: &[(&str, Option<&str>)]) -> Result<(), SaiError> {
     for &(option, value) in fields {
-        if let Some(value) = value.filter(|value| !value.is_ascii()) {
+        if value.is_some_and(|value| !value.is_ascii()) {
             return Err(SaiError::usage(format!(
-                "Invalid value for '{option}': {} is not a valid decimal.",
-                repr(value),
+                "Invalid value for '{option}': expected a decimal."
             )));
         }
     }
