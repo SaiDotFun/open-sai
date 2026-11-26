@@ -983,6 +983,18 @@ class Cursor(Client):
             raise ClientError("No working directory for the project registration")
         return base / ".cursor" / "mcp.json"
 
+    def shares_user_config(self) -> bool:
+        if self.cwd is None:
+            return False
+        try:
+            return (
+                self.config_path("user").resolve()
+                == self.config_path("project").resolve()
+            )
+        except RuntimeError as exc:
+            # Path.resolve() raises RuntimeError for symlink loops before 3.13.
+            raise ClientError("Could not resolve the Cursor MCP config") from exc
+
     def registrations(self, name: str = NAME) -> list[Registration]:
         found = []
         for scope in SCOPES if self.cwd is not None else ("user",):
@@ -1829,12 +1841,7 @@ def check_registration(
             name, "fail", "Could not inspect Sai registration", "Put `codex` on PATH"
         )
     try:
-        if (
-            isinstance(client, Cursor)
-            and client.cwd is not None
-            and client.config_path("user").resolve()
-            == client.config_path("project").resolve()
-        ):
+        if isinstance(client, Cursor) and client.shares_user_config():
             client = Cursor(client.home, client.environ, None)
         found = [
             (server, reg)

@@ -1762,6 +1762,34 @@ def test_update_repairs_cursor_once_when_project_config_is_user_config(
     assert json.loads(config.read_text()) == original
 
 
+def test_cursor_symlink_loop_keeps_other_client_reports(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+):
+    profile = str(env.root / "profile")
+    monkeypatch.setenv("SAI_HOME", profile)
+    env.cursor_path().parent.mkdir()
+    loop = env.project / ".cursor" / "mcp.json"
+    loop.parent.mkdir()
+    loop.symlink_to(loop.name)
+    env.write_codex(
+        {"sai": {"command": OLD_COMMAND, "args": [], "env": {"SAI_HOME": profile}}}
+    )
+
+    outcome = updater.repair_after_update(
+        updater.Outcome(updater.UPDATED, "updated"), env.sai, False
+    )
+    results = {row["client"]: row for row in outcome.mcp_results()}
+    assert not outcome.mcp_notes
+    assert results["codex"]["status"] == "fixed"
+    assert results["cursor"]["status"] == "fail"
+    assert loop.readlink() == Path(loop.name)
+
+    checks = mcp_checks(invoke("doctor", "--offline"))
+    assert checks["codex"]["status"] == "pass"
+    assert checks["cursor"]["status"] == "fail"
+    assert "Could not read" in checks["cursor"]["summary"]
+
+
 @pytest.mark.parametrize("background", [False, True])
 def test_update_ignores_a_healthy_claude_profile_pin(env: Env, background: bool):
     config = env.home / ".claude.json"
