@@ -52,6 +52,18 @@ impl<'a> Action<'a> {
         let session =
             StoredSession::load(storage, endpoint, addr).into_trade_session(signed_out_open)?;
         let addr = session.as_ref().map(|session| session.addr());
+        let with_recovery_account = |mut error: SaiError| {
+            if let Some(addr) = addr
+                && error.intent_key.is_some()
+                && error.hint.is_some()
+            {
+                error
+                    .details
+                    .get_or_insert_with(Box::default)
+                    .insert("addr".into(), json!(addr));
+            }
+            error
+        };
         let trading = Trading::new(endpoint, storage, events).with_lcd_endpoint(lcd);
         let order_type = (self.kind == "open").then(|| match required("order_type") {
             "market" => OrderType::Market,
@@ -100,7 +112,8 @@ impl<'a> Action<'a> {
             };
             return trading
                 .position_trade(addr, lcd, integer("trade_id"), action, mode)
-                .await;
+                .await
+                .map_err(with_recovery_account);
         }
 
         let preview = match self.kind {
@@ -147,7 +160,8 @@ impl<'a> Action<'a> {
         let notice = preview.requires_market_price_refresh() && text("price").is_some();
         let (accepted, price) = trading
             .submit_with_reference_price(session, &preview, options, pending())
-            .await?;
+            .await
+            .map_err(with_recovery_account)?;
         let mut result = json!(accepted);
         if let Some(price) = price {
             result["referencePrice"] = json!(price);
@@ -214,22 +228,35 @@ pub(super) fn failure(home: &Path, error: SaiError) -> Value {
             .flatten()
     });
     let mut result = json!({"error": reason.unwrap_or(&error.message), "code": error.code});
-    match error.code {
-        Code::OutcomeUnknown => {
-            if let Some(key) = error.intent_key {
-                result["intentKey"] = json!(key);
-                result["next"] = json!(format!(
-                    "Call intent_status with key {key} to reconcile. Do not resubmit until it reports a final outcome."
-                ));
-            }
-        }
-        Code::RecentOpenPending => {
-            if let Some(key) = error.intent_key {
+    if let (Some(key), Some(addr)) = (
+        error.intent_key.as_deref(),
+        details.get("addr").and_then(Value::as_str),
+    ) {
+        result["intentKey"] = json!(key);
+        let next = match error.code {
+            Code::OutcomeUnknown => format!(
+                "Call intent_status with key {key} and addr {addr} to reconcile. Do not resubmit until it reports a final outcome."
+            ),
+            Code::RecentOpenPending => {
+                let next = format!(
+                    "Call intent_status with addr {addr} and each key in intentKeys before retrying."
+                );
                 result["error"] = json!(format!(
-                    "Earlier open intent {key} may still execute. Call intent_status with each key in intentKeys before retrying."
+                    "Earlier open intent {key} may still execute. {next}"
                 ));
+                next
             }
-        }
+            Code::InvalidRequest => {
+                result["intentKeys"] = json!([key]);
+                format!(
+                    "Call intent_status with key {key} and addr {addr} to reconcile before resubmitting."
+                )
+            }
+            _ => format!("Call intent_status with key {key} and addr {addr} before retrying."),
+        };
+        result["next"] = json!(next);
+    }
+    match error.code {
         Code::PreviewMismatch => {
             if let Some(preview) = preview
                 .as_ref()

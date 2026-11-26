@@ -162,18 +162,19 @@ def describe(exc: Exception) -> dict[str, Any]:
             intentKey=key,
             addr=exc.account,
             next=(
-                f"Call intent_status with key {key} to reconcile. Do not"
+                f"Call intent_status with key {key} and addr {exc.account} to reconcile. Do not"
                 " resubmit until it reports a final outcome."
             ),
         )
     if isinstance(exc, storage.RecentOpenPending):
+        next_step = f"Call intent_status with addr {exc.account} and each key in intentKeys before retrying."
         return error(
-            f"Earlier open intent {failure.intent_key} may still execute. Call"
-            " intent_status with each key in intentKeys before retrying.",
+            f"Earlier open intent {failure.intent_key} may still execute. {next_step}",
             failure.code,
             intentKey=failure.intent_key,
             intentKeys=exc.keys,
             addr=exc.account,
+            next=next_step,
         )
     if isinstance(exc, Refused):
         reason = estimates.rejection_reason((exc.preview or {}).get("estimates", {}))
@@ -228,6 +229,11 @@ def describe(exc: Exception) -> dict[str, Any]:
                 next=(
                     f"Call intent_status with key {key} and addr {exc.account}"
                     " to reconcile before resubmitting."
+                ),
+                **(
+                    {"intentKeys": [key]}
+                    if isinstance(exc, storage.UnresolvedIntent)
+                    else {}
                 ),
             )
         return error(failure.message, failure.code)
