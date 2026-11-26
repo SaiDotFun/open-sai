@@ -1967,8 +1967,6 @@ seed = "session"
 expect = 2
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "error.code" = "INVALID_REQUEST", "error.message" = "Invalid value for '--percent': '5__0' is not a valid integer." }
-accepted_difference = "Python PR #194 changed the invalid percent diagnostic."
-rust = { output = { "error.code" = "INVALID_REQUEST", "error.message" = "Invalid value for '--percent': '5__0' is not a valid integer range." } }
 
 [[case]]
 name = "trade-partial-close-unicode-percent"

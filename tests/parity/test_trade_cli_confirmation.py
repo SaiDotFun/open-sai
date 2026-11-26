@@ -70,6 +70,69 @@ def test_unconfirmed_trade_checks_execution_before_reserving(
             )
 
 
+@pytest.mark.parametrize(
+    ("preview_args", "submit_args", "scenario", "kind", "argument"),
+    [
+        (
+            CANCEL,
+            (*CANCEL[:2], "0_7"),
+            "pending-order",
+            "CANCEL_PENDING_TRADE",
+            "TRADE_ID",
+        ),
+        (
+            PARTIAL,
+            (*PARTIAL[:-1], "5_0"),
+            "position-execution-ready",
+            "DECREASE_POSITION_SIZE",
+            "--percent",
+        ),
+    ],
+    ids=["order-id", "percent"],
+)
+def test_confirmed_trade_rejects_underscores_before_reserving(
+    pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    preview_args: CLI,
+    submit_args: CLI,
+    scenario: str,
+    kind: str,
+    argument: str,
+) -> None:
+    with loopback(scenario) as endpoints:
+        home = tmp_path / "preview"
+        seed_home(home, endpoints, "session")
+        code, preview, stderr = run(
+            pair[0], home, endpoints, (*preview_args, "--dry-run"), python=True
+        )
+        assert (code, stderr) == (0, ""), preview
+        assert not endpoints.errors
+        digest = preview["previewDigest"]
+
+    results = []
+    for index, cli in enumerate(pair):
+        replay = TradeReplay(kind)
+        with loopback(scenario, trade_replay=replay) as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            outcome = run(
+                cli,
+                home,
+                endpoints,
+                (*submit_args, "--preview-digest", digest),
+                python=index == 0,
+            )
+            assert not replay.attempts()
+            assert not rows(home)
+            assert not endpoints.wire
+            assert not endpoints.errors
+            code, result, stderr = outcome
+            assert (code, result["error"]["code"], stderr) == (2, "INVALID_REQUEST", "")
+            assert f"'{argument}'" in result["error"]["message"]
+            results.append(outcome)
+    assert results[0] == results[1]
+
+
 def test_partial_close_with_unreadable_leverage_cannot_be_confirmed(
     pair: tuple[CLI, CLI], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -755,9 +755,23 @@ def test_exact_decimal_checks_intentionally_differ_from_python(
         ("trade", "margin", "7", "--direction", "add", "--amount", "3٣"),
         ("trade", "partial-close", "3٣", "--percent", "50"),
         ("trade", "partial-close", "7", "--percent", "3٣"),
+        *(
+            args
+            for bad in ("0_7", "+7", " 7 ")
+            for args in (
+                (*OPEN, "--market", bad),
+                (*CLOSE[:2], bad),
+                (*CANCEL[:2], bad),
+                ("trade", "tpsl", bad, "--take-profit", "110"),
+                ("trade", "leverage", bad, "--leverage", "5"),
+                ("trade", "margin", bad, "--direction", "add", "--amount", "1"),
+                ("trade", "partial-close", bad, "--percent", "50"),
+                ("trade", "partial-close", "7", "--percent", bad),
+            )
+        ),
     ],
 )
-def test_non_ascii_trade_numbers_are_usage_errors(
+def test_malformed_trade_numbers_are_usage_errors(
     cli_pair: tuple[CLI, CLI], tmp_path: Path, args: CLI
 ) -> None:
     python = (str(Path(sys.executable).with_name("sai")),)
