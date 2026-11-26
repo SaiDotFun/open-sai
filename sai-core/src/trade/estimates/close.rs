@@ -8,7 +8,7 @@ use crate::{
     trade::{
         TradePreview, Trading,
         actions::invalid,
-        position::{ContractPositionError, Lcd, PositionRoute, Snapshot, SnapshotError},
+        position::{ContractPositionError, Lcd, PositionRoute, Read, Snapshot, SnapshotError},
     },
 };
 
@@ -183,7 +183,7 @@ impl Trading<'_> {
             }
             return Some(());
         }
-        let pair = lcd.market(&raw["market_index"], height).await?;
+        let pair = lcd.market(&raw["market_index"], Read::At(height?)).await?;
         let group = lcd.group(&pair, height).await?;
         let ttl = group["stale_price_expiration_secs"].as_u64()?;
         if ttl > 0

@@ -35,9 +35,17 @@ impl<'a> QuoteLcd<'a> {
             .map(|(value, _)| value)
     }
 
-    pub(super) async fn market(&self, index: &Value, height: Option<&str>) -> Option<Value> {
-        self.object(json!({"get_market": {"index": index}}), height)
+    pub(super) async fn market(&self, index: &Value, read: Read<'_>) -> Option<Value> {
+        let (result, _) = self
+            .lcd
+            .smart(
+                &self.contract,
+                json!({"get_market": {"index": index}}),
+                read,
+            )
             .await
+            .ok()?;
+        result.is_object().then_some(result)
     }
 
     pub(super) async fn group(&self, pair: &Value, height: Option<&str>) -> Option<Value> {

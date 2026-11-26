@@ -360,7 +360,7 @@ async fn close_preview_requires_verified_ownership_to_issue_a_digest() {
 }
 
 #[tokio::test]
-async fn close_preview_withholds_digest_when_the_height_check_returns_a_different_index() {
+async fn close_preview_checks_the_index_even_without_a_block_height() {
     for (latest_index, verified) in [(8, false), (7, true)] {
         let server = PositionServer::start(ACCOUNT, ACCOUNT);
         // Neither response serves a block height. Only a conflicting index
@@ -390,12 +390,15 @@ async fn close_preview_withholds_digest_when_the_height_check_returns_a_differen
             ]
         );
         assert_eq!(output["estimates"]["fees"]["status"], "unavailable");
+        assert!(output.get("previewDigest").is_none());
         if verified {
-            assert!(output["previewDigest"].is_string());
+            assert_eq!(
+                output["estimates"]["execution"]["code"],
+                "OraclePublicationTimeUnknown"
+            );
             assert_eq!(output["positionRoute"]["contractAddress"], CONTRACT);
             assert!(output.get("positionOwnerVerified").is_none());
         } else {
-            assert!(output.get("previewDigest").is_none());
             assert!(output.get("positionRoute").is_none());
             assert_eq!(output["positionOwnerVerified"], false);
         }
@@ -685,6 +688,30 @@ async fn confirmed_core_open_checks_market_state_before_reserving() {
         error.details.unwrap()["preview"]["estimates"]["execution"]["code"],
         "MarketClosed"
     );
+    server.state.lock().unwrap().price = "110";
+    let moved = trading
+        .submit(
+            &session,
+            &preview,
+            SubmitOptions {
+                confirmation: Some(
+                    Confirmation::new(issued["previewDigest"].as_str().unwrap(), Some("100"))
+                        .unwrap(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(moved.code, Code::PriceMoved);
+    let details = moved.details.unwrap();
+    let replacement = &details["preview"];
+    assert_eq!(
+        replacement["estimates"]["execution"]["code"],
+        "MarketClosed"
+    );
+    assert!(replacement.get("previewDigest").is_none());
     assert!(!server.requests().iter().any(|label| label == "admission"));
     assert!(!home.path().join("trader/intents.sqlite3").exists());
 }
@@ -708,6 +735,13 @@ async fn confirmed_core_close_checks_oracle_age_before_reserving() {
         state.stale_oracle = true;
     }
 
+    let stale = trading
+        .confirmed_trade_preview(&session, preview.clone())
+        .await
+        .unwrap();
+    assert_eq!(stale["estimates"]["execution"]["code"], "OraclePriceStale");
+    assert!(stale.get("previewDigest").is_none());
+
     let error = trading
         .submit(
             &session,
@@ -723,10 +757,13 @@ async fn confirmed_core_close_checks_oracle_age_before_reserving() {
         .err()
         .unwrap();
     assert_eq!(error.code, Code::PreviewMismatch);
+    let details = error.details.unwrap();
+    let replacement = &details["preview"];
     assert_eq!(
-        error.details.unwrap()["preview"]["estimates"]["execution"]["code"],
+        replacement["estimates"]["execution"]["code"],
         "OraclePriceStale"
     );
+    assert!(replacement.get("previewDigest").is_none());
     assert!(!server.requests().iter().any(|label| label == "admission"));
     assert!(!home.path().join("trader/intents.sqlite3").exists());
 }

@@ -296,7 +296,7 @@ def test_position_execution_refuses_before_reserving(
     ],
     ids=["margin-pinned", "leverage-snapshot", "leverage-pinned"],
 )
-def test_confirmed_trade_refuses_funding_for_another_collateral(
+def test_confirmed_trade_handles_balance_for_another_collateral(
     pair: tuple[CLI, CLI],
     tmp_path: Path,
     command: CLI,
@@ -314,16 +314,13 @@ def test_confirmed_trade_refuses_funding_for_another_collateral(
         assert not endpoints.errors
 
     for index, cli in enumerate(pair):
-        # Python treats a failed standalone leverage estimate as advisory.
-        if index == 0 and command == LEVERAGE:
-            continue
         replay = TradeReplay("UPDATE_TRADE")
         with loopback(
             scenario, trade_replay=replay, wrong_balance_at=wrong_balance_at
         ) as endpoints:
             home = tmp_path / f"submit-{index}"
             seed_home(home, endpoints, "session")
-            refusal = run(
+            result = run(
                 cli,
                 home,
                 endpoints,
@@ -331,9 +328,20 @@ def test_confirmed_trade_refuses_funding_for_another_collateral(
                 python=index == 0,
             )
             assert not endpoints.errors
+            if command == LEVERAGE:
+                # A wrong-token balance leaves the standalone estimate unavailable.
+                code, _, stderr = result
+                assert (code, stderr) == (0, "")
+                (key,) = replay.admitted_keys()
+                assert replay.attempts() == {key: 1}
+                assert replay.intent(key)["body"] == preview["intent"]["body"]
+                assert [row[:6] for row in rows(home)] == [
+                    (key, "UPDATE_TRADE", "accepted", "7", preview["addr"], None)
+                ]
+                continue
             assert not replay.attempts()
-            assert not (home / "sai/trader/intents.sqlite3").exists()
-            assert refusal == (
+            assert not rows(home)
+            assert result == (
                 4,
                 {
                     "error": {
@@ -623,7 +631,8 @@ def test_verified_close_refuses_unconfirmable_oracle(
             assert (code, stderr) == (0, "")
             assert "previewDigest" not in preview
             assert not endpoints.errors
-        with loopback(scenario) as endpoints:
+        replay = TradeReplay()
+        with loopback(scenario, trade_replay=replay) as endpoints:
             home = tmp_path / str(index)
             seed_home(home, endpoints, "session")
             code, result, stderr = run(
@@ -639,7 +648,115 @@ def test_verified_close_refuses_unconfirmable_oracle(
                 "",
             )
             assert "previewDigest" not in result["error"]["details"]["preview"]
-            assert not (home / "sai/trader/intents.sqlite3").exists()
+            assert not replay.attempts()
+            assert not rows(home)
             assert not endpoints.errors
             refusals.append(result)
     assert refusals[0] == refusals[1]
+
+
+@pytest.mark.parametrize(
+    ("scenario", "accepted"),
+    [
+        ("quote-close-height-failed", False),
+        ("quote-close-collateral-changed", True),
+    ],
+)
+def test_confirmed_close_rechecks_position_height(
+    pair: tuple[CLI, CLI], tmp_path: Path, scenario: str, accepted: bool
+) -> None:
+    python, _ = pair
+    with loopback("quote-queued") as endpoints:
+        home = tmp_path / "preview"
+        seed_home(home, endpoints, "session")
+        code, preview, stderr = run(
+            python, home, endpoints, (*CLOSE, "--dry-run"), python=True
+        )
+        assert (code, stderr) == (0, "")
+        assert not endpoints.errors
+        assert not rows(home)
+
+    for index, cli in enumerate(pair):
+        replay = TradeReplay()
+        with loopback(scenario, trade_replay=replay) as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            code, result, stderr = run(
+                cli,
+                home,
+                endpoints,
+                (*CLOSE, "--preview-digest", preview["previewDigest"]),
+                python=index == 0,
+            )
+            assert not endpoints.errors
+            assert [entry.label for entry in endpoints.wire].count("get_trade_raw") == 2
+            if accepted:
+                assert (code, stderr) == (0, "")
+                (key,) = replay.admitted_keys()
+                assert replay.attempts() == {key: 1}
+                assert replay.intent(key)["kind"] == "CLOSE_POSITION"
+                assert [row[:6] for row in rows(home)] == [
+                    (key, "CLOSE_POSITION", "accepted", "7", preview["addr"], None)
+                ]
+            else:
+                assert (code, stderr) == (4, "")
+                error = result["error"]
+                assert error["code"] == "PREVIEW_MISMATCH"
+                assert error["details"]["preview"]["estimates"]["execution"][
+                    "code"
+                ] == ("OraclePublicationTimeUnknown")
+                assert not replay.attempts()
+                assert not rows(home)
+
+
+@pytest.mark.parametrize(
+    ("scenario", "reopened"),
+    [("quote-cache-reopened", True), ("quote-cache-closed", False)],
+)
+@pytest.mark.parametrize("implementation", ["python", "rust"])
+def test_open_submission_uses_fresh_market_state(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    scenario: str,
+    reopened: bool,
+    implementation: str,
+) -> None:
+    python = implementation == "python"
+    cli = (
+        (str(Path(sys.executable).with_name("sai")),)
+        if python
+        else request.getfixturevalue("cli_pair")[1]
+    )
+    replay = TradeReplay("OPEN_TRADE", "")
+    home = tmp_path / "home"
+    with loopback(scenario, trade_replay=replay, market_price=100) as endpoints:
+        seed_home(home, endpoints, "session")
+        code, preview, stderr = run(
+            cli, home, endpoints, (*OPEN, "--dry-run"), python=python
+        )
+        assert (code, stderr) == (0, "")
+        assert ("previewDigest" in preview) == (not reopened)
+        assert not replay.attempts()
+        assert not rows(home)
+
+        code, result, stderr = run(cli, home, endpoints, OPEN[:-2], python=python)
+        assert not endpoints.errors
+        assert [entry.label for entry in endpoints.wire].count("get_market") == 2
+        if reopened:
+            assert (code, stderr) == (0, "")
+            (key,) = replay.admitted_keys()
+            assert replay.attempts() == {key: 1}
+            assert replay.intent(key)["kind"] == "OPEN_TRADE"
+            assert replay.intent(key)["body"] == preview["intent"]["body"]
+            assert [row[:6] for row in rows(home)] == [
+                (key, "OPEN_TRADE", "accepted", "", preview["addr"], None)
+            ]
+        else:
+            assert (code, stderr) == (4, "")
+            error = result["error"]
+            assert error["code"] == "PREVIEW_MISMATCH"
+            assert error["details"]["preview"]["estimates"]["execution"]["code"] == (
+                "MarketClosed"
+            )
+            assert not replay.attempts()
+            assert not rows(home)
