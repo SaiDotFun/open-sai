@@ -544,7 +544,7 @@ signature = "f56030577aefb046dcae35899fac71e1e9b4b6c574846fd290114ef290eb453e"
 
 [gap."case:trade-partial-close-index-lag-before-minimum"]
 owner = "#211"
-signature = "993975abd95dd189c0c4d902e92a4085e7b428029a7a2017aaa7da783e252453"
+signature = "22c52a8a52e267104a590314b5af3e01ac062a94c26c5723dfaaea975be923a2"
 
 [gap."case:trade-partial-close-invalid-id"]
 owner = "#211"
@@ -560,7 +560,7 @@ signature = "2dfce535971a46428d16a7917dc67eb38b82481903132023119a6faee87aaa67"
 
 [gap."case:trade-partial-close-malformed-percent"]
 owner = "#211"
-signature = "b7afb4548020da4f7e90e54b7112aba5f4fc6619e9240175678b314728547d69"
+signature = "4f264b3264ad84549e26b00b867dde006e21ebbbf3db9a775a0569f29b186228"
 
 [gap."case:trade-partial-close-market-minimum"]
 owner = "#211"
@@ -596,7 +596,7 @@ signature = "239f76a3be30caf98fa3d5ed7716a23e0f36dcc0934cb4b833f4f5f4f0b6841d"
 
 [gap."case:trade-partial-close-unicode-percent"]
 owner = "#139"
-signature = "ffaba9f1d2410e69746974d2d655c7d53671af6a9ae4836609cfc08d0dd2b9b3"
+signature = "5b545493cbedb49797318e5516595b2029764cc350bda78b5c3493f002389a5e"
 
 [gap."case:trade-partial-close-unknown-blocks-retry"]
 owner = "#174"

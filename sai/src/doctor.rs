@@ -386,7 +386,9 @@ fn install_info() -> (Check, Value, bool) {
     let provenance = if let Some(root) = checkout {
         json!({"kind": "source-checkout", "path": root, "git": mcp::checkout_state(root)})
     } else {
-        json!({"kind": "installed", "path": executable})
+        let launcher = crate::mcp::launcher_path(&executable);
+        let directory = launcher.as_deref().unwrap_or(&executable).parent();
+        json!({"kind": "installed", "path": directory})
     };
     let launchers = mcp::launchers_on_path();
     let mut details = json!({"version": VERSION, "provenance": provenance, "onPath": launchers});
@@ -552,7 +554,7 @@ fn session_check(home: &Path, settings: &Settings, now: DateTime<Utc>) -> (Check
             guidance,
         )
     } else if !matches {
-        let login = keeper_hint(home, settings.endpoint(), &["auth", "login", "NAME"]);
+        let login = storage.trade_command_hint(settings.endpoint(), &["auth", "login", "NAME"]);
         match endpoint {
             Some(origin) => Check::new("session", "fail", format!("Session for {addr} belongs to a different Keeper endpoint. Stored origin {origin}, configured origin {}", log::origin(settings.endpoint())))
                 .fix(format!("{login}, or restore the Keeper URL used to sign in")),
@@ -584,32 +586,6 @@ fn session_recovery(mut check: Check, command: Option<String>, guidance: Option<
     }
     check.fix = command;
     check
-}
-
-fn shell_quote(arg: &str) -> String {
-    if !arg.is_empty()
-        && arg
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&b))
-    {
-        return arg.to_owned();
-    }
-    format!("'{}'", arg.replace('\'', "'\"'\"'"))
-}
-
-fn keeper_hint(home: &Path, endpoint: &str, args: &[&str]) -> String {
-    let flag = if log::origin(endpoint) == endpoint && log::redact(home, endpoint) == endpoint {
-        shell_quote(endpoint)
-    } else {
-        r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#
-            .into()
-    };
-    let args = args
-        .iter()
-        .map(|arg| shell_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("sai --endpoint {flag} {args}")
 }
 
 fn render_text(checks: &[Check], overall: &str) -> String {

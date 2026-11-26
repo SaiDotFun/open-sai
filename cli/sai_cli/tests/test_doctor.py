@@ -917,9 +917,9 @@ def test_unknown_intent_for_signed_in_account_fails():
     check = one(doctor.check_intents, ctx())
     assert check.status == "fail"
     assert check.summary == "1 unknown intent blocks trading for 0x4803…"
-    assert check.fix is not None
-    assert check.fix.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
-    assert check.fix.endswith(f"intent status {ADDR} --key 20261118T000000000000-a")
+    assert check.fix == (
+        f"sai --endpoint {ENDPOINT} intent status {ADDR} --key 20261118T000000000000-a"
+    )
     assert check.details["otherAccounts"] == {"unknown": 1, "accounts": 1}
 
 

@@ -24,7 +24,7 @@ from typing import Any
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from . import log, paths
+from . import keeper, log, paths
 from .errors import Code, SaiError, SessionError, describe
 
 
@@ -523,7 +523,11 @@ def keeper_command_hint(endpoint: str, *args: str) -> str:
     Ask the caller to supply the original URL when the origin is insufficient.
     """
     origin = log.origin(endpoint)
-    if origin != log.REDACTED_URL and origin == endpoint == log.redact(endpoint):
+    if (
+        origin != log.REDACTED_URL
+        and endpoint in (origin, keeper.MAINNET_HTTP)
+        and endpoint == log.redact(endpoint)
+    ):
         flag = shlex.quote(endpoint)
     else:
         flag = (
@@ -552,7 +556,18 @@ def _check_open_pending(
         (endpoint, account.lower(), allow_concurrent_open),
     ).fetchall()
     if opens:
-        raise RecentOpenPending([row[0] for row in opens], endpoint, account)
+        keys = [row[0] for row in opens]
+        for key in keys:
+            log.event(
+                "intent.open_blocked",
+                "warn",
+                intentKey=key,
+                addr=account,
+                endpoint=log.endpoint(endpoint),
+                endpointId=log.endpoint_identity(endpoint),
+                code=Code.RECENT_OPEN_PENDING,
+            )
+        raise RecentOpenPending(keys, endpoint, account)
 
 
 @contextmanager

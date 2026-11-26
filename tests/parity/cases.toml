@@ -1942,8 +1942,6 @@ seed = "session"
 expect = 2
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "error.code" = "INVALID_REQUEST", "error.message" = "Invalid value for '--percent': '5__0' is not a valid integer." }
-accepted_difference = "Python PR #194 changed the invalid percent diagnostic."
-rust = { output = { "error.code" = "INVALID_REQUEST", "error.message" = "Invalid value for '--percent': '5__0' is not a valid integer range." } }
 
 [[case]]
 name = "trade-partial-close-unicode-percent"
@@ -1953,15 +1951,6 @@ server = "position-default"
 expect = 2
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "error.code" = "INVALID_REQUEST", "error.message" = "Invalid value for '--percent': '٥_٠' is not a valid integer." }
-accepted_difference = "Python PR #194 rejects non-ASCII percent digits. Rust accepts the pinned Python syntax."
-
-[case.rust]
-expect = 0
-wire = [
-    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
-]
-output = { "quote.percent" = 50 }
 
 [[case]]
 name = "trade-partial-close-invalid-id"
@@ -2230,7 +2219,7 @@ wire = ["oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw", "
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "error.code" = "INVALID_REQUEST", "error.message" = "Indexed position differs from contract state. Retry after Keeper synchronizes. No intent was submitted." }
 accepted_difference = "Python retries stale Keeper index reads. Rust refuses the stale snapshot immediately."
-rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance"], output = { "error.code" = "INVALID_REQUEST", "error.message" = "Indexed position differs from contract state; wait for synchronization and retry" } }
+rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance"], output = { "error.code" = "INVALID_REQUEST", "error.message" = "Indexed position differs from contract state; wait for synchronization and retry", "error.retryable" = true } }
 
 [[case]]
 name = "trade-partial-close-market-minimum"

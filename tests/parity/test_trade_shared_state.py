@@ -485,6 +485,39 @@ def assert_trade_events(
     ] == statuses
 
 
+@pytest.mark.parametrize(
+    ("submitter", "retry_runtime"), [("rust", "python"), ("python", "rust")]
+)
+def test_accepted_open_blocks_other_runtime_retry(
+    submitter: str,
+    retry_runtime: str,
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    python_reference: Path | None,
+) -> None:
+    writer = runtime(submitter, request, python_reference)
+    retry = runtime(retry_runtime, request, python_reference)
+    action = ACTIONS["open"]
+    replay = action.replay()
+    with loopback(action.server, trade_replay=replay) as endpoints:
+        home = Home(tmp_path / "home", endpoints)
+        seed_home(home.path, endpoints, "session")
+        args = ("trade", *action.args)
+        first = home.json(writer, *args)
+        assert first["status"] == "accepted"
+        key = first["intentKey"]
+
+        result = home.invoke(retry, "--json", *args)
+        assert_blocked(result, key)
+        assert json.loads(result.stdout)["error"]["code"] == "RECENT_OPEN_PENDING"
+        for runtime_ in (writer, retry):
+            home.local(runtime_, key, action.kind, "accepted")
+        home.row(key, action.kind, action.entity, "accepted")
+        assert replay.attempts() == {key: 1} and replay.admitted_keys() == {key}
+        assert_trade_events(home, key, ["accepted"], acked=True)
+        assert not endpoints.errors
+
+
 @pytest.mark.parametrize("action_name", ACTIONS)
 @pytest.mark.parametrize(
     ("submitter", "reconciler", "retry_runtime"),

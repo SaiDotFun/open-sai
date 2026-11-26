@@ -179,9 +179,7 @@ def test_success_and_sign_in_exit_codes():
     args = ["--json", "--endpoint", keeper.MAINNET_HTTP]
     signed_out = runner.invoke(main, [*args, "trade", "close", "7"])
     hint = assert_error(signed_out, 6, "SIGNED_OUT")["hint"]
-    assert hint.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
-    assert hint.endswith("auth login NAME")
-    assert keeper.MAINNET_HTTP not in signed_out.output
+    assert hint == f"sai --endpoint {keeper.MAINNET_HTTP} auth login NAME"
     listed = runner.invoke(main, [*args, "auth", "list"])
     assert listed.exit_code == 0 and json.loads(listed.stdout) == {"accounts": []}
     storage.save_session(

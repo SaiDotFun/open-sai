@@ -80,6 +80,14 @@ def is_confirmable(preview: dict[str, Any]) -> bool:
 
 def with_digest(preview: dict[str, Any]) -> dict[str, Any]:
     values = preview.get("estimates", {})
-    if rejection_reason(values) is not None or close_oracle_time_unknown(values):
+    unknown_partial_leverage = (
+        preview["intent"]["kind"] == "DECREASE_POSITION_SIZE"
+        and (preview.get("quote") or {}).get("effectiveLeverage") is None
+    )
+    if (
+        rejection_reason(values) is not None
+        or close_oracle_time_unknown(values)
+        or unknown_partial_leverage
+    ):
         return {key: value for key, value in preview.items() if key != "previewDigest"}
     return {**preview, "previewDigest": preview_digest(preview)}
