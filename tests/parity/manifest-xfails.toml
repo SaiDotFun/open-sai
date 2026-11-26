@@ -310,6 +310,11 @@ signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
 owner = "#175"
 signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
 
+# Rust masks the SAI_HOME value in the reported Claude argv.
+[gap."case:mcp-install-all"]
+owner = "#215"
+signature = "5eeeab657a0ad2a74b8e2c03899c04758b2742520cb7af98954a8ae8ef57437f"
+
 [gap."case:mcp-install-empty-scope"]
 owner = "#211"
 signature = "891eeb4559dd23e926a278cdd41a7b5e3b97a28a0798417a5d0770c1a9037369"

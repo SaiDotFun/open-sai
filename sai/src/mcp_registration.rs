@@ -187,20 +187,30 @@ fn reported_argv(args: &[String]) -> Vec<String> {
                 }
                 return origin;
             }
-            if flag.is_none()
-                && let Some((name, _)) = assignment
+            if let Some(flag @ ("-e" | "--env")) = flag {
+                return format!("{flag}={}", reported_assignment(value));
+            }
+            if let Some(binding) = arg.strip_prefix("-e")
+                && binding.split_once('=').is_some_and(|(name, _)| {
+                    !name.is_empty()
+                        && name
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                })
             {
-                let uppercase = name.to_ascii_uppercase();
-                if ["KEY", "TOKEN", "SECRET", "PASSWORD", "AUTH"]
-                    .iter()
-                    .any(|part| uppercase.contains(part))
-                {
-                    return format!("{name}=[redacted]");
-                }
+                return format!("-e{}", reported_assignment(binding));
+            }
+            if flag.is_none() {
+                return reported_assignment(arg);
             }
             arg.clone()
         })
         .collect()
+}
+
+fn reported_assignment(arg: &str) -> String {
+    arg.split_once('=')
+        .map_or_else(|| arg.to_owned(), |(name, _)| format!("{name}=[redacted]"))
 }
 
 struct Registration {

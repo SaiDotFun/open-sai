@@ -577,42 +577,96 @@ def test_mcp_install_redacts_custom_launcher_credentials(
     assert entry["args"] == list(command[1:])
 
 
-def test_mcp_install_dry_run_redacts_launcher_environment_credentials(
-    wave_clis: tuple[str, str], tmp_path: Path
+@pytest.mark.parametrize(
+    ("launcher_name", "operands", "reported_operands"),
+    [
+        (
+            "env",
+            (
+                "SESSION_COOKIE=synthetic-private-cookie",
+                "APP_MODE=synthetic-private-mode",
+            ),
+            ("SESSION_COOKIE=[redacted]", "APP_MODE=[redacted]"),
+        ),
+        (
+            "docker",
+            ("run", "--env=OPENAI_API_KEY=synthetic-private=key"),
+            ("run", "--env=OPENAI_API_KEY=[redacted]"),
+        ),
+        (
+            "docker",
+            (
+                "run",
+                "--env",
+                "APP_LABEL=synthetic-private-label",
+                "-e",
+                "TERM=synthetic-private-term",
+                "-e=REGION=synthetic-private-region",
+                "-eCOLOR=synthetic-private-color",
+                "--env",
+                "PASSTHROUGH",
+                "-e",
+                "https://fixture.invalid/synthetic-private",
+            ),
+            (
+                "run",
+                "--env",
+                "APP_LABEL=[redacted]",
+                "-e",
+                "TERM=[redacted]",
+                "-e=REGION=[redacted]",
+                "-eCOLOR=[redacted]",
+                "--env",
+                "PASSTHROUGH",
+                "-e",
+                "https://fixture.invalid",
+            ),
+        ),
+    ],
+    ids=["bare-cookie-and-generic", "inline-key", "generic-env-options"],
+)
+def test_mcp_install_redacts_launcher_environment_assignments(
+    wave_clis: tuple[str, str],
+    tmp_path: Path,
+    launcher_name: str,
+    operands: tuple[str, ...],
+    reported_operands: tuple[str, ...],
 ) -> None:
     _, rust = wave_clis
     overrides = {"PATH": os.defpath}
     seed_clients(tmp_path, overrides, "empty")
-    names = ["OPENAI_API_KEY", "accessToken", "APP_SECRET", "DB_PASSWORD", "AUTH_MODE"]
-    public_env = "APP_LABEL=public=value"
+    launcher = "/usr/bin/env"
+    if launcher_name == "docker":
+        docker = tmp_path / "bin/docker"
+        docker.write_text("#!/bin/sh\nexit 0\n")
+        docker.chmod(0o700)
+        launcher = str(docker)
     server = (str(tmp_path / "bin/sai"), "mcp", "serve")
+    prefix = ("--json", "mcp", "install", "claude")
+    command = (launcher, *operands, *server)
     result = run_cli(
         rust,
         tmp_path,
-        "--json",
-        "mcp",
-        "install",
-        "claude",
+        *prefix,
         "--dry-run",
         "--",
-        "/usr/bin/env",
-        *(f"{name}=synthetic-private={index}" for index, name in enumerate(names)),
-        public_env,
-        *server,
+        *command,
         overrides=overrides,
     )
     assert result.returncode == 0
     assert "synthetic-private" not in result.stdout + result.stderr
     [report] = json.loads(result.stdout)["results"]
-    expected = [
-        "/usr/bin/env",
-        *(f"{name}=[redacted]" for name in names),
-        public_env,
-        *server,
-    ]
+    expected = [launcher, *reported_operands, *server]
     assert report["command"] == expected
     assert report["argv"][0][-len(expected) :] == expected
+    assert "--env=SAI_HOME=[redacted]" in report["argv"][0]
     assert not (tmp_path / ".claude.json").exists()
+
+    installed = run_cli(rust, tmp_path, *prefix, "--", *command, overrides=overrides)
+    assert installed.returncode == 0
+    entry = json.loads((tmp_path / ".claude.json").read_text())["mcpServers"]["sai"]
+    assert entry["command"] == launcher
+    assert entry["args"] == list(command[1:])
 
 
 @pytest.mark.parametrize("kind", ["cwd", "remote"])
