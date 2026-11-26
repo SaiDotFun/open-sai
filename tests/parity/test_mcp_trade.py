@@ -308,6 +308,49 @@ def test_mcp_partial_close_previews_remainder_below_market_minimum(
     assert previews[0] == previews[1]
 
 
+def test_mcp_partial_close_withholds_digest_when_leverage_is_unknown(
+    mcp_pair: tuple[Path, Path], tmp_path: Path
+) -> None:
+    args = {**POSITION, "percent": "50"}
+    with (
+        loopback("partial-preview") as endpoints,
+        server(
+            mcp_pair[0],
+            tmp_path / "preview",
+            endpoints,
+            seed="session",
+            call_timeout=15,
+        ) as stdio,
+    ):
+        confirmed = trade_args(
+            result(stdio.call(2, "preview_partial_close", **args)), args
+        )
+
+    previews = []
+    for i, executable in enumerate(mcp_pair):
+        home = tmp_path / str(i)
+        with (
+            loopback("position-malformed-after-hours-cap") as endpoints,
+            server(
+                executable, home, endpoints, seed="session", call_timeout=15
+            ) as stdio,
+        ):
+            preview = result(stdio.call(2, "preview_partial_close", **args))
+            assert preview["quote"]["effectiveLeverage"] is None
+            assert preview["quote"]["closedNotionalIsEstimate"] is True
+            assert "previewDigest" not in preview
+            refused = result(stdio.call(3, "trade_partial_close", **confirmed))
+            assert refused["code"] == "PREVIEW_MISMATCH"
+            assert "Cannot verify effective leverage" in refused["error"]
+            assert refused["quoteStatus"] == "unavailable"
+            assert "previewDigest" not in refused.get("preview", {})
+            assert not any(item.label == "recordUserIntent" for item in endpoints.wire)
+            assert not rows(home)
+            assert not endpoints.errors
+            previews.append(binding(preview))
+    assert previews[0] == previews[1]
+
+
 def test_mcp_open_binds_the_selected_account(
     mcp_pair: tuple[Path, Path], tmp_path: Path
 ) -> None:
