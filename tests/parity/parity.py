@@ -1169,6 +1169,24 @@ def run_case(
     ):
         project_reference_doctor_keeper_log(left, right)
     if (
+        rust
+        and not cutover
+        and case.accepted_divergence == "launcher-argument-report"
+        and isinstance(right.output, dict)
+    ):
+        # Rust may still show the exact fixture command before both CLIs use placeholders.
+        command = case.args[case.args.index("--") + 1 :]
+        launcher, *args = command
+        for row in right.output.get("results", []):
+            if row.get("command") == command:
+                row["command"] = [
+                    launcher,
+                    *(
+                        f"<argument hidden {index} of {len(args)}>"
+                        for index in range(1, len(args) + 1)
+                    ),
+                ]
+    if (
         candidate != reference
         and case.accepted_divergence == "codex-uninstall-rollback"
     ):
