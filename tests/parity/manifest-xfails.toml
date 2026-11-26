@@ -222,10 +222,6 @@ signature = "69ef87aee2da5b8600241b502f63a8a50c0cbf6e09525e66fb6ab65da7feb7ab"
 owner = "#172"
 signature = "26bb482fd9db4137e02af7d3689ea2cf7a1509f67a01d3af3a82e3bd159c9496"
 
-[gap."case:intent-status"]
-owner = "#212"
-signature = "58002bce2458ceba72cfc7aeb162f352823deceee91c10c4a2fd5d1ea65a530e"
-
 [gap."case:market-bare"]
 owner = "#211"
 signature = "ccdedb96b86e2ccdcb90c39e17859c64da7dab27c49872a0ccc05514945ef9d1"

@@ -39,6 +39,7 @@ pub(super) enum SnapshotError {
     Owner(&'static str),
     IndexMismatch,
     CollateralMismatch,
+    PositionChanged,
     Unavailable,
 }
 
@@ -384,7 +385,7 @@ impl Snapshot {
         .iter()
         .any(|&key| latest.get(key) != self.raw.get(key))
         {
-            return Err(SnapshotError::Unavailable);
+            return Err(SnapshotError::PositionChanged);
         }
         Ok(height)
     }
