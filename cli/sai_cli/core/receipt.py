@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+from fractions import Fraction
 from typing import Any, Literal
 
 from . import keeper
@@ -24,6 +25,7 @@ REQUESTED_CHANGES = {
     "UPDATE_OPEN_ORDER": {"order_updated"},
     "UPDATE_TRADE": {"tp_updated", "sl_updated", "tpsl_updated", "leverage_updated"},
 }
+FillValues = tuple[int | float | str | None, int | None]
 
 
 def _execution_rows(
@@ -131,6 +133,79 @@ def _number(value: object) -> int | float | str | None:
     return None
 
 
+def _block(value: object) -> int | None:
+    block = value.get("block") if isinstance(value, dict) else None
+    return block if type(block) is int and 0 < block < 2**63 else None
+
+
+def opening_fill_position(
+    row: dict[str, Any], history: list[dict[str, Any]]
+) -> tuple[int, int] | None:
+    """Identify a position opened by a correlated end-block market order."""
+    indexed = _indexed(row, _execution_rows(row, history))
+    if indexed.get("tradeChangeType") != "position_opened":
+        return None
+    block = _block(indexed.get("block"))
+    order, trade = indexed.get("marketOrder"), indexed.get("trade")
+    if block is None or not isinstance(order, dict) or not isinstance(trade, dict):
+        return None
+    trade_id = trade.get("id")
+    order_block = order.get("orderExecBlock")
+    if (
+        type(trade_id) is not int
+        or not 0 <= trade_id < 2**63
+        or type(order_block) is not int
+        or order_block != block
+        or _block(trade.get("openBlock")) != block
+    ):
+        return None
+    # Opening collateral cannot exceed the amount originally escrowed.
+    collateral = trade.get("openCollateralAmount")
+    escrow = order.get("collateralAmount")
+    if type(collateral) is int and type(escrow) is int and collateral > escrow:
+        return None
+    return trade_id, block
+
+
+def opening_fill(
+    data: dict[str, Any], trade_id: int, block: int, account: str, row: dict[str, Any]
+) -> FillValues:
+    perp = data.get("perp")
+    trade = perp.get("trade") if isinstance(perp, dict) else None
+    # Ordinary transactions finish before the end-block market fill. A new
+    # position still at its opening update therefore describes that fill.
+    if (
+        not isinstance(trade, dict)
+        or type(trade.get("id")) is not int
+        or trade.get("id") != trade_id
+        or keeper.canonical_account(trade.get("trader")) != account
+        or trade.get("tradeType") != "trade"
+        or trade.get("isOpen") is not True
+        or _block(trade.get("openBlock")) != block
+        or _block(trade.get("lastUpdatedBlock")) != block
+    ):
+        return None, None
+    price = _number(trade.get("openPrice"))
+    if price is not None and Fraction(str(price)) <= 0:
+        price = None
+    collateral = trade.get("collateralAmount")
+    leverage = _number(trade.get("leverage"))
+    body = row.get("body")
+    requested = _number(body.get("leverage")) if isinstance(body, dict) else None
+    if (
+        type(collateral) is not int
+        or not 0 < collateral < 2**63
+        or leverage is None
+        or not isinstance(requested, str)
+        or float(requested) != float(leverage)
+    ):
+        return price, None
+    # The intent preserves the exact decimal. GraphQL Float rounding could
+    # otherwise change the size when flooring to whole collateral base units.
+    size = int(collateral * Fraction(requested))
+    return price, size if 0 < size < 2**63 else None
+
+
 def _position(row: dict[str, Any], public: dict[str, Any]) -> dict[str, Any] | None:
     trade = row.get("trade")
     if not isinstance(trade, dict):
@@ -174,6 +249,7 @@ def build(
     *,
     request_tx_hash: str | None,
     request_block: int | None,
+    fill_values: FillValues = (None, None),
 ) -> dict[str, Any]:
     """Keep the request transaction distinct from execution and fill data."""
     matching = _execution_rows(row, history)
@@ -219,12 +295,9 @@ def build(
         }
     fill = None
     if outcome == "filled":
-        # Keeper's history joins the current position, so its entry price and
-        # collateral can change after this fill. The oracle quote and escrow
-        # in the correlated market order describe the indexed execution.
         fill = {
-            "price": None,
-            "sizeCollateralBaseUnits": None,
+            "price": fill_values[0],
+            "sizeCollateralBaseUnits": fill_values[1],
             "oraclePrice": _number(order.get("execPrice")),
             "escrowedCollateralBaseUnits": _number(order.get("collateralAmount")),
         }

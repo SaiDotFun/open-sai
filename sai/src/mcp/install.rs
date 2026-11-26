@@ -38,7 +38,7 @@ impl Installation {
     }
 }
 
-fn launcher_path(executable: &Path) -> Option<PathBuf> {
+pub(crate) fn launcher_path(executable: &Path) -> Option<PathBuf> {
     let invoked = PathBuf::from(env::args_os().next()?);
     let belongs_to_process =
         |path: &Path| path.canonicalize().is_ok_and(|target| target == executable);

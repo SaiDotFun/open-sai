@@ -341,6 +341,10 @@ impl Trading<'_> {
             raw
         } else {
             // Retry only amount or leverage drift, with both reads checked again.
+            let index_lag = || SaiError {
+                retryable_override: true,
+                ..invalid(INDEX_LAG)
+            };
             let deadline = Instant::now() + INDEX_RETRY_BUDGET;
             timeout_at(deadline, async {
                 for delay in INDEX_RETRY_DELAYS {
@@ -358,10 +362,10 @@ impl Trading<'_> {
                         return Ok(raw);
                     }
                 }
-                Err(invalid(INDEX_LAG))
+                Err(index_lag())
             })
             .await
-            .unwrap_or_else(|_| Err(invalid(INDEX_LAG)))?
+            .unwrap_or_else(|_| Err(index_lag()))?
         };
         let (funds, _) = lcd
             .smart(

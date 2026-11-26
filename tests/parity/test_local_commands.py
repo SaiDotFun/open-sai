@@ -66,6 +66,28 @@ def invoke(
     )
 
 
+def test_native_doctor_reports_the_launcher_directory(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> None:
+    install = tmp_path / "install"
+    install.mkdir()
+    payload = install / "version" / "sai"
+    payload.parent.mkdir()
+    shutil.copy2(local_pair[1][0], payload)
+    launcher = install / "sai"
+    launcher.symlink_to(payload)
+
+    result = invoke(
+        (str(launcher),), tmp_path / "home", "--json", "doctor", "--offline"
+    )
+    assert result.returncode == 0 and not result.stderr, result
+    report = json.loads(result.stdout)
+    expected = {"kind": "installed", "path": str(install)}
+    assert report["sai"]["install"] == expected
+    check = next(check for check in report["checks"] if check["id"] == "install")
+    assert check["details"]["provenance"] == expected
+
+
 @pytest.mark.parametrize(
     "args,page",
     [
