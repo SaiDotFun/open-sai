@@ -713,8 +713,10 @@ def loopback(
                 else "1.234567890123456789"
             ),
         )
-    if scenario == "quote-close-only":
+    if scenario in {"quote-close-only", "quote-close-only-no-borrowings"}:
         contracts["get_market"]["market_trading_state"] = "close_only"
+    if scenario == "quote-close-only-no-borrowings":
+        markets["data"]["perp"]["borrowings"] = []
     if scenario == "quote-pair-cap":
         contracts["get_pair_custom_max_leverage"] = "1.5"
     if scenario == "quote-minimum":

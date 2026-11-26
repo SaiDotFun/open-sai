@@ -189,6 +189,14 @@ def test_mcp_preview_and_confirm(
             "MarketClosed",
         ),
         (
+            "open",
+            {**OPEN, "order_type": "limit", "price": "100"},
+            "quote-market",
+            "quote-close-only-no-borrowings",
+            "PREVIEW_MISMATCH",
+            "MarketClosed",
+        ),
+        (
             "close",
             POSITION,
             "quote-close",
@@ -205,7 +213,13 @@ def test_mcp_preview_and_confirm(
             "MarketClosed",
         ),
     ],
-    ids=["price-moved", "market-close-only", "close-stale", "leverage-close-only"],
+    ids=[
+        "price-moved",
+        "market-close-only",
+        "limit-close-only-no-borrowings",
+        "close-stale",
+        "leverage-close-only",
+    ],
 )
 def test_mcp_refuses_changed_execution(
     mcp_pair: tuple[Path, Path],
@@ -234,25 +248,30 @@ def test_mcp_refuses_changed_execution(
         home = tmp_path / str(i)
         with (
             loopback(
-                changed, market_price=102 if code == "PRICE_MOVED" else None
+                changed,
+                market_price=102 if code == "PRICE_MOVED" else None,
+                trade_replay=TradeReplay("OPEN_TRADE", "")
+                if action == "open"
+                else None,
             ) as endpoints,
             server(
                 executable, home, endpoints, seed="session", call_timeout=15
             ) as stdio,
         ):
             refused = result(stdio.call(2, f"trade_{action}", **confirmed))
+            assert not any(item.label == "recordUserIntent" for item in endpoints.wire)
+            assert not rows(home)
             assert refused["code"] == code
             fresh = refused["preview"]
             if execution is None:
                 assert fresh["previewDigest"] != preview["previewDigest"]
                 assert fresh["referencePrice"] == "102"
             else:
+                assert fresh["estimates"]["execution"]["status"] == "would_be_rejected"
                 assert fresh["estimates"]["execution"]["code"] == execution
                 assert "previewDigest" not in fresh
                 assert refused["quoteStatus"] == "unavailable"
                 assert refused["recovery"]["action"] == "request_preview"
-            assert not any(item.label == "recordUserIntent" for item in endpoints.wire)
-            assert not rows(home)
             assert not endpoints.errors
             replacements.append(binding(fresh))
     assert replacements[0] == replacements[1]

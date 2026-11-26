@@ -87,7 +87,7 @@ impl<'a> Confirmation<'a> {
 
     fn submission_preview_mode(&self) -> PreviewMode {
         if self.is_mcp() {
-            PreviewMode::Mcp
+            PreviewMode::McpSubmission
         } else {
             PreviewMode::CliSubmission
         }
