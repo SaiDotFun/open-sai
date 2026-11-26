@@ -121,16 +121,8 @@ class Registration:
             return {"command": []}
         if dry_run:
             launcher, *args = self.argv
-            path = Path(launcher)
-            if (
-                plain_launcher(launcher)
-                and plain_launcher(path.name)
-                and all(
-                    char.isalnum() or char in "._-/" or char == os.sep
-                    for char in launcher.removeprefix(path.drive)
-                )
-            ):
-                return {"command": [path.name, *hidden_arguments(len(args))]}
+            if resolved := shutil.which(launcher):
+                return {"command": [resolved, *hidden_arguments(len(args))]}
             return {"command": hidden_arguments(len(self.argv))}
         if target is not None and self.matches_command(target):
             return {"command": target.argv}

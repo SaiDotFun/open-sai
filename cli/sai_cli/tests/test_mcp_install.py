@@ -2212,9 +2212,9 @@ def test_dry_run_displays_launcher_and_argument_placeholders(
 def test_dry_run_hides_arguments_of_a_matching_legacy_entry(
     install_preview: Path,
 ) -> None:
-    write_exe(install_preview.parent / "sh", "")
+    launcher = write_exe(install_preview.parent / "sh", "")
     command = ["sh", "-c", "exec sai mcp serve"]
-    shown = ["sh", "<argument hidden 1 of 2>", "<argument hidden 2 of 2>"]
+    shown = [str(launcher), "<argument hidden 1 of 2>", "<argument hidden 2 of 2>"]
     config = install_preview.parent / ".mcp.json"
     config.write_text(json.dumps({"mcpServers": {OLD_COMMAND: claude_entry(command)}}))
 
@@ -2222,7 +2222,7 @@ def test_dry_run_hides_arguments_of_a_matching_legacy_entry(
 
     assert result.exit_code == 0, result.output
     report = payload(result)
-    assert report["command"] == shown
+    assert report["command"] == ["sh", *shown[1:]]
     claude = next(row for row in report["clients"] if row["client"] == "claude")
     assert claude["registeredCommand"] == shown
     [registration] = claude["registrations"]
@@ -2240,22 +2240,38 @@ def test_dry_run_hides_arguments_of_a_matching_legacy_entry(
 
 
 @pytest.mark.parametrize(
-    ("launcher", "name"),
+    ("launcher", "executable"),
     [
-        ("sai", "sai"),
-        ("/saved/bin/wrapper", "wrapper"),
-        ("MODE=fixture-saved", None),
-        ("-fixture-saved", None),
-        ("/saved/mode=fixture-saved/wrapper", None),
-        ("sh -c /saved/fixture-saved", None),
+        ("sai", True),
+        ("bin/wrapper", True),
+        ("slot=staging/wrapper", True),
+        ("opaque-fixture-saved", False),
+        ("MODE=fixture-saved", False),
+        ("-fixture-saved", False),
+        ("sh -c /saved/fixture-saved", False),
     ],
-    ids=["matching", "path", "assignment", "option", "path-assignment", "shell"],
+    ids=[
+        "matching",
+        "path",
+        "path-assignment",
+        "opaque",
+        "assignment",
+        "option",
+        "shell",
+    ],
 )
 def test_dry_run_lists_saved_commands_for_all_clients(
-    install_preview: Path, launcher: str, name: str | None
+    install_preview: Path, launcher: str, executable: bool
 ) -> None:
     root = install_preview.parent
     write_exe(root / "sai", "")
+    resolved = None
+    if executable:
+        path = root / launcher
+        path.parent.mkdir(exist_ok=True)
+        resolved = str(write_exe(path, ""))
+        if "/" in launcher:
+            launcher = resolved
     write_exe(root / "codex", FAKE_CODEX)
     (root / "codex-home").mkdir()
     (root / ".cursor").mkdir()
@@ -2276,9 +2292,9 @@ def test_dry_run_lists_saved_commands_for_all_clients(
     report = payload(result)
     assert report["command"] == ["sai", *args[:-1], "http://127.0.0.1:8765"]
     assert {row["client"] for row in report["clients"]} == {"claude", "codex", "cursor"}
-    hidden = len(args) + (name is None)
+    hidden = len(args) + (resolved is None)
     shown = [
-        *([name] if name is not None else []),
+        *([resolved] if resolved is not None else []),
         *(f"<argument hidden {i} of {hidden}>" for i in range(1, hidden + 1)),
     ]
     for row in report["clients"]:
