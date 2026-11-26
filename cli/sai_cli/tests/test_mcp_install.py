@@ -2149,6 +2149,38 @@ def test_install_accepts_resolvable_launcher_with_assignment_or_dash(
     assert (entry["command"], entry["args"]) == (launcher, args)
 
 
+@pytest.mark.parametrize("repair_existing", [False, True], ids=["install", "repair"])
+def test_claude_dry_run_masks_profile_in_repair_hint(
+    install_preview: Path, repair_existing: bool
+) -> None:
+    root = install_preview.parent
+    profile = str(root / "sai-home")
+    launcher = write_exe(root / "sai", "")
+    argv = [str(launcher), "mcp", "serve", "--endpoint", "http://127.0.0.1:8765"]
+    config = root / ".claude.json"
+    original = json.dumps(
+        {"mcpServers": {"sai": claude_entry(argv, {"SAI_HOME": profile})}}
+    )
+    config.write_text(original)
+    args = ["mcp", "install", "claude", "--dry-run"]
+    if repair_existing:
+        args.extend(["--repair-existing", "sai"])
+
+    result = invoke(*args)
+
+    assert "differs from the requested settings" in failure(result)
+    [row] = payload(result)["error"]["details"]["results"]
+    assert "--env=SAI_HOME=<original-SAI_HOME>" in row["fix"]
+    assert profile not in result.output
+
+    text = CliRunner().invoke(main, args)
+    assert text.exit_code == 1
+    assert "--env=SAI_HOME=<original-SAI_HOME>" in text.stderr
+    assert profile not in text.output
+    assert config.read_text() == original
+    assert not (root / "argv.log").exists()
+
+
 @pytest.mark.parametrize(
     ("launcher", "args", "reported_args"),
     [

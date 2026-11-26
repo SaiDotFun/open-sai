@@ -340,7 +340,12 @@ def claude_advice_home(
 
 
 def report_different_claude_entry(
-    client: Claude, result: Result, existing: Registration, target: Target
+    client: Claude,
+    result: Result,
+    existing: Registration,
+    target: Target,
+    *,
+    dry_run: bool,
 ) -> Result:
     launcher = target.argv[0]
     launcher_args: tuple[str, ...] = ()
@@ -359,11 +364,14 @@ def report_different_claude_entry(
             launcher = os.path.abspath(default_launcher or sys.argv[0])
     scope = existing.scope
     path = client.registration_path(scope)
+    sai_home = claude_advice_home(existing, target.env.get("SAI_HOME"))
+    if dry_run and sai_home is not None:
+        sai_home = CLAUDE_HOME_PLACEHOLDER
     entry = ClaudeRepair(
         scope,
         NAME,
         replace_entry=True,
-        sai_home=claude_advice_home(existing, target.env.get("SAI_HOME")),
+        sai_home=sai_home,
         config_path=path,
         fields=claude_differing_fields(existing, target),
         launcher=launcher,
@@ -1205,7 +1213,9 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
             result.action = "unchanged"
             return result
         if isinstance(client, Claude) and existing is not None:
-            return report_different_claude_entry(client, result, existing, target)
+            return report_different_claude_entry(
+                client, result, existing, target, dry_run=dry_run
+            )
         action = "added" if existing is None else "replaced"
         if isinstance(client, (Codex, Cursor)):
             result.path = str(client.config_path(scope))
@@ -1752,7 +1762,9 @@ def repair_claude_existing(
                     "Review MCP approvals and settings in the client."
                 )
             if not existing.matches(target):
-                return report_different_claude_entry(client, result, existing, target)
+                return report_different_claude_entry(
+                    client, result, existing, target, dry_run=dry_run
+                )
             result.action = "unchanged"
             return result
         if not existing.stdio:
