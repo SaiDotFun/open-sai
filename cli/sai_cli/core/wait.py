@@ -79,11 +79,28 @@ def for_intent(
     clock: Clock = Clock(),
 ) -> dict[str, Any]:
     """Run the CLI wait with the same polling logic as MCP."""
-    return asyncio.run(
-        for_intent_async(
-            endpoint, addr, key, timeout=timeout, started=started, clock=clock
+    confirmed: dict[str, Any] | None = None
+
+    def remember_fill(result: dict[str, Any]) -> None:
+        nonlocal confirmed
+        confirmed = result
+
+    try:
+        return asyncio.run(
+            for_intent_async(
+                endpoint,
+                addr,
+                key,
+                timeout=timeout,
+                started=started,
+                clock=clock,
+                remember_fill=remember_fill,
+            )
         )
-    )
+    except KeyboardInterrupt:
+        if confirmed is None:
+            raise
+        return confirmed
 
 
 def _recorded_outcome(endpoint: str, addr: str, key: str) -> Outcome | None:
@@ -112,6 +129,7 @@ async def for_intent_async(
     timeout: float,
     started: float | None = None,
     clock: Clock = Clock(),
+    remember_fill: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Poll the same intent within one deadline, including every network read."""
     validate_timeout(timeout)
@@ -204,6 +222,20 @@ async def for_intent_async(
                                 )
                             ):
                                 trade_id, block = opening
+                                # SIGINT cancels the CLI's asyncio runner. Keep
+                                # the receipt before the optional read can yield.
+                                if remember_fill is not None:
+                                    remember_fill(
+                                        _result(
+                                            key,
+                                            addr,
+                                            outcome,
+                                            row,
+                                            history,
+                                            request_tx_hash,
+                                            request_block,
+                                        )
+                                    )
                                 with suppress(keeper.KeeperError, TimeoutError):
                                     async with asyncio.timeout(left):
                                         position = await keeper.read_async(

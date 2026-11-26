@@ -6,6 +6,8 @@ import json
 import signal
 import sqlite3
 import subprocess
+import sys
+import threading
 import time
 from contextlib import closing
 from copy import deepcopy
@@ -22,6 +24,7 @@ from test_intent_status import (
     OTHER,
     RESPONSES,
     Reply,
+    Request,
     cli_environment,
     invoke,
     read_events,
@@ -280,6 +283,75 @@ def ledger_state(home: Path) -> list[tuple[str, str, str | None]]:
         return connection.execute(
             "SELECT id, status, keeper_status FROM intents ORDER BY id"
         ).fetchall()
+
+
+def assert_wait_keeps_interrupted_fill(
+    cli: CLI, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lookup_started = threading.Event()
+    release_lookup = threading.Event()
+
+    def hold_lookup(request: Request) -> Reply:
+        assert "lastUpdatedBlock { block }" in json.loads(request.body)["query"]
+        lookup_started.set()
+        release_lookup.wait(5)
+        return Reply(disconnect=True)
+
+    fill = indexed()
+    fill["trade"].update(
+        openPrice=81001.25, openCollateralAmount=3_950_000, collateralAmount=3_950_000
+    )
+    with replay() as (endpoint, replies, requests):
+        seed(home, endpoint, monkeypatch, "unknown")
+        replies.extend(
+            (
+                response(
+                    intent("filled", body={"orderType": "market", "leverage": "2"})
+                ),
+                response(history(fill)),
+                hold_lookup,
+            )
+        )
+        with subprocess.Popen(
+            [*cli, "--endpoint", endpoint, "--json", "intent", "wait", KEY],
+            env=cli_environment(home),
+            cwd=home.parent,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) as process:
+            try:
+                assert lookup_started.wait(5), "CLI did not start the fill lookup"
+                process.send_signal(signal.SIGINT)
+                stdout, stderr = process.communicate(timeout=1.5)
+            finally:
+                release_lookup.set()
+                if process.poll() is None:
+                    process.kill()
+            assert (process.returncode, stderr) == (0, b""), stdout
+
+        document = json.loads(stdout)
+        assert document["outcome"] == "filled"
+        assert document["intentKey"] == KEY
+        receipt = document["receipt"]
+        assert receipt["execution"]["block"] == FILL_BLOCK
+        assert receipt["execution"]["historyId"] == fill["id"]
+        assert receipt["fill"] == {
+            "price": None,
+            "sizeCollateralBaseUnits": None,
+            "oraclePrice": "81000.50",
+            "escrowedCollateralBaseUnits": 4_000_000,
+        }
+        assert ledger_state(home)[0] == (KEY, "terminal", "terminal")
+        assert len(requests) == 3
+        assert not replies
+
+
+def test_python_wait_keeps_interrupted_fill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert_wait_keeps_interrupted_fill(
+        (str(Path(sys.executable).with_name("sai")),), tmp_path / "sai", monkeypatch
+    )
 
 
 def test_wait_scrubs_a_stored_token_shaped_like_a_history_hash(
