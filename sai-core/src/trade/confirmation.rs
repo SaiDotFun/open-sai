@@ -13,7 +13,6 @@ use super::{
 use crate::{
     errors::{Code, SaiError},
     keeper::TIMEOUT,
-    settings::repr,
     storage::Session,
 };
 
@@ -57,10 +56,9 @@ impl<'a> Confirmation<'a> {
             invalid("Pass the confirmed market preview's referencePrice via --price")
         })?;
         if decimal_parts(price).is_none() {
-            return Err(SaiError::usage(format!(
-                "Invalid value for '--price': {} is not a valid decimal.",
-                repr(price)
-            )));
+            return Err(SaiError::usage(
+                "Invalid value for '--price': expected a decimal.",
+            ));
         }
         let units = reference_price_units(price, "Reference price")?;
         Ok(Self {

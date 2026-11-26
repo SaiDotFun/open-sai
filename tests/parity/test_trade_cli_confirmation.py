@@ -436,20 +436,35 @@ def test_confirmed_trade_rejects_changed_digest_before_reserving(
 
 
 @pytest.mark.parametrize(
-    ("price", "exit_code", "message"),
+    ("price", "exit_code", "messages"),
     [
-        ((), 1, "Pass the confirmed market preview's referencePrice via --price"),
-        (("--price", "0"), 1, "Reference price must be a positive finite decimal"),
+        (
+            (),
+            1,
+            ("Pass the confirmed market preview's referencePrice via --price",) * 2,
+        ),
+        (
+            ("--price", "0"),
+            1,
+            ("Reference price must be a positive finite decimal",) * 2,
+        ),
         (
             ("--price", "1e2"),
             2,
-            "Invalid value for '--price': '1e2' is not a valid decimal.",
+            (
+                "Invalid value for '--price': '1e2' is not a valid decimal.",
+                "Invalid value for '--price': expected a decimal.",
+            ),
         ),
     ],
     ids=["missing", "invalid", "malformed"],
 )
 def test_confirmed_market_requires_reference_before_keeper_reads(
-    pair: tuple[CLI, CLI], tmp_path: Path, price: CLI, exit_code: int, message: str
+    pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    price: CLI,
+    exit_code: int,
+    messages: tuple[str, str],
 ) -> None:
     for index, cli in enumerate(pair):
         with loopback("quote-market") as endpoints:
@@ -461,7 +476,7 @@ def test_confirmed_market_requires_reference_before_keeper_reads(
                 {
                     "error": {
                         "code": "INVALID_REQUEST",
-                        "message": message,
+                        "message": messages[index],
                         "retryable": False,
                     }
                 },
