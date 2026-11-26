@@ -119,6 +119,11 @@ def current_trade_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
             True,
         ),
         (("trade", "partial-close", "7", "--percent", "50"), "partial-preview", True),
+        (
+            ("trade", "partial-close", "7", "--percent", "50"),
+            "quote-close-collateral-changed",
+            True,
+        ),
     ],
     ids=[
         "market-explicit",
@@ -134,6 +139,7 @@ def current_trade_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
         "leverage",
         "margin",
         "partial-close",
+        "partial-close-collateral-changed",
     ],
 )
 def test_cli_dry_run_matches_python_main(
@@ -163,6 +169,28 @@ def test_cli_dry_run_matches_python_main(
             previews.append(OBSERVED_AT.sub(b'"observedAt": "<time>"', canonical))
             assert not endpoints.errors
             assert not rows(home)
+        if scenario == "quote-close-collateral-changed":
+            assert isinstance(digest, str)
+            with loopback("partial-preview-changed") as endpoints:
+                retry = tmp_path / f"retry-{index}"
+                seed_home(retry, endpoints, "session")
+                code, refusal, stderr = run(
+                    cli,
+                    retry,
+                    endpoints,
+                    (*args, "--preview-digest", digest),
+                    python=index == 0,
+                )
+                assert (code, stderr, refusal["error"]["code"]) == (
+                    4,
+                    "",
+                    "PREVIEW_MISMATCH",
+                ), (refusal, endpoints.errors)
+                assert not any(
+                    request.label == "recordUserIntent" for request in endpoints.wire
+                )
+                assert not endpoints.errors
+                assert not rows(retry)
     assert previews[0] == previews[1]
 
 

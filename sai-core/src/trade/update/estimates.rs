@@ -288,6 +288,7 @@ impl Trading<'_> {
                     Err(
                         SnapshotError::CollateralMismatch
                         | SnapshotError::IndexMismatch
+                        | SnapshotError::PositionChanged
                         | SnapshotError::Unavailable,
                     ) => unavailable(),
                 }
