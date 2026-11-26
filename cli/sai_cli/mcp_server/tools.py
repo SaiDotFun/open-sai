@@ -798,7 +798,4 @@ def partial_close(
         dry_run=dry_run,
         before_submit=check,
     )
-    quote = result.get("quote")
-    if dry_run and quote is not None and quote.get("effectiveLeverage") is None:
-        return {**result, "addr": load.account()}
     return finish(load, dry_run, result)
