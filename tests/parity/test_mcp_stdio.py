@@ -351,8 +351,8 @@ def test_invalid_request_frames(native: Path, tmp_path: Path, use_python: bool) 
         assert stdio.receive() == {"jsonrpc": "2.0", "id": 4, "result": {}}
 
 
-@pytest.mark.parametrize("market_id", ["  -3.00 ", "01_1", "+02", 3.0, True])
-def test_trade_integer_coercion(
+@pytest.mark.parametrize("market_id", ["003", "0", 3])
+def test_trade_accepts_nonnegative_integers_and_ascii_digit_strings(
     native: Path, tmp_path: Path, market_id: object
 ) -> None:
     with (
@@ -371,8 +371,16 @@ def test_trade_integer_coercion(
             preview_digest="fixture",
         )
         assert result["isError"] is False
-        assert json.loads(result["content"][0]["text"])["code"] == "NOT_IMPLEMENTED"
+        body = json.loads(result["content"][0]["text"])
+        assert body["code"] == "INVALID_REQUEST"
+        assert body["error"].startswith("reference_price is required")
         assert not endpoints.wire
+
+
+TRADE_INTEGER_ERROR = (
+    "Value error, Expected a nonnegative integer or a string of ASCII digits",
+    "value_error",
+)
 
 
 def validation_text(tool: str, *issues: tuple[str | None, str, str]) -> str:
@@ -391,23 +399,10 @@ def validation_text(tool: str, *issues: tuple[str | None, str, str]) -> str:
 
 
 @pytest.mark.parametrize(
-    ("market_id", "detail", "code"),
-    [
-        (
-            1.5,
-            "Input should be a valid integer, got a number with a fractional part",
-            "int_from_float",
-        ),
-        (
-            "3e0",
-            "Input should be a valid integer, unable to parse string as an integer",
-            "int_parsing",
-        ),
-        ([], "Input should be a valid integer", "int_type"),
-    ],
+    "market_id", [-3, " 3", "3e0", "01_1", "+02", "٣", 3.0, True, []]
 )
 def test_trade_integer_rejections(
-    native: Path, tmp_path: Path, market_id: object, detail: str, code: str
+    native: Path, tmp_path: Path, market_id: object
 ) -> None:
     with (
         loopback("normal") as endpoints,
@@ -428,7 +423,10 @@ def test_trade_integer_rejections(
         assert result["content"] == [
             {
                 "type": "text",
-                "text": validation_text("trade_open", ("market_id", detail, code)),
+                "text": validation_text(
+                    "trade_open",
+                    ("market_id", *TRADE_INTEGER_ERROR),
+                ),
             }
         ]
         assert "structuredContent" not in result
@@ -515,13 +513,7 @@ INVALID_ADDRESS = ("addr", "Input should be a valid string", "string_type")
         (
             "preview_close",
             {"trade_id": f"{REJECTED_MARKER}-" + "z" * 1024},
-            (
-                (
-                    "trade_id",
-                    "Input should be a valid integer, unable to parse string as an integer",
-                    "int_parsing",
-                ),
-            ),
+            (("trade_id", *TRADE_INTEGER_ERROR),),
         ),
     ],
     ids=[
