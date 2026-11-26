@@ -14,7 +14,6 @@ use serde_json::{Map, Value, json};
 use crate::{
     errors::{Code, SaiError},
     keeper::{MARKET, MARKETS, POSITION, ROUTE, TIMEOUT, truthy},
-    settings::repr,
 };
 
 use super::estimates::{PartialCloseQuote, now};
@@ -50,42 +49,14 @@ pub enum PositionMode<'a> {
 }
 
 pub fn parse_partial_close_percent(input: &str) -> Result<u8, SaiError> {
-    if !input.is_ascii() {
-        return Err(SaiError::usage(format!(
-            "Invalid value for '--percent': {} is not a valid integer.",
-            repr(input),
-        )));
-    }
-    let invalid = || {
-        SaiError::usage(format!(
-            "Invalid value for '--percent': {} is not a valid integer range.",
-            repr(input),
-        ))
-    };
-    let text = input.trim();
-    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
-    if digits.split('_').any(str::is_empty) {
-        return Err(invalid());
-    }
-    let digits = digits.replace('_', "");
-    if digits.len() > 4300 || !digits.bytes().all(|digit| digit.is_ascii_digit()) {
-        return Err(invalid());
-    }
-    let significant = digits.trim_start_matches('0');
-    let normalized = if significant.is_empty() {
-        "0"
-    } else {
-        significant
-    };
-    let negative = text.starts_with('-') && normalized != "0";
-    normalized
+    let percent = id(input, "--percent")?.to_string();
+    percent
         .parse::<u8>()
         .ok()
-        .filter(|percent| !negative && (1..=99).contains(percent))
+        .filter(|percent| (1..=99).contains(percent))
         .ok_or_else(|| {
-            let sign = if negative { "-" } else { "" };
             SaiError::usage(format!(
-                "Invalid value for '--percent': {sign}{normalized} is not in the range 1<=x<=99."
+                "Invalid value for '--percent': {percent} is not in the range 1<=x<=99."
             ))
         })
 }
@@ -802,7 +773,9 @@ mod percent_tests {
     use super::parse_partial_close_percent;
 
     #[test]
-    fn percentages_reject_non_ascii_digits() {
+    fn percentages_accept_plain_ascii_digits() {
+        assert_eq!(parse_partial_close_percent("0050").unwrap(), 50);
+        assert!(parse_partial_close_percent("5_0").is_err());
         assert!(parse_partial_close_percent("\u{0665}_\u{0660}").is_err());
         assert!(parse_partial_close_percent("\u{10d45}\u{10d40}").is_err());
     }
