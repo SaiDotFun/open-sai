@@ -7,6 +7,7 @@ secrets. The report carries names, paths, and a commit, never secret values.
 from __future__ import annotations
 
 import subprocess
+import sys
 import tomllib
 from importlib import metadata
 from pathlib import Path
@@ -82,4 +83,4 @@ def provenance(root: Path = SOURCE_ROOT) -> dict[str, Any]:
     """Report a source checkout with its git state, or an installed package."""
     if is_checkout(root):
         return {"kind": "source-checkout", "path": str(root), "git": git_state(root)}
-    return {"kind": "installed", "path": str(Path(__file__).resolve().parent)}
+    return {"kind": "installed", "path": str(Path(sys.prefix).resolve())}

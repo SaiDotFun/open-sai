@@ -55,6 +55,7 @@ transaction and fill details.
 | `doctor.result` | `sai_cli.doctor_command` | `info`, `warn` | `overall` (string), `fix` (boolean), `offline` (boolean), `checks` (object[]) | `code` (string) |
 | `intent.keeper` | `core.reconcile.reconcile` | `info` | `intentKey` (string), `addr` (string), `endpoint` (string) | `endpointId` (string), `kind` (string), `lifecycleStep` (string), `execActor` (string), `errorCode` (string), `txHash` (string), `txHashInvalid` (boolean), `found` (boolean), `code` (string) |
 | `intent.reserved` | `core.storage.pending` | `info` | `intentKey` (string), `kind` (string), `status` (string), `addr` (string), `endpoint` (string) | `tradeId` (string), `endpointId` (string) |
+| `intent.open_blocked` | `core.storage._check_open_pending` | `warn` | `intentKey` (string), `addr` (string), `endpoint` (string), `code` (string) | `endpointId` (string) |
 | `intent.status` | `core.storage._log_status` | `info` | `intentKey` (string), `kind` (string), `previous` (string), `status` (string), `addr` (string), `endpoint` (string) | `code` (string), `endpointId` (string) |
 | `intent.submitted` | `core.intents.submit` | `info` | `intentKey` (string), `kind` (string), `addr` (string), `endpoint` (string) | `txHash` (string), `txHashInvalid` (boolean), `endpointId` (string) |
 | `intent.status_write_failed` | `core.intents._record_submission_status` | `warn` | `intentKey` (string), `addr` (string), `endpoint` (string), `status` (string), `errorType` (string), `code` (string) | `endpointId` (string) |

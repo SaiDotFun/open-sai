@@ -544,7 +544,7 @@ signature = "f56030577aefb046dcae35899fac71e1e9b4b6c574846fd290114ef290eb453e"
 
 [gap."case:trade-partial-close-index-lag-before-minimum"]
 owner = "#211"
-signature = "993975abd95dd189c0c4d902e92a4085e7b428029a7a2017aaa7da783e252453"
+signature = "22c52a8a52e267104a590314b5af3e01ac062a94c26c5723dfaaea975be923a2"
 
 [gap."case:trade-partial-close-invalid-id"]
 owner = "#211"

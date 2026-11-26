@@ -543,8 +543,10 @@ that filled it. When history is available, `execution.historyId` identifies
 the matching row. `positionNow` shows Keeper's latest state for that trade,
 and `positionFeesUsd` gives cumulative fees. The fill can include an oracle
 quote and the escrowed collateral in base units from the matching market
-order. Actual fill price and size remain null when Keeper exposes only the
-current position.
+order. For a market opening, `fill.price` is the executed entry price and
+`fill.sizeCollateralBaseUnits` is the leveraged size after opening fees,
+rounded down to whole collateral base units. Each field is null when
+Keeper cannot tie its value to the fill.
 
 ### Doctor
 

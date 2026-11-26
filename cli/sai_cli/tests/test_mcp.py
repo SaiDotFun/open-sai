@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import select
+import shutil
 import signal
 import subprocess
 import sys
@@ -1819,6 +1820,54 @@ def test_stdio_client_lists_every_tool_from_sai_mcp_serve(tmp_path):
             "reason": "signed-in",
             "addr": ADDR,
         }
+
+
+def test_installed_provenance_reports_the_python_install_root(tmp_path):
+    site_packages = tmp_path / "site-packages"
+    package = Path(sai_info.__file__).resolve().parents[1]
+    shutil.copytree(
+        package,
+        site_packages / "sai_cli",
+        ignore=shutil.ignore_patterns("__pycache__", "tests", "skills"),
+    )
+    env = {
+        "HOME": str(tmp_path),
+        "USERPROFILE": str(tmp_path),
+        "PYTHONPATH": str(site_packages),
+        "SAI_HOME": str(tmp_path / "sai-home"),
+        "SAI_UPDATE_AUTO": "0",
+    }
+    command, *args = sai_command()
+    doctor = subprocess.run(
+        [command, *args, "--json", "doctor", "--offline", "--no-fix"],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        check=False,
+        timeout=15,
+    )
+
+    async def mcp_info() -> dict[str, Any]:
+        params = StdioServerParameters(
+            command=command, args=[*args, "mcp", "serve"], env=env, cwd=tmp_path
+        )
+        async with (
+            stdio_client(params) as (read, write),
+            ClientSession(read, write) as client,
+        ):
+            await client.initialize()
+            called = await client.call_tool("mcp_info", {})
+        return json.loads(text_of(called.content))
+
+    expected = {"kind": "installed", "path": str(Path(sys.prefix).resolve())}
+    info = asyncio.run(mcp_info())
+    assert info["provenance"] == expected
+    report = json.loads(doctor.stdout)
+    if "error" in report:
+        report = report["error"]["details"]
+    assert report["sai"]["install"] == expected
+    install = next(check for check in report["checks"] if check["id"] == "install")
+    assert install["details"]["provenance"] == expected
 
 
 def stdio_auth_use(
