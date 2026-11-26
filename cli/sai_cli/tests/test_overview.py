@@ -809,7 +809,26 @@ def test_testnet_overview_prices_usdc_without_a_keeper_oracle_quote(replay):
     assert "error" not in report["prices"]
 
 
-def test_overview_displays_only_known_keeper_labels(replay):
+@pytest.mark.parametrize(
+    ("symbol", "token_id", "market_id"),
+    [("HYPE", 44, 43), ("XAU", 77, 1018), ("ABC-1/USD", 99, 99)],
+)
+def test_overview_displays_keeper_market_symbols(replay, symbol, token_id, market_id):
+    long, _ = populate_trades(replay)
+    market = long["perpBorrowing"]
+    market.update(marketId=market_id, baseToken={"id": token_id, "symbol": symbol})
+    install_contract_trade(replay, long, mark=100, liquidation=50)
+
+    report = mcp(replay, addr=ADDR)
+    row = report["positions"]["data"]["items"][0]
+    assert row["market"] == symbol
+    assert row["marketId"] == market_id
+    result = cli(replay, "account", "overview", "--as", ADDR)
+    assert result.exit_code == 0, result.output
+    assert symbol in result.stdout
+
+
+def test_overview_uses_ids_for_invalid_keeper_labels(replay):
     long, _ = populate_trades(replay)
     market = long["perpBorrowing"]
     marker = "SyntheticFixtureLabel"

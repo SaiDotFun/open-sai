@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 import sqlite3
 import time
 from collections.abc import Callable, Mapping
@@ -43,20 +44,8 @@ COLLATERAL_SCALE = {"USDC": 1_000_000, "stNIBI": 1_000_000}
 # contracts/perp/src/constants.rs defines MAX_PNL_P as a fraction.
 MAX_GROSS_PNL = Decimal(9)
 USD_TOKEN_ID = 0
-# Built-in Keeper token labels. Other labels are displayed by numeric ID.
-TOKEN_LABELS = {
-    USD_TOKEN_ID: "uusd",
-    1: "USDC",
-    2: "stNIBI",
-    3: "BTC",
-    4: "ETH",
-    5: "ATOM",
-    17: "SOL",
-    18: "XRP",
-    19: "SUI",
-    20: "ENA",
-    21: "ARB",
-}
+MAX_SYMBOL_LENGTH = 20
+SYMBOL_PATTERN = re.compile(r"[A-Za-z0-9]+(?:[._/-][A-Za-z0-9]+)*")
 
 
 class AccountUnavailable(ValueError):
@@ -131,9 +120,10 @@ def _token_name(token: Mapping[str, Any]) -> str:
     return (_text(symbol) if symbol is not None else "") or _text(token["name"])
 
 
-def _display_label(token_id: int, label: str | None) -> str | None:
-    known = TOKEN_LABELS.get(token_id)
-    return known if known == label else None
+def _display_label(label: str | None) -> str | None:
+    if label and len(label) <= MAX_SYMBOL_LENGTH and SYMBOL_PATTERN.fullmatch(label):
+        return label
+    return None
 
 
 def _check_block(block: Any) -> None:
@@ -403,7 +393,7 @@ def _prices(endpoint: str) -> dict[int, dict[str, Any]]:
             prices[token_id] = {
                 "usd": price,
                 "block": block,
-                "token": _display_label(token_id, _token_name(token)),
+                "token": _display_label(_token_name(token)),
             }
     return prices
 
@@ -741,7 +731,7 @@ def _trade_row(
     collateral, quote = market["collateralToken"], market["quoteToken"]
     symbol = _optional_text(collateral["symbol"])
     collateral_id, quote_id = _uint(collateral["id"]), _uint(quote["id"])
-    base_id = _uint(market["baseToken"]["id"])
+    _uint(market["baseToken"]["id"])
     _check_block(trade["lastUpdatedBlock"])
     if not isinstance(trade["isLong"], bool):
         raise TypeError("Expected a boolean trade side")
@@ -763,17 +753,15 @@ def _trade_row(
     row = {
         "id": trade["id"],
         "marketId": _uint(market["marketId"]),
-        "market": _display_label(
-            base_id, _optional_text(market["baseToken"]["symbol"])
-        ),
+        "market": _display_label(_optional_text(market["baseToken"]["symbol"])),
         "side": "long" if trade["isLong"] else "short",
-        "collateralToken": _display_label(collateral_id, symbol),
+        "collateralToken": _display_label(symbol),
         "collateralTokenId": collateral_id,
         "collateralBaseUnits": trade["collateralAmount"],
         "collateralUsd": _usd(amount, conversion),
         "leverage": _number(float(leverage)),
         "sizeUsd": _usd(amount * leverage, conversion),
-        "quoteToken": _display_label(quote_id, _token_name(quote)),
+        "quoteToken": _display_label(_token_name(quote)),
         "quoteTokenId": quote_id,
         "takeProfitPriceUsd": _usd(tp, quote_usd),
         "stopLossPriceUsd": _usd(sl, quote_usd),
