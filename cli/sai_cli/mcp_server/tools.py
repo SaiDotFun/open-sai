@@ -154,12 +154,13 @@ def preview_mismatch(
 def describe(exc: Exception) -> dict[str, Any]:
     """Format the shared classification using the MCP response fields."""
     failure = describe_error(exc)
-    if failure.code == Code.OUTCOME_UNKNOWN:
+    if isinstance(exc, keeper.OutcomeUnknown):
         key = failure.intent_key
         return error(
             failure.message,
             failure.code,
             intentKey=key,
+            addr=exc.account,
             next=(
                 f"Call intent_status with key {key} to reconcile. Do not"
                 " resubmit until it reports a final outcome."
@@ -170,7 +171,9 @@ def describe(exc: Exception) -> dict[str, Any]:
             f"Earlier open intent {failure.intent_key} may still execute. Call"
             " intent_status with each key in intentKeys before retrying.",
             failure.code,
+            intentKey=failure.intent_key,
             intentKeys=exc.keys,
+            addr=exc.account,
         )
     if isinstance(exc, Refused):
         reason = estimates.rejection_reason((exc.preview or {}).get("estimates", {}))
@@ -198,15 +201,16 @@ def describe(exc: Exception) -> dict[str, Any]:
         )
     if failure.code == Code.PREVIEW_MISMATCH:
         return preview_mismatch(failure.message)
-    if isinstance(exc, storage.IntentReservationError):
+    if isinstance(exc, (storage.UnresolvedIntent, storage.IntentReservationError)):
         if key := failure.intent_key:
             return error(
                 failure.message,
                 failure.code,
                 intentKey=key,
+                addr=exc.account,
                 next=(
                     f"Call intent_status with key {key} and addr {exc.account}"
-                    " to check the local reservation."
+                    " to reconcile before resubmitting."
                 ),
             )
         return error(failure.message, failure.code)

@@ -387,15 +387,16 @@ class AdmissionRejected(KeeperError):
 class OutcomeUnknown(KeeperError):
     """The server may have accepted the request.
 
-    INTENT_KEY names the intent to reconcile, when one was reserved.
+    INTENT_KEY names the intent to reconcile for ACCOUNT.
     """
 
     code = Code.OUTCOME_UNKNOWN
 
     def __init__(
-        self, message: str, intent_key: str | None = None, *, hint: str | None = None
+        self, message: str, intent_key: str, *, account: str, hint: str | None = None
     ) -> None:
         super().__init__(message, intent_key=intent_key, hint=hint)
+        self.account = account
 
 
 class NotSent(KeeperError):

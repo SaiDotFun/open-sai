@@ -115,6 +115,7 @@ class Position:
     oracle_position_updates: deque[tuple[int, str] | None] = field(
         default_factory=deque
     )
+    lose_admission_ack: bool = False
     submitted: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -158,6 +159,9 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 assert self.headers["Authorization"] == f"Bearer {TOKEN}"
                 envelope = request["variables"]["input"]
                 position.submitted.append(envelope["intent"])
+                if position.lose_admission_ack:
+                    self.reply({"data": {"recordUserIntent": None}})
+                    return
                 data = {
                     "recordUserIntent": {
                         "intentKey": envelope["intentKey"],
@@ -549,6 +553,89 @@ async def call(
     block = result.content[0]
     assert isinstance(block, TextContent)
     return json.loads(block.text)
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        (
+            "open",
+            {
+                "market_id": 0,
+                "side": "long",
+                "order_type": "limit",
+                "amount": "5",
+                "leverage": "2",
+                "price": "100",
+                "slippage": "1",
+            },
+        ),
+        *MCP_POSITION_ACTIONS,
+        pytest.param("close", {"trade_id": 7, "cancel_order": True}, id="cancel"),
+        ("margin", {"trade_id": 7, "direction": "add", "amount": "1"}),
+        ("partial_close", {"trade_id": 7, "percent": 50}),
+    ],
+)
+@pytest.mark.parametrize("lose_ack", [False, True], ids=["blocked", "lost-ack"])
+def test_unresolved_trade_returns_ledger_key_and_account(
+    position_service: tuple[Position, str],
+    tool: str,
+    args: dict[str, Any],
+    lose_ack: bool,
+) -> None:
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.lose_admission_ack = lose_ack
+    if args.get("cancel_order"):
+        position.trade_type = "limit"
+    endpoint = f"{base_url}/query"
+    blocked_key = "20261126T200000000Z_0123456789ABCDEF"
+    recent_open = "20261126T200001000Z_0123456789ABCDEF"
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{tool}", args)
+            if not lose_ack:
+                storage.pending(blocked_key, endpoint, ADDR, "CLOSE_POSITION", "7")
+            refused = await call(
+                client,
+                f"trade_{tool}",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            local = await call(client, "intent_local", {"addr": ADDR})
+            [row] = local["intents"]
+            assert row["status"] == "unknown"
+            if not lose_ack:
+                assert row["intentKey"] == blocked_key
+            assert refused["code"] == (
+                "OUTCOME_UNKNOWN" if lose_ack else "INVALID_REQUEST"
+            )
+            assert (refused.get("intentKey"), refused.get("addr")) == (
+                row["intentKey"],
+                ADDR,
+            )
+            assert len(position.submitted) == int(lose_ack)
+            if tool == "open" and not lose_ack:
+                storage.set_status(blocked_key, endpoint, ADDR, "terminal")
+                storage.pending(recent_open, endpoint, ADDR, "OPEN_TRADE", "")
+                refused = await call(
+                    client,
+                    "trade_open",
+                    {**args, "preview_digest": preview["previewDigest"]},
+                )
+                assert refused["code"] == "RECENT_OPEN_PENDING"
+                assert (
+                    refused["intentKey"],
+                    refused["intentKeys"],
+                    refused["addr"],
+                ) == (
+                    recent_open,
+                    [recent_open],
+                    ADDR,
+                )
+                assert not position.submitted
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("command", CLI_POSITION_ACTIONS)

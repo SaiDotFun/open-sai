@@ -305,6 +305,7 @@ def submit(
         raise keeper.OutcomeUnknown(
             f"Outcome unknown for intent {key}; reconcile before another trade",
             key,
+            account=account,
             hint=storage.intent_status_hint(endpoint, account, key),
         ) from exc
     tx_hash, invalid_hash = keeper.request_hash(ack.get("txHash"))
@@ -323,6 +324,7 @@ def submit(
             f"Keeper accepted intent {key}, but the local ledger update failed;"
             " reconcile before another trade",
             key,
+            account=account,
             hint=storage.intent_status_hint(endpoint, account, key),
         ) from failure
     return {
