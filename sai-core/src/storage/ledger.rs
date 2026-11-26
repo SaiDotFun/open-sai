@@ -134,11 +134,14 @@ fn check_open_pending(
         .collect::<Result<_, _>>()?;
     if let Some(key) = keys.first() {
         let hint = storage.intent_status_hint(endpoint, account, key);
-        storage.emit(StorageEvent::OpenBlocked {
-            key,
-            addr: account,
-            endpoint: &endpoint_origin(endpoint),
-        });
+        let origin = endpoint_origin(endpoint);
+        for blocked_key in &keys {
+            storage.emit(StorageEvent::OpenBlocked {
+                key: blocked_key,
+                addr: account,
+                endpoint: &origin,
+            });
+        }
         return Err(StorageError::RecentOpenPending {
             key: key.clone(),
             hint,

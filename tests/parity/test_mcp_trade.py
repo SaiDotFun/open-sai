@@ -709,3 +709,65 @@ def test_mcp_open_confirmation_reserves_once_until_overridden(
             assert replay.attempts() == {key: 1, second: 1}
             assert len(rows(home)) == 2
             assert not endpoints.errors
+
+
+def test_mcp_open_refusal_appears_in_every_blocking_intent_trail(
+    cli_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> None:
+    _, (candidate,) = cli_pair
+    # The checkout's Python CLI logs blocked opens for every key.
+    reference = Path(sys.executable).with_name("sai")
+    for i, executable in enumerate((reference, Path(candidate))):
+        home = tmp_path / str(i)
+        replay = TradeReplay("OPEN_TRADE", "")
+        with (
+            loopback("quote-market", trade_replay=replay) as endpoints,
+            server(
+                executable,
+                home,
+                endpoints,
+                seed="session",
+                logs=True,
+                receive_timeout=15,
+            ) as stdio,
+        ):
+            preview = result(stdio.call(2, "preview_open", **OPEN))
+            confirmed = trade_args(preview, OPEN)
+            first = result(stdio.call(3, "trade_open", **confirmed))
+            second = result(
+                stdio.call(4, "trade_open", **confirmed, allow_concurrent_open=True)
+            )
+            assert first["status"] == second["status"] == "accepted"
+            keys = [second["intentKey"], first["intentKey"]]
+
+            blocked = result(stdio.call(5, "trade_open", **confirmed))
+            assert blocked["code"] == "RECENT_OPEN_PENDING"
+            assert blocked["intentKey"] == keys[0]
+            assert blocked["intentKeys"] == keys
+            assert blocked["addr"] == ADDRESS
+
+            call_ids = set()
+            for request_id, key in enumerate(keys, start=6):
+                trail = result(
+                    stdio.call(request_id, "logs_intent", key=key, offline=True)
+                )
+                refusals = [
+                    event
+                    for event in trail["events"]
+                    if event["event"] == "intent.open_blocked"
+                ]
+                assert len(refusals) == 1, (executable, key, refusals)
+                [refusal] = refusals
+                assert refusal["intentKey"] == key
+                assert refusal["code"] == blocked["code"]
+                call_id = refusal["callId"]
+                assert {"mcp.tool_call", "mcp.tool_result"} <= {
+                    event["event"]
+                    for event in trail["events"]
+                    if event.get("callId") == call_id
+                }
+                call_ids.add(call_id)
+            assert len(call_ids) == 1
+            assert replay.attempts() == {key: 1 for key in keys}
+            assert len(rows(home)) == 2
+            assert not endpoints.errors
