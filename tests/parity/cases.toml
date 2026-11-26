@@ -2220,7 +2220,7 @@ wire = [
     "get_exchange_balance", "is_after_hours_market", "get_collateral_price",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
-output = { "quote.closedNotionalIsEstimate" = true }
+output = { "quote.closedNotionalIsEstimate" = true, "previewDigest" = "<absent>" }
 
 [case.rust]
 wire = [

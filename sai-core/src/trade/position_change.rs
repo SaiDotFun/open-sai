@@ -140,10 +140,14 @@ impl Trading<'_> {
         let Some(rechecked) = rechecked else {
             let latest = async {
                 let mut latest = self.quote_for_position(&lcd, addr, &id, action, confirming).await?;
-                let checked = latest.recheck(&lcd, &id).await?.ok_or_else(|| {
-                    SaiError::new(Code::PreviewMismatch, "The position quote changed again during verification. Request a new preview.")
-                })?;
-                latest.estimate_execution(&lcd, &id, action, Some(&checked)).await?;
+                let checked = if latest.preview.collateral_price_unverified() {
+                    None
+                } else {
+                    Some(latest.recheck(&lcd, &id).await?.ok_or_else(|| {
+                        SaiError::new(Code::PreviewMismatch, "The position quote changed again during verification. Request a new preview.")
+                    })?)
+                };
+                latest.estimate_execution(&lcd, &id, action, checked.as_ref()).await?;
                 Ok(latest)
             }.await;
             return Err(position_changed(action, addr, latest, cli));
@@ -187,13 +191,17 @@ impl Trading<'_> {
         }
         let message = match self.quote_position(lcd, addr, trade_id, action).await {
             Ok(mut fresh) => {
-                let checked = fresh.recheck(lcd, trade_id).await.map_err(|error| {
-                    SaiError::new(Code::PreviewMismatch, format!("Could not verify the replacement position quote. {}", error.message))
-                })?.ok_or_else(|| SaiError::new(
-                    Code::PreviewMismatch,
-                    "The position quote changed again during verification. Request a new preview.",
-                ))?;
-                fresh.estimate_execution(lcd, trade_id, action, Some(&checked)).await?;
+                let checked = if fresh.preview.collateral_price_unverified() {
+                    None
+                } else {
+                    Some(fresh.recheck(lcd, trade_id).await.map_err(|error| {
+                        SaiError::new(Code::PreviewMismatch, format!("Could not verify the replacement position quote. {}", error.message))
+                    })?.ok_or_else(|| SaiError::new(
+                        Code::PreviewMismatch,
+                        "The position quote changed again during verification. Request a new preview.",
+                    ))?)
+                };
+                fresh.estimate_execution(lcd, trade_id, action, checked.as_ref()).await?;
                 return Err(replacement_preview(
                     "Keeper trading route and LCD network differed during confirmation. Review the replacement preview before submitting.",
                     &fresh.preview, addr,
@@ -702,6 +710,11 @@ fn position_changed(
 }
 
 fn replacement_preview(message: &str, preview: &TradePreview, addr: &str) -> SaiError {
+    let message = if preview.collateral_price_unverified() {
+        "Cannot verify the collateral price. Request a new preview when the price is available."
+    } else {
+        message
+    };
     SaiError {
         details: Some(Box::new(variables([(
             "preview",

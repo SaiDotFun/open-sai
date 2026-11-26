@@ -564,7 +564,7 @@ signature = "7e1ec85b7dea610dbf3e800d1f5cda38d559a5999043874b860e22092eba362a"
 
 [gap."case:trade-partial-close-no-oracle"]
 owner = "#211"
-signature = "c59a9e17f5f8d6653db629cf6b318aab590ae767830b65a4154ab0028dca1591"
+signature = "6d1f1fdd8a01211587ee71a9c696742adbcefb127187b8e255677c3b9235e5a4"
 
 [gap."case:trade-partial-close-refuse-stale-chain"]
 owner = "#174"

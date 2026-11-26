@@ -1961,11 +1961,13 @@ def test_partial_close_requires_fresh_confirmation_after_collateral_price_recove
             assert outage["quote"]["effectiveLeverage"] == "2"
             assert outage["quote"]["closedNotionalUsd"] is None
             assert outage["quote"]["closedNotionalIsEstimate"] is True
+            assert "previewDigest" not in outage
+            outage_digest = confirmation.preview_digest(outage)
             position.collateral_price = "1.00119"
             refused = await call(
                 client,
                 "trade_partial_close",
-                {**args, "preview_digest": outage["previewDigest"]},
+                {**args, "preview_digest": outage_digest},
             )
             assert refused.get("code") == "PREVIEW_MISMATCH", refused
             assert position.submitted == []
@@ -1973,7 +1975,7 @@ def test_partial_close_requires_fresh_confirmation_after_collateral_price_recove
             assert fresh["quote"]["closedNotionalUsd"] == "4.00476"
             assert fresh["quote"]["closedNotionalIsEstimate"] is False
             assert fresh["intent"] == outage["intent"]
-            assert fresh["previewDigest"] != outage["previewDigest"]
+            assert fresh["previewDigest"] != outage_digest
             accepted = await call(
                 client,
                 "trade_partial_close",

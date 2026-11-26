@@ -394,6 +394,52 @@ def test_mcp_partial_close_withholds_digest_when_leverage_is_unknown(
     assert previews[0] == previews[1]
 
 
+@pytest.mark.parametrize("outage", [False, True], ids=["verified", "oracle-outage"])
+def test_mcp_partial_close_replacement_requires_verified_collateral_price(
+    mcp_pair: tuple[Path, Path], tmp_path: Path, outage: bool
+) -> None:
+    python = Path(sys.executable).with_name("sai")
+    scenario = "partial-price-rebuild-outage" if outage else "partial-price-rebuild"
+    args = {**POSITION, "percent": 50}
+    for index, cli in enumerate((python, mcp_pair[1])):
+        home = tmp_path / str(index)
+        replay = TradeReplay("DECREASE_POSITION_SIZE", "7")
+        with (
+            loopback(scenario, trade_replay=replay) as endpoints,
+            server(cli, home, endpoints, seed="session", receive_timeout=15) as stdio,
+        ):
+            preview = result(stdio.call(2, "preview_partial_close", **args))
+            confirmed = trade_args(preview, args)
+            refused = result(stdio.call(3, "trade_partial_close", **confirmed))
+            assert refused.get("code") == "PREVIEW_MISMATCH", [
+                request.label for request in endpoints.wire
+            ]
+            assert not replay.attempts()
+            assert not rows(home)
+
+            replacement = refused["preview"]
+            assert replacement["intent"] == preview["intent"]
+            assert replacement["quote"]["closedNotionalIsEstimate"] is outage
+            if outage:
+                assert refused["quoteStatus"] == "unavailable"
+                assert refused["recovery"]["action"] == "request_preview"
+                assert "previewDigest" not in replacement
+                assert replacement["quote"]["collateralPriceUsd"] is None
+                assert replacement["quote"]["closedNotionalUsd"] is None
+                replacement = result(stdio.call(4, "preview_partial_close", **args))
+            else:
+                assert refused["quoteStatus"] == "available"
+                assert refused["recovery"]["action"] == "confirm_preview"
+            accepted = result(
+                stdio.call(5, "trade_partial_close", **trade_args(replacement, args))
+            )
+            key = accepted["intentKey"]
+            assert replay.attempts() == {key: 1}
+            [row] = rows(home)
+            assert (row[0], row[2]) == (key, "accepted")
+            assert not endpoints.errors
+
+
 def test_mcp_open_binds_the_selected_account(
     mcp_pair: tuple[Path, Path], tmp_path: Path
 ) -> None:

@@ -1022,7 +1022,10 @@ def test_confirmed_partial_close_binds_collateral_price_availability(
                 cli, home, endpoints, (*args, "--dry-run"), python=index == 0
             )
             assert code == 0, preview
-            digest = preview["previewDigest"]
+            digest = preview_digest(preview)
+            assert preview.get("previewDigest") == (
+                None if scenario == "partial-price-recovers" else digest
+            )
             code, fresh, _ = run(
                 cli, home, endpoints, (*args, "--dry-run"), python=index == 0
             )

@@ -63,6 +63,8 @@ POSITION_SCENARIOS = {
     "partial-preview-changed",
     "partial-price-changed",
     "partial-price-recovers",
+    "partial-price-rebuild",
+    "partial-price-rebuild-outage",
     "margin-accepted",
     "margin-interrupted",
     "margin-rejected",
@@ -682,6 +684,8 @@ def loopback(
         "partial-preview",
         "partial-price-changed",
         "partial-price-recovers",
+        "partial-price-rebuild",
+        "partial-price-rebuild-outage",
     }:
         contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
         contracts["market_order_config"]["fill_at_next_oracle_price"] = True
@@ -1593,7 +1597,20 @@ def loopback(
             ):
                 self.reply({}, 503)
                 return
+            if (
+                scenario == "partial-price-rebuild-outage"
+                and name == "get_collateral_price"
+                and sum(item.label == name for item in wire) == 4
+            ):
+                self.reply({}, 503)
+                return
             data = contract_data(name, pinned=pinned)
+            if (
+                scenario in {"partial-price-rebuild", "partial-price-rebuild-outage"}
+                and name == "get_perp_prices"
+                and sum(item.label == name for item in wire) == 1
+            ):
+                data = {**data, "collateral": None}
             if name == "get_exchange_balance" and (
                 scenario == "position-execution-unfunded"
                 or (scenario == "position-execution-pinned-unfunded" and pinned)

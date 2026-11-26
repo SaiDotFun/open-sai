@@ -14,7 +14,7 @@ from typing import Any
 
 from . import intents, keeper, margin, partial
 from . import preview as estimates
-from .confirmation import digest_material
+from .confirmation import collateral_price_unverified, digest_material
 from .errors import Code, SaiError
 
 SessionLoader = Callable[[], dict[str, str]]
@@ -562,7 +562,10 @@ def _position_preview(
 ) -> dict[str, Any]:
     def verify_replacement(
         state: margin.PositionSnapshot, inputs: dict[str, Any]
-    ) -> margin.RecheckedPosition:
+    ) -> margin.RecheckedPosition | None:
+        if collateral_price_unverified(inputs):
+            # Return the estimate without a confirmation. This branch never submits.
+            return None
         try:
             checked = margin.recheck_position(lcd_endpoint, state, trade_id, inputs)
         except estimates.READ_ERRORS as exc:
