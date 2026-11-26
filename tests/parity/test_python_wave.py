@@ -764,7 +764,9 @@ def test_saved_mcp_registrations_hide_non_path_launchers_and_arguments(
         )
         assert result.returncode == 0
         assert "synthetic-private" not in result.stdout + result.stderr
-        for row in json.loads(result.stdout)["clients"]:
+        clients = json.loads(result.stdout)["clients"]
+        assert {row["client"] for row in clients} == {"claude", "codex", "cursor"}
+        for row in clients:
             displayed = (
                 expected
                 if row["client"] == client
@@ -775,8 +777,9 @@ def test_saved_mcp_registrations_hide_non_path_launchers_and_arguments(
                 ]
             )
             assert row["registeredCommand"] == displayed
-            [registration] = row["registrations"]
-            assert registration["command"] == displayed
+            assert row["registrations"]
+            for registration in row["registrations"]:
+                assert registration["command"] == displayed
         assert path.read_bytes() == original
 
 
