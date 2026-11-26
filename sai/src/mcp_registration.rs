@@ -141,12 +141,7 @@ impl Target {
             return self.argv.clone();
         }
         let (launcher, args) = self.argv.split_first().expect("target has a launcher");
-        std::iter::once(launcher.clone())
-            .chain(
-                (1..=args.len())
-                    .map(|index| format!("<argument hidden {index} of {}>", args.len())),
-            )
-            .collect()
+        reported_command(Some(launcher), args.len())
     }
 
     fn repair(&self, args: Vec<String>, normalized: bool) -> Self {
@@ -161,6 +156,22 @@ impl Target {
             source: TargetSource::Saved,
         }
     }
+}
+
+fn reported_command(launcher: Option<&str>, hidden: usize) -> Vec<String> {
+    launcher
+        .into_iter()
+        .map(str::to_owned)
+        .chain((1..=hidden).map(|index| format!("<argument hidden {index} of {hidden}>")))
+        .collect()
+}
+
+fn plain_launcher(command: &str) -> bool {
+    !command.is_empty()
+        && !command.starts_with('-')
+        && !command.contains('=')
+        && !command.contains("://")
+        && !command.chars().any(char::is_control)
 }
 
 struct Registration {
@@ -235,11 +246,15 @@ impl Registration {
     }
 
     fn report(&self, target: Option<&Target>) -> Value {
-        let mut out = if let Some(target) = target.filter(|target| self.matches_command(target)) {
-            json!({"command": target.reported_argv()})
-        } else if let Some(command) = self.argv.first() {
-            let mut out = json!({"command": [basename(command)]});
-            if self.argv.len() > 1 {
+        let mut out = if let Some((command, args)) = self.argv.split_first() {
+            let matched = target.filter(|target| self.matches_command(target));
+            let name = matched.map_or_else(|| basename(command), |target| target.argv[0].as_str());
+            let launcher =
+                (plain_launcher(command) && plain_launcher(name) && which(command).is_some())
+                    .then_some(name);
+            let hidden = args.len() + usize::from(launcher.is_none());
+            let mut out = json!({"command": reported_command(launcher, hidden)});
+            if matched.is_none() && !args.is_empty() {
                 out["args"] = json!("<hidden>");
             }
             out

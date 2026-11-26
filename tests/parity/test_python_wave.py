@@ -712,6 +712,105 @@ def test_mcp_install_reports_only_generated_serve_arguments(
         assert report["argv"][0][-3:] == [launcher, "mcp", "serve"]
 
 
+@pytest.mark.parametrize("client", ["claude", "codex", "cursor"])
+@pytest.mark.parametrize("launcher_style", ["assignment", "unresolved", "plain-path"])
+def test_saved_mcp_registrations_hide_non_path_launchers_and_arguments(
+    wave_clis: tuple[str, str], tmp_path: Path, client: str, launcher_style: str
+) -> None:
+    _, rust = wave_clis
+    overrides = {"PATH": os.defpath}
+    seed_clients(tmp_path, overrides, "current")
+    launcher = str(tmp_path / "bin/sai")
+    saved_launchers = {
+        "assignment": "OPENAI_API_KEY=synthetic-private-launcher",
+        "unresolved": "synthetic-private-bare-token",
+        "plain-path": launcher,
+    }
+    command = saved_launchers[launcher_style]
+    args = ["--env", "APP_SETTING=synthetic-private-operand"]
+    path = (
+        tmp_path
+        / {
+            "claude": ".claude.json",
+            "codex": ".codex/config.toml",
+            "cursor": ".cursor/mcp.json",
+        }[client]
+    )
+    if client == "codex":
+        source = path.read_text().replace(
+            f"command = {json.dumps(launcher)}", f"command = {json.dumps(command)}"
+        )
+        path.write_text(
+            source.replace('args = ["mcp", "serve"]', f"args = {json.dumps(args)}")
+        )
+    else:
+        config = json.loads(path.read_text())
+        config["mcpServers"]["sai"].update(command=command, args=args)
+        path.write_text(json.dumps(config))
+    original = path.read_bytes()
+
+    visible = launcher_style == "plain-path"
+    hidden = len(args) + (not visible)
+    expected = [
+        *(["sai"] if visible else []),
+        *(f"<argument hidden {i} of {hidden}>" for i in range(1, hidden + 1)),
+    ]
+    for invocation in (
+        ("list",),
+        ("install", "--dry-run", "--", launcher, "mcp", "serve"),
+    ):
+        result = run_cli(
+            rust, tmp_path, "--json", "mcp", *invocation, overrides=overrides
+        )
+        assert result.returncode == 0
+        assert "synthetic-private" not in result.stdout + result.stderr
+        for row in json.loads(result.stdout)["clients"]:
+            displayed = (
+                expected
+                if row["client"] == client
+                else [
+                    launcher,
+                    "<argument hidden 1 of 2>",
+                    "<argument hidden 2 of 2>",
+                ]
+            )
+            assert row["registeredCommand"] == displayed
+            [registration] = row["registrations"]
+            assert registration["command"] == displayed
+        assert path.read_bytes() == original
+
+
+def test_mcp_install_legacy_report_hides_saved_launcher_starting_with_dash(
+    wave_clis: tuple[str, str], tmp_path: Path
+) -> None:
+    _, rust = wave_clis
+    overrides = {"PATH": os.defpath}
+    seed_clients(tmp_path, overrides, "legacy-retired")
+    path = tmp_path / ".cursor/mcp.json"
+    config = json.loads(path.read_text())
+    config["mcpServers"]["sai" + "-mcp"].update(
+        command="-synthetic-private-launcher",
+        args=["APP_SETTING=synthetic-private-operand"],
+    )
+    path.write_text(json.dumps(config))
+    original = path.read_bytes()
+    result = run_cli(
+        rust,
+        tmp_path,
+        "--json",
+        "mcp",
+        "install",
+        "cursor",
+        "--dry-run",
+        overrides=overrides,
+    )
+    assert result.returncode == 1
+    assert "synthetic-private" not in result.stdout + result.stderr
+    [row] = json.loads(result.stdout)["error"]["details"]["results"]
+    assert row["command"] == ["<argument hidden 1 of 2>", "<argument hidden 2 of 2>"]
+    assert path.read_bytes() == original
+
+
 @pytest.mark.parametrize("kind", ["cwd", "remote"])
 def test_mcp_install_reports_claude_extra_fields(
     wave_clis: tuple[str, str], tmp_path: Path, kind: str

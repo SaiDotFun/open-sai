@@ -328,6 +328,10 @@ signature = "891eeb4559dd23e926a278cdd41a7b5e3b97a28a0798417a5d0770c1a9037369"
 owner = "#211"
 signature = "24bcabada920294bd40525e9dab1a25174929f71ceecf4ae73b448f696ca0017"
 
+[gap."case:mcp-install-legacy"]
+owner = "#215"
+signature = "6c1fe479dc447eafadaf36c1c82268c0bdd5102674edfa349be40e68dcf6f8f3"
+
 [gap."case:mcp-install-missing-scope"]
 owner = "#211"
 signature = "72813cb0759d60f8662b6c203b97583483a017891fc981c01a12243aec443d4c"
@@ -347,6 +351,10 @@ signature = "2337427d7dc1eaeaebd3ea46eb65ba12ee58533478529a6606aa7cba2a4b49bc"
 [gap."case:mcp-keeper-errors"]
 owner = "#175"
 signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
+
+[gap."case:mcp-list-redacted"]
+owner = "#215"
+signature = "9e52f8b34f70748eb6884d3710e58ba8448171fa74386c7e5161892d13a93bb8"
 
 [gap."case:mcp-logs-intent-validation"]
 owner = "#175"
@@ -376,29 +384,53 @@ signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
 owner = "#175"
 signature = "f477c014f28400affe6914cc2dbc47ad2c6dbb06c2b9368080f4303557f722cd"
 
+[gap."case:mcp-uninstall-all"]
+owner = "#215"
+signature = "9f2bf85d6d4761b00ba7260bef092ccce3505273095caf31195d9a4b1ceb3b2b"
+
+[gap."case:mcp-uninstall-codex-crlf"]
+owner = "#215"
+signature = "7e897111c16a90327b129fefe5c0c730044904e8a7abe9390c14393ea2ef3ea5"
+
 [gap."case:mcp-uninstall-codex-project"]
 owner = "#211"
-signature = "e5505d1ad45136d3e91357133d0331b35e4db8fc2271c7ec2fe69b9b195e7585"
+signature = "035be426d513cdf35fc768ccd31f387cd1a89856a35b3d4d217c684645eef78d"
 
 [gap."case:mcp-uninstall-codex-query-failure"]
 owner = "#211"
-signature = "5354ab42bc6836436853ba39c177cbf649578a6bd9403d0ded9ded77203a4e1f"
+signature = "a340353825916830bad4e1195051a7b0b92558d99292009c73d03ecad9899ddd"
 
 [gap."case:mcp-uninstall-codex-read-only"]
 owner = "#211"
-signature = "11e9078c1963b94d852ff3c20cc24c762d5a9d8fae46e94996523dbebde4b791"
+signature = "5badeea48fc7033b4697de6db7bbbdb40cc7213ef61ca06da952a405313b1d8b"
 
 [gap."case:mcp-uninstall-codex-user-shadowed"]
 owner = "#211"
-signature = "86b43cfa4dc2cd99ef45fce9323973b3354d92bbb6a1d0e3e0e8c47a3d06ada1"
+signature = "e085b25316198ae96570d320529335cac9d88e3a85f53f71d2c822e4459f9bf8"
 
 [gap."case:mcp-uninstall-cursor-read-only"]
 owner = "#211"
-signature = "5104e997fdb9483f6ca79bc19f764f713707c0b56488a17734e87cee8b6938a3"
+signature = "635a12dabc79f13efbb45bae9c195e441667d2e4fc0473b1c6e94736848e7c3a"
+
+[gap."case:mcp-uninstall-dry-run"]
+owner = "#215"
+signature = "afc764348227695ce87efe4a1e27fefa42ba4e615fefeedbf1f3cff52c018728"
+
+[gap."case:mcp-uninstall-legacy"]
+owner = "#215"
+signature = "9f2bf85d6d4761b00ba7260bef092ccce3505273095caf31195d9a4b1ceb3b2b"
+
+[gap."case:mcp-uninstall-local"]
+owner = "#215"
+signature = "7e897111c16a90327b129fefe5c0c730044904e8a7abe9390c14393ea2ef3ea5"
 
 [gap."case:mcp-uninstall-no-client"]
 owner = "#211"
 signature = "9573b5ca000cde07a5e9b428ebaabd3f36972e72b7cb1f51223629a2b83ac637"
+
+[gap."case:mcp-uninstall-project"]
+owner = "#215"
+signature = "7e897111c16a90327b129fefe5c0c730044904e8a7abe9390c14393ea2ef3ea5"
 
 [gap."case:skill-flag"]
 owner = "#211"
