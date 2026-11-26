@@ -789,6 +789,26 @@ def test_overview_validates_keeper_fields_and_cleans_display_text(replay):
         )
 
 
+def test_testnet_overview_prices_usdc_without_a_keeper_oracle_quote(replay):
+    long, short = populate_trades(replay)
+    chain = "nibiru-testnet-2"
+    replay["lcdChain"] = chain
+    replay["http"][keeper.ROUTE]["data"]["oneClickTrading"]["chainId"] = chain
+    replay["http"][keeper.PRICES]["data"]["oracle"]["tokenPricesUsd"] = []
+    long["perpBorrowing"]["baseToken"]["id"] = 4
+    for trade, mark, liquidation in ((long, 100, 50), (short, 10, 15)):
+        trade["perpBorrowing"]["collateralToken"] = {"id": 3, "symbol": "USDC"}
+        install_contract_trade(replay, trade, mark=mark, liquidation=liquidation)
+
+    report = mcp(replay, addr=ADDR)
+    positions = report["positions"]["data"]
+    assert positions["unrealizedPnlUsd"] == 7
+    assert [row["collateralUsd"] for row in positions["items"]] == [12, 10]
+    assert [row["collateralUsd"] for row in report["pendingOrders"]["data"]] == [12, 10]
+    assert report["prices"]["data"] == []
+    assert "error" not in report["prices"]
+
+
 def test_overview_displays_only_known_keeper_labels(replay):
     long, _ = populate_trades(replay)
     market = long["perpBorrowing"]

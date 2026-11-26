@@ -1008,9 +1008,12 @@ def _trade_sections(
             "unrealizedPnlBasis": "grossBeforeFees",
         }
     if prices["fetchedAt"] is not None:
+        trades_by_id = {trade["id"]: trade for trade in trades}
         used_ids = set()
         for row in [*items, *orders.get("data", [])]:
-            if row["collateralToken"] != "USDC" and "collateralPriceSource" not in row:
+            trade = trades_by_id[row["id"]]
+            collateral = trade["perpBorrowing"]["collateralToken"]
+            if collateral["symbol"] != "USDC" and "collateralPriceSource" not in row:
                 used_ids.add(row["collateralTokenId"])
             if (
                 row["quoteTokenId"] != USD_TOKEN_ID
