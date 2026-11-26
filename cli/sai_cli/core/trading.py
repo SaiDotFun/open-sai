@@ -496,6 +496,8 @@ def _position_intent(
     if verified is not None:
         preview["positionRoute"] = verified.route
 
+    bind_collateral = target is not None and (dry_run or before_submit is not None)
+
     def estimate(quoted_preview: dict[str, Any]) -> dict[str, Any]:
         values = _estimate_position(
             endpoint,
@@ -507,11 +509,11 @@ def _position_intent(
             target,
             updates_triggers,
             show_collateral=show_collateral and dry_run,
-            bind_collateral=show_collateral and (dry_run or before_submit is not None),
+            bind_collateral=bind_collateral,
         )
         if collateral := values.pop("collateralBaseUnits", None):
             quoted_preview["collateralBaseUnits"] = collateral
-        elif show_collateral and not dry_run and before_submit is not None:
+        elif bind_collateral and not dry_run:
             # A definitive rejection may arrive before Perp can quote collateral.
             _reject_execution(quoted_preview, values, addr)
         return values
