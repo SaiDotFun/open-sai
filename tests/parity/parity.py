@@ -606,6 +606,16 @@ def observe(
     for mismatch in state_differences(state, files):
         check_failed(mismatch)
     display = result.stdout
+    if case.accepted_divergence == "overview-lcd-risk-error" and not candidate:
+        # The pinned Python CLI records the failed LCD reads on each row.
+        # Rust also reports the failure on the positions section.
+        reference_overview = json.loads(display)
+        reference_overview["positions"]["error"] = {
+            "code": "INCOMPLETE_DATA",
+            "message": "LCD position read failed. Position risk is partial.",
+            "retryable": False,
+        }
+        display = json.dumps(reference_overview) + "\n"
     if case.command == "account overview" and case.mode == "text":
         display = mask_overview_stdout(display, case.mode)
     if case.command == "doctor" and case.exact_output and case.mode == "text":

@@ -39,6 +39,13 @@ jobs:
             4bd968eb956c154f0a0ab53ccc288ceb78dd8713
       - name: Build the release fixture artifacts
         run: uv run --locked python scripts/build-installer-fixtures.py "$RUNNER_TEMP/sai-installer"
+      - name: Download the published Python bridge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release download sai-cli/v0.1.3 --repo SaiDotFun/open-sai
+          --pattern sai_cli-0.1.3-py3-none-any.whl
+          --dir "$RUNNER_TEMP/sai-installer/published"
       - name: Run the installer, recovery, and rollback replays
         env:
           SAI_C10B_REQUIRED: "1"
@@ -46,6 +53,7 @@ jobs:
           SAI_C10B_RECOVERY_RUST: ${{ runner.temp }}/sai-installer/sai
           SAI_C10B_MUTANT: ${{ runner.temp }}/sai-installer/sai-mutant
           SAI_C10B_BRIDGE: ${{ runner.temp }}/sai-installer/bridge
+          SAI_C10B_PUBLISHED_BRIDGE: ${{ runner.temp }}/sai-installer/published/sai_cli-0.1.3-py3-none-any.whl
           SAI_C10B_SHIM: ${{ runner.temp }}/sai-installer/shim
           SAI_C10B_PRE_BRIDGE: ${{ runner.temp }}/sai-installer/pre-bridge
         run: uv run --locked pytest -q tests/parity/test_installer_bridge.py -k 'not windows'
