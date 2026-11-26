@@ -566,7 +566,7 @@ impl PositionQuote {
                     match leverage_execution_estimates(lcd, &state, id, height, target, effective)
                         .await
                     {
-                        Ok(estimates) => estimates,
+                        Ok((estimates, _)) => estimates,
                         Err(_) if rechecked.is_none() => super::update::unknown_execution_inputs(),
                         Err(_) => return Err(position_mismatch()),
                     }
