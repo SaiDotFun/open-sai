@@ -34,6 +34,7 @@ pty = pytest.importorskip("pty")
 
 REPO = "/SaiDotFun/open-sai"
 NEW = "9999.0.0"
+RETIRED = "sai" + "-mcp"
 PLATFORM = {
     ("Linux", "x86_64"): "x86_64-unknown-linux-gnu",
     ("Linux", "aarch64"): "aarch64-unknown-linux-gnu",
@@ -950,6 +951,86 @@ def cached_shim_release(
         **wheel_assets,
         **native_assets,
     }
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+@pytest.mark.parametrize("owner", ["standalone", "uv"])
+def test_doctor_repairs_cursor_through_its_managed_launcher(
+    standalone: NativeInstall, tmp_path: Path, owner: str
+) -> None:
+    install = uv_install(standalone, tmp_path)[0] if owner == "uv" else standalone
+    config = tmp_path / ".cursor" / "mcp.json"
+    config.parent.mkdir()
+    data = {
+        "mcpServers": {
+            "sai": {
+                "command": RETIRED,
+                "args": [],
+                "env": {"SAI_HOME": str(install.home)},
+            },
+            "other": {"url": "http://127.0.0.1:8765/mcp"},
+        }
+    }
+    config.write_text(json.dumps(data), encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+
+    result = install.invoke(
+        "--json", "doctor", "--offline", cwd=project, PATH=os.defpath
+    )
+
+    out = json.loads(result.stdout)
+    checks = out.get("error", {}).get("details", out)["checks"]
+    [report] = [row for row in checks if row["id"] == "mcp.cursor"]
+    assert report["status"] == "fixed", report
+    data["mcpServers"]["sai"].update(
+        command=str(install.launcher), args=["mcp", "serve"]
+    )
+    assert json.loads(config.read_text(encoding="utf-8")) == data
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+@pytest.mark.parametrize("from_home", [False, True])
+def test_uv_downgrade_repairs_the_stale_cursor_alias(
+    standalone: NativeInstall, tmp_path: Path, from_home: bool
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    old = "0.0.1"
+    replacement = wheel(tmp_path, old)
+    config = tmp_path / ".cursor" / "mcp.json"
+    config.parent.mkdir()
+    current = {"command": str(install.launcher), "args": ["mcp", "serve"]}
+    alias = {
+        "command": RETIRED,
+        "args": [],
+        "env": {"SAI_HOME": str(install.home)},
+        "disabled": True,
+    }
+    data = {"mcpServers": {"sai": current, RETIRED: alias}}
+    config.write_text(json.dumps(data), encoding="utf-8")
+    cwd = tmp_path
+    if not from_home:
+        cwd = tmp_path / "project"
+        cwd.mkdir()
+    local_assets = {
+        **assets(install.installed, initial.name, initial.read_bytes()),
+        **assets(old, replacement.name, replacement.read_bytes()),
+    }
+
+    with releases(local_assets) as server:
+        result = install.invoke("--json", "update", *server.args, "--to", old, cwd=cwd)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    out = json.loads(result.stdout)
+    assert out["installed"] == old
+    alias.update(current)
+    assert json.loads(config.read_text(encoding="utf-8")) == data
+    [report] = out["mcp"]
+    assert report["client"] == "cursor"
+    assert report["status"] == "warn"
+    assert report["legacyName"] == RETIRED
+    assert report["changes"] == ["Repaired the Sai registration in user scope"]
+    assert install.state()["result"]["mcp"] == out["mcp"]
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")

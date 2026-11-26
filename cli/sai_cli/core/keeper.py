@@ -69,6 +69,14 @@ INTENT_HISTORY = """query($trader:String!, $limit:Int!, $offset:Int!) {
     }
   }
 }"""
+FILL_POSITION = """query($trader:String!, $id:Int!) {
+  perp {
+    trade(trader:$trader,id:$id) {
+      id trader isOpen tradeType collateralAmount leverage openPrice
+      openBlock { block } lastUpdatedBlock { block }
+    }
+  }
+}"""
 INTENTS = """query($user:String!, $key:String) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }"""
 WAIT_INTENTS = """query($user:String!, $key:String, $includeAction:Boolean! = false) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind body @include(if:$includeAction) lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }"""
 CHALLENGE = """mutation($address:String!) { createUserIntentAuthChallenge(evmAddress:$address) { nonce evmAddress expiresAt chainId typedData } }"""
@@ -356,6 +364,7 @@ OPERATIONS = {
     ROUTE: "route",
     HISTORY: "history",
     INTENT_HISTORY: "history",
+    FILL_POSITION: "position",
     INTENTS: "intents",
     WAIT_INTENTS: "intents",
     CHALLENGE: "challenge",

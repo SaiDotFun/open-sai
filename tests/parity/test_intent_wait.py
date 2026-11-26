@@ -6,6 +6,8 @@ import json
 import signal
 import sqlite3
 import subprocess
+import sys
+import threading
 import time
 from contextlib import closing
 from copy import deepcopy
@@ -14,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sai_cli.core import storage
+from sai_cli.core import keeper, storage
 from test_intent_status import (
     ADDR,
     CLI,
@@ -22,6 +24,7 @@ from test_intent_status import (
     OTHER,
     RESPONSES,
     Reply,
+    Request,
     cli_environment,
     invoke,
     read_events,
@@ -33,6 +36,9 @@ from test_intent_status import (
 REQUEST_BLOCK = 50109595
 FILL_BLOCK = 50109596
 OPAQUE = "fixture-upstream-private-text"
+PRIVATE_KEEPER_HINT = (
+    '"${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}"'
+)
 
 
 def with_timeout_warning(reference: dict[str, Any]) -> dict[str, Any]:
@@ -136,6 +142,16 @@ CASES = (
                     )
                 ).body.replace(b'"openingFeeUsd": 1.23,', b'"openingFeeUsd": 1.2300,')
             ),
+        ),
+        "filled",
+        "terminal",
+        (None, 0),
+    ),
+    Case(
+        "market-close",
+        (
+            intent("filled", kind="CLOSE_POSITION"),
+            history(indexed("position_closed_user")),
         ),
         "filled",
         "terminal",
@@ -279,6 +295,81 @@ def ledger_state(home: Path) -> list[tuple[str, str, str | None]]:
         ).fetchall()
 
 
+def assert_wait_keeps_interrupted_fill(
+    cli: CLI, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lookup_started = threading.Event()
+    release_lookup = threading.Event()
+
+    def hold_lookup(request: Request) -> Reply:
+        assert "lastUpdatedBlock { block }" in json.loads(request.body)["query"]
+        lookup_started.set()
+        release_lookup.wait(5)
+        return Reply(disconnect=True)
+
+    fill = indexed()
+    fill["trade"].update(
+        openPrice=81001.25, openCollateralAmount=3_950_000, collateralAmount=3_950_000
+    )
+    with replay() as (endpoint, replies, requests):
+        seed(home, endpoint, monkeypatch, "unknown")
+        replies.extend(
+            (
+                response(
+                    intent("filled", body={"orderType": "market", "leverage": "2"})
+                ),
+                response(history(fill)),
+                hold_lookup,
+            )
+        )
+        with subprocess.Popen(
+            [*cli, "--endpoint", endpoint, "--json", "intent", "wait", KEY],
+            env=cli_environment(home),
+            cwd=home.parent,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) as process:
+            try:
+                assert lookup_started.wait(5), "CLI did not start the fill lookup"
+                process.send_signal(signal.SIGINT)
+                stdout, stderr = process.communicate(timeout=1.5)
+            finally:
+                release_lookup.set()
+                if process.poll() is None:
+                    process.kill()
+            assert (process.returncode, stderr) == (0, b""), stdout
+
+        document = json.loads(stdout)
+        assert document["outcome"] == "filled"
+        assert document["intentKey"] == KEY
+        receipt = document["receipt"]
+        assert receipt["execution"]["block"] == FILL_BLOCK
+        assert receipt["execution"]["historyId"] == fill["id"]
+        assert receipt["fill"] == {
+            "price": None,
+            "sizeCollateralBaseUnits": None,
+            "oraclePrice": "81000.50",
+            "escrowedCollateralBaseUnits": 4_000_000,
+        }
+        assert ledger_state(home)[0] == (KEY, "terminal", "terminal")
+        assert len(requests) == 3
+        assert not replies
+
+
+def test_python_wait_keeps_interrupted_fill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert_wait_keeps_interrupted_fill(
+        (str(Path(sys.executable).with_name("sai")),), tmp_path / "sai", monkeypatch
+    )
+
+
+def test_rust_wait_keeps_interrupted_fill(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert_wait_keeps_interrupted_fill(cli_pair[1], tmp_path / "sai", monkeypatch)
+
+
 def test_wait_scrubs_a_stored_token_shaped_like_a_history_hash(
     wait_cli_pair: tuple[CLI, CLI], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -323,6 +414,100 @@ def test_wait_scrubs_a_stored_token_shaped_like_a_history_hash(
             assert receipt["requestTxHash"] == "[redacted session token]"
             assert len(requests) == 2
             assert all("authorization" not in request.headers for request in requests)
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "requested_leverage", "price", "size"),
+    [
+        ({}, "2", 81001.25, 7_900_000),
+        ({}, "1.999999999999999999", 81001.25, 7_899_999),
+        ({"lastUpdatedBlock": {"block": FILL_BLOCK + 1}}, "2", None, None),
+        ({"trader": OTHER}, "2", None, None),
+        ({"openPrice": OPAQUE}, "2", None, 7_900_000),
+        ({}, None, 81001.25, None),
+        ({}, "3", 81001.25, None),
+        (None, "2", None, None),
+        (response({"errors": [{"message": OPAQUE}]}), "2", None, None),
+    ],
+    ids=[
+        "opening-fill",
+        "floor-exact-leverage",
+        "updated-since-fill",
+        "wrong-owner",
+        "missing-price",
+        "missing-exact-leverage",
+        "inconsistent-leverage",
+        "missing-position",
+        "lookup-error",
+    ],
+)
+def test_wait_requires_execution_block_position_for_fill(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    snapshot: dict[str, Any] | Reply | None,
+    requested_leverage: str | None,
+    price: float | None,
+    size: int | None,
+) -> None:
+    monkeypatch.delenv("SAI_PARITY_PYTHON", raising=False)
+    clis: tuple[CLI, CLI] = request.getfixturevalue("cli_pair")
+    fill = indexed()
+    fill["trade"].update(
+        openPrice=81001.25, openCollateralAmount=3_950_000, collateralAmount=3_950_000
+    )
+    if isinstance(snapshot, Reply):
+        lookup = snapshot
+    else:
+        position = (
+            None
+            if snapshot is None
+            else {
+                **fill["trade"],
+                "lastUpdatedBlock": {"block": FILL_BLOCK},
+                **snapshot,
+            }
+        )
+        lookup = response({"data": {"perp": {"trade": position}}})
+    for index, cli in enumerate(clis):
+        with replay() as (endpoint, replies, requests):
+            home = tmp_path / str(index) / "sai"
+            seed(home, endpoint, monkeypatch, "unknown")
+            replies.extend(
+                map(
+                    response,
+                    (
+                        intent(
+                            "filled",
+                            body={
+                                "orderType": "market",
+                                "leverage": requested_leverage,
+                            },
+                        ),
+                        history(fill),
+                        lookup,
+                    ),
+                )
+            )
+            result = invoke(
+                cli, home, "--endpoint", endpoint, "--json", "intent", "wait", KEY
+            )
+            assert (result.returncode, result.stderr) == (0, b"")
+            assert OPAQUE.encode() not in result.stdout
+            document = json.loads(result.stdout)
+            assert document["outcome"] == "filled"
+            assert document["receipt"]["fill"] == {
+                "price": price,
+                "sizeCollateralBaseUnits": size,
+                "oraclePrice": "81000.50",
+                "escrowedCollateralBaseUnits": 4_000_000,
+            }
+            assert len(requests) == 3
+            query = json.loads(requests[-1].body)
+            assert "lastUpdatedBlock { block }" in query["query"]
+            assert query["variables"] == {"trader": ADDR, "id": fill["trade"]["id"]}
+            assert "authorization" not in requests[-1].headers
+            assert not replies
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
@@ -506,6 +691,15 @@ def test_wait_usage(
         observed.append(
             result.stdout if "--help" in args else json.loads(result.stdout)
         )
+    if code == 5:
+        # The pinned CLI treated its own /query route as private.
+        reference = observed[0]
+        old = f"sai --endpoint {PRIVATE_KEEPER_HINT} "
+        for item in (reference, reference["error"]):
+            assert item["hint"].startswith(old)
+            item["hint"] = f"sai --endpoint {keeper.MAINNET_HTTP} " + item[
+                "hint"
+            ].removeprefix(old)
     assert observed[0] == observed[1]
 
 
@@ -548,6 +742,50 @@ def test_wait_bounds_account_lookup_when_ledger_is_locked(
             ]
             observed.append(document)
     assert with_timeout_warning(observed[0]) == observed[1]
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "public"),
+    [
+        (keeper.MAINNET_HTTP, True),
+        (keeper.MAINNET_HTTP + "?key=private-fixture", False),
+    ],
+    ids=["public-keeper", "private-query"],
+)
+def test_wait_recovery_for_the_public_keeper_route(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    endpoint: str,
+    public: bool,
+) -> None:
+    # These recovery hints compare against the current Python CLI.
+    monkeypatch.delenv("SAI_PARITY_PYTHON", raising=False)
+    clis: tuple[CLI, CLI] = request.getfixturevalue("cli_pair")
+    for index, cli in enumerate(clis):
+        home = tmp_path / str(index) / "sai"
+        seed(home, endpoint, monkeypatch, "unknown")
+        # The account lookup exhausts the deadline before any Keeper request.
+        with closing(sqlite3.connect(home / "trader/intents.sqlite3")) as db:
+            db.execute("BEGIN EXCLUSIVE")
+            result = invoke(
+                cli,
+                home,
+                "--endpoint",
+                endpoint,
+                "--json",
+                "intent",
+                "wait",
+                KEY,
+                "--timeout",
+                "0.05",
+            )
+        assert result.returncode == 5 and not result.stderr, result
+        document = json.loads(result.stdout)
+        assert document["addr"] is None
+        expected = endpoint if public else PRIVATE_KEEPER_HINT
+        assert document["hint"] == f"sai --endpoint {expected} intent wait {KEY}"
+        assert document["error"]["hint"] == document["hint"]
 
 
 def test_wait_interrupts_locked_account_lookup(

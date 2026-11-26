@@ -79,11 +79,28 @@ def for_intent(
     clock: Clock = Clock(),
 ) -> dict[str, Any]:
     """Run the CLI wait with the same polling logic as MCP."""
-    return asyncio.run(
-        for_intent_async(
-            endpoint, addr, key, timeout=timeout, started=started, clock=clock
+    confirmed: dict[str, Any] | None = None
+
+    def remember_fill(result: dict[str, Any]) -> None:
+        nonlocal confirmed
+        confirmed = result
+
+    try:
+        return asyncio.run(
+            for_intent_async(
+                endpoint,
+                addr,
+                key,
+                timeout=timeout,
+                started=started,
+                clock=clock,
+                remember_fill=remember_fill,
+            )
         )
-    )
+    except KeyboardInterrupt:
+        if confirmed is None:
+            raise
+        return confirmed
 
 
 def _recorded_outcome(endpoint: str, addr: str, key: str) -> Outcome | None:
@@ -112,6 +129,7 @@ async def for_intent_async(
     timeout: float,
     started: float | None = None,
     clock: Clock = Clock(),
+    remember_fill: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Poll the same intent within one deadline, including every network read."""
     validate_timeout(timeout)
@@ -141,6 +159,7 @@ async def for_intent_async(
     request_block: int | None = None
     row: dict[str, Any] = {}
     history: list[dict[str, Any]] = []
+    fill_values: receipt.FillValues = (None, None)
     delay = INITIAL_DELAY
     log.event(
         "intent.wait.start",
@@ -193,6 +212,54 @@ async def for_intent_async(
                         ):
                             history = data.get("matchedTradeHistory", [])
                             outcome = receipt.success(row, history)
+                            if (
+                                outcome == "filled"
+                                and (left := min(POLL_REQUEST_TIMEOUT, remaining())) > 0
+                                and (
+                                    opening := receipt.opening_fill_position(
+                                        row, history
+                                    )
+                                )
+                            ):
+                                trade_id, block = opening
+                                confirmed = None
+                                if remember_fill is not None:
+                                    confirmed = _result(
+                                        key,
+                                        addr,
+                                        outcome,
+                                        row,
+                                        history,
+                                        request_tx_hash,
+                                        request_block,
+                                    )
+                                    # Deliver cancellations already pending
+                                    # before entering the optional read.
+                                    await asyncio.sleep(0)
+                                    left = min(left, remaining())
+                                    if left <= 0:
+                                        break
+                                try:
+                                    async with asyncio.timeout(left):
+                                        position = await keeper.read_async(
+                                            client,
+                                            endpoint,
+                                            keeper.FILL_POSITION,
+                                            {"trader": addr, "id": trade_id},
+                                        )
+                                except (keeper.KeeperError, TimeoutError):
+                                    pass
+                                except (asyncio.CancelledError, KeyboardInterrupt):
+                                    if (
+                                        remember_fill is not None
+                                        and confirmed is not None
+                                    ):
+                                        remember_fill(confirmed)
+                                    raise
+                                else:
+                                    fill_values = receipt.opening_fill(
+                                        position, trade_id, block, account, row
+                                    )
                             break
                         if classified == "terminal-failed":
                             outcome = "failed"
@@ -227,7 +294,9 @@ async def for_intent_async(
             durationMs=round((clock.now() - started) * 1000),
         )
 
-    return _result(key, addr, outcome, row, history, request_tx_hash, request_block)
+    return _result(
+        key, addr, outcome, row, history, request_tx_hash, request_block, fill_values
+    )
 
 
 def ledger_busy(exc: sqlite3.OperationalError) -> bool:
@@ -314,6 +383,7 @@ def _result(
     history: list[dict[str, Any]],
     request_tx_hash: str | None,
     request_block: int | None,
+    fill_values: receipt.FillValues = (None, None),
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "intentKey": key,
@@ -325,6 +395,7 @@ def _result(
             history,
             request_tx_hash=request_tx_hash,
             request_block=request_block,
+            fill_values=fill_values,
         ),
     }
     if outcome == "failed":

@@ -55,8 +55,14 @@ _AddressInfo = (
 )
 
 
-class IndexLag(ValueError):
+class IndexLag(SaiError, ValueError):
     """Keeper's position did not catch up within the re-read budget."""
+
+    code = Code.INVALID_REQUEST
+
+    @property
+    def retryable(self) -> bool:
+        return True
 
 
 class PositionChanged(SaiError, ValueError):
