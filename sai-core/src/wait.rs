@@ -74,6 +74,13 @@ pub struct ResultReceipt {
     pub body: Value,
 }
 
+pub struct WaitOptions<'a> {
+    pub timeout: Duration,
+    pub started: Instant,
+    /// Save the confirmed receipt before the optional fill lookup can yield.
+    pub remember_fill: Option<&'a (dyn Fn(ResultReceipt) + Sync)>,
+}
+
 pub fn validate_timeout(seconds: f64) -> Result<Duration, SaiError> {
     if !seconds.is_finite() || seconds <= 0.0 {
         return Err(SaiError::new(
@@ -150,11 +157,15 @@ pub async fn for_intent(
     endpoint: &str,
     addr: &str,
     key: &str,
-    timeout: Duration,
-    started: Instant,
+    options: WaitOptions<'_>,
     storage: &Storage<'_>,
     events: EventContext<'_>,
 ) -> Result<ResultReceipt, SaiError> {
+    let WaitOptions {
+        timeout,
+        started,
+        remember_fill,
+    } = options;
     let Some(account) = keeper::canonical_account(addr) else {
         return Err(SaiError::new(
             Code::InvalidRequest,
@@ -271,12 +282,26 @@ pub async fn for_intent(
         .expect("trader directory has a parent");
     let scrub = log::scrubber(home);
     let evidence = Evidence::new(&row, &history);
+    let build = |fill_values| {
+        let receipt = evidence.build(
+            wait_log.outcome,
+            &request_hash,
+            &request_block,
+            fill_values,
+            |value| scrub(value.into()),
+        );
+        result(key, Some(addr), wait_log.outcome, &row, receipt)
+    };
     let mut fill_values = (Value::Null, None);
     let remaining = budget.remaining().min(FILL_POSITION_TIMEOUT);
     if wait_log.outcome == Outcome::Filled
         && !remaining.is_zero()
         && let Some((trade_id, block)) = evidence.opening_fill_position()
-        && let Ok(position) = keeper
+    {
+        if let Some(remember_fill) = remember_fill {
+            remember_fill(build((Value::Null, None)));
+        }
+        if let Ok(position) = keeper
             .wait_request(
                 keeper::FILL_POSITION,
                 Map::from_iter([
@@ -286,17 +311,11 @@ pub async fn for_intent(
                 remaining,
             )
             .await
-    {
-        fill_values = evidence.opening_fill(&position, trade_id, block, &account);
+        {
+            fill_values = evidence.opening_fill(&position, trade_id, block, &account);
+        }
     }
-    let receipt = evidence.build(
-        wait_log.outcome,
-        &request_hash,
-        &request_block,
-        fill_values,
-        |value| scrub(value.into()),
-    );
-    Ok(result(key, Some(addr), wait_log.outcome, &row, receipt))
+    Ok(build(fill_values))
 }
 
 pub fn unknown_result(key: &str) -> ResultReceipt {

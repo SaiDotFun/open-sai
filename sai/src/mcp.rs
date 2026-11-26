@@ -395,7 +395,12 @@ impl SaiMcp {
                         };
                         let addr = account["addr"].as_str().expect("resolved account address");
                         let receipt = wait::for_intent(
-                            &endpoint, addr, &key, timeout, started, &storage, events,
+                            &endpoint,
+                            addr,
+                            &key,
+                            wait::WaitOptions { timeout, started, remember_fill: None },
+                            &storage,
+                            events,
                         )
                         .await?;
                         Ok(wait_result(account, receipt))

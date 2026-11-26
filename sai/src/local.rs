@@ -4,6 +4,7 @@ mod receipt_output;
 use std::{
     fmt::Write as _,
     io::{self, Write},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -172,12 +173,22 @@ pub fn intent(
                     "Pass --addr with the account that submitted this intent",
                 )
             })?;
+                let confirmed = OnceLock::new();
+                let remember_fill = |receipt| {
+                    let _ = confirmed.set(receipt);
+                };
+                let options = wait::WaitOptions {
+                    timeout,
+                    started,
+                    remember_fill: Some(&remember_fill),
+                };
                 let (receipt, recovered) = tokio::select! {
                     biased;
-                    _ = signal.recv() => (
-                        wait::recovery_result(&storage, endpoint, &addr, &key, true, None), true,
+                    _ = signal.recv() => confirmed.into_inner().map_or_else(
+                        || (wait::recovery_result(&storage, endpoint, &addr, &key, true, None), true),
+                        |receipt| (receipt, false),
                     ),
-                    receipt = wait::for_intent(endpoint, &addr, &key, timeout, started, &storage, events) => {
+                    receipt = wait::for_intent(endpoint, &addr, &key, options, &storage, events) => {
                         match receipt {
                             Ok(receipt) => (receipt, false),
                             Err(_) => (wait::recovery_result(&storage, endpoint, &addr, &key, false, None), true),

@@ -354,6 +354,12 @@ def test_python_wait_keeps_interrupted_fill(
     )
 
 
+def test_rust_wait_keeps_interrupted_fill(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert_wait_keeps_interrupted_fill(cli_pair[1], tmp_path / "sai", monkeypatch)
+
+
 def test_wait_scrubs_a_stored_token_shaped_like_a_history_hash(
     wait_cli_pair: tuple[CLI, CLI], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
