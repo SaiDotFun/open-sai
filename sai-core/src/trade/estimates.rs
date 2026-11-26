@@ -142,13 +142,7 @@ impl Trading<'_> {
             "liquidationPrice": unavailable("An entry price and opening fee estimate are required."),
             "worstCaseFill": fill,
         });
-        let has_collateral = market_row
-            .as_ref()
-            .and_then(|row| json_index(&row["collateralToken"]["id"]))
-            .is_some();
-        if let Some(endpoint) = self.lcd_endpoint
-            && (has_collateral || !matches!(mode, PreviewMode::Mcp))
-        {
+        if let Some(endpoint) = self.lcd_endpoint {
             self.quote_open(
                 endpoint,
                 preview,

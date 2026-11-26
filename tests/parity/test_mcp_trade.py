@@ -449,6 +449,34 @@ def test_mcp_signed_out_open_is_informational(
             assert not endpoints.errors
 
 
+def test_mcp_close_only_limit_preview_withholds_digest_without_borrowings(
+    mcp_pair: tuple[Path, Path], tmp_path: Path
+) -> None:
+    quotes = []
+    for i, executable in enumerate(mcp_pair):
+        home = tmp_path / str(i)
+        with (
+            loopback("quote-close-only-no-borrowings") as endpoints,
+            server(
+                executable, home, endpoints, seed="session", call_timeout=15
+            ) as stdio,
+        ):
+            preview = result(
+                stdio.call(
+                    2, "preview_open", **{**OPEN, "order_type": "limit", "price": "100"}
+                )
+            )
+            execution = preview["estimates"]["execution"]
+            assert execution["status"] == "would_be_rejected"
+            assert execution["code"] == "MarketClosed"
+            assert "previewDigest" not in preview
+            assert not any(item.label == "recordUserIntent" for item in endpoints.wire)
+            assert not rows(home)
+            assert not endpoints.errors
+            quotes.append((binding(preview), execution))
+    assert quotes[0] == quotes[1]
+
+
 def test_mcp_open_checks_confirmation_before_building_an_intent(
     mcp_pair: tuple[Path, Path], tmp_path: Path
 ) -> None:
