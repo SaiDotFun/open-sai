@@ -206,10 +206,17 @@ impl Trading<'_> {
 
 pub(super) fn id(value: &str, parameter: &str) -> Result<BigInt, SaiError> {
     let invalid = || {
-        SaiError::usage(format!(
-            "Invalid value for '{parameter}': {} is not a valid integer.",
-            repr(value),
-        ))
+        // Arbitrary rejected arguments can contain credentials.
+        let reason = if value.chars().all(|character| {
+            character.is_numeric()
+                || character.is_whitespace()
+                || matches!(character, '+' | '-' | '_')
+        }) {
+            format!("{} is not a valid integer.", repr(value))
+        } else {
+            "expected an integer.".into()
+        };
+        SaiError::usage(format!("Invalid value for '{parameter}': {reason}"))
     };
     if value.is_empty() || value.len() > 4300 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(invalid());
