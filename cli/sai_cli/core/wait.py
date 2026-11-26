@@ -7,7 +7,7 @@ import math
 import sqlite3
 import time
 from collections.abc import Callable, Generator
-from contextlib import closing, contextmanager, suppress
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -222,21 +222,24 @@ async def for_intent_async(
                                 )
                             ):
                                 trade_id, block = opening
-                                # SIGINT cancels the CLI's asyncio runner. Keep
-                                # the receipt before the optional read can yield.
+                                confirmed = None
                                 if remember_fill is not None:
-                                    remember_fill(
-                                        _result(
-                                            key,
-                                            addr,
-                                            outcome,
-                                            row,
-                                            history,
-                                            request_tx_hash,
-                                            request_block,
-                                        )
+                                    confirmed = _result(
+                                        key,
+                                        addr,
+                                        outcome,
+                                        row,
+                                        history,
+                                        request_tx_hash,
+                                        request_block,
                                     )
-                                with suppress(keeper.KeeperError, TimeoutError):
+                                    # Deliver cancellations already pending
+                                    # before entering the optional read.
+                                    await asyncio.sleep(0)
+                                    left = min(left, remaining())
+                                    if left <= 0:
+                                        break
+                                try:
                                     async with asyncio.timeout(left):
                                         position = await keeper.read_async(
                                             client,
@@ -244,9 +247,19 @@ async def for_intent_async(
                                             keeper.FILL_POSITION,
                                             {"trader": addr, "id": trade_id},
                                         )
-                                        fill_values = receipt.opening_fill(
-                                            position, trade_id, block, account, row
-                                        )
+                                except (keeper.KeeperError, TimeoutError):
+                                    pass
+                                except (asyncio.CancelledError, KeyboardInterrupt):
+                                    if (
+                                        remember_fill is not None
+                                        and confirmed is not None
+                                    ):
+                                        remember_fill(confirmed)
+                                    raise
+                                else:
+                                    fill_values = receipt.opening_fill(
+                                        position, trade_id, block, account, row
+                                    )
                             break
                         if classified == "terminal-failed":
                             outcome = "failed"
