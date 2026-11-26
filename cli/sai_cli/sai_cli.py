@@ -991,7 +991,23 @@ def market() -> None:
 @click.pass_context
 def market_list(ctx: click.Context) -> None:
     """List Keeper borrowing markets."""
-    perform_query(ctx, keeper.MARKETS)
+    data = keeper.request(keeper_url(ctx), keeper.MARKETS)
+    if ctx.obj["json"]:
+        emit(ctx, data)
+        return
+    rows = trading.usdc_markets(data["perp"]["borrowings"])
+    ReplSkin("sai").table(
+        ["Symbol", "ID", "Collateral", "Price"],
+        [
+            [
+                row["baseToken"]["symbol"],
+                str(row["marketId"]),
+                row["collateralToken"]["symbol"],
+                str(row["price"]) if row["price"] is not None else "-",
+            ]
+            for row in rows
+        ],
+    )
 
 
 @market.command("prices")
@@ -1006,7 +1022,8 @@ def market_prices(ctx: click.Context) -> None:
 def account(ctx: click.Context) -> None:
     """Inspect positions and account activity."""
     if ctx.invoked_subcommand != "overview":
-        session_notice(ctx, ctx.obj["as_addr"])
+        if ctx.invoked_subcommand != "balances":
+            session_notice(ctx, ctx.obj["as_addr"])
         if auto_update_applies("account", ctx.obj["json"]):
             updater.tick(warn)
 
@@ -1032,6 +1049,8 @@ def account_overview(ctx: click.Context, addr: str | None, json_output: bool) ->
         raise SessionError(f"{exc}. Pass --as ADDR explicitly.") from exc
     if auto_update_applies("account", ctx.obj["json"]):
         updater.tick(warn)
+    for row in result["balances"].get("data", {}).values():
+        row["stale"] = overview.balance_stale(row["sourceAgeSeconds"])
     if ctx.obj["json"]:
         emit(ctx, result)
     else:
@@ -1062,15 +1081,28 @@ def history(ctx: click.Context, addr: str) -> None:
 @click.pass_context
 def balances(ctx: click.Context, addr: str, ws_endpoint: str | None) -> None:
     """Read one account balance snapshot from Keeper's subscription."""
-    emit(
-        ctx,
-        stream.snapshot(
-            ws_url(ctx, ws_endpoint),
-            stream.BALANCES,
-            {"user": addr},
-            notify=warn,
-        ),
-    )
+    flags = ctx.obj["flags"]
+    if ws_endpoint is not None:
+        flags["keeper.ws_endpoint"] = ws_endpoint
+    explicit_ws = flags["keeper.ws_endpoint"]
+    if explicit_ws is not None:
+        ws_url(ctx, explicit_ws)
+    try:
+        resolved = settings(ctx)
+    except sai_settings.InvalidSetting:
+        if explicit_ws is None:
+            raise
+        # An explicit subscription can read balances without block times.
+        resolved = None
+        endpoint = explicit_ws
+    else:
+        session_notice(ctx, ctx.obj["as_addr"])
+        endpoint = resolved.ws_endpoint
+    snapshot = overview.balance_snapshot(resolved, endpoint, addr, notify=warn)
+    if ctx.obj["json"]:
+        emit(ctx, snapshot)
+    else:
+        overview_format.show_balances(snapshot["data"]["userBalances"])
 
 
 @main.group()
@@ -1273,6 +1305,12 @@ def emit_wait(ctx: click.Context, result: dict[str, Any]) -> None:
         ctx.exit(exit_code)
 
 
+def poll_trade(ctx: click.Context, account: str, key: str) -> dict[str, Any]:
+    if not ctx.obj["json"]:
+        warn(f"Waiting for intent {key} to confirm...")
+    return wait.for_intent(keeper_url(ctx), account, key, timeout=TRADE_WAIT_TIMEOUT)
+
+
 def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
     """Print a trade result with the account it used or would use.
 
@@ -1294,16 +1332,34 @@ def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
         and account
         and result.get("status") == "accepted"
     ):
-        final = wait.for_intent(
-            keeper_url(ctx), account, result["intentKey"], timeout=TRADE_WAIT_TIMEOUT
-        )
+        final = poll_trade(ctx, account, result["intentKey"])
         # Keep trade quote metadata, but report the final outcome as the status.
         metadata = {key: value for key, value in result.items() if key != "message"}
         emit_wait(ctx, {**metadata, **final, "status": final["outcome"]})
         return
-    output = {"addr": account, **result}
+    output: dict[str, Any] = {"addr": account, **result}
     if confirmation.is_confirmable(output):
         output = confirmation.with_digest(output)
+    if not ctx.obj["json"]:
+        collateral = output.get("collateral")
+        trade_estimates = output.get("estimates", {})
+        execution = trade_estimates.get("execution", {})
+        if (collateral or execution.get("code") == "InsufficientDepositBalance") and (
+            reason := estimates.rejection_reason(trade_estimates)
+        ):
+            raise trading.ExecutionRejected(reason, output)
+        if warning := execution.get("warning"):
+            click.echo(warning)
+        if collateral:
+
+            def value(side: str) -> str:
+                usd = collateral[f"{side}Usd"]
+                dollars = f"${usd}" if usd is not None else "USD unavailable"
+                return f"{collateral[f'{side}Usdc']} USDC ({dollars})"
+
+            click.echo(f"Estimated collateral: {value('before')} → {value('after')}")
+            if output.get("warning"):
+                click.echo(output["warning"])
     emit(ctx, output)
 
 
@@ -1323,9 +1379,7 @@ def trade_error(ctx: click.Context, exc: Exception) -> None:
             final = (
                 wait.rejected_result(exc.intent_key, account, str(exc))
                 if isinstance(exc, keeper.AdmissionRejected)
-                else wait.for_intent(
-                    keeper_url(ctx), account, exc.intent_key, timeout=TRADE_WAIT_TIMEOUT
-                )
+                else poll_trade(ctx, account, exc.intent_key)
             )
             emit_wait(ctx, {**final, "status": final["outcome"]})
             return
@@ -1406,8 +1460,49 @@ TRADE_INT = TradeInt()
 TRADE_DECIMAL = TradeDecimal()
 
 
+class TradeMarket(click.ParamType):
+    def convert(
+        self, value: Any, param: click.Parameter | None, ctx: click.Context | None
+    ) -> int | str:
+        if (
+            isinstance(value, str)
+            and value.isascii()
+            and any(c.isalpha() for c in value)
+        ):
+            return value
+        return TRADE_INT.convert(value, param, ctx)
+
+
+def resolve_market(endpoint: str, market: int | str) -> int:
+    if isinstance(market, int):
+        return market
+    rows = keeper.request(endpoint, keeper.MARKETS)["perp"]["borrowings"]
+    matches = sorted(
+        {
+            row["marketId"]
+            for row in trading.usdc_markets(rows)
+            if row["baseToken"]["symbol"].casefold() == market.casefold()
+        }
+    )
+    if not matches:
+        raise ValueError(f"Unknown market symbol {market!r}. Run sai market list.")
+    if len(matches) > 1:
+        ids = ", ".join(map(str, matches))
+        raise ValueError(
+            f"Ambiguous market symbol {market!r}. Pass a market ID: {ids}."
+        )
+    return matches[0]
+
+
 @trade.command("open")
-@click.option("--market", "market_id", type=TRADE_INT, required=True)
+@click.option(
+    "--market",
+    "market_id",
+    type=TradeMarket(),
+    metavar="MARKET",
+    required=True,
+    help="Market ID or symbol, such as BTC.",
+)
 @click.option("--side", type=click.Choice(["long", "short"]), required=True)
 @click.option(
     "--type",
@@ -1443,7 +1538,7 @@ TRADE_DECIMAL = TradeDecimal()
 @click.pass_context
 def trade_open(
     ctx: click.Context,
-    market_id: int,
+    market_id: int | str,
     side: str,
     order_type: str,
     amount: str,
@@ -1470,7 +1565,7 @@ def trade_open(
             trading.open_trade(
                 keeper_url(ctx),
                 loader(ctx),
-                market_id=market_id,
+                market_id=resolve_market(keeper_url(ctx), market_id),
                 side=side,
                 order_type=order_type,
                 amount=amount,
@@ -1521,6 +1616,32 @@ def trade_close(
     preview_digest: str | None,
 ) -> None:
     """Close a position or cancel a pending order."""
+    close_or_cancel(ctx, trade_id, cancel_order, dry_run, preview_digest)
+
+
+@trade.command("cancel")
+@click.argument("trade_id", type=TRADE_INT)
+@click.option("--dry-run", is_flag=True)
+@preview_digest_option
+@wait_option
+@click.pass_context
+def trade_cancel(
+    ctx: click.Context,
+    trade_id: int,
+    dry_run: bool,
+    preview_digest: str | None,
+) -> None:
+    """Cancel a pending order."""
+    close_or_cancel(ctx, trade_id, True, dry_run, preview_digest)
+
+
+def close_or_cancel(
+    ctx: click.Context,
+    trade_id: int,
+    cancel_order: bool,
+    dry_run: bool,
+    preview_digest: str | None,
+) -> None:
     try:
         emit_trade(
             ctx,
@@ -1608,6 +1729,7 @@ def trade_leverage(
                 trade_id=trade_id,
                 leverage=leverage,
                 dry_run=dry_run,
+                show_collateral=True,
                 lcd_endpoint=settings(ctx).lcd_endpoint,
                 before_submit=trade_submit_check(loader(ctx), preview_digest),
             ),
@@ -1636,6 +1758,11 @@ def lcd_trade_settings(
     help="USDC amount for a leverage quote, not an execution cap.",
 )
 @click.option(
+    "--max-collateral-usd",
+    type=TRADE_DECIMAL,
+    help="Cap the margin quote only. Actual collateral in USD can exceed this cap.",
+)
+@click.option(
     "--lcd-endpoint",
     help="Nibiru REST endpoint for exact contract state. Defaults to the"
     " lcd.endpoint setting.",
@@ -1649,6 +1776,7 @@ def trade_margin(
     trade_id: int,
     direction: str,
     amount: str,
+    max_collateral_usd: str | None,
     lcd_endpoint: str | None,
     dry_run: bool,
     preview_digest: str | None,
@@ -1667,6 +1795,8 @@ def trade_margin(
                 trade_id=trade_id,
                 direction=direction,
                 amount=amount,
+                max_collateral_usd=max_collateral_usd,
+                show_collateral=True,
                 lcd_endpoint=resolved.lcd_endpoint,
                 dry_run=dry_run,
                 before_submit=trade_submit_check(loader(ctx), preview_digest),

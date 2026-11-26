@@ -103,6 +103,9 @@ def _checked(
 
 
 def _attach_estimates(preview: dict[str, Any], values: dict[str, Any]) -> None:
+    if "collateral" in values:
+        preview["collateral"] = values["collateral"]
+        values = {key: value for key, value in values.items() if key != "collateral"}
     preview["estimates"] = values
     rejected = estimates.rejection_reason(values) is not None
     if rejected:
@@ -149,6 +152,11 @@ def _check_unavailable_target(
         raise
 
 
+def usdc_markets(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return borrowing rows for the collateral Keeper uses to open trades."""
+    return [row for row in rows if row["collateralToken"]["symbol"] == "USDC"]
+
+
 def open_usdc_market(
     endpoint: str, market_id: int, *, timeout: float = 20, require_open: bool = True
 ) -> dict[str, Any]:
@@ -158,10 +166,8 @@ def open_usdc_market(
     ]
     candidates = [
         item
-        for item in markets
-        if item["marketId"] == market_id
-        and item["collateralToken"]["symbol"] == "USDC"
-        and (not require_open or item["isOpen"])
+        for item in usdc_markets(markets)
+        if item["marketId"] == market_id and (not require_open or item["isOpen"])
     ]
     if len(candidates) != 1:
         raise ValueError("Current open USDC market data is unavailable")
@@ -434,6 +440,7 @@ def set_leverage(
     dry_run: bool,
     lcd_endpoint: str | None = None,
     before_submit: SubmitCheck | None = None,
+    show_collateral: bool = False,
 ) -> dict[str, Any]:
     """Set target leverage without changing TP or SL."""
     payload = intents.leverage_intent(trade_id, leverage)
@@ -447,6 +454,7 @@ def set_leverage(
         lcd_endpoint,
         trade_id,
         target=Decimal(leverage),
+        show_collateral=show_collateral,
     )
 
 
@@ -461,6 +469,7 @@ def _position_intent(
     *,
     target: Decimal | None = None,
     updates_triggers: bool = False,
+    show_collateral: bool = False,
 ) -> dict[str, Any]:
     addr = get_session()["evmAddress"]
     preview = {"dryRun": True, "intent": payload}
@@ -487,10 +496,25 @@ def _position_intent(
     if verified is not None:
         preview["positionRoute"] = verified.route
 
-    def estimate(_preview: dict[str, Any]) -> dict[str, Any]:
-        return _estimate_position(
-            endpoint, lcd, addr, trade_id, indexed, verified, target, updates_triggers
+    def estimate(quoted_preview: dict[str, Any]) -> dict[str, Any]:
+        values = _estimate_position(
+            endpoint,
+            lcd,
+            addr,
+            trade_id,
+            indexed,
+            verified,
+            target,
+            updates_triggers,
+            show_collateral=show_collateral and dry_run,
+            bind_collateral=show_collateral and (dry_run or before_submit is not None),
         )
+        if collateral := values.pop("collateralBaseUnits", None):
+            quoted_preview["collateralBaseUnits"] = collateral
+        elif show_collateral and not dry_run and before_submit is not None:
+            # A definitive rejection may arrive before Perp can quote collateral.
+            _reject_execution(quoted_preview, values, addr)
+        return values
 
     if dry_run:
         if verified is None:
@@ -516,6 +540,9 @@ def _estimate_position(
     verified: margin.VerifiedPosition | None,
     target: Decimal | None,
     updates_triggers: bool,
+    *,
+    show_collateral: bool = False,
+    bind_collateral: bool = False,
 ) -> dict[str, Any]:
     state = None
     if lcd is not None and verified is not None:
@@ -538,6 +565,8 @@ def _estimate_position(
         state,
         trade_id,
         target=target,
+        show_collateral=show_collateral,
+        bind_collateral=bind_collateral,
     )
 
 
@@ -650,6 +679,8 @@ def change_margin(
     lcd_endpoint: str,
     dry_run: bool,
     before_submit: SubmitCheck | None = None,
+    show_collateral: bool = False,
+    max_collateral_usd: str | None = None,
 ) -> dict[str, Any]:
     """Add or remove margin through a target-leverage intent.
 
@@ -657,6 +688,11 @@ def change_margin(
     must match the first, or the change is refused for review.
     """
     delta = margin.margin_amount_usdc(amount)
+    cap = None
+    if max_collateral_usd is not None:
+        if direction != "add":
+            raise ValueError("--max-collateral-usd requires --direction add")
+        cap = intents.positive(max_collateral_usd, "Maximum collateral in USD")
     addr = get_session()["evmAddress"]
 
     def build_preview() -> PositionPreview:
@@ -666,19 +702,46 @@ def change_margin(
         leverage, inputs = margin.leverage_inputs(lcd_endpoint, state, trade_id)
         if leverage is None:
             raise ValueError("Cannot verify effective leverage for this margin change")
+        price = None
+        quote_delta = delta
+        if (show_collateral and dry_run) or cap is not None:
+            price = margin.optional_collateral_price(lcd_endpoint, state)
+        if cap is not None:
+            if price is None:
+                raise ValueError(
+                    "Cannot apply the USD collateral cap without an oracle price"
+                )
+            cap_num, cap_den = cap.as_integer_ratio()
+            price_num, price_den = price.as_integer_ratio()
+            max_units = cap_num * price_den * 1_000_000 // (cap_den * price_num)
+            quote_delta = min(delta, max_units - int(state.raw["collateral_amount"]))
+            if quote_delta <= 0:
+                raise ValueError("The USD collateral cap leaves no room to add margin")
         quote = margin.margin_quote(
             state.raw,
             None,
             state.market,
             direction,
-            delta,
+            quote_delta,
             effective_leverage=leverage,
+        )
+        if cap is not None:
+            quote["maxCollateralUsd"] = format(cap, "f")
+        display = (
+            {
+                "collateral": margin.collateral_amounts(
+                    int(quote["collateralBefore"]), int(quote["collateralAfter"]), price
+                )
+            }
+            if show_collateral and dry_run
+            else {}
         )
         return (
             state,
             inputs,
             {
                 "dryRun": True,
+                **display,
                 "positionRoute": state.route,
                 "quote": {
                     **quote,

@@ -222,10 +222,6 @@ signature = "69ef87aee2da5b8600241b502f63a8a50c0cbf6e09525e66fb6ab65da7feb7ab"
 owner = "#172"
 signature = "26bb482fd9db4137e02af7d3689ea2cf7a1509f67a01d3af3a82e3bd159c9496"
 
-[gap."case:intent-status"]
-owner = "#212"
-signature = "58002bce2458ceba72cfc7aeb162f352823deceee91c10c4a2fd5d1ea65a530e"
-
 [gap."case:market-bare"]
 owner = "#211"
 signature = "ccdedb96b86e2ccdcb90c39e17859c64da7dab27c49872a0ccc05514945ef9d1"
@@ -392,11 +388,11 @@ signature = "5ae8c49462c0c2a01cfe44d95295174f5bdfb9bfc2899af7198e98a42bd0de7d"
 
 [gap."case:skill-install"]
 owner = "#211"
-signature = "dafec9d32c6ae85bd81a697744f9dc71ed54a5ad6ef8c5c988ea97901262e9d3"
+signature = "4cd6006cfdd5d5873e75e4be8435d6a87e534421f8152270b4eba8a256b6fe94"
 
 [gap."case:skill-page"]
 owner = "#211"
-signature = "c04cc028a854a4fe97b8e895bbe5f733cbd1a63733dba18e3a138a2845449d07"
+signature = "bbba576bda87b5f0db4d7b22ea601921f457ad8f1a279f2274bf67a9afa389fa"
 
 [gap."case:skill-show"]
 owner = "#211"

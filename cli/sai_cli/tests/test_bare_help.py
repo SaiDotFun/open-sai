@@ -78,3 +78,11 @@ def test_repl_bare_command_and_partial_command(
         help_result = runner.invoke(main, ["trade", "open", "--help"], prog_name="sai")
         assert help_result.stdout in result.stderr
         assert "Missing option '--market'" not in result.stderr
+
+
+def test_margin_cap_help_discloses_quote_scope() -> None:
+    result = CliRunner().invoke(main, ["trade", "margin", "--help"])
+    assert result.exit_code == 0, result.output
+    help_text = " ".join(result.stdout.split())
+    assert "--max-collateral-usd DECIMAL Cap the margin quote only." in help_text
+    assert "Actual collateral in USD can exceed this cap." in help_text

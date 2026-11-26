@@ -524,24 +524,24 @@ impl PositionQuote {
         };
         let actual;
         let height = if let Some(rechecked) = rechecked {
-            Some(rechecked.height.as_str())
+            Ok(Some(rechecked.height.as_str()))
         } else {
-            actual = state.verified_height(lcd, id).await.ok().flatten();
-            actual.as_deref()
+            actual = state.verified_height(lcd, id).await;
+            actual.as_ref().map(|height| height.as_deref())
         };
         match action {
             PositionAction::Margin { .. } => {
                 let Some(target) = self.preview.intent.body["requestedLeverage"].as_str() else {
                     return Ok(());
                 };
-                self.preview.estimates = Some(if let Some(height) = height {
+                self.preview.estimates = Some(if let Ok(Some(height)) = height {
                     let effective = ContractDecimal::parse(&self.inputs["effectiveLeverage"])
                         .ok()
                         .map(|value| value.units);
                     match leverage_execution_estimates(lcd, &state, id, height, target, effective)
                         .await
                     {
-                        Ok(estimates) => estimates,
+                        Ok((estimates, _)) => estimates,
                         Err(_) if rechecked.is_none() => super::update::unknown_execution_inputs(),
                         Err(_) => return Err(position_mismatch()),
                     }
