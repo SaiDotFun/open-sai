@@ -153,7 +153,12 @@ impl AccountCommand {
                 // A cancelled system DNS job can outlive the overview's deadline.
                 // Let the CLI report its result without waiting for that blocking job.
                 runtime.shutdown_background();
-                let value = value?;
+                let value = value.map_err(|mut error| {
+                    if error.code == Code::SessionUnavailable {
+                        error.message.push_str(". Pass --as ADDR explicitly.");
+                    }
+                    error
+                })?;
                 return if json || overview_json {
                     output::read(&value, true)
                 } else {
