@@ -4,16 +4,14 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 from scenarios import child_env, loopback, seed_home
-from test_trade import CANCEL, CLI, CLOSE, OPEN, rows, run
+from test_trade import CANCEL, CLI, CLOSE, OBSERVED_AT, OPEN, rows, run
 
-OBSERVED_AT = re.compile(rb'"observedAt": "\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z"')
 OPEN_READS = (
     "borrowings oneClickTrading node_info get_market get_group "
     "get_pair_custom_max_leverage get_fees get_collateral_price"

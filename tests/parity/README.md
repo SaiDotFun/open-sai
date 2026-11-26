@@ -326,6 +326,11 @@ tag `sai-cli/v0.1.2`, commit `8557a7e13dceab0accc369191182c8e01423c91b`.
 The focused release CI step runs this file and the intent status replays
 against the same executable.
 
+The `intent-status` manifest case checks that a valid transaction hash
+matches exactly one history row. The focused tests also cover the original
+malformed hash from #212. Python v0.1.2 matches it by string equality. Rust
+requires a valid hash as evidence and keeps an unresolved intent pending.
+
 ## Comparison Rules
 
 The C7d estimate cases use the Python v0.1.2 commit
