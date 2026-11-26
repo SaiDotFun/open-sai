@@ -31,7 +31,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ContentBlock, TextContent, ToolAnnotations
 from pydantic import BeforeValidator, ConfigDict, ValidationError
 
-from ..core import intents, log_queries, wait
+from ..core import intents, keeper, log_queries, wait
 from ..core import log as sai_log
 from ..core import settings as sai_settings
 from ..core.errors import Code, ExitCode, McpStdioError, SaiError, describe
@@ -877,6 +877,10 @@ class SaiMCP(FastMCP):
             names = tool.parameters.get("properties", {})
             if name in {"auth_use", "logs_intent"}:
                 return {}, sum(key not in names for key in given)
+            if name == "account_overview" and "addr" in given:
+                addr = given["addr"]
+                if addr is not None and not keeper.is_address(addr):
+                    return {}, sum(key not in names for key in given)
             known = {key: loggable_value(given[key]) for key in names if key in given}
             return known, len(given) - len(known)
         except Exception:  # noqa: BLE001 - logging must not fail a call
@@ -885,6 +889,11 @@ class SaiMCP(FastMCP):
     async def checked_call(
         self, name: str, arguments: dict[str, Any]
     ) -> Sequence[ContentBlock] | dict[str, Any]:
+        if name == "account_overview":
+            addr = arguments.get("addr")
+            if addr is not None and not isinstance(addr, str):
+                message = "Argument 'addr' must be a string or null."
+                raise ToolError(message) from SaiError(message, Code.INVALID_REQUEST)
         if name in TRADE_TOOL_NAMES:
             addr = arguments.get("addr")
             refusal = await asyncio.to_thread(
@@ -1008,7 +1017,7 @@ def session_refusal(addr: str | None = None) -> str | None:
 
 def create_server(
     settings: Settings | None = None, *, standalone_stdio: bool = False
-) -> FastMCP:
+) -> SaiMCP:
     """Build a server that lists every read, preview, and trade tool.
 
     Trade tools check sign-in on each call, so registering them while
