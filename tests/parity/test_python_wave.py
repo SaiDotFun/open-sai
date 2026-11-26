@@ -577,6 +577,44 @@ def test_mcp_install_redacts_custom_launcher_credentials(
     assert entry["args"] == list(command[1:])
 
 
+def test_mcp_install_dry_run_redacts_launcher_environment_credentials(
+    wave_clis: tuple[str, str], tmp_path: Path
+) -> None:
+    _, rust = wave_clis
+    overrides = {"PATH": os.defpath}
+    seed_clients(tmp_path, overrides, "empty")
+    names = ["OPENAI_API_KEY", "accessToken", "APP_SECRET", "DB_PASSWORD", "AUTH_MODE"]
+    public_env = "APP_LABEL=public=value"
+    server = (str(tmp_path / "bin/sai"), "mcp", "serve")
+    result = run_cli(
+        rust,
+        tmp_path,
+        "--json",
+        "mcp",
+        "install",
+        "claude",
+        "--dry-run",
+        "--",
+        "/usr/bin/env",
+        *(f"{name}=synthetic-private={index}" for index, name in enumerate(names)),
+        public_env,
+        *server,
+        overrides=overrides,
+    )
+    assert result.returncode == 0
+    assert "synthetic-private" not in result.stdout + result.stderr
+    [report] = json.loads(result.stdout)["results"]
+    expected = [
+        "/usr/bin/env",
+        *(f"{name}=[redacted]" for name in names),
+        public_env,
+        *server,
+    ]
+    assert report["command"] == expected
+    assert report["argv"][0][-len(expected) :] == expected
+    assert not (tmp_path / ".claude.json").exists()
+
+
 @pytest.mark.parametrize("kind", ["cwd", "remote"])
 def test_mcp_install_reports_claude_extra_fields(
     wave_clis: tuple[str, str], tmp_path: Path, kind: str

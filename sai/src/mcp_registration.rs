@@ -138,8 +138,8 @@ fn reported_argv(args: &[String]) -> Vec<String> {
             if std::mem::take(&mut redact_next) {
                 return "[redacted]".into();
             }
-            let (flag, value) = arg
-                .split_once('=')
+            let assignment = arg.split_once('=');
+            let (flag, value) = assignment
                 .filter(|(flag, _)| flag.starts_with('-'))
                 .map_or((None, arg.as_str()), |(flag, value)| (Some(flag), value));
             let name = flag.unwrap_or(arg);
@@ -186,6 +186,17 @@ fn reported_argv(args: &[String]) -> Vec<String> {
                     return format!("{flag}={origin}");
                 }
                 return origin;
+            }
+            if flag.is_none()
+                && let Some((name, _)) = assignment
+            {
+                let uppercase = name.to_ascii_uppercase();
+                if ["KEY", "TOKEN", "SECRET", "PASSWORD", "AUTH"]
+                    .iter()
+                    .any(|part| uppercase.contains(part))
+                {
+                    return format!("{name}=[redacted]");
+                }
             }
             arg.clone()
         })
