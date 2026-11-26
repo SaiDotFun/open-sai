@@ -1173,8 +1173,15 @@ def test_cli_errors_share_one_envelope(
         payload = json.loads(result.stdout)
         assert payload["error"]["code"] == code
         if code == "SIGNED_OUT":
-            origin = None if index == 0 else keeper.MAINNET_HTTP.removesuffix("/query")
-            expected_hint = origin_login_hint(origin)
+            expected_hint = f"sai --endpoint {keeper.MAINNET_HTTP} auth login NAME"
+            if (
+                index == 0
+                and invoke(
+                    cli, tmp_path / "reference-version", "--version"
+                ).stdout.strip()
+                == b"sai, version 0.1.2"
+            ):
+                expected_hint = origin_login_hint(None)
             assert payload["error"].pop("hint") == expected_hint
             outputs.append(payload)
         elif args[0] == "--bad-option":

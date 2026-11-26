@@ -112,6 +112,21 @@
         "endpointId": "string"
       }
     },
+    "intent.open_blocked": {
+      "emitter": "core.storage._check_open_pending",
+      "levels": [
+        "warn"
+      ],
+      "required": {
+        "intentKey": "string",
+        "addr": "string",
+        "endpoint": "string",
+        "code": "string"
+      },
+      "optional": {
+        "endpointId": "string"
+      }
+    },
     "intent.status": {
       "emitter": "core.storage._log_status",
       "levels": [

@@ -311,12 +311,7 @@ impl Storage<'_> {
         location: &str,
         args: &[&str],
     ) -> String {
-        let flag = if origin == Some(endpoint)
-            && self
-                .trader
-                .parent()
-                .is_some_and(|home| log::redact(home, endpoint) == endpoint)
-        {
+        let flag = if self.keeper_hint_uses_url(endpoint, origin) {
             shell_quote(endpoint)
         } else {
             format!(

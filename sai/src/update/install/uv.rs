@@ -60,6 +60,17 @@ struct Pending {
 }
 
 impl Uv {
+    pub(super) fn shim_launcher(exe: &Path, home: &Path) -> Option<PathBuf> {
+        let install = Self::discover(exe, home, super::super::WEB)?;
+        // A pending update can identify an install even after its receipt has
+        // moved. Doctor needs the current receipt and its live uv entry point.
+        if registered_launcher(&install.prefix).as_deref() != Some(install.launcher()) {
+            return None;
+        }
+        install.owner(false).ok()?;
+        Some(install.launcher)
+    }
+
     pub(super) fn discover(exe: &Path, home: &Path, web_base: &str) -> Option<Self> {
         // uvx may share the same native cache. The shim supplies its actual
         // sys.prefix, and only an installed tool has a receipt and launcher.

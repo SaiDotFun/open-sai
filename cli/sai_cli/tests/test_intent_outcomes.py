@@ -502,6 +502,17 @@ def test_acknowledged_open_blocks_retry(connected_replay, submitted_keys, retry)
     assert error["code"] == "RECENT_OPEN_PENDING"
     assert submitted_keys == [key]
 
+    trail = cli.invoke(main, [*options, "logs", "intent", key, "--offline"])
+    assert trail.exit_code == 0, trail.output
+    [refusal] = [
+        event
+        for event in json.loads(trail.stdout)["events"]
+        if event["event"] == "intent.open_blocked"
+    ]
+    assert refusal["code"] == error["code"]
+    assert refusal["intentKey"] == key and refusal["addr"] == ADDR
+    assert refusal["surface"] == ("mcp" if retry == "mcp" else "cli")
+
     if retry == "same_process":
         failure = RESPONSES["simulation_failed"]["data"]["userIntents"][0]
         replies.append({"data": {"userIntents": [{**failure, "intentKey": key}]}})
@@ -521,6 +532,50 @@ def test_acknowledged_open_blocks_retry(connected_replay, submitted_keys, retry)
     assert allowed["status"] == "accepted"
     assert allowed["intentKey"] != key
     assert submitted_keys == [key, allowed["intentKey"]]
+
+
+def test_mcp_refusal_appears_in_every_blocking_intent_trail(connected_replay):
+    endpoint, replies = connected_replay
+    other_key = "earlier-approved-open"
+    reserve(endpoint)
+    storage.set_status(KEY, endpoint, ADDR, "accepted")
+    storage.pending(
+        other_key, endpoint, ADDR, "OPEN_TRADE", "", allow_concurrent_open=True
+    )
+    storage.set_status(other_key, endpoint, ADDR, "accepted")
+    mcp = open_mcp(endpoint)
+    replies.append(MARKET)
+    preview = call_mcp(mcp, "preview_open", OPEN_ARGS)
+    result = call_mcp(
+        mcp,
+        "trade_open",
+        {
+            **OPEN_ARGS,
+            "preview_digest": preview["previewDigest"],
+            "reference_price": preview["referencePrice"],
+        },
+    )
+    assert result["code"] == "RECENT_OPEN_PENDING"
+    assert result["intentKeys"] == [other_key, KEY]
+
+    call_ids = set()
+    for key in result["intentKeys"]:
+        trail = call_mcp(mcp, "logs_intent", {"key": key, "offline": True})
+        [refusal] = [
+            event
+            for event in trail["events"]
+            if event["event"] == "intent.open_blocked"
+        ]
+        assert refusal["intentKey"] == key
+        assert refusal["code"] == result["code"]
+        call_id = refusal["callId"]
+        assert {"mcp.tool_call", "mcp.tool_result"} <= {
+            event["event"]
+            for event in trail["events"]
+            if event.get("callId") == call_id
+        }
+        call_ids.add(call_id)
+    assert len(call_ids) == 1
 
 
 @pytest.mark.parametrize(
@@ -1255,14 +1310,32 @@ def fill_history() -> dict:
 def test_wait_retries_provisional_sweep_and_returns_fill_receipt(keeper_replay):
     endpoint, replies = keeper_replay
     reserve(endpoint)
+    filled = fill_history()
+    position = filled["data"]["perp"]["tradeHistory"][0]["trade"]
+    completed = deepcopy(RESPONSES["filled"])
+    completed["data"]["userIntents"][0]["body"] = {
+        "orderType": "market",
+        "leverage": "2",
+    }
     replies.extend(
         (
             "pending_exec",
             "outcome_not_indexed",
             "not_yet_in_history",
             "not_yet_in_history",
-            "filled",
-            fill_history(),
+            completed,
+            filled,
+            {
+                "data": {
+                    "perp": {
+                        "trade": {
+                            **position,
+                            "tradeType": "trade",
+                            "lastUpdatedBlock": {"block": 50109596},
+                        }
+                    }
+                }
+            },
         )
     )
     clock = FakeClock()
@@ -1278,9 +1351,9 @@ def test_wait_retries_provisional_sweep_and_returns_fill_receipt(keeper_replay):
     assert receipt["execution"]["historyId"] == 1007
     assert receipt["execution"]["marketOrderSequence"] == 49
     assert receipt["fill"] == {
-        "price": None,
+        "price": 81001.25,
+        "sizeCollateralBaseUnits": 7900000,
         "oraclePrice": 81000.5,
-        "sizeCollateralBaseUnits": None,
         "escrowedCollateralBaseUnits": 4000000,
     }
     assert receipt["positionFeesUsd"] == {"opening": 0.05, "closing": 0, "borrowing": 0}
@@ -1305,7 +1378,7 @@ def test_wait_projects_receipt_fields_from_keeper(keeper_replay):
     row["marketOrder"]["execPrice"] = opaque
     row["trade"].update(openPrice=opaque, unrelated=opaque)
     row["openingFeeUsd"] = opaque
-    replies.extend(("filled", history))
+    replies.extend(("filled", history, {"data": {"perp": {"trade": None}}}))
 
     outcome = wait.for_intent(endpoint, ADDR, KEY)
     assert outcome["outcome"] == "filled"
@@ -1576,6 +1649,31 @@ def test_cli_wait_budgets_initial_locked_ledger_lookup(keeper_replay):
     assert status(endpoint) == "unknown"
 
 
+def test_cli_wait_recovery_hint_names_the_public_keeper():
+    endpoint = keeper.MAINNET_HTTP
+    reserve(endpoint)
+    with closing(storage.db()) as connection:
+        connection.execute("BEGIN EXCLUSIVE")
+        command = CliRunner().invoke(
+            main,
+            [
+                "--endpoint",
+                endpoint,
+                "--json",
+                "intent",
+                "wait",
+                KEY,
+                "--timeout",
+                "0.02",
+            ],
+        )
+
+    assert command.exit_code == 5, command.output
+    error = json.loads(command.stdout)["error"]
+    assert error["code"] == "OUTCOME_UNKNOWN"
+    assert error["hint"] == f"sai --endpoint {endpoint} intent wait {KEY}"
+
+
 def test_wait_keeps_resized_position_out_of_original_fill(keeper_replay):
     endpoint, replies = keeper_replay
     reserve(endpoint)
@@ -1588,9 +1686,12 @@ def test_wait_keeps_resized_position_out_of_original_fill(keeper_replay):
     result = wait.for_intent(endpoint, ADDR, KEY)
     receipt = result["receipt"]
     assert receipt["execution"]["historyId"] == 1007
-    assert receipt["fill"]["price"] is None
-    assert receipt["fill"]["sizeCollateralBaseUnits"] is None
-    assert receipt["fill"]["oraclePrice"] == 81000.5
+    assert receipt["fill"] == {
+        "price": None,
+        "sizeCollateralBaseUnits": None,
+        "oraclePrice": 81000.5,
+        "escrowedCollateralBaseUnits": 4000000,
+    }
     assert receipt["positionNow"]["openPrice"] == 87000
     assert receipt["positionNow"]["openCollateralAmount"] == 6000000
 
@@ -1824,5 +1925,11 @@ def test_trade_wait_uses_submission_key(keeper_replay, admission, exit_code, out
     assert local[0]["status"] == ("terminal" if outcome == "filled" else "rejected")
     if outcome == "filled":
         assert log.tail(1, name="intent.wait.start")[0]["timeoutMs"] == 60_000
-        assert value["receipt"]["fill"]["price"] is None
+        assert value["receipt"]["fill"] == {
+            "price": None,
+            "sizeCollateralBaseUnits": None,
+            "oraclePrice": 81000.5,
+            "escrowedCollateralBaseUnits": 4000000,
+        }
         assert value["receipt"]["positionNow"]["isOpen"] is False
+        assert value["receipt"]["positionNow"]["closePrice"] == 81001.25
