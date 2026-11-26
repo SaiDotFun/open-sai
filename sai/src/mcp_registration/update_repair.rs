@@ -3,7 +3,7 @@ use std::{env, path::Path, time::Duration};
 use sai_core::log::{EventContext, Level};
 use serde_json::{Map, Value, json};
 
-use super::{Clients, RETIRED_NAME, Target, in_uv_cache, which};
+use super::{Client, Clients, RETIRED_NAME, Target, in_uv_cache, which};
 
 const BACKGROUND: (&str, &str) = (
     "background",
@@ -18,13 +18,11 @@ const FAILED: (&str, &str) = (
     "Could not check MCP registrations. Run `sai doctor` for details.",
 );
 
-#[allow(dead_code, reason = "Consumed by the updater when PR #121 integrates")]
 pub(crate) struct UpdateRepair {
     reports: Vec<Value>,
     notes: Vec<(&'static str, &'static str)>,
 }
 
-#[allow(dead_code, reason = "Consumed by the updater when PR #121 integrates")]
 impl UpdateRepair {
     pub(crate) fn json_fields(&self) -> Map<String, Value> {
         self.fields(|(_, text)| text)
@@ -55,7 +53,6 @@ impl UpdateRepair {
 /// Check registrations after the installer has verified and committed the
 /// new install. Use the installer's stable launcher, since the old binary may
 /// still be running. Add the repair fields to the successful outcome and state.
-#[allow(dead_code, reason = "Called by the updater when PR #121 integrates")]
 pub(crate) fn repair_after_update(
     launcher: &Path,
     background: bool,
@@ -73,7 +70,10 @@ pub(crate) fn repair_after_update(
         let target = verified_target(launcher, &home)?;
         Some((Clients { home, cwd }, target))
     }) {
-        for check in clients.check_all(Some(&target), true, None, Duration::from_secs(7)) {
+        // Clients can save their configs after the writer's last check and
+        // before publication. Keep background checks read-only.
+        let may_repair = |_| !background;
+        for check in clients.check_all(Some(&target), may_repair, None, Duration::from_secs(7)) {
             if !matches!(check.status, "fixed" | "fail") && !check.pinned && !check.legacy_name {
                 continue;
             }
@@ -90,6 +90,10 @@ pub(crate) fn repair_after_update(
             }
             if !check.manual_repairs.is_empty() {
                 report["manualRepairs"] = json!(check.manual_repairs);
+            }
+            if !check.manual_repairs.is_empty()
+                || (background && check.client != Client::Claude.name() && check.status == "fail")
+            {
                 report["fix"] = json!(check.fix);
             }
             reports.push(report);

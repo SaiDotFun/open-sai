@@ -1722,6 +1722,74 @@ def test_claude_uses_the_main_checkout_toggle_for_the_local_entry(
     assert all(call[:2] == ["mcp", "get"] for call in env.calls())
 
 
+@pytest.mark.parametrize("via_symlink", [False, True])
+def test_update_repairs_cursor_once_when_project_config_is_user_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, via_symlink: bool
+):
+    home = tmp_path / "home"
+    config = home / ".cursor" / "mcp.json"
+    config.parent.mkdir(parents=True)
+    cwd = home
+    if via_symlink:
+        cwd = tmp_path / "project"
+        cwd.mkdir()
+        (cwd / ".cursor").symlink_to(config.parent, target_is_directory=True)
+    launcher = tmp_path / "sai"
+    launcher.symlink_to(sys.executable)
+    original = {
+        "mcpServers": {
+            "sai": {"command": OLD_COMMAND, "args": [], "env": {"SAI_HOME": "saved"}},
+            "other": {"url": "http://127.0.0.1:8765/mcp"},
+        }
+    }
+    config.write_text(json.dumps(original))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("SAI_HOME", str(tmp_path / "profile"))
+    monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / ".claude"))
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.chdir(cwd)
+
+    outcome = updater.repair_after_update(
+        updater.Outcome(updater.UPDATED, "updated"), launcher, False
+    )
+
+    [report] = outcome.mcp_results()
+    assert report["client"] == "cursor"
+    assert report["status"] == "fixed"
+    assert report["changes"] == ["Repaired the Sai registration in user scope"]
+    original["mcpServers"]["sai"].update(command=str(launcher), args=["mcp", "serve"])
+    assert json.loads(config.read_text()) == original
+
+
+def test_cursor_symlink_loop_keeps_other_client_reports(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+):
+    profile = str(env.root / "profile")
+    monkeypatch.setenv("SAI_HOME", profile)
+    env.cursor_path().parent.mkdir()
+    loop = env.project / ".cursor" / "mcp.json"
+    loop.parent.mkdir()
+    loop.symlink_to(loop.name)
+    env.write_codex(
+        {"sai": {"command": OLD_COMMAND, "args": [], "env": {"SAI_HOME": profile}}}
+    )
+
+    outcome = updater.repair_after_update(
+        updater.Outcome(updater.UPDATED, "updated"), env.sai, False
+    )
+    results = {row["client"]: row for row in outcome.mcp_results()}
+    assert not outcome.mcp_notes
+    assert results["codex"]["status"] == "fixed"
+    assert results["cursor"]["status"] == "fail"
+    assert loop.readlink() == Path(loop.name)
+
+    checks = mcp_checks(invoke("doctor", "--offline"))
+    assert checks["codex"]["status"] == "pass"
+    assert checks["cursor"]["status"] == "fail"
+    assert "Could not read" in checks["cursor"]["summary"]
+
+
 @pytest.mark.parametrize("background", [False, True])
 def test_update_ignores_a_healthy_claude_profile_pin(env: Env, background: bool):
     config = env.home / ".claude.json"
