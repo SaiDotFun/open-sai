@@ -755,6 +755,52 @@ def test_mcp_install_reports_only_generated_serve_arguments(
         assert report["argv"][0][-3:] == [launcher, "mcp", "serve"]
 
 
+@pytest.mark.parametrize("flags", [(), ("--json",)], ids=["text", "json"])
+def test_noninteractive_mcp_install_listing_hides_launcher_arguments(
+    wave_clis: tuple[str, str], tmp_path: Path, flags: tuple[str, ...]
+) -> None:
+    _, rust = wave_clis
+    overrides = {"PATH": os.defpath}
+    original = seed_clients(tmp_path, overrides, "current")
+    launcher = "/bin/sh"
+    args = ["-c", "APP_MODE=synthetic-private-wrapper exec sai mcp serve"]
+    path = tmp_path / ".cursor/mcp.json"
+    config = json.loads(path.read_bytes())
+    config["mcpServers"]["sai"].update(command=launcher, args=args)
+    original[".cursor/mcp.json"] = json.dumps(config).encode()
+    path.write_bytes(original[".cursor/mcp.json"])
+
+    hidden = ["<argument hidden 1 of 2>", "<argument hidden 2 of 2>"]
+    for options in ((), ("--dry-run",)):
+        result = run_cli(
+            rust,
+            tmp_path,
+            *flags,
+            "mcp",
+            "install",
+            *options,
+            "--",
+            launcher,
+            *args,
+            overrides=overrides,
+        )
+        assert result.returncode == 0
+        assert "synthetic-private-wrapper" not in result.stdout + result.stderr
+        report = json.loads(result.stdout)
+        assert report["command"] == [launcher, *hidden]
+        clients = report["clients"]
+        assert {row["client"] for row in clients} == {"claude", "codex", "cursor"}
+        for row in clients:
+            matches = row["client"] == "cursor"
+            shown = [launcher if matches else "sai", *hidden]
+            assert row["current"] is matches
+            assert row["registeredCommand"] == shown
+            assert row["registrations"]
+            assert all(entry["command"] == shown for entry in row["registrations"])
+        for relative, source in original.items():
+            assert (tmp_path / relative).read_bytes() == source
+
+
 @pytest.mark.parametrize("client", ["claude", "codex", "cursor"])
 @pytest.mark.parametrize("launcher_style", ["assignment", "unresolved", "plain-path"])
 def test_saved_mcp_registrations_hide_non_path_launchers_and_arguments(
