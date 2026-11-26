@@ -118,6 +118,54 @@ def test_native_archive_initializes_mcp(distribution: SimpleNamespace) -> None:
         verify_mcp_startup(d)
 
 
+def test_native_doctor_repairs_standalone_launcher_outside_path(
+    distribution: SimpleNamespace,
+) -> None:
+    d = distribution
+    tool = d.tool
+    (tool.home / ".codex").rmdir()
+    bin_dir = tool.home / "custom-bin"
+    root = bin_dir / ".sai-native"
+    with d.archive.open("rb") as archive:
+        digest = hashlib.file_digest(archive, "sha256").hexdigest()
+    selected = Path(f"{d.version}-{digest}") / "sai"
+    executable = root / selected
+    executable.parent.mkdir(mode=0o700, parents=True)
+    root.chmod(0o700)
+    with tarfile.open(d.archive) as archive, executable.open("wb") as output:
+        binary = archive.extractfile("sai")
+        assert binary is not None
+        with binary:
+            shutil.copyfileobj(binary, output)
+    executable.chmod(0o700)
+    (root / "current").symlink_to(selected)
+    launcher = bin_dir / "sai"
+    launcher.symlink_to(Path(".sai-native") / "current")
+    assert str(bin_dir) not in tool.env["PATH"].split(os.pathsep)
+
+    config = tool.home / ".cursor" / "mcp.json"
+    config.parent.mkdir()
+    entry = {
+        "command": str(bin_dir / "missing" / "sai"),
+        "args": ["mcp", "serve"],
+        "env": {"SAI_HOME": str(tool.sai_home)},
+    }
+    config.write_text(json.dumps({"mcpServers": {"sai": entry}}), encoding="utf-8")
+
+    stdout = run(
+        tool, "Repair standalone launcher", launcher, "--json", "doctor", "--offline"
+    )
+
+    [report] = [
+        row for row in json.loads(stdout)["checks"] if row["id"] == "mcp.cursor"
+    ]
+    assert report["status"] == "fixed", report
+    entry["command"] = str(bin_dir.resolve() / "sai")
+    assert json.loads(config.read_text(encoding="utf-8")) == {
+        "mcpServers": {"sai": entry}
+    }
+
+
 def write_shell_probe_archive(probe_archive: Path) -> None:
     shell = Path("/bin/sh")
     member = tarfile.TarInfo("sai")
