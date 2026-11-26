@@ -684,14 +684,14 @@ pub(crate) fn check_registrations(
         Some(value) => profile_value(&clients.home, value),
         None => profile(&clients.home),
     };
-    Ok(clients.check_all(target.as_ref(), fix, Some(&expected_profile), timeout))
+    Ok(clients.check_all(target.as_ref(), |_| fix, Some(&expected_profile), timeout))
 }
 
 impl Clients {
     fn check_all(
         &self,
         target: Option<&Target>,
-        fix: bool,
+        may_repair: impl Fn(Client) -> bool,
         expected_profile: Option<&Option<String>>,
         timeout: Duration,
     ) -> Vec<RegistrationCheck> {
@@ -713,7 +713,13 @@ impl Clients {
                     }
                     _ => self,
                 };
-                clients.check(client, target, expected_profile, fix, deadline)
+                clients.check(
+                    client,
+                    target,
+                    expected_profile,
+                    may_repair(client),
+                    deadline,
+                )
             })
             .collect()
     }

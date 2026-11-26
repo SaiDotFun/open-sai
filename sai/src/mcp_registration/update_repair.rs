@@ -3,7 +3,7 @@ use std::{env, path::Path, time::Duration};
 use sai_core::log::{EventContext, Level};
 use serde_json::{Map, Value, json};
 
-use super::{Clients, RETIRED_NAME, Target, in_uv_cache, which};
+use super::{Client, Clients, RETIRED_NAME, Target, in_uv_cache, which};
 
 const BACKGROUND: (&str, &str) = (
     "background",
@@ -70,7 +70,10 @@ pub(crate) fn repair_after_update(
         let target = verified_target(launcher, &home)?;
         Some((Clients { home, cwd }, target))
     }) {
-        for check in clients.check_all(Some(&target), true, None, Duration::from_secs(7)) {
+        // Cursor can save its config after the writer's last check and before
+        // publication. Keep the background check read-only for this client.
+        let may_repair = |client| !background || client != Client::Cursor;
+        for check in clients.check_all(Some(&target), may_repair, None, Duration::from_secs(7)) {
             if !matches!(check.status, "fixed" | "fail") && !check.pinned && !check.legacy_name {
                 continue;
             }
@@ -87,6 +90,10 @@ pub(crate) fn repair_after_update(
             }
             if !check.manual_repairs.is_empty() {
                 report["manualRepairs"] = json!(check.manual_repairs);
+            }
+            if !check.manual_repairs.is_empty()
+                || (background && check.client == Client::Cursor.name() && check.status == "fail")
+            {
                 report["fix"] = json!(check.fix);
             }
             reports.push(report);
