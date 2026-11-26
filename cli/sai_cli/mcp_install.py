@@ -48,6 +48,7 @@ INSTALL_URL = "git+https://github.com/SaiDotFun/open-sai"
 ENDPOINT_FLAGS = {spec.flag: spec.key for spec in settings.SETTINGS if spec.flag}
 CLAUDE_ARG_PLACEHOLDER = "<original-argument>"
 CLAUDE_HOME_PLACEHOLDER = "<original-SAI_HOME>"
+INSTALL_PROFILE_PLACEHOLDER = "<profile>"
 
 
 class InstallError(Exception):
@@ -270,6 +271,8 @@ def claude_repair_hint(entries: tuple[ClaudeRepair, ...]) -> str:
             )
             launcher = shlex.quote(entry.launcher)
             check = f"test -f {launcher} && test -x {launcher}"
+            if entry.sai_home == INSTALL_PROFILE_PLACEHOLDER:
+                hint += "\nReplace <profile> with the intended SAI_HOME path before removing the entry."
             if (
                 entry.sai_home == CLAUDE_HOME_PLACEHOLDER
                 or entry.extra_env
@@ -328,8 +331,6 @@ def report_different_claude_entry(
     result: Result,
     existing: Registration,
     target: Target,
-    *,
-    dry_run: bool,
 ) -> Result:
     launcher = target.argv[0]
     launcher_args: tuple[str, ...] = ()
@@ -349,13 +350,11 @@ def report_different_claude_entry(
     scope = existing.scope
     path = client.registration_path(scope)
     sai_home = claude_advice_home(existing, target.env.get("SAI_HOME"))
-    if dry_run and sai_home is not None:
-        sai_home = CLAUDE_HOME_PLACEHOLDER
     entry = ClaudeRepair(
         scope,
         NAME,
         replace_entry=True,
-        sai_home=sai_home,
+        sai_home=INSTALL_PROFILE_PLACEHOLDER if sai_home is not None else None,
         config_path=path,
         fields=claude_differing_fields(existing, target),
         launcher=launcher,
@@ -1224,22 +1223,23 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
             result.action = "unchanged"
             return result
         if isinstance(client, Claude) and existing is not None:
-            return report_different_claude_entry(
-                client, result, existing, target, dry_run=dry_run
-            )
+            return report_different_claude_entry(client, result, existing, target)
         action = "added" if existing is None else "replaced"
         if isinstance(client, (Codex, Cursor)):
             result.path = str(client.config_path(scope))
             steps: list[list[str]] = []
         else:
-            step_target = (
-                replace(target, env=dict.fromkeys(target.env, "[redacted]"))
-                if dry_run
-                else target
-            )
-            steps = client.add_steps(scope, step_target)
+            steps = client.add_steps(scope, target)
             # The server argv follows the client's own options.
-            result.argv = [[*step[: -len(target.argv)], *command] for step in steps]
+            result.argv = []
+            for step in steps:
+                options = [
+                    f"--env=SAI_HOME={INSTALL_PROFILE_PLACEHOLDER}"
+                    if arg.startswith("--env=SAI_HOME=")
+                    else arg
+                    for arg in step[: -len(target.argv)]
+                ]
+                result.argv.append([*options, *command])
         if dry_run:
             result.action, result.would = "planned", action
             return result
@@ -1772,9 +1772,7 @@ def repair_claude_existing(
                     "Review MCP approvals and settings in the client."
                 )
             if not existing.matches(target):
-                return report_different_claude_entry(
-                    client, result, existing, target, dry_run=dry_run
-                )
+                return report_different_claude_entry(client, result, existing, target)
             result.action = "unchanged"
             return result
         if not existing.stdio:

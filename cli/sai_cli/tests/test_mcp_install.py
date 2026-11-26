@@ -1408,11 +1408,16 @@ def test_claude_install_reports_an_explicit_command_blocked_by_a_legacy_alias(
     assert not env.calls()
 
 
-def claude_add_command(hint: str) -> str:
+def claude_add_command(hint: str, *, profile: Path | str | None = None) -> str:
     [command] = [
         part for part in hint.split("`")[1::2] if part.startswith("claude mcp add ")
     ]
-    return command
+    if profile is None:
+        return command
+    return command.replace(
+        shlex.quote("--env=SAI_HOME=<profile>"),
+        shlex.quote(f"--env=SAI_HOME={profile}"),
+    )
 
 
 def test_claude_manual_commands_are_copyable(env: Env, monkeypatch: pytest.MonkeyPatch):
@@ -1430,7 +1435,7 @@ def test_claude_manual_commands_are_copyable(env: Env, monkeypatch: pytest.Monke
     [row] = payload(result)["error"]["details"]["results"]
     assert config.read_bytes() == before
     assert not env.calls()
-    command = claude_add_command(row["fix"])
+    command = claude_add_command(row["fix"], profile=profile)
     shell = shutil.which("sh", path=os.defpath)
     assert shell is not None
     assert f"The user sai entry in {config} differs in env, cwd." in row["fix"]
@@ -1454,15 +1459,13 @@ def test_claude_printed_profile_matches_normal_install(
     result = invoke("mcp", "install", "claude")
     failure(result)
     [row] = payload(result)["error"]["details"]["results"]
-    commands = row["fix"].split("`")[1::2]
-    assert any(
-        shlex.quote(f"--env=SAI_HOME={expected_home}") in cmd for cmd in commands
-    )
+    assert "--env=SAI_HOME=<profile>" in claude_add_command(row["fix"])
+    assert expected_home not in result.output
     shell = shutil.which("sh", path=os.defpath)
     assert shell
     monkeypatch.delenv("SAI_HOME")
     config.write_text('{"mcpServers": {}}')
-    command = claude_add_command(row["fix"])
+    command = claude_add_command(row["fix"], profile=expected_home)
     subprocess.run([shell, "-c", command], cwd=env.home, check=True)
     assert env.claude_json()["mcpServers"]["sai"]["env"] == {"SAI_HOME": expected_home}
     monkeypatch.setenv("SAI_HOME", profile)
@@ -1519,7 +1522,7 @@ def test_claude_printed_add_uses_the_absolute_launcher_and_inline_profile(
         "--scope",
         "user",
         "sai",
-        f"--env=SAI_HOME={profile}",
+        "--env=SAI_HOME=<profile>",
         "--",
         *serve(env),
     ]
@@ -1533,6 +1536,7 @@ def test_claude_printed_add_uses_the_absolute_launcher_and_inline_profile(
     monkeypatch.delenv("SAI_HOME")
     monkeypatch.setenv("PATH", str(client_bin))
     config.write_text('{"mcpServers": {}}')
+    command = claude_add_command(row["fix"], profile=profile)
     subprocess.run([shell, "-c", command], cwd=env.project, check=True)
     assert env.claude_json()["mcpServers"]["sai"] == claude_entry(
         serve(env), {"SAI_HOME": str(profile)}
@@ -1889,7 +1893,11 @@ def test_claude_replacement_advice_preserves_saved_server_options(
     assert all(
         value not in diagnostic for value in (SECRET, private_key, "private.example")
     )
-    redacted_profile = profile if surface == "background" else "<original-SAI_HOME>"
+    redacted_profile = {
+        "background": profile,
+        "doctor": "<original-SAI_HOME>",
+        "install": "<profile>",
+    }[surface]
     if surface != "background":
         assert profile not in diagnostic
     assert (
@@ -1918,7 +1926,7 @@ def test_claude_replacement_advice_preserves_saved_server_options(
         "--ws-endpoint=<original-argument>",
     ]
     replacements = {
-        "--env=SAI_HOME=<original-SAI_HOME>": f"--env=SAI_HOME={profile}",
+        f"--env=SAI_HOME={redacted_profile}": f"--env=SAI_HOME={profile}",
         "--env=<NAME>=<value>": f"--env={private_key}={SECRET}",
         "<original-argument>": endpoint,
         "--ws-endpoint=<original-argument>": f"--ws-endpoint={ws_endpoint}",
@@ -2149,9 +2157,29 @@ def test_install_accepts_resolvable_launcher_with_assignment_or_dash(
     assert (entry["command"], entry["args"]) == (launcher, args)
 
 
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_claude_install_masks_profile_in_success_report(
+    install_preview: Path, json_output: bool
+) -> None:
+    root = install_preview.parent
+    profile = str(root / "sai-home")
+    write_exe(root / "sai", "")
+    flags = ["--json"] if json_output else []
+
+    result = CliRunner().invoke(main, [*flags, "mcp", "install", "claude"])
+
+    assert result.exit_code == 0, result.output
+    assert profile not in result.output
+    [row] = payload(result)["results"]
+    assert "--env=SAI_HOME=<profile>" in row["argv"][0]
+    config = json.loads((root / ".claude.json").read_text())
+    assert config["mcpServers"]["sai"]["env"] == {"SAI_HOME": profile}
+
+
 @pytest.mark.parametrize("repair_existing", [False, True], ids=["install", "repair"])
-def test_claude_dry_run_masks_profile_in_repair_hint(
-    install_preview: Path, repair_existing: bool
+@pytest.mark.parametrize("dry_run", [False, True], ids=["apply", "dry-run"])
+def test_claude_install_masks_profile_in_repair_hint(
+    install_preview: Path, repair_existing: bool, dry_run: bool
 ) -> None:
     root = install_preview.parent
     profile = str(root / "sai-home")
@@ -2162,7 +2190,9 @@ def test_claude_dry_run_masks_profile_in_repair_hint(
         {"mcpServers": {"sai": claude_entry(argv, {"SAI_HOME": profile})}}
     )
     config.write_text(original)
-    args = ["mcp", "install", "claude", "--dry-run"]
+    args = ["mcp", "install", "claude"]
+    if dry_run:
+        args.append("--dry-run")
     if repair_existing:
         args.extend(["--repair-existing", "sai"])
 
@@ -2170,12 +2200,12 @@ def test_claude_dry_run_masks_profile_in_repair_hint(
 
     assert "differs from the requested settings" in failure(result)
     [row] = payload(result)["error"]["details"]["results"]
-    assert "--env=SAI_HOME=<original-SAI_HOME>" in row["fix"]
+    assert "--env=SAI_HOME=<profile>" in row["fix"]
     assert profile not in result.output
 
     text = CliRunner().invoke(main, args)
     assert text.exit_code == 1
-    assert "--env=SAI_HOME=<original-SAI_HOME>" in text.stderr
+    assert "--env=SAI_HOME=<profile>" in text.stderr
     assert profile not in text.output
     assert config.read_text() == original
     assert not (root / "argv.log").exists()
@@ -2244,7 +2274,7 @@ def test_dry_run_displays_launcher_and_argument_placeholders(
             "--scope",
             "project",
             "sai",
-            "--env=SAI_HOME=[redacted]",
+            "--env=SAI_HOME=<profile>",
             "--",
             *shown,
         ]
@@ -3171,12 +3201,13 @@ def test_claude_install_reports_scoped_commands_without_credentials(
     assert f"Remove the existing {scope} sai entry" in row["fix"]
     assert f"The {scope} sai entry in {config} differs in env." in row["fix"]
     assert (
-        f"claude mcp add --scope {scope} sai {shlex.quote(f'--env=SAI_HOME={profile}')}"
+        f"claude mcp add --scope {scope} sai '--env=SAI_HOME=<profile>'"
         f" '--env=<NAME>=<value>' -- {shlex.quote(str(env.sai))}"
         " '<original-argument>' '<original-argument>'"
     ) in row["fix"]
     assert "substitute your requested command" in row["fix"]
     assert SECRET not in output and OTHER not in output
+    assert str(profile) not in output
     assert config.read_bytes() == before
     assert not env.calls()
 

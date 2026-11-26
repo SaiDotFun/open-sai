@@ -1163,6 +1163,21 @@ def run_case(
         project_reference_log_privacy(left, right)
         if case.name in {"mcp-install-invalid-scope", "mcp-install-empty-scope"}:
             left = project_reference_rejected_scope(left)
+        if case.accepted_divergence == "install-profile-report" and isinstance(
+            right.output, dict
+        ):
+            # Normalize the older Rust report for this exact fixture profile.
+            for row in right.output.get("results", []):
+                if row.get("client") == "claude" and "argv" in row:
+                    row["argv"] = [
+                        [
+                            "--env=SAI_HOME=<profile>"
+                            if arg == "--env=SAI_HOME=<HOME>/sai"
+                            else arg
+                            for arg in step
+                        ]
+                        for step in row["argv"]
+                    ]
     if (
         candidate != reference
         and case.accepted_divergence == "doctor-keeper-log-context"
