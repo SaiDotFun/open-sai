@@ -174,6 +174,20 @@ fn plain_launcher(command: &str) -> bool {
         && !command.chars().any(char::is_control)
 }
 
+fn reported_env_name(entry: &str) -> &str {
+    let name = entry.split_once('=').map_or(entry, |(name, _)| name);
+    let mut bytes = name.bytes();
+    if bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        name
+    } else {
+        "<hidden>"
+    }
+}
+
 struct Registration {
     // Codex compares the complete replies, ignoring key order. JSON
     // adapters use the original entry to detect an edit during repair.
@@ -262,7 +276,12 @@ impl Registration {
             json!({"command": []})
         };
         if !self.stale_env.is_empty() {
-            out["staleEnv"] = json!(self.stale_env);
+            let names = self
+                .stale_env
+                .iter()
+                .map(|entry| reported_env_name(entry))
+                .collect::<std::collections::BTreeSet<_>>();
+            out["staleEnv"] = json!(names);
         }
         if !self.extra.is_empty() {
             out["extraSettings"] = json!(self.extra);

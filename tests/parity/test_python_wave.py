@@ -801,6 +801,62 @@ def test_noninteractive_mcp_install_listing_hides_launcher_arguments(
             assert (tmp_path / relative).read_bytes() == source
 
 
+@pytest.mark.parametrize("flags", [(), ("--json",)], ids=["text", "json"])
+def test_mcp_reports_only_stale_environment_names(
+    wave_clis: tuple[str, str], tmp_path: Path, flags: tuple[str, ...]
+) -> None:
+    _, rust = wave_clis
+    overrides = {"PATH": os.defpath}
+    seed_clients(tmp_path, overrides, "current")
+    marker = "synthetic-private-env"
+    codex = tmp_path / ".codex/config.toml"
+    forwarded = [
+        f"OPENAI_API_KEY={marker}=suffix",
+        "OPENAI_API_KEY",
+        f"invalid name {marker}",
+        f"={marker}",
+    ]
+    codex.write_text(
+        codex.read_text().replace(
+            'args = ["mcp", "serve"]',
+            f'args = ["mcp", "serve"]\nenv_vars = {json.dumps(forwarded)}',
+        )
+    )
+    paths = [codex, tmp_path / ".claude.json", tmp_path / ".cursor/mcp.json"]
+    for path in paths[1:]:
+        config = json.loads(path.read_bytes())
+        config["mcpServers"]["sai"]["env"].update(
+            {f"APP_TOKEN={marker}": marker, "APP_MODE": marker}
+        )
+        path.write_text(json.dumps(config))
+    original = {path: path.read_bytes() for path in paths}
+
+    launcher = str(tmp_path / "bin/sai")
+    for invocation in (
+        ("list",),
+        ("install", "--", launcher, "mcp", "serve"),
+        ("install", "--dry-run", "--", launcher, "mcp", "serve"),
+    ):
+        result = run_cli(
+            rust, tmp_path, *flags, "mcp", *invocation, overrides=overrides
+        )
+        assert result.returncode == 0
+        assert marker not in result.stdout + result.stderr
+        clients = json.loads(result.stdout)["clients"]
+        assert {row["client"] for row in clients} == {"claude", "codex", "cursor"}
+        for row in clients:
+            expected = (
+                ["<hidden>", "OPENAI_API_KEY"]
+                if row["client"] == "codex"
+                else ["APP_MODE", "APP_TOKEN"]
+            )
+            assert not row["current"]
+            assert row["staleEnv"] == expected
+            assert row["registrations"]
+            assert all(entry["staleEnv"] == expected for entry in row["registrations"])
+        assert {path: path.read_bytes() for path in paths} == original
+
+
 @pytest.mark.parametrize("client", ["claude", "codex", "cursor"])
 @pytest.mark.parametrize("launcher_style", ["assignment", "unresolved", "plain-path"])
 def test_saved_mcp_registrations_hide_non_path_launchers_and_arguments(
