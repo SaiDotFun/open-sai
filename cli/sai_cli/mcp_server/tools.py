@@ -206,6 +206,18 @@ def describe(exc: Exception) -> dict[str, Any]:
         )
     if failure.code == Code.PREVIEW_MISMATCH:
         return preview_mismatch(failure.message)
+    if (
+        isinstance(exc, (keeper.AdmissionRejected, keeper.NotSent))
+        and (account := exc.recovery_account)
+        and (key := failure.intent_key)
+    ):
+        return error(
+            failure.message,
+            failure.code,
+            intentKey=key,
+            addr=account,
+            next=f"Call intent_status with key {key} and addr {account} before retrying.",
+        )
     if isinstance(exc, (storage.UnresolvedIntent, storage.IntentReservationError)):
         if key := failure.intent_key:
             return error(

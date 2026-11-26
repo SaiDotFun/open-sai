@@ -368,6 +368,7 @@ class KeeperError(SaiError):
     """Keeper rejected a query or transport failed."""
 
     code = Code.KEEPER_ERROR
+    recovery_account: str | None = None
 
 
 class UdUnavailable(KeeperError):

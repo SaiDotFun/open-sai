@@ -116,6 +116,7 @@ class Position:
         default_factory=deque
     )
     lose_admission_ack: bool = False
+    reject_admission: bool = False
     submitted: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -159,6 +160,11 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 assert self.headers["Authorization"] == f"Bearer {TOKEN}"
                 envelope = request["variables"]["input"]
                 position.submitted.append(envelope["intent"])
+                if position.reject_admission:
+                    self.reply(
+                        {"errors": [{"extensions": {"code": "INTENT_NOT_ACCEPTED"}}]}
+                    )
+                    return
                 if position.lose_admission_ack:
                     self.reply({"data": {"recordUserIntent": None}})
                     return
@@ -634,6 +640,37 @@ def test_unresolved_trade_returns_ledger_key_and_account(
                     ADDR,
                 )
                 assert not position.submitted
+
+    asyncio.run(scenario())
+
+
+def test_mcp_rejection_preserves_recovery_when_status_write_fails(
+    position_service: tuple[Position, str],
+) -> None:
+    position, base_url = position_service
+    position.reject_admission = True
+    params = {"trade_id": 7}
+    with storage.db() as ledger:
+        ledger.execute(
+            "CREATE TRIGGER reject_status_write BEFORE UPDATE OF status ON intents "
+            "BEGIN SELECT RAISE(ABORT, 'ledger write failed'); END"
+        )
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, "preview_close", params)
+            outcome = await call(
+                client,
+                "trade_close",
+                {**params, "preview_digest": preview["previewDigest"]},
+            )
+            assert outcome["code"] == "ADMISSION_REJECTED"
+            [row] = (await call(client, "intent_local", {"addr": ADDR}))["intents"]
+            assert row["status"] == "unknown"
+            key = row["intentKey"]
+            assert (outcome.get("intentKey"), outcome.get("addr")) == (key, ADDR)
+            assert all(item in outcome["next"] for item in ("intent_status", key, ADDR))
+            assert len(position.submitted) == 1
 
     asyncio.run(scenario())
 

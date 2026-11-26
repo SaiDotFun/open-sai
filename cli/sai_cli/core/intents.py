@@ -293,6 +293,7 @@ def submit(
         status = "rejected" if isinstance(exc, keeper.AdmissionRejected) else "not_sent"
         if failure := _record_submission_status(key, endpoint, account, status):
             exc.hint = storage.intent_status_hint(endpoint, account, key)
+            exc.recovery_account = account
             raise exc from failure
         raise
     except (
