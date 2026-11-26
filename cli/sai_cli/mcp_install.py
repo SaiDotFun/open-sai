@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -79,8 +80,8 @@ class Target:
 class Registration:
     """The `sai` entry found in a client.
 
-    Keeps argv, the SAI_HOME value (a path), and only the names of any other
-    environment settings. Install writes only SAI_HOME to canonical entries.
+    Keeps argv, the SAI_HOME path, and entries the client reports as other
+    environment names. Install writes only SAI_HOME to canonical entries.
     """
 
     argv: list[str]
@@ -147,7 +148,7 @@ class Registration:
             "effective": effective,
         }
         if self.stale_env:
-            out["staleEnv"] = list(self.stale_env)
+            out["staleEnv"] = reported_env_names(self.stale_env)
         if self.extra_settings:
             out["extraSettings"] = list(self.extra_settings)
         if self.disabled:
@@ -451,6 +452,17 @@ def reported_command(
     return [launcher, *reported]
 
 
+def reported_env_names(entries: tuple[str, ...]) -> list[str]:
+    """Show validated names from saved environment entries."""
+    names = (entry.partition("=")[0] for entry in entries)
+    return sorted(
+        {
+            name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) else HIDDEN
+            for name in names
+        }
+    )
+
+
 def launcher_target(launcher: str, environ: Mapping[str, str]) -> Target:
     return Target([launcher, "mcp", "serve"], server_env(environ))
 
@@ -548,8 +560,8 @@ def entry_registration(
 ) -> Registration | None:
     """Keep command, args, SAI_HOME, and other env names from a `sai` entry.
 
-    Other env values are never kept. Codex `env_vars` (variables passed
-    through from the client's environment) count as other env too. The
+    Other values in the env mapping are discarded. Codex `env_vars`
+    (variables passed through from the client's environment) also count. The
     fingerprint hashes `whole`, everything the client reported for the
     server, or the entry itself when that is all there is.
     """
@@ -1150,7 +1162,7 @@ def list_clients(
             if "args" in shown:
                 row["args"] = shown["args"]
             if reg.stale_env:
-                row["staleEnv"] = list(reg.stale_env)
+                row["staleEnv"] = reported_env_names(reg.stale_env)
             if reg.extra_settings:
                 row["extraSettings"] = list(reg.extra_settings)
             if reg.disabled:

@@ -2354,6 +2354,71 @@ def test_noninteractive_install_listing_hides_matching_cursor_arguments(
     assert config.read_text() == original
 
 
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_mcp_listings_report_only_saved_environment_names(
+    install_preview: Path, json_output: bool
+) -> None:
+    root = install_preview.parent
+    launcher = write_exe(root / "sai", "")
+    write_exe(root / "codex", FAKE_CODEX)
+    (root / "codex-home").mkdir()
+    (root / ".cursor").mkdir()
+    command = [str(launcher), "mcp", "serve"]
+    marker = "fixture-env-value"
+    profile = str(root / "sai-home")
+    json_entry = claude_entry(
+        command,
+        {
+            "SAI_HOME": profile,
+            "APP_MODE": marker,
+            f"APP_TOKEN={marker}=suffix": marker,
+            "APP_TOKEN": marker,
+            f"invalid name={marker}": marker,
+        },
+    )
+    codex_entry = claude_entry(command, {"SAI_HOME": profile})
+    codex_entry["env_vars"] = [
+        f"CODEX_TOKEN={marker}=suffix",
+        "CODEX_TOKEN",
+        "_APP_MODE_2",
+        f"invalid name {marker}",
+        f"={marker}",
+    ]
+    files = {
+        root / ".claude.json": json.dumps({"mcpServers": {"sai": json_entry}}),
+        root / ".cursor/mcp.json": json.dumps({"mcpServers": {"sai": json_entry}}),
+        root / "codex-home/config.toml": tomlkit.dumps(
+            {"mcp_servers": {"sai": codex_entry}}
+        ),
+    }
+    for path, data in files.items():
+        path.write_text(data)
+
+    flags = ["--json"] if json_output else []
+    for invocation in (
+        ["list"],
+        ["install", "--", *command],
+        ["install", "--dry-run", "--", *command],
+    ):
+        result = CliRunner().invoke(main, [*flags, "mcp", *invocation])
+
+        assert result.exit_code == 0, result.output
+        assert marker not in result.output
+        rows = payload(result)["clients"]
+        assert {row["client"] for row in rows} == {"claude", "codex", "cursor"}
+        for row in rows:
+            expected = (
+                ["<hidden>", "CODEX_TOKEN", "_APP_MODE_2"]
+                if row["client"] == "codex"
+                else ["<hidden>", "APP_MODE", "APP_TOKEN"]
+            )
+            assert row["registered"] and not row["current"]
+            assert row["staleEnv"] == expected
+            assert row["registrations"]
+            assert all(reg["staleEnv"] == expected for reg in row["registrations"])
+        assert {path: path.read_text() for path in files} == files
+
+
 @pytest.mark.parametrize(
     ("launcher", "executable"),
     [
