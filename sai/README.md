@@ -27,9 +27,11 @@ key to reconcile it before trading again.
 
 `sai mcp serve` exposes the Sai tool inventory over stdio. The Rust server
 handles `mcp_info`, auth tools, market and account reads, and local and
-Keeper intent lookups and waits. The auth tools use the same session store as
-the CLI and read it on every call. Valid calls to `account_overview`,
-`logs_intent`, and preview tools return `NOT_IMPLEMENTED`. Trade calls
+Keeper intent lookups and waits. The account overview reads the active
+account on each call and retains available sections when a source fails.
+The `logs_intent` tool reads retained events and can look up the current
+Keeper record. Auth tools read the shared session store on each call.
+Valid preview calls return `NOT_IMPLEMENTED`. Trade calls
 check the stored session first, then return `NOT_IMPLEMENTED` when the
 session and arguments pass validation.
 

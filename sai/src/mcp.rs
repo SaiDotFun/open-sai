@@ -1,4 +1,6 @@
 mod install;
+mod logs;
+mod overview;
 mod session;
 mod stdio;
 mod trade;
@@ -89,7 +91,7 @@ impl ServeArgs {
             }
         })?;
         let server = SaiMcp {
-            settings,
+            settings: Arc::new(settings),
             env: env.clone(),
             writer,
             install: install::Installation::detect(),
@@ -97,6 +99,8 @@ impl ServeArgs {
             trade_slots: Arc::new(Semaphore::new(2)),
             reconcile_slots: Arc::new(Semaphore::new(8)),
             wait_slots: Arc::new(Semaphore::new(stdio::MAX_IN_FLIGHT)),
+            log_slots: Arc::new(Semaphore::new(2)),
+            overview_slots: Arc::new(Semaphore::new(2)),
         };
         server.events().event(
             "mcp.server_start",
@@ -125,7 +129,7 @@ impl ServeArgs {
 }
 
 struct SaiMcp {
-    settings: Settings,
+    settings: Arc<Settings>,
     env: Environment,
     writer: Option<Arc<LogWriter>>,
     install: install::Installation,
@@ -133,6 +137,8 @@ struct SaiMcp {
     trade_slots: Arc<Semaphore>,
     reconcile_slots: Arc<Semaphore>,
     wait_slots: Arc<Semaphore>,
+    log_slots: Arc<Semaphore>,
+    overview_slots: Arc<Semaphore>,
 }
 
 impl SaiMcp {
@@ -180,6 +186,12 @@ impl SaiMcp {
             "market_prices" => keeper::PRICES,
             "mcp_info" => return self.info(&storage).await,
             "intent_wait" => return self.wait_for_intent(args, call_id).await,
+            "logs_intent" => return self.logs_intent(args).await,
+            "account_overview" => {
+                return self
+                    .account_overview(args.get("addr").and_then(Value::as_str), call_id)
+                    .await;
+            }
             "auth_list" | "auth_status" | "auth_use" => {
                 return self
                     .auth(name, args.get("addr").and_then(Value::as_str), call_id)
@@ -726,7 +738,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let env = Environment::new(home.path().to_owned(), |_| None);
         let server = SaiMcp {
-            settings: Settings::load(&Flags::default(), &env).unwrap(),
+            settings: Arc::new(Settings::load(&Flags::default(), &env).unwrap()),
             env,
             writer: None,
             install: install::Installation::detect(),
@@ -734,6 +746,8 @@ mod tests {
             trade_slots: Arc::new(Semaphore::new(2)),
             reconcile_slots: Arc::new(Semaphore::new(8)),
             wait_slots: Arc::new(Semaphore::new(0)),
+            log_slots: Arc::new(Semaphore::new(2)),
+            overview_slots: Arc::new(Semaphore::new(2)),
         };
         let args = json!({
             "addr": "https://keeper.invalid/?key=fixture-wait-addr",

@@ -118,7 +118,7 @@ impl TradePreview {
         if let Some(route) = &self.position_route {
             output["positionRoute"] = json!(route);
         }
-        if !self.has_unknown_partial_leverage() {
+        if self.execution_refusal(true).is_none() && !self.has_unknown_partial_leverage() {
             output["previewDigest"] = json!(preview_digest(self, account));
         }
         output
@@ -150,20 +150,25 @@ impl TradePreview {
             output["positionRoute"] = json!(route);
             let execution = &output["estimates"]["execution"];
             let rejected = execution["status"] == "would_be_rejected";
-            let missing_oracle = execution["code"] == "OraclePublicationTimeUnknown";
             if rejected && let Some(fields) = output.as_object_mut() {
                 fields.shift_remove("quote");
             }
             if self.position_owner_verified != Some(false)
                 && (!self.requires_market_price_refresh() || self.reference_price.is_some())
-                && !rejected
-                && !missing_oracle
+                && self.execution_refusal(true).is_none()
                 && !self.has_unknown_partial_leverage()
             {
                 output["previewDigest"] = json!(preview_digest(self, account));
             }
         }
         output
+    }
+
+    fn execution_refusal(&self, require_oracle_time: bool) -> Option<&Value> {
+        let execution = &self.estimates.as_ref()?["execution"];
+        (execution["status"] == "would_be_rejected"
+            || (require_oracle_time && execution["code"] == "OraclePublicationTimeUnknown"))
+            .then_some(execution)
     }
 
     fn has_unknown_partial_leverage(&self) -> bool {

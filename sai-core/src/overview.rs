@@ -51,12 +51,7 @@ pub async fn read(
     } else {
         "session"
     };
-    let unavailable = |message: &str| {
-        SaiError::new(
-            Code::SessionUnavailable,
-            format!("{message}. Pass --as ADDR explicitly."),
-        )
-    };
+    let unavailable = |message: &str| SaiError::new(Code::SessionUnavailable, message);
     let accounts = storage.load_accounts();
     let (addr, session) = match accounts {
         Ok(accounts) => {
@@ -65,23 +60,39 @@ pub async fn read(
                     .iter()
                     .map(|(session, _)| session.token().to_owned()),
             );
-            let stored = accounts.selected(addr);
-            let addr = match addr {
-                Some(addr) => addr,
+            let (addr, section) = match addr {
+                Some(addr) => {
+                    let section = match accounts.selected(Some(addr)) {
+                        Some((key, stored)) if stored.checked_address(key).is_err() => {
+                            failed(incomplete("Stored session has an invalid address"))
+                        }
+                        selected => session_section(
+                            selected.map(|(_, stored)| stored),
+                            settings.endpoint(),
+                            &storage,
+                        ),
+                    };
+                    (addr, section)
+                }
                 None => {
-                    let active = stored.ok_or_else(|| unavailable("No active Sai account"))?;
+                    let (key, active) = accounts
+                        .selected(None)
+                        .ok_or_else(|| unavailable("No active Sai account"))?;
                     if active.endpoint() != Some(settings.endpoint()) {
                         return Err(unavailable(
                             "The active session belongs to another Keeper endpoint",
                         ));
                     }
-                    active.addr()
+                    let addr = active
+                        .checked_address(key)
+                        .map_err(|_| unavailable("Stored session has an invalid address"))?;
+                    (
+                        addr,
+                        session_section(Some(active), settings.endpoint(), &storage),
+                    )
                 }
             };
-            (
-                addr.to_owned(),
-                session_section(stored, settings.endpoint(), &storage),
-            )
+            (addr.to_owned(), section)
         }
         Err(error) => {
             let addr = addr.ok_or_else(|| unavailable(&error.to_string()))?;
@@ -238,6 +249,7 @@ impl Overview<'_> {
     }
 
     async fn scan(&self, query: &str, field: &str, id: &str) -> Result<Pages, SaiError> {
+        let keep_malformed_rows = query == keeper::PENDING_MARKET_ORDERS;
         let mut rows = Vec::new();
         let mut seen = HashSet::new();
         for page in 0..MAX_PAGES {
@@ -253,11 +265,17 @@ impl Overview<'_> {
                         .ok_or_else(invalid)?
                         .iter()
                         .map(|row| {
-                            let row = row.as_object().ok_or_else(invalid)?;
-                            Ok((
-                                row.get(id).and_then(Value::as_u64).ok_or_else(invalid)?,
-                                row.clone(),
-                            ))
+                            let key = row[id].as_u64();
+                            if keep_malformed_rows && (key.is_none() || !valid_queued_order(row)) {
+                                // Keep one slot per response row so offset pagination
+                                // advances past malformed queued orders.
+                                return Ok((None, Object::new()));
+                            }
+                            let fields = row
+                                .as_object()
+                                .filter(|_| key.is_some())
+                                .ok_or_else(invalid)?;
+                            Ok((key, fields.clone()))
                         })
                         .collect::<Result<Vec<_>, SaiError>>()
                 });
@@ -276,7 +294,7 @@ impl Overview<'_> {
             let count = entries.len();
             let fetched = json!(iso(now()));
             for (key, mut row) in entries {
-                if !seen.insert(key) {
+                if key.is_some_and(|key| !seen.insert(key)) {
                     return Ok(Pages {
                         rows,
                         complete: false,
@@ -312,7 +330,7 @@ impl Overview<'_> {
         let ids = |scan: &Pages| {
             scan.rows
                 .iter()
-                .map(|row| row[id].as_u64().expect("scan validated IDs"))
+                .map(|row| row.get(id).and_then(Value::as_u64))
                 .collect::<Vec<_>>()
         };
         let mut previous_ids = ids(&first);
@@ -361,23 +379,23 @@ impl Overview<'_> {
             ("fetchedAt", "fetchedAt"),
         ];
         let mut rows = Vec::new();
+        let mut malformed = false;
         for row in &pages.rows {
             let Some(mapped) = fields
                 .iter()
                 .map(|(out, key)| Some((out.to_string(), row.get(*key)?.clone())))
                 .collect::<Option<Object>>()
             else {
-                return failed(invalid());
+                malformed = true;
+                continue;
             };
-            if !row.contains_key("orderReqBlock") || !row.contains_key("orderReqBlockTs") {
-                return failed(invalid());
-            }
-            rows.push(Value::Object(mapped));
+            rows.push((Value::Object(mapped), row));
         }
         let fetched = now();
-        for (mapped, raw) in rows.iter_mut().zip(pages.rows) {
+        let mut projected = Vec::with_capacity(rows.len());
+        for (mut mapped, raw) in rows {
             merge(
-                mapped,
+                &mut mapped,
                 self.block_source(
                     &raw["orderReqBlock"],
                     &raw["orderReqBlockTs"],
@@ -386,13 +404,43 @@ impl Overview<'_> {
                 )
                 .await,
             );
+            projected.push(mapped);
         }
-        let mut section = success(json!(rows), fetched);
-        if !pages.complete {
-            section["error"] = error_value(incomplete(PAGINATION_ERROR));
+        let mut section = success(json!(projected), fetched);
+        const MALFORMED_ROWS: &str =
+            "Keeper returned invalid queued orders. Invalid rows were omitted.";
+        let error = match (malformed, pages.complete) {
+            (true, true) => Some(incomplete(MALFORMED_ROWS)),
+            (true, false) => Some(incomplete(format!("{MALFORMED_ROWS} {PAGINATION_ERROR}"))),
+            (false, false) => Some(incomplete(PAGINATION_ERROR)),
+            (false, true) => None,
+        };
+        if let Some(error) = error {
+            section["error"] = error_value(error);
         }
         section
     }
+}
+
+fn valid_queued_order(row: &Value) -> bool {
+    let valid_hash = |key| {
+        row.get(key)
+            .is_some_and(|value| !keeper::request_hash(value).1)
+    };
+    row["tradeId"].as_u64().is_some()
+        && row["perpMarketId"].as_u64().is_some()
+        && matches!(
+            row["side"].as_str(),
+            Some("open" | "close" | "increase" | "decrease" | "update_leverage")
+        )
+        && row["status"] == "pending_exec"
+        && row
+            .get("collateralAmount")
+            .is_some_and(|value| value.is_null() || valid_base_units(value))
+        && valid_hash("orderReqTxHash")
+        && valid_hash("orderReqEvmTxHash")
+        && row["orderReqBlock"].as_u64().is_some()
+        && instant(&row["orderReqBlockTs"]).is_some()
 }
 
 fn parse_balances(payload: Value) -> Result<Value, SaiError> {
@@ -402,15 +450,18 @@ fn parse_balances(payload: Value) -> Result<Value, SaiError> {
         .ok_or_else(invalid)?
     {
         let token = &row["token_info"];
-        let kind = token.get("type").ok_or_else(invalid)?;
+        let kind = token["type"].as_str().ok_or_else(invalid)?;
         if kind != "sai" {
             continue;
         }
-        let name = token.get("name").ok_or_else(invalid)?;
+        let name = token["name"].as_str().ok_or_else(invalid)?;
         if let Some((_, key)) = BALANCE_KEYS.iter().find(|(label, _)| name == *label) {
             let usd = number(&row["usd_value"]).ok_or_else(invalid)?;
-            let block = row.get("lastUpdatedBlock").ok_or_else(invalid)?;
-            selected.insert((*key).to_owned(), json!({"usd": usd, "block": block}));
+            let height = &row["lastUpdatedBlock"];
+            if !valid_block(height, &Value::Null) {
+                return Err(invalid());
+            }
+            selected.insert((*key).to_owned(), json!({"usd": usd, "block": height}));
         }
     }
     Ok(Value::Object(selected))
@@ -485,6 +536,20 @@ fn merge(into: &mut Value, from: Value) {
 
 fn number(value: &Value) -> Option<f64> {
     value.as_f64().filter(|value| value.is_finite())
+}
+
+fn valid_base_units(value: &Value) -> bool {
+    value
+        .as_str()
+        .or_else(|| value.as_number().map(serde_json::Number::as_str))
+        .is_some_and(|text| {
+            text.bytes().all(|byte| byte.is_ascii_digit()) && text.parse::<u128>().is_ok()
+        })
+}
+
+fn valid_block(height: &Value, timestamp: &Value) -> bool {
+    (height.is_null() || height.as_u64().is_some())
+        && (timestamp.is_null() || timestamp.is_string())
 }
 
 fn now() -> Stamp {

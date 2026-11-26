@@ -15,7 +15,7 @@ use super::{
     actions::decimal_price,
     cancel,
     confirmation::{plain_decimal, positive_decimal},
-    position::Lcd,
+    position::{Lcd, Read},
 };
 use crate::{errors::SaiError, storage::Session};
 
@@ -99,14 +99,11 @@ impl Trading<'_> {
     ) -> Value {
         let market = preview.requires_market_price_refresh();
         let mcp_market = market && matches!(mode, PreviewMode::Mcp | PreviewMode::McpSubmission);
-        if market_row.is_none()
-            && self.lcd_endpoint.is_some()
-            && !(market
-                && matches!(
-                    mode,
-                    PreviewMode::CliSubmission | PreviewMode::McpSubmission
-                ))
-        {
+        let submitting = matches!(
+            mode,
+            PreviewMode::CliSubmission | PreviewMode::McpSubmission
+        );
+        if market_row.is_none() && self.lcd_endpoint.is_some() && !(market && submitting) {
             market_row = self.open_market_row(preview, QUOTE_TIMEOUT).await.ok();
         }
         if preview.position_route.is_none()
@@ -149,6 +146,11 @@ impl Trading<'_> {
                 market_row.as_ref(),
                 reference.as_ref(),
                 &mut result,
+                if submitting {
+                    Read::Fresh
+                } else {
+                    Read::Snapshot
+                },
             )
             .await;
         }
@@ -162,12 +164,13 @@ impl Trading<'_> {
         row: Option<&Value>,
         reference: Option<&Price>,
         result: &mut Value,
+        market_read: Read<'_>,
     ) -> Option<()> {
         let contract = preview.position_route.as_ref()?.contract_address.clone();
         let lcd = lcd::QuoteLcd::new(endpoint, contract);
         let body = &preview.intent.body;
         let market = body["market"].get("marketIndex")?;
-        let pair = lcd.market(market, None).await?;
+        let pair = lcd.market(market, market_read).await?;
         let pending = body["orderType"] != "market";
         if let Some(reason) = market_rejection(&pair, !pending) {
             *result = all_unavailable(reason);

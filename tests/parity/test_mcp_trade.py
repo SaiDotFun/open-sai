@@ -127,7 +127,7 @@ def test_mcp_preview_and_confirm(
         with (
             loopback(scenario, trade_replay=replay) as endpoints,
             server(
-                executable, home, endpoints, seed="session", call_timeout=15
+                executable, home, endpoints, seed="session", receive_timeout=15
             ) as stdio,
         ):
             args = {**args, "addr": ADDRESS}
@@ -238,7 +238,7 @@ def test_mcp_refuses_changed_execution(
             tmp_path / "preview",
             endpoints,
             seed="session",
-            call_timeout=15,
+            receive_timeout=15,
         ) as stdio,
     ):
         preview = result(stdio.call(2, f"preview_{action}", **args))
@@ -255,7 +255,7 @@ def test_mcp_refuses_changed_execution(
                 else None,
             ) as endpoints,
             server(
-                executable, home, endpoints, seed="session", call_timeout=15
+                executable, home, endpoints, seed="session", receive_timeout=15
             ) as stdio,
         ):
             refused = result(stdio.call(2, f"trade_{action}", **confirmed))
@@ -288,7 +288,7 @@ def test_mcp_margin_retries_stale_index(
         with (
             loopback("position-index-lag-recovers", trade_replay=replay) as endpoints,
             server(
-                executable, home, endpoints, seed="session", call_timeout=15
+                executable, home, endpoints, seed="session", receive_timeout=15
             ) as stdio,
         ):
             preview = result(stdio.call(2, "preview_margin", **args))
@@ -329,7 +329,7 @@ def test_mcp_partial_close_previews_remainder_below_market_minimum(
         with (
             loopback("partial-preview") as endpoints,
             server(
-                executable, home, endpoints, seed="session", call_timeout=15
+                executable, home, endpoints, seed="session", receive_timeout=15
             ) as stdio,
         ):
             args = {**POSITION, "percent": "99"}
@@ -362,7 +362,7 @@ def test_mcp_partial_close_withholds_digest_when_leverage_is_unknown(
             tmp_path / "preview",
             endpoints,
             seed="session",
-            call_timeout=15,
+            receive_timeout=15,
         ) as stdio,
     ):
         confirmed = trade_args(
@@ -375,7 +375,7 @@ def test_mcp_partial_close_withholds_digest_when_leverage_is_unknown(
         with (
             loopback("position-malformed-after-hours-cap") as endpoints,
             server(
-                executable, home, endpoints, seed="session", call_timeout=15
+                executable, home, endpoints, seed="session", receive_timeout=15
             ) as stdio,
         ):
             preview = result(stdio.call(2, "preview_partial_close", **args))
@@ -402,7 +402,7 @@ def test_mcp_open_binds_the_selected_account(
         with (
             loopback("quote-market") as endpoints,
             server(
-                executable, home, endpoints, seed="accounts", call_timeout=15
+                executable, home, endpoints, seed="accounts", receive_timeout=15
             ) as stdio,
         ):
             preview = result(stdio.call(2, "preview_open", **OPEN, addr=ADDRESS))
@@ -427,7 +427,7 @@ def test_mcp_signed_out_open_is_informational(
         home = tmp_path / str(i)
         with (
             loopback("quote-market") as endpoints,
-            server(executable, home, endpoints, call_timeout=15) as stdio,
+            server(executable, home, endpoints, receive_timeout=15) as stdio,
         ):
             preview = result(stdio.call(2, "preview_open", **OPEN))
             assert preview["addr"] is None
@@ -458,7 +458,7 @@ def test_mcp_close_only_limit_preview_withholds_digest_without_borrowings(
         with (
             loopback("quote-close-only-no-borrowings") as endpoints,
             server(
-                executable, home, endpoints, seed="session", call_timeout=15
+                executable, home, endpoints, seed="session", receive_timeout=15
             ) as stdio,
         ):
             preview = result(
@@ -485,7 +485,7 @@ def test_mcp_auth_status_responds_while_previews_wait(
         with (
             loopback("quote-concurrent-previews") as endpoints,
             server(
-                executable, home, endpoints, seed="session", call_timeout=15
+                executable, home, endpoints, seed="session", receive_timeout=15
             ) as stdio,
         ):
             for id_ in (2, 3):
@@ -501,7 +501,7 @@ def test_mcp_auth_status_responds_while_previews_wait(
             finally:
                 endpoints.admission.release.set()
 
-            previews = [stdio.receive(stdio.call_timeout) for _ in range(2)]
+            previews = [stdio.receive() for _ in range(2)]
             assert {reply["id"] for reply in previews} == {2, 3}
             assert all(result(reply["result"])["previewDigest"] for reply in previews)
             assert not any(item.label == "recordUserIntent" for item in endpoints.wire)
@@ -518,7 +518,7 @@ def test_mcp_open_checks_confirmation_before_building_an_intent(
         with (
             loopback("quote-market") as endpoints,
             server(
-                executable, home, endpoints, seed="session", call_timeout=15
+                executable, home, endpoints, seed="session", receive_timeout=15
             ) as stdio,
         ):
             no_reference = result(
@@ -549,7 +549,7 @@ def test_mcp_confirmation_explains_locked_ledger(
                 home,
                 endpoints,
                 seed="doctor-ledger-session",
-                call_timeout=15,
+                receive_timeout=15,
             ) as stdio,
             closing(sqlite3.connect(home / "sai/trader/intents.sqlite3")) as ledger,
         ):
@@ -580,7 +580,7 @@ def test_mcp_confirmation_explains_corrupt_ledger(
         with (
             loopback("quote-market") as endpoints,
             server(
-                executable, home, endpoints, seed="session", call_timeout=15
+                executable, home, endpoints, seed="session", receive_timeout=15
             ) as stdio,
         ):
             preview = result(stdio.call(2, "preview_open", **OPEN))
@@ -608,7 +608,7 @@ def test_mcp_open_confirmation_reserves_once_until_overridden(
         with (
             loopback("quote-market", trade_replay=replay) as endpoints,
             server(
-                executable, home, endpoints, seed="session", call_timeout=15
+                executable, home, endpoints, seed="session", receive_timeout=15
             ) as stdio,
         ):
             preview = result(stdio.call(2, "preview_open", **OPEN))
@@ -627,7 +627,7 @@ def test_mcp_open_confirmation_reserves_once_until_overridden(
                 assert len(rows(home)) == 1
             finally:
                 replay.release.set()
-            reply = stdio.receive(stdio.call_timeout)
+            reply = stdio.receive()
             assert reply["id"] == 3
             first = result(reply["result"])
             assert first["intentKey"] == key

@@ -41,8 +41,11 @@ modes. The dry-run case compares each CLI with and without `--wait`.
 
 The TP/SL and leverage wait cases use Python main at
 `20493c984e3398756365ea1a2b8786a7a0115a11`. They check the request and
-execution blocks, admission and chain failure codes, the 30-second
-deadline, and intent-key recovery after Ctrl-C.
+execution blocks, admission and chain failure codes, and intent-key recovery
+after Ctrl-C. The deadline cases exercise the pin's 30-second budget and
+Rust's 60-second budget. They also check that Rust reports a leverage
+execution first visible after 33 seconds. Current Python trade `--wait`
+also uses 60 seconds and tests the late result with a simulated clock.
 
 ```sh
 SAI_PARITY_WAIT_PYTHON=/absolute/path/to/pinned/.venv/bin/sai \
@@ -92,11 +95,27 @@ expiry in text and JSON against the native auth implementation from
 disable logging. The auth regression tests check output and log redaction
 directly, including Python MCP stdio responses.
 
-The `auth-use-missing` case checks the fixed diagnostic for an
-unregistered account. The auth privacy comparison checks that command logs
-contain only the command words.
+The `auth-use-missing` case keeps its release exception because Rust uses
+the fixed diagnostic from Python main. Python v0.1.2 echoed the unregistered
+account operand in the error.
+
+For `auth use` and `auth logout`, the focused log tests compare each command
+start, session event, and command end against the release. Rust records only
+the command words in `argv`, following Python main's auth privacy behavior.
+Python v0.1.2 records the address operand and flags.
+
+Rust applies the process umask to mode `0644` when creating
+`trader/sessions.lock`. Python applies it to mode `0666`, so a permissive
+umask can give Python's new lock group or other write permissions. Both
+CLIs preserve the mode of an existing lock.
 
 ## Native Distribution
+
+The Linux installer rehearsal installs the published Python v0.1.3 wheel
+with uv, then runs `sai update` against the candidate shim and archive over
+loopback. The published updater checks for the `sai VERSION` banner during
+its trial. Rust keeps that banner for the handoff, and the manifest records
+the resulting difference from Python's `sai, version VERSION` banner.
 
 The Native Distribution workflow installs the built shim wheel with uv on
 each native target and serves the matching archive over loopback. Build the
@@ -139,8 +158,19 @@ Auth cases check expiry, strict arguments, and active account changes
 from both MCP and a separate CLI process. They also check credential
 redaction and verify that an invalid account summary leaves selection intact.
 The wait transcript verifies exact Keeper request counts and the ledger for
-filled and still-pending intents. The inventory and validation cases cover
-overview and logs while their cores are pending.
+filled and still-pending intents.
+
+Run the overview and log-query transcripts against the published
+`sai-cli/v0.1.3` reference. The overview transcript checks clock values
+before masking them for the byte comparison. The log-query transcript
+checks the retained events and counts Keeper requests in each mode.
+
+```sh
+SAI_MCP_PARITY_V013_PYTHON=/absolute/path/to/python-v013/.venv/bin/sai \
+SAI_PARITY_BIN=/absolute/path/to/rust/sai \
+  unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
+  uv run --locked pytest tests/parity/test_mcp_stdio.py -k v013
+```
 
 Native validation replies report the validation category and schema-defined
 field names. They omit submitted values and unknown field names. Until the

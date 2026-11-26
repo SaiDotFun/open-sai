@@ -373,7 +373,6 @@ impl Trading<'_> {
                         &id,
                         Some((verified.0, Some(verified.1))),
                         indexed,
-                        true,
                     )
                     .await?;
                 }
@@ -445,18 +444,15 @@ impl TradePreview {
         account: &str,
         require_oracle_time: bool,
     ) -> Result<(), SaiError> {
-        if let Some(estimates) = &self.estimates {
-            let execution = &estimates["execution"];
-            if (execution["status"] == "would_be_rejected"
-                || (require_oracle_time && execution["code"] == "OraclePublicationTimeUnknown"))
-                && let Some(reason) = execution["reason"].as_str()
-            {
-                let preview = self.cli_preview_output(Some(account));
-                return Err(SaiError {
-                    details: Some(Box::new(Map::from_iter([("preview".into(), preview)]))),
-                    ..SaiError::new(Code::PreviewMismatch, reason)
-                });
-            }
+        if let Some(reason) = self
+            .execution_refusal(require_oracle_time)
+            .and_then(|execution| execution["reason"].as_str())
+        {
+            let preview = self.cli_preview_output(Some(account));
+            return Err(SaiError {
+                details: Some(Box::new(Map::from_iter([("preview".into(), preview)]))),
+                ..SaiError::new(Code::PreviewMismatch, reason)
+            });
         }
         Ok(())
     }

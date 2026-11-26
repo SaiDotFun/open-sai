@@ -34,7 +34,7 @@ pub enum TradeCommand {
         dry_run: bool,
         #[arg(long)]
         preview_digest: Option<String>,
-        /// Wait up to 30 seconds for the intent outcome.
+        /// Wait up to 60 seconds for the intent outcome.
         #[arg(long)]
         wait: bool,
     },
@@ -46,7 +46,7 @@ pub enum TradeCommand {
         /// Submit only if the trade matches this dry-run digest.
         #[arg(long)]
         preview_digest: Option<String>,
-        /// Wait up to 30 seconds for the intent outcome.
+        /// Wait up to 60 seconds for the intent outcome.
         #[arg(long)]
         wait: bool,
     },
@@ -66,7 +66,7 @@ pub enum TradeCommand {
         dry_run: bool,
         #[arg(long)]
         preview_digest: Option<String>,
-        /// Wait up to 30 seconds for the intent outcome.
+        /// Wait up to 60 seconds for the intent outcome.
         #[arg(long)]
         wait: bool,
     },
@@ -81,7 +81,7 @@ pub enum TradeCommand {
         dry_run: bool,
         #[arg(long)]
         preview_digest: Option<String>,
-        /// Wait up to 30 seconds for the intent outcome.
+        /// Wait up to 60 seconds for the intent outcome.
         #[arg(long)]
         wait: bool,
     },
@@ -115,7 +115,7 @@ pub struct Position {
     lcd_endpoint: Option<String>,
     #[arg(long)]
     dry_run: bool,
-    /// Wait up to 30 seconds for the intent outcome.
+    /// Wait up to 60 seconds for the intent outcome.
     #[arg(long)]
     wait: bool,
     /// Confirm the digest printed by --dry-run.
@@ -187,7 +187,7 @@ pub struct Open {
     dry_run: bool,
     #[arg(long)]
     preview_digest: Option<String>,
-    /// Wait up to 30 seconds for the intent outcome.
+    /// Wait up to 60 seconds for the intent outcome.
     #[arg(long)]
     wait: bool,
 }
@@ -265,7 +265,7 @@ Options:
   --cancel-order         Cancel a pending order instead of closing a position.
   --dry-run
   --preview-digest TEXT  Submit only if the trade matches this dry-run digest.
-  --wait                 Wait up to 30 seconds for the intent outcome.
+  --wait                 Wait up to 60 seconds for the intent outcome.
   --help                 Show this message and exit."#
         }
         "trade leverage" => {
@@ -275,7 +275,7 @@ Options:
   --leverage DECIMAL     Target leverage as a decimal.  [required]
   --dry-run
   --preview-digest TEXT  Submit only if the trade matches this dry-run digest.
-  --wait                 Wait up to 30 seconds for the intent outcome.
+  --wait                 Wait up to 60 seconds for the intent outcome.
   --help                 Show this message and exit."#
         }
         "trade margin" => {
@@ -292,7 +292,7 @@ Options:
   --dry-run
   --preview-digest TEXT     Submit only if the trade matches this dry-run
                             digest.
-  --wait                    Wait up to 30 seconds for the intent outcome.
+  --wait                    Wait up to 60 seconds for the intent outcome.
   --help                    Show this message and exit."#
         }
         "trade open" => {
@@ -318,7 +318,7 @@ Options:
   --dry-run
   --preview-digest TEXT       Submit only if the trade matches this dry-run
                               digest.
-  --wait                      Wait up to 30 seconds for the intent outcome.
+  --wait                      Wait up to 60 seconds for the intent outcome.
   --help                      Show this message and exit."#
         }
         "trade partial-close" => {
@@ -330,7 +330,7 @@ Options:
                          Defaults to the lcd.endpoint setting.
   --dry-run
   --preview-digest TEXT  Submit only if the trade matches this dry-run digest.
-  --wait                 Wait up to 30 seconds for the intent outcome.
+  --wait                 Wait up to 60 seconds for the intent outcome.
   --help                 Show this message and exit."#
         }
         "trade tpsl" => {
@@ -343,7 +343,7 @@ Options:
   --clear-stop-loss
   --dry-run
   --preview-digest TEXT  Submit only if the trade matches this dry-run digest.
-  --wait                 Wait up to 30 seconds for the intent outcome.
+  --wait                 Wait up to 60 seconds for the intent outcome.
   --help                 Show this message and exit."#
         }
         _ => return None,
@@ -665,7 +665,7 @@ impl WaitTrade<'_> {
                 self.endpoint,
                 addr,
                 key,
-                Duration::from_secs_f64(wait::DEFAULT_TIMEOUT),
+                Duration::from_secs(60),
                 Instant::now(),
                 self.storage,
                 self.events,

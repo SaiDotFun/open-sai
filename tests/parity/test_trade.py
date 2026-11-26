@@ -382,7 +382,6 @@ MARKET_PREVIEW = intent_for(
             "Slippage must be between 0 and 100 with at most 16 decimal places",
         ),
         ((*OPEN, "--slippage", "0.0"), "Slippage must be a positive finite decimal"),
-        (("trade", "close", "--", "-1"), "Trade id must not be negative"),
     ],
 )
 def test_validate_before_loading_session(
@@ -755,6 +754,7 @@ def test_exact_decimal_checks_intentionally_differ_from_python(
         ("trade", "margin", "7", "--direction", "add", "--amount", "3٣"),
         ("trade", "partial-close", "3٣", "--percent", "50"),
         ("trade", "partial-close", "7", "--percent", "3٣"),
+        ("trade", "close", "--", "-1"),
         *(
             args
             for bad in ("0_7", "+7", " 7 ")

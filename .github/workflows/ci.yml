@@ -198,6 +198,14 @@ jobs:
           path: .parity-mcp-trade-python
           persist-credentials: false
 
+      - name: Check out Python v0.1.3 for MCP overview and logs
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/sai-cli/v0.1.3
+          path: .parity-mcp-python-v013
+          persist-credentials: false
+
       - name: Check out Python main for auth parity
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -269,6 +277,7 @@ jobs:
           uv sync --project .parity-overview-python --locked --all-groups --python 3.13
           uv sync --project .parity-mcp-python --python 3.12 --locked --all-groups
           uv sync --project .parity-mcp-trade-python --locked --all-groups
+          uv sync --project .parity-mcp-python-v013 --python 3.12 --locked
           uv sync --project .parity-python-c7 --locked --all-groups
           uv sync --project .parity-python-wait --locked --all-groups
           uv sync --project .parity-auth-python --locked --all-groups
@@ -285,6 +294,7 @@ jobs:
           SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
           SAI_MCP_PARITY_PYTHON: ${{ github.workspace }}/.parity-mcp-python/.venv/bin/sai
           SAI_PARITY_MCP_TRADE_PYTHON: ${{ github.workspace }}/.parity-mcp-trade-python/.venv/bin/sai
+          SAI_MCP_PARITY_V013_PYTHON: ${{ github.workspace }}/.parity-mcp-python-v013/.venv/bin/sai
           SAI_MCP_UNINSTALL_PYTHON: ${{ github.workspace }}/.parity-position-v012/.venv/bin/sai
         run: |
           if ! unshare -Urn ip link set lo up; then
@@ -302,6 +312,9 @@ jobs:
           printf 'C8 Python reference '
           git -C .parity-mcp-python rev-parse HEAD
           uv run --locked python tests/parity/parity.py --case 'mcp-*-*'
+          test -x "$SAI_MCP_PARITY_V013_PYTHON"
+          unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
+            uv run --locked pytest tests/parity/test_mcp_stdio.py -k v013
       - name: Compare C3 shared storage against Python v0.1.2
         if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false') }}
         env:

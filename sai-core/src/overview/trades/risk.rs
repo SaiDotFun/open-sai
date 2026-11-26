@@ -20,10 +20,13 @@ pub(super) async fn read(
     let mut risk = json!({"riskStatus": "unavailable"});
     match load(trade, reads, addr, &mut risk).await {
         Some(()) => risk,
-        None => reason(
-            risk,
-            "Could not read matching contract risk data at one block",
-        ),
+        None => {
+            reads.risk_read_failed = true;
+            reason(
+                risk,
+                "Could not read matching contract risk data at one block",
+            )
+        }
     }
 }
 
@@ -34,12 +37,7 @@ async fn load(
     risk: &mut Value,
 ) -> Option<()> {
     let chain = reads.chain;
-    let position = reads
-        .query(
-            None,
-            json!({"get_trade": {"trader": addr, "index": trade["id"]}}),
-        )
-        .await?;
+    let position = reads.trade(addr, &trade["id"]).await?;
     let fetched = now();
     let raw = position.get("trade")?;
     if !agrees(trade, raw)? {
@@ -48,8 +46,8 @@ async fn load(
     }
 
     let market = &trade["perpBorrowing"];
-    let liquidation = decimal(position.get("liquidation_price")?)?;
-    let entry = decimal(raw.get("open_price")?)?;
+    let liquidation = decimal(&position["liquidation_price"])?;
+    let entry = decimal(&raw["open_price"])?;
     let base_id = market["baseToken"]["id"].as_u64()?;
     let quote_id = market["quoteToken"]["id"].as_u64()?;
     let adjustment = crate::keeper::truthy(&position["needs_after_hours_trigger"]);
@@ -67,8 +65,8 @@ async fn load(
     });
 
     let contract_market = reads.market(market["marketId"].as_u64()?).await?;
-    if contract_market.get("base")? != &format!("TokenIndex({base_id})")
-        || contract_market.get("quote")? != &format!("TokenIndex({quote_id})")
+    if contract_market["base"].as_str()? != format!("TokenIndex({base_id})")
+        || contract_market["quote"].as_str()? != format!("TokenIndex({quote_id})")
     {
         inconsistent(risk, "Keeper and contract disagree on the market pair");
         return Some(());
@@ -128,6 +126,7 @@ async fn load(
     );
 
     let Some(expiration) = reads.group_expiration(group.as_deref()?).await else {
+        reads.risk_read_failed = true;
         risk["riskReason"] = json!("Contract oracle staleness limit is unknown");
         return Some(());
     };
@@ -173,18 +172,21 @@ async fn load(
     let conversion = if collateral["symbol"] == "USDC" {
         BigDecimal::new(1.into(), 6)
     } else {
-        let pinned = if collateral["symbol"] == "stNIBI" {
+        let requires_collateral_price = collateral["symbol"] == "stNIBI";
+        let pinned = if requires_collateral_price {
             reads.rate(collateral["id"].as_u64()?, USD_TOKEN).await
         } else {
             None
         };
         let Some((oracle, fetched)) = pinned else {
+            reads.risk_read_failed |= requires_collateral_price;
             risk["riskReason"] = json!("Pinned collateral USD price is unavailable");
             return Some(());
         };
         let rate = oracle.get("rate")?;
         let price = decimal(rate.get("base_per_quote")?)?;
         if price.sign() != Sign::Plus {
+            reads.risk_read_failed = true;
             risk["riskReason"] = json!("Pinned collateral USD price is unavailable");
             return Some(());
         }
