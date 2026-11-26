@@ -35,6 +35,16 @@ FILL_BLOCK = 50109596
 OPAQUE = "fixture-upstream-private-text"
 
 
+def with_timeout_warning(reference: dict[str, Any]) -> dict[str, Any]:
+    """Apply the current CLI warning to a receipt from the older Python pin."""
+    message = "The intent outcome is still unknown. Do not resubmit."
+    return {
+        **reference,
+        "message": message,
+        "error": {**reference["error"], "message": message},
+    }
+
+
 def intent(name: str, **fields: object) -> dict[str, Any]:
     result = deepcopy(RESPONSES[name])
     result["data"]["userIntents"][0].update(fields)
@@ -410,7 +420,10 @@ def test_intent_wait(
                     "oraclePrice": "81000.50",
                     "escrowedCollateralBaseUnits": 4_000_000,
                 }
-            observed.append((result.stdout, wire, ledger))
+            output = result.stdout
+            if case.outcome == "unknown":
+                output = document if index else with_timeout_warning(document)
+            observed.append((output, wire, ledger))
     assert observed[0] == observed[1]
 
 
@@ -534,7 +547,7 @@ def test_wait_bounds_account_lookup_when_ledger_is_locked(
                 ("foreign", "unknown", None),
             ]
             observed.append(document)
-    assert observed[0] == observed[1]
+    assert with_timeout_warning(observed[0]) == observed[1]
 
 
 def test_wait_interrupts_locked_account_lookup(
