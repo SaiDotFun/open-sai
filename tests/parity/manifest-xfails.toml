@@ -33,21 +33,25 @@ signature = "3015bd9644405895117cd0327cfc123b38b5e0e37c50552bd40893a97a0e1b92"
 owner = "#211"
 signature = "fc7b588d1bf24ecc42b258d68e40ffeb6b0fa4eb512342011fd57f25c99dba55"
 
+[gap."case:account-overview-conflicting-height"]
+owner = "#175"
+signature = "b93612e5f1b90c92fc651cb9f6d79cf9dac19bc9276449af9ddc40fb305e66c7"
+
 [gap."case:account-overview-confirmation-fails"]
 owner = "#211"
 signature = "740ca26b317d7ea13fbb52915b7b81a87574d4c15b3b92c72f8bb07f10366678"
 
 [gap."case:account-overview-deadline"]
 owner = "#211"
-signature = "4056dc76f7e45bb951fca0eb8ec54b5c52f2f1dfe35b9f77063e5d37e2a2c935"
+signature = "908760da9d8bf652db5561c0823e6b14bfefece80c4d718c77129c7f6099d42d"
 
 [gap."case:account-overview-expiry"]
 owner = "#211"
-signature = "f66bb7b1230c700104442120b0198859ce2df7bb51813099e3fbb0e5a8099363"
+signature = "d3b64de79765bc06273344289ca3b07d1625e54138306faea4be9bc0afd0edb5"
 
 [gap."case:account-overview-expiry-text"]
 owner = "#211"
-signature = "b3e5d0c8eed6d9edb9ffdfffebca1a34c3b846dfe7a312c3b2a62cffe344e2fc"
+signature = "20528a3719fa10a5115d98fe4ed4dc6687fc0bf42b147aa77fd50007f453544f"
 
 [gap."case:account-overview-interrupt-http"]
 owner = "#211"
@@ -59,7 +63,7 @@ signature = "7996e6f04f7d86166975330ef32f5c7c777ffa832ac2bab1cf891a573b645d05"
 
 [gap."case:account-overview-pnl-total"]
 owner = "#211"
-signature = "95ad27e2dd5305a4ed6b9424a15b345decbbdc5038606e0ac1a7fd1feedf0631"
+signature = "64add034ca66d8dece6d52b9ced6717d2433acc5cbcf8ec1902e978dd4ebc678"
 
 [gap."case:account-overview-signed-out"]
 owner = "#211"
@@ -68,6 +72,10 @@ signature = "1f5512d71e5092ae928423c842c3202dd2647e74f2be994482bd90d9b66d4811"
 [gap."case:account-overview-signed-out-leaf-json"]
 owner = "#211"
 signature = "1f5512d71e5092ae928423c842c3202dd2647e74f2be994482bd90d9b66d4811"
+
+[gap."case:account-overview-wrong-height"]
+owner = "#175"
+signature = "b93612e5f1b90c92fc651cb9f6d79cf9dac19bc9276449af9ddc40fb305e66c7"
 
 [gap."case:auth-import-rejected-operand-json"]
 owner = "#211"

@@ -408,7 +408,7 @@ pub(crate) fn graphql_error_fields(
     (json!(codes), json!(total))
 }
 
-pub(crate) fn is_evm_address(value: &str) -> bool {
+pub fn is_evm_address(value: &str) -> bool {
     value
         .strip_prefix("0x")
         .is_some_and(|hex| hex.len() == 40 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
