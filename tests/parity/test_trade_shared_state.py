@@ -327,6 +327,10 @@ class Action:
     def replay(self, **options: Any) -> TradeReplay:
         return TradeReplay(self.kind, self.entity, self.change, **options)
 
+    @property
+    def leverage_target(self) -> str | None:
+        return self.args[-1] if self.args[0] == "leverage" else None
+
 
 ACTIONS = {
     "open": Action(
@@ -481,6 +485,39 @@ def assert_trade_events(
     ] == statuses
 
 
+@pytest.mark.parametrize(
+    ("submitter", "retry_runtime"), [("rust", "python"), ("python", "rust")]
+)
+def test_accepted_open_blocks_other_runtime_retry(
+    submitter: str,
+    retry_runtime: str,
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    python_reference: Path | None,
+) -> None:
+    writer = runtime(submitter, request, python_reference)
+    retry = runtime(retry_runtime, request, python_reference)
+    action = ACTIONS["open"]
+    replay = action.replay()
+    with loopback(action.server, trade_replay=replay) as endpoints:
+        home = Home(tmp_path / "home", endpoints)
+        seed_home(home.path, endpoints, "session")
+        args = ("trade", *action.args)
+        first = home.json(writer, *args)
+        assert first["status"] == "accepted"
+        key = first["intentKey"]
+
+        result = home.invoke(retry, "--json", *args)
+        assert_blocked(result, key)
+        assert json.loads(result.stdout)["error"]["code"] == "RECENT_OPEN_PENDING"
+        for runtime_ in (writer, retry):
+            home.local(runtime_, key, action.kind, "accepted")
+        home.row(key, action.kind, action.entity, "accepted")
+        assert replay.attempts() == {key: 1} and replay.admitted_keys() == {key}
+        assert_trade_events(home, key, ["accepted"], acked=True)
+        assert not endpoints.errors
+
+
 @pytest.mark.parametrize("action_name", ACTIONS)
 @pytest.mark.parametrize(
     ("submitter", "reconciler", "retry_runtime"),
@@ -505,7 +542,9 @@ def test_lost_admission_blocks_until_reconciliation(
     retry = runtime(retry_runtime, request, python_reference)
     action = ACTIONS[action_name]
     replay = action.replay(lose_reply=True)
-    with loopback(action.server, trade_replay=replay) as endpoints:
+    with loopback(
+        action.server, trade_replay=replay, leverage_target=action.leverage_target
+    ) as endpoints:
         home = Home(tmp_path / "home", endpoints)
         seed_home(home.path, endpoints, "session")
         trade_help(home, writer, action_name)
@@ -550,7 +589,9 @@ def test_trade_wait_replays_pending_then_receipt(
     writer = runtime(submitter, request, python_reference)
     action = ACTIONS[action_name]
     replay = action.replay(phase="pending", fill_on_second_poll=True)
-    with loopback(action.server, trade_replay=replay) as endpoints:
+    with loopback(
+        action.server, trade_replay=replay, leverage_target=action.leverage_target
+    ) as endpoints:
         home = Home(tmp_path / "home", endpoints)
         seed_home(home.path, endpoints, "session")
         required_wait = action_name in ("tpsl", "leverage", "margin", "partial-close")
@@ -886,7 +927,9 @@ def test_cli_and_mcp_overlap(
         "partial-close": "shared-confirmable-position",
         "leverage": "shared-confirmable-leverage",
     }.get(action_name, action.server)
-    with loopback(scenario, trade_replay=replay) as endpoints:
+    with loopback(
+        scenario, trade_replay=replay, leverage_target=action.leverage_target
+    ) as endpoints:
         home = Home(tmp_path / "home", endpoints)
         seed_home(home.path, endpoints, "session")
         trade_help(home, cli, action_name)

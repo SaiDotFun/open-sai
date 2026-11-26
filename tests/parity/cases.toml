@@ -1978,15 +1978,6 @@ server = "position-default"
 expect = 2
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "error.code" = "INVALID_REQUEST", "error.message" = "Invalid value for '--percent': '٥_٠' is not a valid integer." }
-accepted_difference = "Python PR #194 rejects non-ASCII percent digits. Rust accepts the pinned Python syntax."
-
-[case.rust]
-expect = 0
-wire = [
-    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "get_trade_raw",
-]
-output = { "quote.percent" = 50 }
 
 [[case]]
 name = "trade-partial-close-invalid-id"

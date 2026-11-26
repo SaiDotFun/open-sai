@@ -118,7 +118,9 @@ impl TradePreview {
         if let Some(route) = &self.position_route {
             output["positionRoute"] = json!(route);
         }
-        output["previewDigest"] = json!(preview_digest(self, account));
+        if !self.has_unknown_partial_leverage() {
+            output["previewDigest"] = json!(preview_digest(self, account));
+        }
         output
     }
 
@@ -156,11 +158,20 @@ impl TradePreview {
                 && (!self.requires_market_price_refresh() || self.reference_price.is_some())
                 && !rejected
                 && !missing_oracle
+                && !self.has_unknown_partial_leverage()
             {
                 output["previewDigest"] = json!(preview_digest(self, account));
             }
         }
         output
+    }
+
+    fn has_unknown_partial_leverage(&self) -> bool {
+        self.intent.kind == "DECREASE_POSITION_SIZE"
+            && self
+                .quote
+                .as_ref()
+                .is_none_or(|quote| quote["effectiveLeverage"].is_null())
     }
 
     pub fn is_market_close(&self) -> bool {
@@ -285,12 +296,6 @@ impl<'a> Trading<'a> {
     ) -> Result<Option<position::PositionRoute>, SaiError> {
         let account = session.addr();
         let no_lcd = match preview.intent.kind {
-            "CLOSE_POSITION" => {
-                return self
-                    .close_submit_route(session, preview, confirmation)
-                    .await
-                    .map(Some);
-            }
             "CANCEL_PENDING_TRADE" => "Cannot verify the pending order without an LCD",
             "OPEN_TRADE" if bind_open => "Cannot verify the trade route without an LCD",
             _ => return Ok(None),
@@ -312,12 +317,12 @@ impl<'a> Trading<'a> {
         Ok(Some(route))
     }
 
-    async fn close_submit_route(
+    async fn prepare_close_submission(
         &self,
         session: &Session,
         preview: &TradePreview,
         confirmation: Option<&Confirmation<'_>>,
-    ) -> Result<position::PositionRoute, SaiError> {
+    ) -> Result<TradePreview, SaiError> {
         let account = session.addr();
         let id = preview.position_id()?;
         let confirmed_route = if let Some(confirmation) = confirmation {
@@ -328,7 +333,7 @@ impl<'a> Trading<'a> {
         } else {
             None
         };
-        self.indexed_position(account, &id, keeper::TIMEOUT).await?;
+        let indexed = self.indexed_position(account, &id, keeper::TIMEOUT).await?;
         let lcd = self
             .lcd_endpoint
             .map(position::Lcd)
@@ -339,8 +344,15 @@ impl<'a> Trading<'a> {
         } else {
             self.position_route(&lcd, false).await?
         };
-        let (route, _) = Self::verify_contract_owner(&lcd, account, &id, route).await?;
-        Ok(route)
+        let verified = Self::verify_contract_owner(&lcd, account, &id, route.clone()).await?;
+        let (owner_verified, estimates) = self
+            .estimate_verified_close(&lcd, account, &id, indexed, verified)
+            .await?;
+        let mut prepared = preview.clone();
+        prepared.position_route = Some(route);
+        prepared.position_owner_verified = Some(owner_verified);
+        prepared.estimates = Some(estimates);
+        Ok(prepared)
     }
 
     /// Verify a confirmed preview, commit the reservation, then send once.
@@ -392,15 +404,22 @@ impl<'a> Trading<'a> {
         } else {
             None
         };
-        let route = if confirmed_preview.is_none() {
+        let close = if confirmed_preview.is_none() && preview.is_market_close() {
+            Some(
+                self.prepare_close_submission(session, preview, options.confirmation.as_ref())
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let route = if confirmed_preview.is_none() && close.is_none() {
             self.basic_trade_route(session, preview, confirming, options.confirmation.as_ref())
                 .await?
         } else {
             None
         };
-        let checked_route = route.is_some() || confirmed_preview.is_some();
-        let market = preview.requires_market_price_refresh();
-        let mut market_row = None;
+        let checked_route = route.is_some() || confirmed_preview.is_some() || close.is_some();
+        let open = preview.intent.kind == "OPEN_TRADE";
         let update = if confirmed_preview.is_none() && preview.is_standalone_position_update() {
             Some(
                 self.preflight_position_update(account, preview, options.confirmation.is_some())
@@ -410,23 +429,14 @@ impl<'a> Trading<'a> {
             None
         };
         let mut prepared;
-        let preview = if let Some(preview) = &confirmed_preview {
+        let preview = if let Some(preview) = confirmed_preview.as_ref().or(close.as_ref()) {
             preview
-        } else if market || confirming && checked_route {
+        } else if open || confirming && checked_route {
             prepared = preview.clone();
             prepared.position_route = route;
-            if market {
-                market_row = Some(self.refresh_market_quote(&mut prepared).await?);
-                let price = prepared
-                    .reference_price
-                    .as_deref()
-                    .ok_or_else(SaiError::internal)?;
-                if confirming {
-                    confirmation::reference_price_units(price, "Current price")?;
-                } else {
-                    positive_decimal(price, "Current price")?;
-                }
-                prepared.intent.body["intentPrice"] = json!(price);
+            if open {
+                self.prepare_open_submission(session, &mut prepared, confirming)
+                    .await?;
             }
             &prepared
         } else if let Some(update) = &update {
@@ -437,7 +447,7 @@ impl<'a> Trading<'a> {
         // Live reads can outlast the session. Reload the pinned account
         // before confirmation and reserve with its current token.
         let reloaded;
-        let session = if checked_route || market || update.is_some() || confirming {
+        let session = if checked_route || open || update.is_some() || confirming {
             reloaded = self.load_session(Some(account))?;
             &reloaded
         } else {
@@ -456,23 +466,15 @@ impl<'a> Trading<'a> {
                     .and_then(|details| details.get_mut("preview"))
             {
                 let mut replacement = preview.clone();
-                self.estimate_preview(
-                    &mut replacement,
-                    Some(session),
-                    PreviewMode::Mcp,
-                    market_row,
-                )
-                .await?;
+                if replacement.estimates.is_none() {
+                    self.estimate_preview(&mut replacement, Some(session), PreviewMode::Mcp, None)
+                        .await?;
+                }
                 *fresh = replacement.confirmed_output(Some(account));
             }
             return Err(error);
         }
-        if confirmed_preview.is_some()
-            || preview.margin_change
-            || preview.intent.kind == "DECREASE_POSITION_SIZE"
-        {
-            preview.check_cli_execution(account, confirming)?;
-        }
+        preview.check_cli_execution(account, confirming)?;
 
         let (key, stamp) = intent_identity();
         let intent = &preview.intent;

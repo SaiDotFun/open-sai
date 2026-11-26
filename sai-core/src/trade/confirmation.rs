@@ -230,6 +230,63 @@ impl<'a> Confirmation<'a> {
 }
 
 impl Trading<'_> {
+    pub(super) async fn prepare_open_submission(
+        &self,
+        session: &Session,
+        preview: &mut TradePreview,
+        confirming: bool,
+    ) -> Result<(), SaiError> {
+        let mode = if confirming {
+            PreviewMode::McpSubmission
+        } else {
+            PreviewMode::CliSubmission
+        };
+        let market_row = if preview.requires_market_price_refresh() {
+            match self.refresh_market_quote(preview).await {
+                Ok(row) => {
+                    self.load_session(Some(session.addr()))?;
+                    let price = preview
+                        .reference_price
+                        .as_deref()
+                        .ok_or_else(SaiError::internal)?;
+                    if confirming {
+                        reference_price_units(price, "Current price")?;
+                    } else {
+                        positive_decimal(price, "Current price")?;
+                    }
+                    preview.intent.body["intentPrice"] = json!(price);
+                    Some(row)
+                }
+                Err(error) => {
+                    self.estimate_preview(preview, Some(session), mode, None)
+                        .await?;
+                    if confirming {
+                        self.recheck_bound_open_route(preview).await?;
+                    }
+                    preview.check_cli_execution(session.addr(), false)?;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        self.estimate_preview(preview, Some(session), mode, market_row)
+            .await?;
+        if confirming {
+            self.recheck_bound_open_route(preview).await?;
+        }
+        Ok(())
+    }
+
+    async fn recheck_bound_open_route(&self, preview: &TradePreview) -> Result<(), SaiError> {
+        let endpoint = self.lcd_endpoint.ok_or_else(SaiError::internal)?;
+        let route = preview
+            .position_route
+            .as_ref()
+            .ok_or_else(SaiError::internal)?;
+        self.recheck_open_route(&Lcd(endpoint), route).await
+    }
+
     pub(super) async fn prepare_confirmation(
         &self,
         session: &Session,

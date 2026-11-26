@@ -423,7 +423,7 @@ signature = "866e192520eeeb1c7bc98f00573be7158e9f797c43a29d596c42d42fa157aa95"
 
 [gap."case:trade-concurrent-close"]
 owner = "#174"
-signature = "4fa163afadfadfd6db677f4d84c8a7c582fdd04081b820357492e66965056d15"
+signature = "128757aa7c8cd1da9b691ce38413eac6610dee99bf0b5ef1b234bb2bb4b357bd"
 
 [gap."case:trade-leverage"]
 owner = "#174"
@@ -587,7 +587,7 @@ signature = "42a8fcab94344028ba1b214addab6cf937da48ead8445f9af1083e0db5b80b58"
 
 [gap."case:trade-partial-close-unicode-percent"]
 owner = "#139"
-signature = "656337836343aa8bc94cf24a4debbfaea928cf073c4291cde7da4c280436afe1"
+signature = "5b545493cbedb49797318e5516595b2029764cc350bda78b5c3493f002389a5e"
 
 [gap."case:trade-partial-close-unknown-blocks-retry"]
 owner = "#174"

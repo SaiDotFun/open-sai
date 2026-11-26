@@ -5,6 +5,7 @@ use std::time::Duration;
 use crate::{
     errors::{Code, SaiError},
     keeper::{MARKETS, TIMEOUT},
+    settings::repr,
 };
 
 use super::{TradeIntent, TradePreview, Trading, confirmation::plain_decimal, positive_decimal};
@@ -204,6 +205,12 @@ impl Trading<'_> {
 }
 
 pub(super) fn id(value: &str, parameter: &str) -> Result<BigInt, SaiError> {
+    if !value.is_ascii() {
+        return Err(SaiError::usage(format!(
+            "Invalid value for '{parameter}': {} is not a valid integer.",
+            repr(value),
+        )));
+    }
     let invalid = || {
         SaiError::usage(format!(
             "Invalid value for '{parameter}': expected an integer."

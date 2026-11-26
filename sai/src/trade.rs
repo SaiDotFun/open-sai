@@ -43,6 +43,9 @@ pub enum TradeCommand {
         trade_id: String,
         #[arg(long)]
         dry_run: bool,
+        /// Submit only if the trade matches this dry-run digest.
+        #[arg(long)]
+        preview_digest: Option<String>,
         /// Wait up to 30 seconds for the intent outcome.
         #[arg(long)]
         wait: bool,
@@ -209,7 +212,7 @@ impl Open {
             take_profit: self.take_profit.as_deref(),
             stop_loss: self.stop_loss.as_deref(),
         };
-        if confirmed {
+        if confirmed || !self.slippage.is_ascii() {
             trade.confirmed_cli_preview()
         } else {
             trade.preview()
@@ -356,6 +359,28 @@ pub fn run(
     json: bool,
     events: EventContext<'_>,
 ) -> Result<ExitCode, SaiError> {
+    match &command {
+        TradeCommand::Open(open) => check_ascii_decimals(&[
+            ("--amount", Some(&open.amount)),
+            ("--leverage", Some(&open.leverage)),
+            ("--price", open.price.as_deref()),
+            ("--take-profit", open.take_profit.as_deref()),
+            ("--stop-loss", open.stop_loss.as_deref()),
+        ])?,
+        TradeCommand::Margin { amount, .. } => check_ascii_decimals(&[("--amount", Some(amount))])?,
+        TradeCommand::Tpsl {
+            take_profit,
+            stop_loss,
+            ..
+        } => check_ascii_decimals(&[
+            ("--take-profit", take_profit.as_deref()),
+            ("--stop-loss", stop_loss.as_deref()),
+        ])?,
+        TradeCommand::Leverage { leverage, .. } => {
+            check_ascii_decimals(&[("--leverage", Some(leverage))])?;
+        }
+        _ => {}
+    }
     let settings = load_settings(flags, env)?;
     let log_storage = |event: StorageEvent<'_>| {
         local::storage_event_with_endpoint(events, event, Some(settings.endpoint()))
@@ -415,6 +440,7 @@ pub fn run(
             TradeCommand::Cancel {
                 trade_id,
                 dry_run,
+                preview_digest,
                 wait,
             } => (
                 close_preview(trade_id, true)?,
@@ -422,7 +448,7 @@ pub fn run(
                 *wait,
                 false,
                 false,
-                None,
+                preview_digest.as_deref().map(trade::Confirmation::for_cli),
             ),
             TradeCommand::Margin {
                 position,
@@ -561,6 +587,18 @@ pub fn run(
     }
     local::emit(&runtime.block_on(submit)?, json)?;
     Ok(ExitCode::Ok)
+}
+
+fn check_ascii_decimals(fields: &[(&str, Option<&str>)]) -> Result<(), SaiError> {
+    for &(option, value) in fields {
+        if let Some(value) = value.filter(|value| !value.is_ascii()) {
+            return Err(SaiError::usage(format!(
+                "Invalid value for '{option}': {} is not a valid decimal.",
+                repr(value),
+            )));
+        }
+    }
+    Ok(())
 }
 
 struct WaitTrade<'a> {
