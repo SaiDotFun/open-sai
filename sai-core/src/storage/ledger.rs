@@ -132,6 +132,11 @@ fn check_open_pending(
         .optional()?;
     if let Some(key) = key {
         let hint = storage.intent_status_hint(endpoint, account, &key);
+        storage.emit(StorageEvent::OpenBlocked {
+            key: &key,
+            addr: account,
+            endpoint: &endpoint_origin(endpoint),
+        });
         return Err(StorageError::RecentOpenPending { key, hint });
     }
     Ok(())

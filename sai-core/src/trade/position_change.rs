@@ -423,9 +423,12 @@ impl Trading<'_> {
             != number_text(field(position, "collateralAmount")?)?
             || float(&raw["leverage"])? != float(field(position, "leverage")?)?
         {
-            return Err(invalid(
-                "Indexed position differs from contract state; wait for synchronization and retry",
-            ));
+            return Err(SaiError {
+                retryable_override: true,
+                ..invalid(
+                    "Indexed position differs from contract state; wait for synchronization and retry",
+                )
+            });
         }
         Ok(Snapshot {
             raw,

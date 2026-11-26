@@ -2,6 +2,7 @@
 
 use std::{ptr, sync::LazyLock};
 
+use bigdecimal::{BigDecimal, ToPrimitive};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 
@@ -86,11 +87,75 @@ impl<'a> Evidence<'a> {
         }
     }
 
+    /// Identify a position opened by a correlated end-block market order.
+    pub fn opening_fill_position(&self) -> Option<(i64, i64)> {
+        if self.indexed["tradeChangeType"] != "position_opened" {
+            return None;
+        }
+        let block = self.indexed["block"]["block"].as_i64()?;
+        let trade = &self.indexed["trade"];
+        let order = &self.indexed["marketOrder"];
+        let trade_id = trade["id"].as_i64()?;
+        if block <= 0
+            || trade_id < 0
+            || order["orderExecBlock"].as_i64() != Some(block)
+            || trade["openBlock"]["block"].as_i64() != Some(block)
+        {
+            return None;
+        }
+        // Opening collateral cannot exceed the original escrow. This
+        // already proves some history snapshots are stale.
+        if trade["openCollateralAmount"]
+            .as_i64()
+            .zip(order["collateralAmount"].as_i64())
+            .is_some_and(|(collateral, escrow)| collateral > escrow)
+        {
+            return None;
+        }
+        Some((trade_id, block))
+    }
+
+    pub fn opening_fill(
+        &self,
+        data: &Map<String, Value>,
+        trade_id: i64,
+        block: i64,
+        account: &str,
+    ) -> (Value, Option<i64>) {
+        let Some(trade) = data.get("perp").and_then(|perp| perp.get("trade")) else {
+            return (Value::Null, None);
+        };
+        // Ordinary transactions finish before the end-block market fill. A
+        // new position still at its opening update describes that fill.
+        if trade["id"].as_i64() != Some(trade_id)
+            || trade["trader"]
+                .as_str()
+                .and_then(keeper::canonical_account)
+                .as_deref()
+                != Some(account)
+            || trade["tradeType"] != "trade"
+            || trade["isOpen"] != true
+            || trade["openBlock"]["block"].as_i64() != Some(block)
+            || trade["lastUpdatedBlock"]["block"].as_i64() != Some(block)
+        {
+            return (Value::Null, None);
+        }
+        let price = number(&trade["openPrice"]);
+        let price = if decimal_float(&price).is_some_and(|value| value > 0.0) {
+            price
+        } else {
+            Value::Null
+        };
+        let size = opening_size(trade, &self.row["body"]["leverage"]);
+        (price, size)
+    }
+
     pub fn build(
         &self,
         outcome: Outcome,
         request_hash: &Value,
         request_block: &Value,
+        fill_values: (Value, Option<i64>),
         project: impl Fn(Value) -> Value,
     ) -> Value {
         let public = self
@@ -130,8 +195,8 @@ impl<'a> Evidence<'a> {
         });
         let fill = (outcome == Outcome::Filled).then(|| {
             json!({
-                "price": null,
-                "sizeCollateralBaseUnits": null,
+                "price": fill_values.0,
+                "sizeCollateralBaseUnits": fill_values.1,
                 "oraclePrice": number(&order["execPrice"]),
                 "escrowedCollateralBaseUnits": number(&order["collateralAmount"]),
             })
@@ -156,6 +221,32 @@ impl<'a> Evidence<'a> {
             "positionNow": position(&self.indexed["trade"], &public["trade"]),
             "positionFeesUsd": fees,
         }))
+    }
+}
+
+fn opening_size(trade: &Value, requested_leverage: &Value) -> Option<i64> {
+    let collateral = trade["collateralAmount"]
+        .as_i64()
+        .filter(|value| *value > 0)?;
+    let leverage = number(&trade["leverage"]);
+    let indexed = decimal_float(&leverage).filter(|value| *value > 0.0)?;
+    let requested = number(requested_leverage);
+    let decimal = requested.as_str()?;
+    if decimal_float(&requested) != Some(indexed) {
+        return None;
+    }
+    // The intent preserves the exact decimal. GraphQL Float rounding could
+    // otherwise change the size when flooring to whole collateral base units.
+    let leverage: BigDecimal = decimal.parse().ok()?;
+    (leverage * BigDecimal::from(collateral))
+        .to_i64()
+        .filter(|size| *size > 0)
+}
+
+fn decimal_float(value: &Value) -> Option<f64> {
+    match value {
+        Value::String(text) => text.parse().ok(),
+        _ => value.as_f64(),
     }
 }
 

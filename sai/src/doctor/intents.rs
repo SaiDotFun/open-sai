@@ -16,7 +16,7 @@ use sai_core::{
 };
 use serde_json::json;
 
-use super::{Check, DEADLINE, TIMEOUT, files, keeper_hint, plural, short};
+use super::{Check, DEADLINE, TIMEOUT, files, plural, short};
 
 const FILES: [&str; 4] = [
     "intents.sqlite3",
@@ -439,11 +439,7 @@ pub(super) fn check(
             "fail",
             format!("{count} unknown {noun} trading for {}", short(addr)),
         )
-        .fix(keeper_hint(
-            home,
-            endpoint,
-            &["intent", "status", addr, "--key", key],
-        ))
+        .fix(Storage::new(home).intent_status_hint(endpoint, addr, key))
     } else if unknown != 0 {
         Check::new(
             "intents",

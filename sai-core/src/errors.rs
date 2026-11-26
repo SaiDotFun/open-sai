@@ -58,6 +58,7 @@ pub struct SaiError {
     pub intent_key: Option<String>,
     pub hint: Option<String>,
     pub details: Option<Box<serde_json::Map<String, Value>>>,
+    pub retryable_override: bool,
 }
 
 impl SaiError {
@@ -71,6 +72,7 @@ impl SaiError {
             intent_key: None,
             hint: (exit_code == ExitCode::SignIn).then(|| "sai auth login NAME".into()),
             details: None,
+            retryable_override: false,
         }
     }
 
@@ -86,6 +88,6 @@ impl SaiError {
     }
 
     pub fn retryable(&self) -> bool {
-        self.exit_code == ExitCode::Rejected
+        self.retryable_override || self.exit_code == ExitCode::Rejected
     }
 }
