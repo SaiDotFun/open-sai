@@ -81,6 +81,12 @@ signature, unexpected pass, or unused entry fails the required job. Owners
 remove their entries in the same change that repairs the corresponding gaps.
 `M2-unassigned` entries include proposed issue titles for triage.
 
+[`python-main-gaps.toml`](python-main-gaps.toml) records Python CLI changes
+that landed after the release reference. The runner checks these signatures
+when it compares current Python against a candidate and reports
+`CURRENT_PYTHON_ROW` results. A changed signature or unexpected pass fails the
+comparison. Port the behavior and remove its entry in the same change.
+
 CI records the C3 storage replays against v0.1.2 and a separate C2/C3 replay
 against v0.1.1. The nine C2 config cases share their exact log-schema
 signatures across both releases. Each v0.1.1 config result appears as a

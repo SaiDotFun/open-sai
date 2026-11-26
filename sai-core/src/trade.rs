@@ -64,10 +64,17 @@ pub struct TradePreview {
     pub reference_price: Option<String>,
     pub quote: Option<Value>,
     pub warning: Option<&'static str>,
+    leverage_collateral: Option<LeverageCollateral>,
     position_route: Option<position::PositionRoute>,
     position_owner_verified: Option<bool>,
     estimates: Option<Value>,
     margin_change: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct LeverageCollateral {
+    before: String,
+    after: String,
 }
 
 impl TradePreview {
@@ -77,6 +84,7 @@ impl TradePreview {
             reference_price: None,
             quote: None,
             warning: None,
+            leverage_collateral: None,
             position_route: None,
             position_owner_verified: None,
             estimates: None,
@@ -91,6 +99,9 @@ impl TradePreview {
         }
         if let Some(quote) = &self.quote {
             output["quote"] = quote.clone();
+        }
+        if let Some(collateral) = &self.leverage_collateral {
+            output["collateralBaseUnits"] = json!(collateral);
         }
         output["intent"] = json!(self.intent);
         if self.position_owner_verified == Some(false) {

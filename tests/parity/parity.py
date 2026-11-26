@@ -105,6 +105,9 @@ class Case:
     interrupt_on_request: bool = False
     overview_expected: dict[str, Any] | None = None
     exact_output: bool = False
+    current_only: bool = False
+    reference_stderr_contains: list[str] | None = None
+    collateral_price_after: str | None = None
 
     @property
     def command(self) -> str:
@@ -525,6 +528,10 @@ def observe(
         for marker in case.absent_output_text or ()
     ):
         raise ValueError("Fixture credential appeared in CLI output")
+    if not candidate and any(
+        marker not in result.stderr for marker in case.reference_stderr_contains or ()
+    ):
+        check_failed("Reference stderr is missing required help text")
     for error in endpoints.errors:
         check_failed(error)
     actual, expected = [request.label for request in endpoints.wire], case.wire or []
@@ -1106,13 +1113,22 @@ def run_case(
     candidate: list[str],
     *,
     cutover: bool = False,
+    python_main: bool = False,
     tool_evidence: dict[str, list[str]] | None = None,
 ) -> tuple[list[str], dict[str, str], str | None]:
     rust = candidate is not reference
     candidate_case = case.rust_case() if rust else case
+    account_balances = case.command == "account balances"
+    if python_main and case.collateral_price_after is not None:
+        wire = list(case.wire or [])
+        index = wire.index(case.collateral_price_after)
+        wire.insert(index + 1, "get_collateral_price")
+        case = replace(case, wire=wire)
+        if not rust:
+            candidate_case = case
     with (
         tempfile.TemporaryDirectory(prefix="sai-parity-") as temp,
-        loopback(case.server) as endpoints,
+        loopback(case.server, balance_block_reads=account_balances) as endpoints,
     ):
         left, left_error = safe_observe(
             case, reference, Path(temp) / "reference", endpoints, cutover=cutover
@@ -1228,7 +1244,11 @@ def run_case(
                 diffs.append(
                     f"expected candidate exit {candidate_case.expect}, got {right.exit_code}"
                 )
-            if left.stderr != right.stderr:
+            # Clap prints the cancel description before the usage line.
+            if case.name == "bare-help-trade-cancel":
+                if set(left.stderr) != set(right.stderr):
+                    diffs.append("stderr categories differ")
+            elif left.stderr != right.stderr:
                 diffs.append("stderr differs")
         else:
             diffs = differences(left, right)
@@ -1299,6 +1319,23 @@ def release_commands(reference: list[str]) -> set[str]:
     ):
         raise ValueError("Invalid release command inventory")
     return set(names)
+
+
+def supports_current_trade_ux(reference: list[str]) -> bool:
+    """Probe the executable so installed launchers and wrappers both work."""
+    with (
+        tempfile.TemporaryDirectory(prefix="sai-reference-help-") as temp,
+        loopback("normal") as endpoints,
+    ):
+        home = Path(temp)
+        result = invoke(
+            reference, ["trade", "cancel", "--help"], home, child_env(home, endpoints)
+        )
+    return (
+        result.returncode == 0
+        and result.stdout.startswith("Usage: sai trade cancel")
+        and "--preview-digest" in result.stdout
+    )
 
 
 def project_position_estimates(value: Any) -> None:
@@ -1404,14 +1441,18 @@ def main() -> int:
     cases = [Case(**item) for item in configured["case"]]
     deferred: dict[str, str] = configured.get("deferred", {})
     commands = cli_commands(python_cli)
-    if args.cutover:
-        try:
+    try:
+        if args.cutover:
             require_manifest_case_ids(
                 (case.name for case in cases), HERE / "release-case-ids.txt"
             )
             commands |= release_commands(reference)
-        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
-            parser.error(str(exc))
+        # The cancel command and the current margin preview shipped together.
+        python_main = not comparing_release and (
+            configured_reference is None or supports_current_trade_ux(reference)
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        parser.error(str(exc))
     missing = commands - ({case.command for case in cases} | deferred.keys())
     if missing:
         parser.error(
@@ -1420,7 +1461,8 @@ def main() -> int:
     selected = [
         case
         for case in cases
-        if (
+        if (python_main or not case.current_only)
+        and (
             case.name in C2_CONFIG_CASE_IDS
             if args.c2_v011
             else not args.case
@@ -1471,6 +1513,13 @@ def main() -> int:
             else None,
             row_label="C2_V011_ROW" if args.c2_v011 else "CUTOVER_ROW",
         )
+    current_gaps = None
+    if python_main and candidate is not reference:
+        current_gaps = ManifestGaps(
+            HERE / "python-main-gaps.toml",
+            case_ids={f"case:{case.name}" for case in selected} if args.case else None,
+            row_label="CURRENT_PYTHON_ROW",
+        )
     overview_reference = os.environ.get("SAI_PARITY_OVERVIEW_PYTHON")
     for case in selected:
         if args.reference is not None:
@@ -1497,18 +1546,23 @@ def main() -> int:
                 accepted_divergence=None,
                 mcp_deferred_trade_exception=False,
             )
+        case_id = f"case:{case.name}"
+        current_gap = (
+            current_gaps is not None
+            and oracle is reference
+            and case_id in current_gaps.gaps
+        )
         diffs, listed, expected = run_case(
             case,
             oracle,
             executable,
-            cutover=comparing_release,
+            cutover=comparing_release or current_gap,
+            python_main=python_main and oracle is reference,
             tool_evidence=evidence if gaps else None,
         )
         for tool, status in listed.items():
             if status != "LISTED" or tool not in tools:
                 tools[tool] = status
-        mismatches += bool(diffs)
-        expected_differences += bool(expected and not diffs)
         shown_args = [
             "<redacted>"
             if any(marker in arg for marker in case.absent_output_text or ())
@@ -1516,6 +1570,14 @@ def main() -> int:
             for arg in case.args
         ]
         command = f"`sai {shlex.join(shown_args)}` ({case.name})"
+        if current_gap and current_gaps is not None:
+            status, detail = current_gaps.result(case_id, diffs)
+            mismatches += status in {"DIFF", "XPASS"}
+            expected_differences += status == "XFAIL"
+            row(command, status, detail)
+            continue
+        mismatches += bool(diffs)
+        expected_differences += bool(expected and not diffs)
         if gaps:
             row(
                 command,
@@ -1554,7 +1616,8 @@ def main() -> int:
             print("Cutover could not verify an MCP inventory.")
             return 1
         return gaps.finish()
-    return int(bool(mismatches))
+    current_status = current_gaps.finish() if current_gaps is not None else 0
+    return int(bool(mismatches or current_status))
 
 
 if __name__ == "__main__":

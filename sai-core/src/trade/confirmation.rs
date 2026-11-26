@@ -321,8 +321,12 @@ impl Trading<'_> {
                         &id,
                         Some((verified.0, Some(verified.1))),
                         indexed,
+                        true,
                     )
                     .await?;
+                    // A definitive rejection can leave no collateral projection
+                    // to compare with the approved digest.
+                    prepared.check_cli_execution(addr, false)?;
                 }
             }
         }
@@ -523,6 +527,9 @@ pub fn digest_bytes(preview: &TradePreview, account: Option<&str>) -> Vec<u8> {
             fields.insert("closedNotionalUsdAvailable".into(), json!(usd_available));
         }
         material["quote"] = quote;
+    }
+    if let Some(collateral) = &preview.leverage_collateral {
+        material["collateralBaseUnits"] = json!(collateral);
     }
     if let Some(route) = &preview.position_route {
         material["positionRoute"] = json!(route);

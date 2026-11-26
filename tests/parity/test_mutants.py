@@ -84,7 +84,7 @@ def run_mutant(
         ("history-operation", "account-history", "Keeper HTTP GraphQL request differs"),
         ("ws-projection", "watch-price", "WebSocket GraphQL request differs"),
         ("stdout-key-order", "market-list", "stdout bytes differ"),
-        ("stderr-duplicate", "account-balances", "stderr bytes differ"),
+        ("stderr-duplicate", "account-balances", "parity.raw[1]"),
         ("ledger-milliseconds", "trade-concurrent-close", "Unix timestamp in seconds"),
         ("ledger-rowid", "intent-local-reserved", "intents.sqlite3.schema"),
         ("ledger-index", "intent-local-reserved", "intents.sqlite3.schema"),
@@ -288,3 +288,24 @@ def auth_import_differences(candidate: str) -> tuple[list[str], list[str]]:
 if __name__ == "__main__":
     enter_loopback()
     print(json.dumps(auth_import_differences(sys.argv[1])))
+
+
+@pytest.mark.parametrize("selector", ["--reference", "SAI_PARITY_PYTHON"])
+def test_current_reference_selects_cancel_and_margin_fixtures(
+    selector: str, tmp_path: Path
+) -> None:
+    launcher = tmp_path / "sai-launcher"
+    installed_cli = shlex.quote(str(Path(sys.executable).with_name("sai")))
+    launcher.write_text(f'#!/bin/sh\nexec {installed_cli} "$@"\n', encoding="utf-8")
+    launcher.chmod(0o700)
+    environment = {**os.environ}
+    environment.pop("SAI_PARITY_BIN", None)
+    options = ["--case", "trade-margin"]
+    if selector == "--reference":
+        options.extend(("--reference", str(launcher)))
+    else:
+        environment[selector] = str(launcher)
+    run = run_driver("bare-help-trade-cancel", environment, *options)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert "(bare-help-trade-cancel) | PASS |" in run.stdout
+    assert "(trade-margin) | PASS |" in run.stdout

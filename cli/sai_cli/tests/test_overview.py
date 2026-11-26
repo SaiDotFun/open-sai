@@ -17,12 +17,18 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 import pytest
+import uvicorn
 from click.testing import CliRunner
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import TextContent
 from sai_cli.core import keeper, overview, reconcile, settings, storage, stream
 from sai_cli.mcp_server.server import create_server
 from sai_cli.sai_cli import main
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse, RedirectResponse
+from starlette.routing import Route, WebSocketRoute
+from starlette.websockets import WebSocket
 from websockets.sync.server import serve
 from websockets.typing import Subprotocol
 
@@ -314,7 +320,7 @@ def static_fields(value: Any) -> Any:
         return {
             key: static_fields(item)
             for key, item in value.items()
-            if key not in {"fetchedAt", "sourceAgeSeconds"}
+            if key not in {"fetchedAt", "sourceAgeSeconds", "stale"}
             and not (
                 key == "sourceAt"
                 and item is not None
@@ -341,6 +347,7 @@ def test_replays_mainnet_and_preserves_freshness_on_both_surfaces(replay):
     assert data["balance"]["sourceAt"] == decoded["balances"]["fetchedAt"]
     assert data["balance"]["sourceAtBasis"] == "fetchedAt"
     assert data["balance"]["sourceAgeSeconds"] is None
+    assert data["balance"]["stale"] is None
     assert data["balance"]["sourceBlock"] == 49819589
     assert data["unsettled"]["sourceAt"] is None
     assert datetime.fromisoformat(decoded["balances"]["fetchedAt"]).tzinfo == UTC
@@ -1496,3 +1503,165 @@ def test_next_oracle_pending_intent_remains_a_local_trade_blocker(replay):
     assert [(row["status"], row["scope"]) for row in result["data"]] == [
         ("pending", "allTrades")
     ]
+
+
+@pytest.mark.parametrize("redirected", [False, True], ids=["direct", "redirected"])
+def test_balance_commands_report_source_block_age(replay, redirected):
+    balance_endpoint = replay["config"].ws_endpoint
+
+    async def query(request: Request) -> JSONResponse:
+        body = await request.json()
+        return JSONResponse(replay["http"][body["query"]])
+
+    async def balances(ws: WebSocket) -> None:
+        if redirected:
+            await ws.send_denial_response(RedirectResponse(balance_endpoint))
+            return
+        await ws.accept(subprotocol="graphql-transport-ws")
+        assert await ws.receive_json() == {"type": "connection_init"}
+        await ws.send_json({"type": "connection_ack"})
+        request = await ws.receive_json()
+        assert request["payload"]["query"] == stream.BALANCES_WITH_BLOCK
+        await ws.send_json({"id": "1", "type": "next", "payload": replay["ws"]})
+        await ws.close()
+
+    app = Starlette(
+        routes=[
+            Route("/query", query, methods=["POST"]),
+            WebSocketRoute("/query", balances),
+        ]
+    )
+    rows = replay["ws"]["data"]["userBalances"]
+    by_name = {row["token_info"]["name"]: row for row in rows}
+    by_name["USDC on Sai"]["lastUpdatedBlock"] = RISK_BLOCK
+    by_name["USDC Credits on Sai"]["lastUpdatedBlock"] = MARK_BLOCK
+    with socket.create_server(("127.0.0.1", 0)) as listener:
+        origin = f"127.0.0.1:{listener.getsockname()[1]}"
+        config = uvicorn.Config(app, log_level="error", ws="websockets-sansio")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, kwargs={"sockets": [listener]})
+        thread.start()
+        replay["config"] = replace(
+            replay["config"],
+            endpoint=f"http://{origin}/query",
+            ws_endpoint=f"ws://{origin}/query",
+        )
+        try:
+            for command in (("overview", "--as", ADDR), ("balances", ADDR)):
+                human = cli(replay, "account", *command)
+                assert human.exit_code == 0, human.output
+                assert f"block {RISK_BLOCK}" in human.stdout
+                stale_row = next(
+                    line
+                    for line in human.stdout.splitlines()
+                    if f"block {MARK_BLOCK}" in line
+                )
+                if redirected:
+                    assert f"block {RISK_BLOCK} (age unknown)" in human.stdout
+                    assert "age unknown" in stale_row
+                else:
+                    assert "old" in stale_row and "stale" in stale_row
+
+                machine = cli(replay, "--json", "account", *command)
+                assert machine.exit_code == 0, machine.output
+                response = json.loads(machine.stdout)
+                if command[0] == "overview":
+                    if redirected:
+                        assert response["balances"]["source"] == {
+                            "endpoint": balance_endpoint.removesuffix("/query"),
+                            "matchesKeeper": False,
+                        }
+                    result = response["balances"]["data"]
+                    fresh, stale = result["balance"], result["credits"]
+                else:
+                    result = {
+                        row["sourceBlock"]: row
+                        for row in response["data"]["userBalances"]
+                    }
+                    fresh, stale = result[RISK_BLOCK], result[MARK_BLOCK]
+                assert fresh["sourceBlock"] == RISK_BLOCK
+                assert stale["sourceBlock"] == MARK_BLOCK
+                if redirected:
+                    for row in (fresh, stale):
+                        assert row["stale"] is None
+                        assert row["sourceAgeSeconds"] is None
+                else:
+                    assert fresh["stale"] is False
+                    assert (
+                        0 <= fresh["sourceAgeSeconds"] < overview.BALANCE_STALE_SECONDS
+                    )
+                    assert stale["stale"] is True
+                    assert stale["sourceAgeSeconds"] > overview.BALANCE_STALE_SECONDS
+        finally:
+            server.should_exit = True
+            thread.join(timeout=10)
+
+
+def test_balance_subcommand_ws_flag_overrides_invalid_environment(replay, monkeypatch):
+    config = replay["config"]
+    monkeypatch.setenv("SAI_WS_ENDPOINT", "not-a-websocket-url")
+    result = CliRunner().invoke(
+        main,
+        [
+            "--json",
+            "--endpoint",
+            config.endpoint,
+            "account",
+            "balances",
+            ADDR,
+            "--ws-endpoint",
+            config.ws_endpoint,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    response = json.loads(result.stdout)
+    assert response["data"]["userBalances"]
+    assert (stream.BALANCES_WITH_BLOCK, {"user": ADDR}) in replay["calls"]
+
+
+def test_explicit_balance_websocket_works_without_valid_lcd(replay, monkeypatch):
+    config = replay["config"]
+    monkeypatch.setenv("SAI_LCD_ENDPOINT", "not-an-lcd-url")
+    row = replay["ws"]["data"]["userBalances"][0]
+    row["lastUpdatedBlock"] = RISK_BLOCK
+    args = ["--json", "--endpoint", config.endpoint, "account", "balances", ADDR]
+    cli = CliRunner()
+
+    result = cli.invoke(main, [*args, "--ws-endpoint", config.ws_endpoint])
+    assert result.exit_code == 0, result.output
+    response = json.loads(result.stdout)
+    balance = response["data"]["userBalances"][0]
+    assert balance["amount"] == row["amount"]
+    assert balance["sourceBlock"] == RISK_BLOCK
+    assert balance["sourceAgeSeconds"] is None
+    assert balance["stale"] is None
+    assert replay["calls"] == [(stream.BALANCES_WITH_BLOCK, {"user": ADDR})]
+
+    derived = cli.invoke(main, args)
+    assert derived.exit_code == 2, derived.output
+    assert json.loads(derived.stdout)["error"]["code"] == "INVALID_REQUEST"
+
+
+def test_text_balances_show_unpriced_token_quantities(replay):
+    replay["ws"] = {
+        "data": {
+            "userBalances": [
+                {
+                    "amount": "123456789012345678901234567891",
+                    "usd_value": 0,
+                    "lastUpdatedBlock": RISK_BLOCK,
+                    "token_info": {
+                        "name": "Unpriced token",
+                        "symbol": "UP",
+                        "decimals": 18,
+                        "type": "erc20",
+                    },
+                }
+            ]
+        }
+    }
+    result = cli(replay, "account", "balances", ADDR)
+    assert result.exit_code == 0, result.output
+    assert "Quantity" in result.stdout
+    assert "123456789012.345678901234567891 UP" in result.stdout
+    assert f"block {RISK_BLOCK}" in result.stdout

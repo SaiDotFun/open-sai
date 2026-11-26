@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 from ..core.session import expiry_notice_text
@@ -20,6 +21,57 @@ def _source(row: dict[str, Any]) -> str:
     if row.get("sourceBlock") is not None:
         return f"block {row['sourceBlock']} (time unknown)"
     return UNKNOWN
+
+
+def _balance_source(row: dict[str, Any]) -> str:
+    height = row["sourceBlock"]
+    source = f"block {height}" if height is not None else "block unknown"
+    age = row["sourceAgeSeconds"]
+    if age is None:
+        return f"{source} (age unknown)"
+    minutes, seconds = divmod(int(age), 60)
+    hours, minutes = divmod(minutes, 60)
+    elapsed = f"{hours}h {minutes}m" if hours else f"{minutes}m {seconds}s"
+    return f"{source} ({elapsed} old{' · stale' if row['stale'] else ''})"
+
+
+def _token_quantity(row: dict[str, Any]) -> str:
+    token = row["token_info"]
+    amount = str(row.get("amount"))
+    decimals = token.get("decimals")
+    symbol = token.get("symbol")
+    if not (
+        amount.isascii()
+        and amount.isdecimal()
+        and type(decimals) is int
+        and 0 <= decimals <= 255
+        and isinstance(symbol, str)
+        and symbol
+    ):
+        return UNKNOWN
+    quantity = format(Decimal(f"{amount}e-{decimals}"), "f")
+    if "." in quantity:
+        quantity = quantity.rstrip("0").rstrip(".")
+    return f"{quantity} {symbol}"
+
+
+def show_balances(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        print("No balance rows returned.")
+        return
+    ReplSkin("sai").table(
+        ["Balance", "Quantity", "USD", "Source (Age)"],
+        [
+            [
+                row["token_info"]["name"],
+                _token_quantity(row),
+                _value(row["usd_value"]),
+                _balance_source(row),
+            ]
+            for row in rows
+        ],
+        max_col_width=72,
+    )
 
 
 def _collateral(row: dict[str, Any]) -> str:
@@ -81,7 +133,7 @@ def show(result: dict[str, Any]) -> None:
                 [
                     "Unsettled Teller" if key == "unsettled" else key.title(),
                     _value(row["usd"]),
-                    _source(row),
+                    _balance_source(row),
                 ]
                 for key, row in balances.items()
             ],

@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from typing import Any
 from urllib.parse import urlsplit
 
 from websockets.exceptions import WebSocketException
 from websockets.sync.client import ClientConnection, connect
 from websockets.typing import Subprotocol
+from websockets.uri import WebSocketURI
 
 from . import keeper
 from .errors import Code, SaiError
@@ -140,7 +141,23 @@ def payloads(
     an invalid message, or fails or ends the subscription, and one of DISCONNECTS
     when the connection drops or a read exceeds TIMEOUT seconds.
     """
+    with closing(_payloads(ws_endpoint, query, variables, timeout, notify)) as items:
+        for payload, _ in items:
+            yield payload
+
+
+def _payloads(
+    ws_endpoint: str,
+    query: str,
+    variables: dict[str, Any],
+    timeout: float | None,
+    notify: Callable[[str], None],
+) -> Generator[tuple[dict[str, Any], WebSocketURI | None]]:
     with _open(ws_endpoint, 10) as socket:
+        # Older supported versions expose the parsed URI as wsuri.
+        endpoint = getattr(socket.protocol, "uri", None) or getattr(
+            socket.protocol, "wsuri", None
+        )
         socket.send(
             json.dumps(
                 {
@@ -156,7 +173,7 @@ def payloads(
             if message.get("type") == "ping":
                 socket.send(json.dumps({"type": "pong"}))
             elif message.get("type") == "next":
-                yield check_payload(message.get("payload"), query)
+                yield check_payload(message.get("payload"), query), endpoint
             elif message.get("type") in ("error", "complete"):
                 raise StreamError("Keeper subscription ended")
 
@@ -168,8 +185,18 @@ def snapshot(
     notify: Callable[[str], None] = _ignore,
 ) -> dict[str, Any]:
     """Read the first snapshot of a subscription and disconnect."""
+    return snapshot_with_endpoint(ws_endpoint, query, variables, notify)[0]
+
+
+def snapshot_with_endpoint(
+    ws_endpoint: str,
+    query: str,
+    variables: dict[str, Any],
+    notify: Callable[[str], None] = _ignore,
+) -> tuple[dict[str, Any], WebSocketURI | None]:
+    """Read one snapshot and return the connected endpoint after redirects."""
     check_ws(ws_endpoint)
-    stream = payloads(ws_endpoint, query, variables, timeout=20, notify=notify)
+    stream = _payloads(ws_endpoint, query, variables, timeout=20, notify=notify)
     try:
         return next(stream)
     except DISCONNECTS as exc:

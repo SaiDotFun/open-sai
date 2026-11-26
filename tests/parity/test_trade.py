@@ -164,6 +164,19 @@ def test_cli_dry_run_matches_python_main(
                 assert digest == preview_digest(preview)
             else:
                 assert digest is None
+            if args[:2] == ("trade", "leverage"):
+                assert preview["collateralBaseUnits"] == {
+                    "before": "10000000",
+                    "after": "10999999",
+                }
+            if index == 0 and args[1] in {"leverage", "margin"}:
+                # Issue 231 tracks the Python-only collateral display fields.
+                assert preview.pop("collateral") == {
+                    "beforeUsdc": "10.000000",
+                    "afterUsdc": "10.999999",
+                    "beforeUsd": "10",
+                    "afterUsd": "10.999999",
+                }
             assert preview["positionRoute"]
             canonical = json.dumps(preview, sort_keys=True).encode()
             previews.append(OBSERVED_AT.sub(b'"observedAt": "<time>"', canonical))
