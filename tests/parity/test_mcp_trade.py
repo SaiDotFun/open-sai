@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 from scenarios import ADDRESS, OTHER_ADDRESS, loopback
 from test_mcp_stdio import server
-from test_trade import rows
+from test_trade import rows, run
 from trade_replay import TradeReplay
 
 OPEN = {
@@ -121,7 +121,10 @@ def test_mcp_preview_and_confirm(
     scenario: str,
 ) -> None:
     observations = []
-    for i, executable in enumerate(mcp_pair):
+    python, rust = mcp_pair
+    if action == "leverage":
+        python = Path(sys.executable).with_name("sai")
+    for i, executable in enumerate((python, rust)):
         home = tmp_path / str(i)
         replay = TradeReplay(kind, "" if action == "open" else "7")
         with (
@@ -137,6 +140,27 @@ def test_mcp_preview_and_confirm(
             assert preview["intent"]["kind"] == kind
             assert not replay.attempts()
             assert not rows(home)
+
+            if action == "leverage":
+                code, cli_preview, stderr = run(
+                    (str(executable),),
+                    home,
+                    endpoints,
+                    (
+                        "trade",
+                        "leverage",
+                        str(args["trade_id"]),
+                        "--leverage",
+                        args["leverage"],
+                        "--dry-run",
+                    ),
+                    python=i == 0,
+                )
+                assert (code, stderr) == (0, "")
+                assert cli_preview["previewDigest"] == preview["previewDigest"]
+                assert (
+                    cli_preview["collateralBaseUnits"] == preview["collateralBaseUnits"]
+                )
 
             confirmed = trade_args(preview, args)
             refused = result(

@@ -1019,14 +1019,15 @@ def test_trade_confirmation_binds_verified_route(
             cli_digest = cli_document["previewDigest"]
             assert cli_document["positionRoute"] == preview["positionRoute"]
             if tool == "leverage":
-                assert "collateralBaseUnits" not in preview
+                assert (
+                    preview["collateralBaseUnits"]
+                    == cli_document["collateralBaseUnits"]
+                )
                 assert cli_document["collateralBaseUnits"] == {
                     "before": "4000000",
                     "after": "2666666",
                 }
-                assert cli_digest != digest
-            else:
-                assert cli_digest == digest
+            assert cli_digest == digest
             assert preview["positionRoute"] == {
                 "chainId": CHAIN_ID,
                 "contractAddress": "nibi1contract",

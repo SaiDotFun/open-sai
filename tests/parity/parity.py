@@ -86,6 +86,7 @@ class Case:
     mcp_protocol: str = "2025-11-25"
     mcp_logs: bool = False
     mcp_trade: bool = False
+    checkout_reference: bool = False
     seed: str = "empty"
     server: str = "normal"
     setup: list[str] | None = None
@@ -1479,7 +1480,9 @@ def main() -> int:
         )
     overview_reference = os.environ.get("SAI_PARITY_OVERVIEW_PYTHON")
     for case in selected:
-        if case.mcp_trade and mcp_trade_reference:
+        if case.checkout_reference:
+            oracle = [checkout_python]
+        elif case.mcp_trade and mcp_trade_reference:
             oracle = mcp_trade_reference
         elif args.reference is not None:
             oracle = reference

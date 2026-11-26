@@ -1700,6 +1700,8 @@ name = "mcp-trade-leverage-confirmation"
 args = ["mcp", "serve"]
 mode = "mcp"
 mcp_trade = true
+# The collateral binding was added after the MCP trade reference release.
+checkout_reference = true
 mcp_calls = [
     { name = "preview_leverage", arguments = { trade_id = 7, leverage = "1.818181818181818182" } },
     { name = "trade_leverage", arguments = { trade_id = 7, leverage = "1.818181818181818182", preview_digest = "fixture-mismatch" } },
@@ -1707,7 +1709,7 @@ mcp_calls = [
 seed = "session"
 server = "quote-close"
 state = { "trader/intents.sqlite3#tables.intents.rows.0" = "<absent>" }
-output = { "1.result.content.0.text.previewDigest" = "24e8cede5d70c5fb9942ddc457ff96cc9f856011c324c5f4dc0660fe918126c6", "2.result.content.0.text.code" = "PREVIEW_MISMATCH", "2.result.content.0.text.preview.previewDigest" = "24e8cede5d70c5fb9942ddc457ff96cc9f856011c324c5f4dc0660fe918126c6" }
+output = { "1.result.content.0.text.previewDigest" = "d8f9ebbe79ae2a06786bdc51609d5d09de48ab07daa062b98971b2ad224dc0b5", "1.result.content.0.text.collateralBaseUnits" = { before = "10000000", after = "10999999" }, "2.result.content.0.text.code" = "PREVIEW_MISMATCH", "2.result.content.0.text.preview.previewDigest" = "d8f9ebbe79ae2a06786bdc51609d5d09de48ab07daa062b98971b2ad224dc0b5", "2.result.content.0.text.preview.collateralBaseUnits" = { before = "10000000", after = "10999999" } }
 
 [[case]]
 name = "mcp-trade-margin-confirmation"
