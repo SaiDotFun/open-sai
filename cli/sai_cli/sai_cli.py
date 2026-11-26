@@ -46,6 +46,7 @@ from .utils import overview_format
 from .utils.repl_skin import ReplSkin
 
 PACKAGE = "sai-cli"
+TRADE_WAIT_TIMEOUT = 60.0
 
 
 def package_version() -> str:
@@ -1238,7 +1239,7 @@ def wait_option(action: Callable[..., None]) -> Callable[..., None]:
         is_flag=True,
         expose_value=False,
         callback=record,
-        help=f"Wait up to {wait.DEFAULT_TIMEOUT:g} seconds for the intent outcome.",
+        help=f"Wait up to {TRADE_WAIT_TIMEOUT:g} seconds for the intent outcome.",
     )(run)
 
 
@@ -1246,6 +1247,7 @@ def emit_wait(ctx: click.Context, result: dict[str, Any]) -> None:
     outcome = result["outcome"]
     exit_code = ExitCode.OK
     if outcome == "unknown":
+        result["message"] = "The intent outcome is still unknown. Do not resubmit."
         addr_args = ["--addr", result["addr"]] if result.get("addr") else []
         result["hint"] = storage.keeper_command_hint(
             keeper_url(ctx),
@@ -1292,7 +1294,9 @@ def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
         and account
         and result.get("status") == "accepted"
     ):
-        final = wait.for_intent(keeper_url(ctx), account, result["intentKey"])
+        final = wait.for_intent(
+            keeper_url(ctx), account, result["intentKey"], timeout=TRADE_WAIT_TIMEOUT
+        )
         # Keep trade quote metadata, but report the final outcome as the status.
         metadata = {key: value for key, value in result.items() if key != "message"}
         emit_wait(ctx, {**metadata, **final, "status": final["outcome"]})
@@ -1319,7 +1323,9 @@ def trade_error(ctx: click.Context, exc: Exception) -> None:
             final = (
                 wait.rejected_result(exc.intent_key, account, str(exc))
                 if isinstance(exc, keeper.AdmissionRejected)
-                else wait.for_intent(keeper_url(ctx), account, exc.intent_key)
+                else wait.for_intent(
+                    keeper_url(ctx), account, exc.intent_key, timeout=TRADE_WAIT_TIMEOUT
+                )
             )
             emit_wait(ctx, {**final, "status": final["outcome"]})
             return

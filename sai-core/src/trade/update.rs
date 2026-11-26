@@ -139,7 +139,6 @@ impl Trading<'_> {
             &id,
             verified.map(|(route, raw)| (route, Some(raw))),
             indexed,
-            false,
         )
         .await?;
         Ok(if confirmed {
@@ -162,10 +161,20 @@ impl Trading<'_> {
             .map(Lcd)
             .ok_or_else(|| invalid("Cannot verify the position without an LCD"))?;
         let mut preview = preview.clone();
-        let (route, _) = self
+        let (route, raw) = self
             .verify_position_owner(&lcd, addr, &id, confirming)
             .await?;
-        preview.position_route = Some(route);
+        preview.position_route = Some(route.clone());
+        if !preview.intent.body["requestedLeverage"].is_null() {
+            self.estimate_position_update(
+                &mut preview,
+                addr,
+                &id,
+                Some((route, Some(raw))),
+                indexed.clone(),
+            )
+            .await?;
+        }
         Ok(PositionUpdate { preview, indexed })
     }
 
@@ -176,22 +185,23 @@ impl Trading<'_> {
         mut error: SaiError,
     ) -> SaiError {
         if error.code == Code::PreviewMismatch {
-            let Ok(id) = update.preview.update_id() else {
-                return error;
-            };
-            let route = update.preview.position_route.clone();
-            if let Err(ownership) = self
-                .estimate_position_update(
-                    &mut update.preview,
-                    addr,
-                    &id,
-                    route.map(|route| (route, None)),
-                    update.indexed,
-                    false,
-                )
-                .await
-            {
-                return ownership;
+            if update.preview.estimates.is_none() {
+                let Ok(id) = update.preview.update_id() else {
+                    return error;
+                };
+                let route = update.preview.position_route.clone();
+                if let Err(ownership) = self
+                    .estimate_position_update(
+                        &mut update.preview,
+                        addr,
+                        &id,
+                        route.map(|route| (route, None)),
+                        update.indexed,
+                    )
+                    .await
+                {
+                    return ownership;
+                }
             }
             if let Some(details) = &mut error.details {
                 details.insert(

@@ -41,8 +41,11 @@ modes. The dry-run case compares each CLI with and without `--wait`.
 
 The TP/SL and leverage wait cases use Python main at
 `20493c984e3398756365ea1a2b8786a7a0115a11`. They check the request and
-execution blocks, admission and chain failure codes, the 30-second
-deadline, and intent-key recovery after Ctrl-C.
+execution blocks, admission and chain failure codes, and intent-key recovery
+after Ctrl-C. The deadline cases exercise the pin's 30-second budget and
+Rust's 60-second budget. They also check that Rust reports a leverage
+execution first visible after 33 seconds. Current Python trade `--wait`
+also uses 60 seconds and tests the late result with a simulated clock.
 
 ```sh
 SAI_PARITY_WAIT_PYTHON=/absolute/path/to/pinned/.venv/bin/sai \
