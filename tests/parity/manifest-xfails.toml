@@ -33,21 +33,25 @@ signature = "3015bd9644405895117cd0327cfc123b38b5e0e37c50552bd40893a97a0e1b92"
 owner = "#211"
 signature = "fc7b588d1bf24ecc42b258d68e40ffeb6b0fa4eb512342011fd57f25c99dba55"
 
+[gap."case:account-overview-conflicting-height"]
+owner = "#175"
+signature = "b93612e5f1b90c92fc651cb9f6d79cf9dac19bc9276449af9ddc40fb305e66c7"
+
 [gap."case:account-overview-confirmation-fails"]
 owner = "#211"
 signature = "740ca26b317d7ea13fbb52915b7b81a87574d4c15b3b92c72f8bb07f10366678"
 
 [gap."case:account-overview-deadline"]
 owner = "#211"
-signature = "4056dc76f7e45bb951fca0eb8ec54b5c52f2f1dfe35b9f77063e5d37e2a2c935"
+signature = "908760da9d8bf652db5561c0823e6b14bfefece80c4d718c77129c7f6099d42d"
 
 [gap."case:account-overview-expiry"]
 owner = "#211"
-signature = "f66bb7b1230c700104442120b0198859ce2df7bb51813099e3fbb0e5a8099363"
+signature = "d3b64de79765bc06273344289ca3b07d1625e54138306faea4be9bc0afd0edb5"
 
 [gap."case:account-overview-expiry-text"]
 owner = "#211"
-signature = "b3e5d0c8eed6d9edb9ffdfffebca1a34c3b846dfe7a312c3b2a62cffe344e2fc"
+signature = "20528a3719fa10a5115d98fe4ed4dc6687fc0bf42b147aa77fd50007f453544f"
 
 [gap."case:account-overview-interrupt-http"]
 owner = "#211"
@@ -59,7 +63,7 @@ signature = "7996e6f04f7d86166975330ef32f5c7c777ffa832ac2bab1cf891a573b645d05"
 
 [gap."case:account-overview-pnl-total"]
 owner = "#211"
-signature = "95ad27e2dd5305a4ed6b9424a15b345decbbdc5038606e0ac1a7fd1feedf0631"
+signature = "64add034ca66d8dece6d52b9ced6717d2433acc5cbcf8ec1902e978dd4ebc678"
 
 [gap."case:account-overview-signed-out"]
 owner = "#211"
@@ -69,6 +73,10 @@ signature = "1f5512d71e5092ae928423c842c3202dd2647e74f2be994482bd90d9b66d4811"
 owner = "#211"
 signature = "1f5512d71e5092ae928423c842c3202dd2647e74f2be994482bd90d9b66d4811"
 
+[gap."case:account-overview-wrong-height"]
+owner = "#175"
+signature = "b93612e5f1b90c92fc651cb9f6d79cf9dac19bc9276449af9ddc40fb305e66c7"
+
 [gap."case:auth-import-rejected-operand-json"]
 owner = "#211"
 signature = "b9cd24acfe95b5081aa533032dcf6d737785a5b3a3137f1f7646a9464a5d7765"
@@ -77,17 +85,9 @@ signature = "b9cd24acfe95b5081aa533032dcf6d737785a5b3a3137f1f7646a9464a5d7765"
 owner = "#211"
 signature = "daa6bb6c28c5e4088d2b9ede7a99c4b8086fd9b4c28dc6defba571e677319b8f"
 
-[gap."case:auth-logout"]
-owner = "#213"
-signature = "3d90c0ac924b0ee4ede71e61d34a078f89ded1255e95ac382ed214eb83ca5276"
-
 [gap."case:auth-status-signed-out"]
 owner = "#211"
 signature = "f723398d06b9a2175fd86982b2249fe4ee6baf193fe28ad0c951a5d195e2f1ec"
-
-[gap."case:auth-use"]
-owner = "#213"
-signature = "3d90c0ac924b0ee4ede71e61d34a078f89ded1255e95ac382ed214eb83ca5276"
 
 [gap."case:auth-use-invalid-expiry-json"]
 owner = "#171"
@@ -99,7 +99,8 @@ signature = "5219af5b19ddc2160975b3fdcad6f0369df5e397ce7c2b0d57bf68c5bb2e0264"
 
 [gap."case:auth-use-missing"]
 owner = "#213"
-signature = "8fb1bd41d5d04c4e0773494c2ea1869c4bb8571f0c104785980e21412bde8b3b"
+# Keep the fixed diagnostic from Python main. The release echoes the operand.
+signature = "a5a3b63e5e796da8b5dea0a7978511ab96dcc1925e743e83475668032cf065cf"
 
 [gap."case:bare-help-trade-close"]
 owner = "#172"
@@ -619,6 +620,7 @@ signature = "c679060efa7aa7397617b86a739843d544153b80d6eb63798ac9bdaa21ef9ca9"
 
 [gap."case:version"]
 owner = "#213"
+# The published v0.1.3 updater requires the native banner during its trial.
 signature = "d1a087013957a4980439a4e5a774af1a6843531593dbb0cf17ba98d2869d2007"
 
 [gap."case:watch-balances"]

@@ -112,6 +112,10 @@ if malformed_expiry := data["malformed_expiry"]:
     else:
         session["expiresAt"] = 123
     storage._save_accounts(accounts)
+if embedded_address := data["embedded_address"]:
+    accounts = storage.load_accounts()
+    accounts["sessions"][data["address"]]["evmAddress"] = embedded_address
+    storage._save_accounts(accounts)
 if data["ledger"]:
     if data.get("accepted_blockers"):
         for key, kind, entity in (
@@ -350,7 +354,9 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         },
         malformed_expiry=malformed_expiry,
     )
-    if malformed_expiry or seed in {
+    if seed == "accounts":
+        (sai_home / "trader" / "sessions.lock").chmod(0o644)
+    elif malformed_expiry or seed in {
         "mcp-auth-switch",
         "mcp-auth-redaction",
         "invalid-expiry",
@@ -379,6 +385,7 @@ def write_seed(
     accepted_blockers: bool = False,
     disable_logs: bool = False,
     malformed_expiry: str | None = None,
+    embedded_address: str | None = None,
 ) -> None:
     env = child_env(home, endpoints)
     if disable_logs:
@@ -389,6 +396,7 @@ def write_seed(
             {
                 "sessions": sessions,
                 "malformed_expiry": malformed_expiry,
+                "embedded_address": embedded_address,
                 "ledger": ledger,
                 "accepted_blockers": accepted_blockers,
                 "key": INTENT,
@@ -415,6 +423,7 @@ def loopback(
     cancel_target: str | None = None,
     close_target: str | None = None,
     lcd_query: bool = False,
+    overview_delay: float = 0,
     wrong_balance_at: Literal["snapshot", "pinned"] | None = None,
 ) -> Generator[Endpoints]:
     errors: list[str] = []
@@ -1026,6 +1035,8 @@ def loopback(
                             interrupt_ready.set()
                             interrupt_closed.wait(8)
                         else:
+                            if name == "overviewTrades" and overview_delay:
+                                time.sleep(overview_delay)
                             self.reply(response)
                         return
                 if name == "recordUserIntent" and scenario.startswith("trade-"):
@@ -1276,6 +1287,14 @@ def loopback(
                     if entry is not None:
                         request, response, height = entry
                         wire.append(request)
+                        if (
+                            scenario
+                            in {"overview-lcd-fails", "overview-fill-and-lcd-fail"}
+                            and request.label == "get_trade"
+                            and request.variables["index"] == 0
+                        ):
+                            self.reply({}, 503)
+                            return
                         if (
                             scenario == "overview-deadline"
                             and request.label == "get_trade"
@@ -1619,6 +1638,16 @@ def loopback(
                 connection.recv(timeout=8)
                 errors.append("Balance read continued the subscription after SIGINT")
                 return
+            if scenario == "overview-balance-pings":
+                # Withhold the balance payload while keeping GraphQL traffic
+                # flowing. The client should close at its snapshot deadline.
+                while True:
+                    connection.send(json.dumps({"type": "ping"}))
+                    if json.loads(connection.recv(timeout=5)) != {"type": "pong"}:
+                        errors.append("Expected GraphQL pong")
+                        return
+                    wire.append(WireRequest("ws:pong"))
+                    time.sleep(1)
             payload = queue_payloads[name]
             if scenario == "ws-partial":
                 connection.send(json.dumps({"type": "ping"}))

@@ -61,6 +61,7 @@ fn has_intent(row: &Row, key: &str) -> bool {
 }
 
 const ATTRIBUTION_SEPARATOR: &str = "~intent~";
+const PYTHON_CURSOR_STATE_SEPARATOR: &str = "~s2~";
 // Sparse contexts can seek directly to each anchor. Dense contexts replay
 // neighboring anchors in bounded spans without growing with their count.
 const MAX_INLINE_ANCHORS: usize = 1024;
@@ -69,6 +70,13 @@ const MAX_ANCHOR_CURSOR_BYTES: usize = 64 * 1024;
 fn parse_cursor(
     bound: Option<&str>,
 ) -> Result<(Cursor<'_>, Option<Vec<scan::AnchorRange>>), SaiError> {
+    if bound.is_some_and(|bound| bound.contains(PYTHON_CURSOR_STATE_SEPARATOR)) {
+        // Python stores the scan offsets and attribution in a sidecar file.
+        // Resuming only its base cursor could silently omit events.
+        return Err(usage(
+            "This cursor was issued by Python Sai. Start a new intent log query without a cursor.",
+        ));
+    }
     let Some((bound, positions)) = bound.and_then(|bound| bound.split_once(ATTRIBUTION_SEPARATOR))
     else {
         return Ok((Cursor::parse(bound)?, None));
@@ -374,11 +382,10 @@ pub async fn intent(
             .map(|(account, _)| account.clone())
             .or(addr)
             .or_else(|| {
-                Storage::new(home)
-                    .load_session(None)
-                    .ok()
-                    .filter(|session| session.endpoint() == Some(endpoint))
-                    .map(|session| session.addr().to_ascii_lowercase())
+                let accounts = Storage::new(home).load_accounts().ok()?;
+                let (key, session) = accounts.selected(None)?;
+                let addr = session.checked_address(key).ok()?;
+                (session.endpoint() == Some(endpoint)).then(|| addr.to_ascii_lowercase())
             });
         if let Some(account) = account.filter(|_| !ambiguous) {
             match lookup(endpoint, key, &account).await {
