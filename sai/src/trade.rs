@@ -600,6 +600,7 @@ impl WaitTrade<'_> {
             ))
         };
         let mut signal = local::wait_signal()?;
+        let confirmed = OnceLock::new();
         let waited = async {
             let result = submit.await;
             let Some((addr, key)) = self.reservation.get() else {
@@ -623,12 +624,18 @@ impl WaitTrade<'_> {
                 Err(error) if error.code == Code::OutcomeUnknown => None,
                 Err(error) => return Err(error),
             };
+            let remember_fill = |receipt| {
+                let _ = confirmed.set((receipt, metadata.clone(), false));
+            };
             let receipt = wait::for_intent(
                 self.endpoint,
                 addr,
                 key,
-                Duration::from_secs(60),
-                Instant::now(),
+                wait::WaitOptions {
+                    timeout: Duration::from_secs(60),
+                    started: Instant::now(),
+                    remember_fill: Some(&remember_fill),
+                },
                 self.storage,
                 self.events,
             )
@@ -637,7 +644,10 @@ impl WaitTrade<'_> {
         };
         let (mut receipt, metadata, recovered) = tokio::select! {
             biased;
-            _ = signal.recv() => recover(true, local::wait_aborted()),
+            _ = signal.recv() => confirmed.into_inner().map_or_else(
+                || recover(true, local::wait_aborted()),
+                Ok,
+            ),
             result = waited => result.or_else(|error| recover(false, error)),
         }?;
         if let Some(mut metadata) = metadata {

@@ -98,6 +98,17 @@ EVENTS = {
         },
         {"tradeId": "string", "endpointId": "string"},
     ),
+    "intent.open_blocked": Event(
+        "core.storage._check_open_pending",
+        ("warn",),
+        {
+            "intentKey": "string",
+            "addr": "string",
+            "endpoint": "string",
+            "code": "string",
+        },
+        {"endpointId": "string"},
+    ),
     "intent.status": Event(
         "core.storage._log_status",
         ("info",),
