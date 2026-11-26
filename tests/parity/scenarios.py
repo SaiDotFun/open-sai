@@ -46,6 +46,7 @@ POSITION_SCENARIOS = {
     "position-default",
     "position-precision",
     "position-after-hours",
+    "position-malformed-after-hours-cap",
     "position-index-lag",
     "position-wrong-chain",
     "position-foreign-trader",
@@ -419,6 +420,7 @@ def loopback(
     *,
     trade_replay: Callable[[WireRequest, str | None], dict[str, Any] | None]
     | None = None,
+    leverage_target: str | None = None,
     market_price: float | None = None,
     cancel_target: str | None = None,
     close_target: str | None = None,
@@ -715,12 +717,16 @@ def loopback(
     if scenario == "position-scientific-reduction":
         trade["collateralAmount"] = 10**29
         contracts["get_trade_raw"]["collateral_amount"] = str(10**29)
-    if scenario == "position-after-hours":
+    if scenario in {"position-after-hours", "position-malformed-after-hours-cap"}:
         contracts.update(
             is_after_hours_market=True,
             get_market={"block_last_opened": 110, "block_last_closed": 100},
             get_trade_infos=[{"created_block": 90}],
-            get_after_hours_leverage="1.234567890123456789",
+            get_after_hours_leverage=(
+                "malformed"
+                if scenario == "position-malformed-after-hours-cap"
+                else "1.234567890123456789"
+            ),
         )
     if scenario == "quote-close-only":
         contracts["get_market"]["market_trading_state"] = "close_only"
@@ -794,7 +800,7 @@ def loopback(
             "action": {
                 "update_leverage": {
                     "trade_index": "UserTradeIndex(7)",
-                    "new_leverage": "1.818181818181818182",
+                    "new_leverage": leverage_target or "1.818181818181818182",
                 }
             },
         },
@@ -1393,7 +1399,10 @@ def loopback(
                             and query == {name: {"trader": ADDRESS, "index": 7}}
                         )
                         if name == "get_trade_raw":
-                            if scenario == "concurrent-close":
+                            if (
+                                scenario == "concurrent-close"
+                                or close_target == "verified"
+                            ):
                                 allowed.append(
                                     {name: {"trader": position["trader"], "index": 7}}
                                 )
@@ -1446,6 +1455,13 @@ def loopback(
                         if owner_read and scenario == "quote-owner-read-error":
                             self.reply({}, 503)
                             return
+                        if (
+                            scenario == "quote-close-height-failed"
+                            and name == "get_trade_raw"
+                            and anchor
+                        ):
+                            self.reply({}, 503)
+                            return
                         if name == "get_trade_raw" and cancel_target is not None:
                             [nonce] = parse_qs(urlsplit(self.path).query).get(
                                 "_sai_query", [""]
@@ -1469,6 +1485,29 @@ def loopback(
                                     self.reject("Cancellation session gate timed out")
                                     return
                         data = contract_data(name, pinned=HEIGHT_HEADER in self.headers)
+                        if name == "get_market" and scenario in {
+                            "quote-cache-reopened",
+                            "quote-cache-closed",
+                        }:
+                            fresh = "_sai_query" in parse_qs(request_url.query)
+                            close_only = fresh == (scenario == "quote-cache-closed")
+                            data = {
+                                **data,
+                                "market_trading_state": "close_only"
+                                if close_only
+                                else "open",
+                            }
+                        if (
+                            scenario == "quote-close-collateral-changed"
+                            and name == "get_trade_raw"
+                            and anchor
+                        ):
+                            data = {
+                                **data,
+                                "collateral_amount": str(
+                                    int(data["collateral_amount"]) + 1
+                                ),
+                            }
                         self.reply({"data": data}, lcd=True)
                         return
                     except (ValueError, KeyError, TypeError):

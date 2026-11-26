@@ -1041,12 +1041,14 @@ def perform_query(
 def account_overview(ctx: click.Context, addr: str | None, json_output: bool) -> None:
     """Show Sai funds, positions, orders, local blockers, and session expiry."""
     ctx.obj["json"] = ctx.obj["json"] or json_output
-    if auto_update_applies("account", ctx.obj["json"]):
-        updater.tick(warn)
     try:
-        result = overview.account_overview(settings(ctx), addr or ctx.obj["as_addr"])
+        result = overview.account_overview(
+            settings(ctx), addr if addr is not None else ctx.obj["as_addr"]
+        )
     except overview.AccountUnavailable as exc:
         raise SessionError(f"{exc}. Pass --as ADDR explicitly.") from exc
+    if auto_update_applies("account", ctx.obj["json"]):
+        updater.tick(warn)
     for row in result["balances"].get("data", {}).values():
         row["stale"] = overview.balance_stale(row["sourceAgeSeconds"])
     if ctx.obj["json"]:
