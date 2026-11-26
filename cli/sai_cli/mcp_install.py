@@ -427,6 +427,10 @@ def missing_absolute_launcher(command: str) -> bool:
     return os.path.isabs(command) and shutil.which(command) is None
 
 
+def plain_launcher(command: str) -> bool:
+    return bool(command) and not command.startswith("-") and "=" not in command
+
+
 def launcher_target(launcher: str, environ: Mapping[str, str]) -> Target:
     return Target([launcher, "mcp", "serve"], server_env(environ))
 

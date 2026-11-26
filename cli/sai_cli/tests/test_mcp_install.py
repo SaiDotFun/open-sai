@@ -1034,9 +1034,9 @@ def test_codex_install_rejects_a_matching_broken_explicit_launcher(env: Env):
 
     result = invoke("mcp", "install", "codex", "--", *argv)
 
-    assert "requested server launcher is missing or not executable" in failure(result)
-    [row] = payload(result)["error"]["details"]["results"]
-    assert row["action"] == "failed" and not row["changed"]
+    assert "existing executable" in failure(result, 2)
+    assert str(launcher) not in result.output
+    assert "details" not in payload(result)["error"]
     assert env.codex_path().read_bytes() == original
     assert not env.calls()
 
@@ -1381,6 +1381,7 @@ def test_claude_install_reports_an_explicit_command_blocked_by_a_legacy_alias(
         )
     )
     before = config.read_bytes()
+    write_exe(env.bin / "uv", "")
     command = ["uv", "run", "--directory", f"/src/{SECRET}", "sai", "mcp", "serve"]
     if not different:
         command = serve(env)
@@ -2085,12 +2086,47 @@ def install_preview(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     profile = tmp_path / "sai-home"
     profile.mkdir(mode=0o700)
     monkeypatch.setenv("SAI_HOME", str(profile))
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
     monkeypatch.setenv("PATH", str(tmp_path))
     monkeypatch.setenv("FAKE_LOG", str(tmp_path / "argv.log"))
     monkeypatch.chdir(tmp_path)
     return write_exe(tmp_path / "claude", FAKE_CLAUDE)
+
+
+@pytest.mark.parametrize(
+    "kind", ["assignment", "option", "missing", "missing-path", "non-executable"]
+)
+def test_install_refuses_invalid_launcher_before_reporting(
+    install_preview: Path, kind: str
+) -> None:
+    root = install_preview.parent
+    marker = "fixture-launcher"
+    if kind in {"assignment", "option"}:
+        launcher = f"MODE={marker}" if kind == "assignment" else f"-{marker}"
+        write_exe(root / launcher, "")
+    elif kind == "missing":
+        launcher = marker
+    else:
+        launcher = str(root / marker)
+        if kind == "non-executable":
+            Path(launcher).touch(mode=0o600)
+
+    args = ("mcp", "install")
+    for options in (("claude", "--dry-run"), ("--dry-run",), ("claude",)):
+        result = invoke(*args, *options, "--", launcher, "mcp", "serve")
+        assert "existing executable" in failure(result, 2)
+        assert marker not in result.output
+        assert "details" not in payload(result)["error"]
+
+    text = CliRunner().invoke(main, [*args, "claude", "--dry-run", "--", launcher])
+    assert text.exit_code == 2
+    assert not text.stdout
+    assert "existing executable" in text.stderr
+    assert marker not in text.stderr
+    assert not (root / ".claude.json").exists()
+    assert not (root / "argv.log").exists()
 
 
 @pytest.mark.parametrize(
@@ -2127,6 +2163,7 @@ def test_dry_run_displays_launcher_and_argument_placeholders(
     reported_args: list[str] | None,
 ) -> None:
     root = install_preview.parent
+    write_exe(root / launcher, "")
     command = [launcher, *args]
     shown = [
         launcher,
@@ -2175,6 +2212,7 @@ def test_dry_run_displays_launcher_and_argument_placeholders(
 def test_dry_run_hides_arguments_of_a_matching_legacy_entry(
     install_preview: Path,
 ) -> None:
+    write_exe(install_preview.parent / "sh", "")
     command = ["sh", "-c", "exec sai mcp serve"]
     shown = ["sh", "<argument hidden 1 of 2>", "<argument hidden 2 of 2>"]
     config = install_preview.parent / ".mcp.json"
@@ -2194,9 +2232,10 @@ def test_dry_run_hides_arguments_of_a_matching_legacy_entry(
         "mcp", "install", "claude", "--scope", "project", "--dry-run", "--", *command
     )
 
-    assert "registration needs repair" in failure(result)
-    [row] = payload(result)["error"]["details"]["results"]
+    assert result.exit_code == 0, result.output
+    [row] = payload(result)["results"]
     assert row["name"] == OLD_COMMAND
+    assert row["action"] == "unchanged"
     assert row["command"] == shown
 
 
@@ -2268,6 +2307,7 @@ def test_default_uv_cache_is_refused_without_variables(env: Env, monkeypatch):
 
 
 def test_argv_after_dash_overrides_the_sai_on_path(env: Env):
+    write_exe(env.bin / "uv", "")
     dev = ["uv", "run", "--directory", "/src/open-sai", "sai", "mcp", "serve"]
     result = invoke("mcp", "install", "claude", "--", *dev)
     assert result.exit_code == 0, result.output

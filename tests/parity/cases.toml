@@ -1383,7 +1383,7 @@ state = { "clients/.claude.json#changed" = false, "clients/.codex/config.toml#ch
 
 [[case]]
 name = "mcp-install-dry-run"
-args = ["--json", "mcp", "install", "cursor", "--scope", "project", "--dry-run", "--", "fixture-wrapper", "sai", "mcp", "serve"]
+args = ["--json", "mcp", "install", "cursor", "--scope", "project", "--dry-run", "--", "env", "sai", "mcp", "serve"]
 accepted_divergence = "launcher-argument-report"
 client_seed = "empty"
 state = { "clients/.cursor/mcp.json" = "<absent>", "clients/argv.jsonl" = "<absent>" }
