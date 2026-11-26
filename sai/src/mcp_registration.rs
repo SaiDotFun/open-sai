@@ -191,12 +191,9 @@ fn reported_argv(args: &[String]) -> Vec<String> {
                 return format!("{flag}={}", reported_assignment(value));
             }
             if let Some(binding) = arg.strip_prefix("-e")
-                && binding.split_once('=').is_some_and(|(name, _)| {
-                    !name.is_empty()
-                        && name
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-                })
+                && let Some((name, _)) = binding.split_once('=')
+                && !name.is_empty()
+                && !name.contains("://")
             {
                 return format!("-e{}", reported_assignment(binding));
             }

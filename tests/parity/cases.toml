@@ -1372,6 +1372,7 @@ state = { "clients/.claude.json#changed" = false, "clients/.codex/config.toml#ch
 [[case]]
 name = "mcp-install-all"
 args = ["--json", "mcp", "install", "--all"]
+accepted_divergence = "claude-env-report"
 client_seed = "empty"
 state = { "clients/.codex/config.toml#@mode" = 384, "clients/.cursor/mcp.json#@mode" = 384 }
 

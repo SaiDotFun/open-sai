@@ -1163,6 +1163,18 @@ def run_case(
         project_reference_log_privacy(left, right)
         if case.name in {"mcp-install-invalid-scope", "mcp-install-empty-scope"}:
             left = project_reference_rejected_scope(left)
+        if case.accepted_divergence == "claude-env-report":
+            for result in left.output["results"]:
+                if result["client"] == "claude":
+                    result["argv"] = [
+                        [
+                            "--env=SAI_HOME=[redacted]"
+                            if arg.startswith("--env=SAI_HOME=")
+                            else arg
+                            for arg in argv
+                        ]
+                        for argv in result["argv"]
+                    ]
     if (
         candidate != reference
         and case.accepted_divergence == "doctor-keeper-log-context"
