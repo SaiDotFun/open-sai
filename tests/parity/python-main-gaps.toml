@@ -25,7 +25,7 @@ signature = "0c6c09717aa97c5866132f1e0020d745530d9da7f38155739014b3c2479aa160"
 [gap."case:bare-help-trade-cancel"]
 owner = "#231"
 title = "Python cancel help includes digest confirmation."
-signature = "d96ba5f5a978b8e04e5593cf29e0e0c62b0bba07b17f7cc5b768f5037e390e68"
+signature = "78a2271b0886994d8e6f171ca0962565fad3a96d4e2240936d0e29dd061ac31e"
 
 [gap."case:trade-open-market-symbol"]
 owner = "#231"

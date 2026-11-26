@@ -46,6 +46,7 @@ from .utils import overview_format
 from .utils.repl_skin import ReplSkin
 
 PACKAGE = "sai-cli"
+TRADE_WAIT_TIMEOUT = 60.0
 
 
 def package_version() -> str:
@@ -1257,7 +1258,7 @@ def wait_option(action: Callable[..., None]) -> Callable[..., None]:
         is_flag=True,
         expose_value=False,
         callback=record,
-        help=f"Wait up to {wait.DEFAULT_TIMEOUT:g} seconds for the intent outcome.",
+        help=f"Wait up to {TRADE_WAIT_TIMEOUT:g} seconds for the intent outcome.",
     )(run)
 
 
@@ -1265,6 +1266,7 @@ def emit_wait(ctx: click.Context, result: dict[str, Any]) -> None:
     outcome = result["outcome"]
     exit_code = ExitCode.OK
     if outcome == "unknown":
+        result["message"] = "The intent outcome is still unknown. Do not resubmit."
         addr_args = ["--addr", result["addr"]] if result.get("addr") else []
         result["hint"] = storage.keeper_command_hint(
             keeper_url(ctx),
@@ -1293,7 +1295,7 @@ def emit_wait(ctx: click.Context, result: dict[str, Any]) -> None:
 def poll_trade(ctx: click.Context, account: str, key: str) -> dict[str, Any]:
     if not ctx.obj["json"]:
         warn(f"Waiting for intent {key} to confirm...")
-    return wait.for_intent(keeper_url(ctx), account, key)
+    return wait.for_intent(keeper_url(ctx), account, key, timeout=TRADE_WAIT_TIMEOUT)
 
 
 def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
