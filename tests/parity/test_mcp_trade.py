@@ -571,6 +571,31 @@ def test_mcp_confirmation_explains_locked_ledger(
             }
 
 
+def test_mcp_confirmation_explains_corrupt_ledger(
+    mcp_pair: tuple[Path, Path], tmp_path: Path
+) -> None:
+    corrupt = b"corrupt ledger fixture"
+    for i, executable in enumerate(mcp_pair):
+        home = tmp_path / str(i)
+        with (
+            loopback("quote-market") as endpoints,
+            server(
+                executable, home, endpoints, seed="session", call_timeout=15
+            ) as stdio,
+        ):
+            preview = result(stdio.call(2, "preview_open", **OPEN))
+            ledger = home / "sai/trader/intents.sqlite3"
+            ledger.write_bytes(corrupt)
+            refused = result(stdio.call(3, "trade_open", **trade_args(preview, OPEN)))
+            assert not any(item.label == "recordUserIntent" for item in endpoints.wire)
+            assert ledger.read_bytes() == corrupt
+            assert not endpoints.errors
+            assert refused == {
+                "code": "INTERNAL_ERROR",
+                "error": "Could not reserve the trade intent. file is not a database. Nothing was sent.",
+            }
+
+
 @pytest.mark.parametrize("lose_reply", [False, True], ids=["accepted", "unknown"])
 def test_mcp_open_confirmation_reserves_once_until_overridden(
     mcp_pair: tuple[Path, Path], tmp_path: Path, lose_reply: bool

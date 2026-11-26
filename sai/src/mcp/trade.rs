@@ -3,7 +3,7 @@ use std::{future::pending, path::Path};
 use sai_core::{
     errors::{Code, SaiError},
     log::{self, EventContext, Surface},
-    storage::{Storage, StorageEvent, TRADE_LEDGER_LOCKED},
+    storage::{Storage, StorageEvent, is_trade_reservation_diagnostic},
     trade::{
         Confirmation, MARKET_PRICE_NOTICE, MarginDirection, OpenTrade, OrderType, PositionAction,
         PositionMode, PreviewMode, Side, SubmitOptions, Trading, close_preview, leverage_preview,
@@ -198,7 +198,7 @@ impl SaiMcp {
 }
 
 pub(super) fn failure(home: &Path, error: SaiError) -> Value {
-    if error.code == Code::InternalError && error.message != TRADE_LEDGER_LOCKED {
+    if error.code == Code::InternalError && !is_trade_reservation_diagnostic(&error.message) {
         eprintln!("Unexpected error in Sai MCP tool");
         return json!({
             "error": "Unexpected error in the Sai MCP server; see its stderr log",
