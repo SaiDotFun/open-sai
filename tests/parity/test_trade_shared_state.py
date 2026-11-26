@@ -32,7 +32,7 @@ from trade_replay import REQUEST_HASH, SESSION, TradeReplay
 
 pytestmark = pytest.mark.parity_namespace
 
-REFERENCE = "973f3f59f38dd89d0c2e03e674157934a00316ae"
+REFERENCE = "7c7b00dee586a6e148da7d482c89fc91c610b968"
 KEY = "20261124T120000000Z_0123456789ABCDEF"
 RETRY = "20261124T120001000Z_0123456789ABCDEF"
 LEDGER = Path("sai/trader/intents.sqlite3")

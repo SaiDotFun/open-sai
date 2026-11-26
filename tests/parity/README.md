@@ -433,11 +433,11 @@ Accepted C9b divergences from the pinned Python reference
 
 ## Shared-Home Trade Replays
 
-The shared-state cases pin Python to commit
-`973f3f59f38dd89d0c2e03e674157934a00316ae`. This pin includes the
-position-confirmation changes in #150. Use a checkout at that commit with
-its project environment installed. The Rust CI job runs this file separately
-from the Keeper and auth parity files.
+The shared-state cases pin the Python CLI and MCP to the released
+`sai-cli/v0.1.3` tag at commit
+`7c7b00dee586a6e148da7d482c89fc91c610b968`. Use a checkout at that commit
+with its project environment installed. The Rust CI job runs this file
+separately from the Keeper and auth parity files.
 
 ```sh
 uv sync --project "$SAI_PYTHON_REFERENCE" --locked
