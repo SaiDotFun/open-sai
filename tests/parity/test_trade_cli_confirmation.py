@@ -225,13 +225,21 @@ def test_position_execution_refuses_before_reserving(
 
 
 @pytest.mark.parametrize(
-    ("command", "scenario", "wrong_balance_at"),
+    ("command", "scenario", "wrong_balance_at", "preview_unavailable"),
     [
-        (MARGIN, "position-execution-ready", "pinned"),
-        (LEVERAGE, "quote-close", "snapshot"),
-        (LEVERAGE, "quote-close", "pinned"),
+        (MARGIN, "position-execution-ready", "pinned", False),
+        (LEVERAGE, "quote-close", "snapshot", False),
+        (LEVERAGE, "quote-close", "pinned", False),
+        (LEVERAGE, "quote-close", "snapshot", True),
+        (LEVERAGE, "quote-close", "pinned", True),
     ],
-    ids=["margin-pinned", "leverage-snapshot", "leverage-pinned"],
+    ids=[
+        "margin-pinned",
+        "leverage-snapshot",
+        "leverage-pinned",
+        "leverage-snapshot-advisory",
+        "leverage-pinned-advisory",
+    ],
 )
 def test_confirmed_trade_handles_balance_for_another_collateral(
     pair: tuple[CLI, CLI],
@@ -239,9 +247,12 @@ def test_confirmed_trade_handles_balance_for_another_collateral(
     command: CLI,
     scenario: str,
     wrong_balance_at: Literal["snapshot", "pinned"],
+    preview_unavailable: bool,
 ) -> None:
     python, _ = pair
-    with loopback(scenario) as endpoints:
+    with loopback(
+        scenario, wrong_balance_at=wrong_balance_at if preview_unavailable else None
+    ) as endpoints:
         home = tmp_path / "preview"
         seed_home(home, endpoints, "session")
         code, preview, stderr = run(
@@ -249,6 +260,8 @@ def test_confirmed_trade_handles_balance_for_another_collateral(
         )
         assert (code, stderr) == (0, "")
         assert not endpoints.errors
+        if command == LEVERAGE:
+            assert ("collateralBaseUnits" in preview) is not preview_unavailable
 
     for index, cli in enumerate(pair):
         replay = TradeReplay("UPDATE_TRADE")
@@ -266,8 +279,17 @@ def test_confirmed_trade_handles_balance_for_another_collateral(
             )
             assert not endpoints.errors
             if command == LEVERAGE:
-                # A wrong-token balance leaves the standalone estimate unavailable.
-                code, _, stderr = result
+                code, output, stderr = result
+                if not preview_unavailable:
+                    assert (code, output["error"]["code"], stderr) == (
+                        4,
+                        "PREVIEW_MISMATCH",
+                        "",
+                    )
+                    assert not replay.attempts()
+                    assert not rows(home)
+                    continue
+                # A preview with no collateral estimate can still be confirmed.
                 assert (code, stderr) == (0, "")
                 (key,) = replay.admitted_keys()
                 assert replay.attempts() == {key: 1}

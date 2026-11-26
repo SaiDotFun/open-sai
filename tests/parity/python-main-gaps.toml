@@ -1,5 +1,5 @@
 # Reviewed Python main vs Rust comparisons for issue 231.
-# Leverage collateral and digest differences also run in test_position_update.py.
+# The leverage collateral display difference runs in test_position_update.py.
 # The text-only wait progress test runs in test_trade_wait.py.
 
 [gap."case:account-balances"]

@@ -582,24 +582,22 @@ def test_position_update_dry_run(
             if (
                 command == LEVERAGE
                 and expected["liquidationPrice"]["status"] == "estimate"
-                and implementation == "python"
             ):
-                # Issue 231 tracks the collateral field against current Python.
-                assert document.pop("collateral") == {
-                    "beforeUsdc": "20.000000",
-                    "afterUsdc": "10.000000",
-                    "beforeUsd": "20.2",
-                    "afterUsd": "10.1",
-                }
                 assert document["collateralBaseUnits"] == {
                     "before": "20000000",
                     "after": "10000000",
                 }
-                assert document.pop("previewDigest") == preview_digest(document)
-                document.pop("collateralBaseUnits")
-                document["previewDigest"] = preview_digest(document)
-                expected_wire += ["get_collateral_price"]
-                output = (json.dumps(document, sort_keys=True) + "\n").encode()
+                assert document["previewDigest"] == preview_digest(document)
+                if implementation == "python":
+                    # Issue 231 still tracks USD display in Rust.
+                    assert document.pop("collateral") == {
+                        "beforeUsdc": "20.000000",
+                        "afterUsdc": "10.000000",
+                        "beforeUsd": "20.2",
+                        "afterUsd": "10.1",
+                    }
+                    expected_wire += ["get_collateral_price"]
+                    output = (json.dumps(document, sort_keys=True) + "\n").encode()
             outputs.append(output)
             assert [entry.label for entry in endpoints.wire] == expected_wire
             assert not endpoints.errors
@@ -639,18 +637,21 @@ def test_missing_pair_cap_still_checks_liquidation(
             )
 
 
+@pytest.mark.parametrize("bound", [True, False], ids=["bound", "advisory"])
 def test_confirmed_leverage_with_unavailable_preliminary_balance(
-    cli_pair: tuple[CLI, CLI], tmp_path: Path
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, bound: bool
 ) -> None:
     _, rust = cli_pair
     python = (str(Path(sys.executable).with_name("sai")),)
-    with update_loopback("default") as endpoints:
+    mode = "default" if bound else "balance-missing-index"
+    with update_loopback(mode) as endpoints:
         home = tmp_path / "preview"
         seed_home(home, endpoints, "session")
         code, preview, stderr = run(
             python, home, endpoints, (*LEVERAGE, "--dry-run"), python=True
         )
         assert (code, stderr) == (0, "")
+        assert ("collateralBaseUnits" in preview) is bound
         assert not endpoints.errors
         assert not rows(home)
 
@@ -659,9 +660,20 @@ def test_confirmed_leverage_with_unavailable_preliminary_balance(
         home = tmp_path / str(index)
         with update_loopback("balance-missing-index") as endpoints:
             seed_home(home, endpoints, "session")
-            code, _, stderr = run(cli, home, endpoints, args, python=index == 0)
-            assert (code, stderr) == (0, "")
+            code, result, stderr = run(cli, home, endpoints, args, python=index == 0)
             assert not endpoints.errors
+            if bound:
+                assert (code, result["error"]["code"], stderr) == (
+                    4,
+                    "PREVIEW_MISMATCH",
+                    "",
+                )
+                assert all(
+                    entry.label != "recordUserIntent" for entry in endpoints.wire
+                )
+                assert not rows(home)
+                continue
+            assert (code, stderr) == (0, "")
             (request,) = [
                 entry.variables["input"]
                 for entry in endpoints.wire
