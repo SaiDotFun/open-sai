@@ -2296,8 +2296,8 @@ def mcp_install_command(
             emit(
                 ctx,
                 {
-                    "command": target.argv,
-                    "clients": mcp_install.list_clients(found, target),
+                    "command": target.reported_argv(dry_run=dry_run),
+                    "clients": mcp_install.list_clients(found, target, dry_run=dry_run),
                 },
             )
             warn(

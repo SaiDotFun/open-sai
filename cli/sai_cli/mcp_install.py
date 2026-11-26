@@ -31,7 +31,7 @@ import tomlkit
 from tomlkit.exceptions import TOMLKitError
 from tomlkit.items import InlineTable
 
-from .core import settings
+from .core import log, settings
 
 NAME = "sai"
 RETIRED_NAME = "sai-mcp"
@@ -66,6 +66,32 @@ class Target:
     env: dict[str, str] = field(default_factory=dict)
     explicit_command: bool = False
 
+    def reported_argv(self, *, dry_run: bool) -> list[str]:
+        """Show a launcher preview without its custom argument values."""
+        if not dry_run or not self.explicit_command:
+            return self.argv
+        launcher, *args = self.argv
+        reported = [
+            f"<argument hidden {index} of {len(args)}>"
+            for index in range(1, len(args) + 1)
+        ]
+        if Path(launcher).name in {NAME, f"{NAME}.exe"} and serves_mcp(args):
+            tokens = iter(enumerate(args))
+            for index, arg in tokens:
+                flag, equals, value = arg.partition("=")
+                if flag in ENDPOINT_FLAGS:
+                    if equals:
+                        reported[index] = f"{flag}={log.origin(value)}"
+                    else:
+                        reported[index] = flag
+                        value_index, value = next(tokens)
+                        reported[value_index] = log.origin(value)
+                elif arg == "--as":
+                    next(tokens)
+                elif arg in {"mcp", "serve", "--json", "--"}:
+                    reported[index] = arg
+        return [launcher, *reported]
+
 
 @dataclass(frozen=True)
 class Registration:
@@ -89,13 +115,13 @@ class Registration:
     invalid_sai_home: bool = False
     stdio: bool = True
 
-    def shown(self, target: Target | None) -> dict[str, Any]:
+    def shown(self, target: Target | None, *, dry_run: bool = False) -> dict[str, Any]:
         """Show the expected argv when the saved command matches.
 
         Saved launcher names, directories, and args can contain private values.
         """
         if target is not None and self.matches_command(target):
-            return {"command": target.argv}
+            return {"command": target.reported_argv(dry_run=dry_run)}
         if not self.argv:
             return {"command": []}
         out: dict[str, Any] = {"command": [HIDDEN]}
@@ -124,10 +150,12 @@ class Registration:
     def matches_sai_home(self, env: Mapping[str, str]) -> bool:
         return not self.invalid_sai_home and self.sai_home == env.get("SAI_HOME")
 
-    def to_json(self, target: Target | None, effective: bool) -> dict[str, Any]:
+    def to_json(
+        self, target: Target | None, effective: bool, *, dry_run: bool = False
+    ) -> dict[str, Any]:
         out: dict[str, Any] = {
             "scope": self.scope,
-            **self.shown(target),
+            **self.shown(target, dry_run=dry_run),
             "current": target is not None and self.matches(target),
             "effective": effective,
         }
@@ -1050,7 +1078,7 @@ def make_clients(
 
 
 def list_clients(
-    clients: dict[str, Client], target: Target | None
+    clients: dict[str, Client], target: Target | None, *, dry_run: bool = False
 ) -> list[dict[str, Any]]:
     rows = []
     for name, client in clients.items():
@@ -1071,7 +1099,9 @@ def list_clients(
             found = []
         row["registrations"] = [
             {
-                **reg.to_json(target, reg is client.effective(entries)),
+                **reg.to_json(
+                    target, reg is client.effective(entries), dry_run=dry_run
+                ),
                 **({"name": server} if server != NAME else {}),
             }
             for server, entries in found
@@ -1082,7 +1112,7 @@ def list_clients(
         )
         if primary is not None:
             server, reg = primary
-            shown = reg.shown(target)
+            shown = reg.shown(target, dry_run=dry_run)
             row.update(
                 registered=True,
                 current=target is not None and reg.matches(target),
@@ -1103,13 +1133,15 @@ def list_clients(
     return rows
 
 
-def report_legacy_install(client: Client, reg: Registration, target: Target) -> Result:
+def report_legacy_install(
+    client: Client, reg: Registration, target: Target, *, dry_run: bool
+) -> Result:
     result = Result(
         client.name,
         "unchanged",
         scope=reg.scope,
         name=RETIRED_NAME,
-        **reg.shown(target),
+        **reg.shown(target, dry_run=dry_run),
     )
     if reg.disabled:
         result.error = (
@@ -1132,7 +1164,8 @@ def report_legacy_install(client: Client, reg: Registration, target: Target) -> 
 
 
 def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Result:
-    result = Result(client.name, "failed", command=target.argv, scope=scope)
+    command = target.reported_argv(dry_run=dry_run)
+    result = Result(client.name, "failed", command=command, scope=scope)
     try:
         if missing_absolute_launcher(target.argv[0]):
             raise ClientError(
@@ -1146,7 +1179,7 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
         if existing is None:
             legacy = client.effective(client.registrations(RETIRED_NAME))
             if legacy is not None:
-                return report_legacy_install(client, legacy, target)
+                return report_legacy_install(client, legacy, target, dry_run=dry_run)
         elif isinstance(client, Claude) and existing.disabled:
             result.command = None
             raise ClientError(
@@ -1172,7 +1205,14 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
             result.path = str(client.config_path(scope))
             steps: list[list[str]] = []
         else:
-            steps = client.add_steps(scope, target)
+            preview_target = (
+                replace(
+                    target, argv=command, env=dict.fromkeys(target.env, "[redacted]")
+                )
+                if dry_run
+                else target
+            )
+            steps = client.add_steps(scope, preview_target)
             result.argv = steps
         if dry_run:
             result.action, result.would = "planned", action

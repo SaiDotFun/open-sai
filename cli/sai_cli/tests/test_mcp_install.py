@@ -2080,6 +2080,126 @@ def test_dry_run_runs_no_client_and_writes_nothing(env: Env):
     assert not env.cursor_path().exists()
 
 
+@pytest.fixture
+def install_preview(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    profile = tmp_path / "sai-home"
+    profile.mkdir(mode=0o700)
+    monkeypatch.setenv("SAI_HOME", str(profile))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("FAKE_LOG", str(tmp_path / "argv.log"))
+    monkeypatch.chdir(tmp_path)
+    return write_exe(tmp_path / "claude", FAKE_CLAUDE)
+
+
+@pytest.mark.parametrize(
+    ("launcher", "args", "reported_args"),
+    [
+        ("env", ["APP_MODE=fixture-value", "sai", "mcp", "serve"], None),
+        ("docker", ["run", "--env=APP_MODE=fixture-value"], None),
+        ("docker", ["run", "-ieAPP_MODE=fixture-value"], None),
+        ("sh", ["-c", "APP_MODE='fixture value' exec sai mcp serve"], None),
+        (
+            "sai",
+            ["mcp", "serve", "--endpoint", "http://127.0.0.1:8765/api?key=fixture"],
+            ["mcp", "serve", "--endpoint", "http://127.0.0.1:8765"],
+        ),
+        (
+            "sai",
+            ["--endpoint=http://127.0.0.1:8765/api?key=fixture", "mcp", "serve"],
+            ["--endpoint=http://127.0.0.1:8765", "mcp", "serve"],
+        ),
+    ],
+    ids=[
+        "assignment",
+        "inline-env",
+        "short-flags",
+        "shell",
+        "endpoint",
+        "root-endpoint",
+    ],
+)
+def test_dry_run_displays_launcher_and_argument_placeholders(
+    install_preview: Path,
+    launcher: str,
+    args: list[str],
+    reported_args: list[str] | None,
+) -> None:
+    root = install_preview.parent
+    command = [launcher, *args]
+    shown = [
+        launcher,
+        *(
+            reported_args
+            if reported_args is not None
+            else [
+                f"<argument hidden {i} of {len(args)}>" for i in range(1, len(args) + 1)
+            ]
+        ),
+    ]
+    prefix = ("mcp", "install", "claude", "--scope", "project")
+    config = root / ".mcp.json"
+    log_path = root / "argv.log"
+
+    planned = invoke(*prefix, "--dry-run", "--", *command)
+
+    assert planned.exit_code == 0, planned.output
+    [row] = payload(planned)["results"]
+    assert row["command"] == shown
+    assert row["argv"] == [
+        [
+            str(install_preview),
+            "mcp",
+            "add",
+            "--scope",
+            "project",
+            "sai",
+            "--env=SAI_HOME=[redacted]",
+            "--",
+            *shown,
+        ]
+    ]
+    assert not config.exists()
+    assert not log_path.exists()
+
+    installed = invoke(*prefix, "--", *command)
+
+    assert installed.exit_code == 0, installed.output
+    entry = json.loads(config.read_text())["mcpServers"]["sai"]
+    assert entry["command"] == launcher
+    assert entry["args"] == args
+    assert entry["env"] == {"SAI_HOME": str(root / "sai-home")}
+
+
+def test_dry_run_hides_arguments_of_a_matching_legacy_entry(
+    install_preview: Path,
+) -> None:
+    command = ["sh", "-c", "exec sai mcp serve"]
+    shown = ["sh", "<argument hidden 1 of 2>", "<argument hidden 2 of 2>"]
+    config = install_preview.parent / ".mcp.json"
+    config.write_text(json.dumps({"mcpServers": {OLD_COMMAND: claude_entry(command)}}))
+
+    result = invoke("mcp", "install", "--dry-run", "--", *command)
+
+    assert result.exit_code == 0, result.output
+    report = payload(result)
+    assert report["command"] == shown
+    claude = next(row for row in report["clients"] if row["client"] == "claude")
+    assert claude["registeredCommand"] == shown
+    [registration] = claude["registrations"]
+    assert registration["command"] == shown
+
+    result = invoke(
+        "mcp", "install", "claude", "--scope", "project", "--dry-run", "--", *command
+    )
+
+    assert "registration needs repair" in failure(result)
+    [row] = payload(result)["error"]["details"]["results"]
+    assert row["name"] == OLD_COMMAND
+    assert row["command"] == shown
+
+
 def test_cursor_keeps_other_servers_and_the_file_mode(env: Env):
     path = env.cursor_path()
     path.parent.mkdir()
