@@ -70,9 +70,9 @@ pub(crate) fn repair_after_update(
         let target = verified_target(launcher, &home)?;
         Some((Clients { home, cwd }, target))
     }) {
-        // Cursor can save its config after the writer's last check and before
-        // publication. Keep the background check read-only for this client.
-        let may_repair = |client| !background || client != Client::Cursor;
+        // Clients can save their configs after the writer's last check and
+        // before publication. Keep background checks read-only.
+        let may_repair = |_| !background;
         for check in clients.check_all(Some(&target), may_repair, None, Duration::from_secs(7)) {
             if !matches!(check.status, "fixed" | "fail") && !check.pinned && !check.legacy_name {
                 continue;
@@ -92,7 +92,7 @@ pub(crate) fn repair_after_update(
                 report["manualRepairs"] = json!(check.manual_repairs);
             }
             if !check.manual_repairs.is_empty()
-                || (background && check.client == Client::Cursor.name() && check.status == "fail")
+                || (background && check.client != Client::Claude.name() && check.status == "fail")
             {
                 report["fix"] = json!(check.fix);
             }
