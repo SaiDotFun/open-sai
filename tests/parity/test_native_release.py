@@ -130,6 +130,35 @@ def test_prerelease_notes_offer_the_managed_stable_python_install() -> None:
     assert "sai-cli-2.0.0-rc.1-full-python.zip" in notes
 
 
+def test_release_notes_lead_with_the_versioned_guide(tmp_path: Path) -> None:
+    dist = runpy.run_path(str(ROOT / "scripts/native-dist.py"))
+    (tmp_path / "sai-cli-v2.0.0.md").write_text(
+        "# Sai CLI v2.0.0\n\n## Upgrade\n\n- Make a fresh preview.\n"
+    )
+    guide = dist["release_guide"](tmp_path, "2.0.0")
+    notes = dist["release_notes"]("2.0.0", "2.0.0", "2.0.0", guide)
+
+    assert notes.startswith("## Upgrade\n\n- Make a fresh preview.\n\n")
+    assert "# Sai CLI v2.0.0" not in notes
+    assert notes.index("## Upgrade") < notes.index("## Choose the Sai Package")
+
+
+def test_renders_the_checked_in_guide_with_absolute_links() -> None:
+    release = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"][
+        "version"
+    ]
+    path = ROOT / f"docs/releases/sai-cli-v{release}.md"
+    if not path.exists():
+        pytest.skip(f"no guide for prerelease {release}")
+    result = native_dist("release-notes")
+
+    assert result.returncode == 0, result.stderr
+    guide = path.read_text()
+    body = guide.split("\n", 1)[1].strip()
+    assert result.stdout.startswith(body + "\n\n## Choose the Sai Package")
+    assert "](../" not in result.stdout
+
+
 def test_stages_python_only_without_cargo_or_shim(tmp_path: Path) -> None:
     scripts = tmp_path / "scripts"
     scripts.mkdir()
