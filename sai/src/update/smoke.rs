@@ -68,11 +68,15 @@ pub(super) async fn version(path: &Path, home: &Path, shim_base: Option<&str>) -
 async fn reported_version(mut command: Command) -> Result<Version> {
     command.arg("--version");
     let stdout = output(command, "`sai --version`", VERIFY_TIMEOUT).await?;
-    stdout
-        .trim()
+    let reported = stdout.trim();
+    reported
         .strip_prefix("sai ")
-        .or_else(|| stdout.trim().strip_prefix("sai, version "))
         .and_then(super::release::version)
+        .or_else(|| {
+            reported
+                .strip_prefix("sai, version ")
+                .and_then(super::release::python_version)
+        })
         .ok_or_else(|| "`sai --version` did not report a release version".into())
 }
 

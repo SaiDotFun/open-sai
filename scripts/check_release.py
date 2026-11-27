@@ -21,9 +21,12 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from typing import Literal
 
 ROOT = Path(__file__).resolve().parents[1]
 TAG_PREFIX = "sai-cli/v"
+MODE_TRAILER = "Sai-Release-Mode"
+PYTHON_ONLY_TRAILER = f"{MODE_TRAILER}: python-only"
 # sai-cli/vMAJOR.MINOR.PATCH, or a pre-release such as sai-cli/v0.2.0-rc.1.
 # Numbers have no leading zero: packaging turns 0.01.0 into 0.1.0, so the
 # wheel of such a tag would not be where the tag says.
@@ -52,19 +55,71 @@ def tag_error(tag: str, version: str) -> str | None:
     return None
 
 
+def native_versions(root: Path = ROOT) -> tuple[str, str]:
+    cargo = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]
+    shim = tomllib.loads((root / "shim" / "pyproject.toml").read_text())["project"]
+    cargo_version, shim_version = cargo["version"], shim["version"]
+    if not TAG.fullmatch(
+        tag_for(cargo_version)
+    ) or shim_version != cargo_version.replace("-rc.", "rc"):
+        raise ValueError("Cargo workspace and shim versions must name the same release")
+    return cargo_version, shim_version
+
+
+def check_tag(tag: str, native_version: str, python_version: str) -> None:
+    """Require a release tag to match the full Python package and native distribution."""
+    if error := tag_error(tag, python_version):
+        raise ValueError(error)
+    if tag != tag_for(native_version):
+        raise ValueError(
+            f"tag {tag} does not match the Cargo and shim version {native_version}"
+        )
+
+
+def tag_mode(tag: str, root: Path = ROOT) -> Literal["native", "python-only"]:
+    """Only an annotated tag can opt in to Python-only publication."""
+    ref = f"refs/tags/{tag}"
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=60,
+        ).stdout.strip()
+
+    if git("cat-file", "-t", ref) != "tag":
+        return "native"
+    trailer = git(
+        "for-each-ref", f"--format=%(trailers:key={MODE_TRAILER},unfold)", ref
+    )
+    if not trailer:
+        return "native"
+    if trailer == PYTHON_ONLY_TRAILER:
+        return "python-only"
+    raise ValueError(f"invalid {MODE_TRAILER} trailer on {tag}")
+
+
+def tag_refs(listing: str) -> dict[str, str]:
+    return dict(
+        reversed(line.split("\t", 1)) for line in listing.splitlines() if "\t" in line
+    )
+
+
 def remote_tag_commit(listing: str, tag: str) -> str | None:
     """Return the commit TAG points at in `git ls-remote` output LISTING.
 
     An annotated tag lists the tag object and, as `refs/tags/TAG^{}`, the
     commit it points at; a lightweight tag lists the commit only.
     """
-    refs = dict(
-        reversed(line.split("\t", 1)) for line in listing.splitlines() if "\t" in line
-    )
+    refs = tag_refs(listing)
     return refs.get(f"refs/tags/{tag}^{{}}") or refs.get(f"refs/tags/{tag}")
 
 
-def remote_tag_error(tag: str, built: str, listing: str) -> str | None:
+def remote_tag_error(
+    tag: str, built: str, listing: str, tag_object: str | None = None
+) -> str | None:
     """Return why the remote TAG is not the commit BUILT, or None."""
     commit = remote_tag_commit(listing, tag)
     if commit is None:
@@ -74,6 +129,11 @@ def remote_tag_error(tag: str, built: str, listing: str) -> str | None:
             f"tag {tag} on the remote points at {commit[:12]}, not the built"
             f" commit {built[:12]}"
         )
+    if (
+        tag_object is not None
+        and tag_refs(listing).get(f"refs/tags/{tag}") != tag_object
+    ):
+        return f"tag {tag} on the remote does not match the built tag object"
     return None
 
 
@@ -95,6 +155,12 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--remote", metavar="URL", help="the remote to read the tag from"
     )
+    parser.add_argument(
+        "--tag-object", help="also require this exact remote tag object"
+    )
+    parser.add_argument(
+        "--print-mode", action="store_true", help="print the local tag mode"
+    )
     try:
         args = parser.parse_args(argv)
     except SystemExit:
@@ -102,17 +168,28 @@ def main(argv: list[str]) -> int:
     if bool(args.built) != bool(args.remote):
         print("error: --built and --remote go together", file=sys.stderr)
         return 2
+    if args.tag_object and not args.built:
+        print("error: --tag-object requires --built and --remote", file=sys.stderr)
+        return 2
     tag = args.tag
     error = tag_error(tag, pyproject_version())
     if error is None and args.built:
         try:
-            error = remote_tag_error(tag, args.built, ls_remote(args.remote, tag))
+            error = remote_tag_error(
+                tag, args.built, ls_remote(args.remote, tag), args.tag_object
+            )
         except (subprocess.SubprocessError, OSError) as exc:
             error = f"could not read {tag} from the remote: {type(exc).__name__}"
     if error:
         print(f"error: {error}", file=sys.stderr)
         return 1
-    if args.built:
+    if args.print_mode:
+        try:
+            print(tag_mode(tag, ROOT))
+        except (subprocess.SubprocessError, OSError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    elif args.built:
         print(f"{tag} matches pyproject.toml and the remote tag is {args.built[:12]}")
     else:
         print(f"{tag} matches pyproject.toml")

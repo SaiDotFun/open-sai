@@ -55,10 +55,7 @@ pub(super) fn installed_version(prefix: &Path) -> Option<Version> {
         .take_while(|line| !line.trim().is_empty())
         .filter_map(|line| line.split_once(':'))
         .find_map(|(name, value)| name.eq_ignore_ascii_case("version").then_some(value.trim()))?;
-    release::version(version).or_else(|| {
-        let (stable, rc) = version.split_once("rc")?;
-        release::version(&format!("{stable}-rc.{rc}"))
-    })
+    release::python_version(version)
 }
 
 pub(super) fn installed_digest(prefix: &Path) -> Option<String> {
