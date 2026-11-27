@@ -136,6 +136,12 @@ def stage_release(
 def release_notes(release: str, shim: str, python_version: str) -> str:
     bundle = full_python_bundle_name(release)
     full_wheel = wheel_name(python_version.replace("-rc.", "rc"))
+    if "-rc." in release:
+        install_version = ""
+        install_target = "the latest stable release"
+    else:
+        install_version = f" --version {release}"
+        install_target = "this release"
     return f"""## Choose the Sai Package
 
 The standard `sai-cli` wheel, `{wheel_name(shim)}`, is the native shim.
@@ -143,19 +149,24 @@ It downloads and runs the matching native Sai binary on Linux and macOS.
 
 ### Install the Full Python CLI
 
-Download `{bundle}` and `SHA256SUMS` from the release assets. From the
-download directory, compute the ZIP's SHA-256 with the command for your
-shell and compare it with the ZIP's entry in `SHA256SUMS`.
+Run the installer to verify and install the full Python wheel from
+{install_target}. The installer records the release for `sai update`.
+
+```console
+uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py --full-python{install_version}
+```
+
+To inspect the packages from this release, download `{bundle}` and `SHA256SUMS`.
+Compute the ZIP's SHA-256 and compare it with the ZIP's entry in `SHA256SUMS`.
 
 - Linux: `sha256sum {bundle}`
 - macOS: `shasum -a 256 {bundle}`
 - Windows PowerShell: `Get-FileHash -Algorithm SHA256 {bundle}`
 
-After the hashes match, extract the ZIP and install its wheel with uv.
+After the hashes match, extract the ZIP to inspect `{full_wheel}` and the sdist.
 
 ```console
 uv run --no-project python -m zipfile -e {bundle} full-python
-uv tool install ./full-python/{full_wheel}
 ```
 """
 

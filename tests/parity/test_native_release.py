@@ -108,14 +108,26 @@ def test_renders_native_release_notes_for_the_staged_packages(candidate) -> None
 
     (bundle,) = output.glob("*.zip")
     (shim,) = output.glob("*.whl")
-    (full_wheel,) = python.glob("*.whl")
+    release = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"][
+        "version"
+    ]
     notes = result.stdout
     assert f"The standard `sai-cli` wheel, `{shim.name}`, is the native shim." in notes
     assert f"`{bundle.name}` and `SHA256SUMS`" in notes
     assert f"sha256sum {bundle.name}" in notes
     assert f"Get-FileHash -Algorithm SHA256 {bundle.name}" in notes
     assert f"python -m zipfile -e {bundle.name} full-python" in notes
-    assert f"uv tool install ./full-python/{full_wheel.name}" in notes
+    assert f"/scripts/install.py --full-python --version {release}" in notes
+    assert "uv tool install ./full-python/" not in notes
+
+
+def test_prerelease_notes_offer_the_managed_stable_python_install() -> None:
+    dist = runpy.run_path(str(ROOT / "scripts/native-dist.py"))
+    notes = dist["release_notes"]("2.0.0-rc.1", "2.0.0rc1", "2.0.0-rc.1")
+
+    assert "/scripts/install.py --full-python\n" in notes
+    assert "--version 2.0.0-rc.1" not in notes
+    assert "sai-cli-2.0.0-rc.1-full-python.zip" in notes
 
 
 def test_stages_python_only_without_cargo_or_shim(tmp_path: Path) -> None:

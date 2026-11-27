@@ -38,17 +38,18 @@ sai update --to 0.1.3
 sai update
 ```
 
-On Windows, use the Python installer. It verifies the release download against
-`SHA256SUMS` and installs the full Python wheel. Add `--version X.Y.Z` to pin
-a stable release. If an older Windows `sai update` asks you to keep your
-current Python version, use this installer to update first.
+Use the managed Python installer on Windows or when you want the full Python
+package on another platform. It verifies the release download against
+`SHA256SUMS` and records the release for `sai update`. Add `--version X.Y.Z`
+to pin a stable release. If an older Windows `sai update` asks you to keep
+your current Python version, use this installer to update first.
 
 ```powershell
-uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py
+uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py --full-python
 ```
 
 On a native release, the standard `sai-cli` wheel is the native shim. To
-install the full Python package yourself, download `sai-cli-X.Y.Z-full-python.zip`
+inspect the full Python packages, download `sai-cli-X.Y.Z-full-python.zip`
 and `SHA256SUMS` from the release assets. Compute the ZIP's SHA-256 and
 compare it with the ZIP's entry in `SHA256SUMS`.
 
@@ -56,11 +57,10 @@ compare it with the ZIP's entry in `SHA256SUMS`.
 - macOS: `shasum -a 256 sai-cli-X.Y.Z-full-python.zip`
 - Windows PowerShell: `Get-FileHash -Algorithm SHA256 sai-cli-X.Y.Z-full-python.zip`
 
-After the hashes match, extract the ZIP and install its wheel with uv.
+After the hashes match, extract the ZIP to inspect the wheel and sdist.
 
 ```console
 uv run --no-project python -m zipfile -e sai-cli-X.Y.Z-full-python.zip full-python
-uv tool install ./full-python/sai_cli-X.Y.Z-py3-none-any.whl
 ```
 
 If uv installed Sai from Git and you want to move to the native release, first

@@ -1417,10 +1417,54 @@ def full_python_bundle(
         )
     )
     wheel = only_wheel(output)
+    return wheel, zip_python_wheel(wheel)
+
+
+def zip_python_wheel(wheel: Path) -> bytes:
     bundle = io.BytesIO()
     with zipfile.ZipFile(bundle, "w") as archive:
         archive.write(wheel, wheel.name)
-    return wheel, bundle.getvalue()
+    return bundle.getvalue()
+
+
+def test_managed_full_python_install_checks_and_applies_the_next_release(
+    install: Install,
+    replay: Replay,
+    full_python_bundle: tuple[Path, bytes],
+) -> None:
+    bridge = wheel_artifact("BRIDGE")
+    prepare_uv(install, bridge, replay)
+    version = wheel_version(bridge)
+    ok(install.run("uv", "tool", "uninstall", "sai-cli"))
+    bundle_name = f"sai-cli-{version}-full-python.zip"
+    replay.add(version, {bundle_name: zip_python_wheel(bridge)})
+    replay.requests.clear()
+    ok(install.install(replay, "--full-python", "--version", version))
+    folder = f"{REPO}/releases/download/sai-cli/v{version}"
+    assert f"{folder}/{bundle_name}" in replay.requests
+    assert f"{folder}/{bridge.name}" not in replay.requests
+
+    wheel, bundle = full_python_bundle
+    target = wheel_version(wheel)
+    if WINDOWS:
+        shim = wheel_artifact("SHIM")
+        replay.add(
+            target,
+            {shim.name: shim.read_bytes(), f"sai-cli-{target}-full-python.zip": bundle},
+        )
+    else:
+        replay.add(target, {wheel.name: wheel.read_bytes()})
+
+    check = json.loads(ok(install.update(replay, "--check")))
+    assert (check["installed"], check["latest"]) == (version, target)
+    assert check["install"]["kind"] == "uv-tool-release"
+    assert check["updateAvailable"] is True
+    result = json.loads(ok(install.update(replay)))
+    assert (result["status"], result["target"]) == ("updated", target)
+    install.pin(target)
+    current = json.loads(ok(install.update(replay, "--check")))
+    assert (current["installed"], current["latest"]) == (target, target)
+    assert current["updateAvailable"] is False
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="requires a Linux native archive")

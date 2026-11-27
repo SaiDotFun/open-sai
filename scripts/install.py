@@ -19,7 +19,7 @@ It needs only uv and the standard library, so it runs straight from GitHub:
 
     uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py
 
-Usage: install.py [--native | --source] [--version VERSION] [--dry-run]
+Usage: install.py [--native | --full-python | --source] [--version VERSION] [--dry-run]
 """
 
 from __future__ import annotations
@@ -392,6 +392,8 @@ def fetch_wheel(
     directory: Path,
     web_base: str = WEB_BASE,
     timeout: float = DOWNLOAD_TIMEOUT,
+    *,
+    full_python: bool = False,
 ) -> tuple[Path, str]:
     """Download TAG's wheel and SHA256SUMS into DIRECTORY, check the hash,
     and return the wheel and its SHA-256."""
@@ -400,6 +402,7 @@ def fetch_wheel(
     wheel, sums = directory / name, directory / "SHA256SUMS"
     bundle = directory / full_python_bundle_name(version)
     base = download_base(tag, web_base)
+    python_only = full_python or os.name == "nt"
 
     def download_verified(
         asset: Path, expected: str, limit: int, deadline: float
@@ -421,7 +424,7 @@ def fetch_wheel(
         download(f"{base}/SHA256SUMS", sums, MAX_SUMS, deadline, origin=web_base)
         manifest = sums.read_text(errors="replace")
         bundle_hash = native_digest(manifest, bundle.name)
-        if os.name == "nt" and bundle_hash is not None:
+        if python_only and bundle_hash is not None:
             return fetch_full_python(bundle_hash, deadline)
         expected = expected_hash(manifest, name)
         if expected is None:
@@ -429,6 +432,8 @@ def fetch_wheel(
         digest = download_verified(wheel, expected, MAX_WHEEL, deadline)
         if not is_shim_wheel(wheel):
             return digest
+        if python_only:
+            raise LookupFailed(f"Sai {version} has no full Python wheel for this host")
         problem = native_wheel_problem(
             version, manifest, directory, base, web_base, deadline
         )
@@ -582,13 +587,21 @@ def private_cache() -> Path:
     return cache
 
 
-def keep_wheel(tag: str, web_base: str, timeout: float) -> tuple[Path, str]:
+def keep_wheel(
+    tag: str,
+    web_base: str,
+    timeout: float,
+    *,
+    full_python: bool = False,
+) -> tuple[Path, str]:
     """Download and verify TAG's wheel in a private directory, then move it
     into the wheel cache. Return the kept wheel and its SHA-256."""
     try:
         cache = private_cache()
         with tempfile.TemporaryDirectory(dir=cache, prefix=".download-") as temp:
-            wheel, digest = fetch_wheel(tag, Path(temp), web_base, timeout)
+            wheel, digest = fetch_wheel(
+                tag, Path(temp), web_base, timeout, full_python=full_python
+            )
             kept = cache / wheel.name
             os.replace(wheel, kept)
     except OSError as error:
@@ -1333,6 +1346,11 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="install the standalone Linux or macOS binary",
     )
+    mode.add_argument(
+        "--full-python",
+        action="store_true",
+        help="install the managed full Python wheel",
+    )
     parser.add_argument("--version", help="install an exact release version")
     parser.add_argument(
         "--dry-run", action="store_true", help="print the command without running it"
@@ -1370,6 +1388,8 @@ def main(argv: list[str]) -> int:
         )
     except LookupFailed as error:
         return give_up(error)
+    if tag is None and args.full_python:
+        return give_up(LookupFailed("no stable Sai release is published"))
     uv = find_uv()
     if tag is None or args.source:
         if tag is None:
@@ -1384,7 +1404,7 @@ def main(argv: list[str]) -> int:
         print(f"Installing sai-cli {version_of(tag)} from its release wheel.")
         if args.dry_run:
             asset = wheel_url(tag, args.web_base)
-            if os.name == "nt":
+            if args.full_python or os.name == "nt":
                 asset = f"the full Python wheel for {tag} (from its ZIP when available)"
             print(
                 f"Would download {asset}, check it against"
@@ -1393,7 +1413,9 @@ def main(argv: list[str]) -> int:
             print("Dry run: nothing was installed.")
             return 0
         try:
-            wheel, digest = keep_wheel(tag, args.web_base, args.timeout * 4)
+            wheel, digest = keep_wheel(
+                tag, args.web_base, args.timeout * 4, full_python=args.full_python
+            )
         except LookupFailed as error:
             return give_up(error)
         print(f"Verified {wheel.name} against the release's SHA256SUMS.")

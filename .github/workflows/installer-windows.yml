@@ -33,10 +33,10 @@ jobs:
         run: git fetch --no-tags origin 8557a7e13dceab0accc369191182c8e01423c91b 4bd968eb956c154f0a0ab53ccc288ceb78dd8713
       - name: Build the three local replay wheels
         run: uv run --locked python scripts/build-installer-fixtures.py "$env:RUNNER_TEMP/sai-installer" --wheels-only
-      - name: Rehearse both Python updaters against the shim
+      - name: Rehearse Windows installation and updates
         env:
           SAI_C10B_REQUIRED: "1"
           SAI_C10B_PRE_BRIDGE: ${{ runner.temp }}/sai-installer/pre-bridge
           SAI_C10B_BRIDGE: ${{ runner.temp }}/sai-installer/bridge
           SAI_C10B_SHIM: ${{ runner.temp }}/sai-installer/shim
-        run: uv run --locked pytest tests/parity/test_installer_bridge.py -k windows
+        run: uv run --locked pytest tests/parity/test_installer_bridge.py -k 'windows or managed_full_python'
