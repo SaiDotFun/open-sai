@@ -113,13 +113,11 @@ when it compares current Python against a candidate and reports
 `CURRENT_PYTHON_ROW` results. A changed signature or unexpected pass fails the
 comparison. Port the behavior and remove its entry in the same change.
 
-The trading UX cases compare the current CLI with Rust in
-`test_manifest_gaps.py`. Until Python adopts fixed USD, its leverage and
-margin previews include a separate USDC amount and an oracle-priced USD
-amount. For those fixtures, project the Python display from its exact USDC
-quantity at $1 per USDC. The capped-margin parity case uses a $1 fixture so
-both quotes and digests can match. A separate Rust case uses a non-$1 oracle
-fixture and verifies the CLI never requests the USDC oracle price.
+The trading UX cases in `test_manifest_gaps.py` and the leverage replays
+in `test_position_update.py` compare the current Python and Rust CLI
+collateral fields directly. The capped-margin fixture supplies a non-$1
+oracle price and checks that both CLIs calculate USD from USDC base units
+and skip the USDC oracle read.
 
 CI records the C3 storage replays against v0.1.2 and a separate C2/C3 replay
 against v0.1.1. The nine C2 config cases share their exact log-schema
