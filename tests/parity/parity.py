@@ -640,6 +640,13 @@ def observe(
                 trade_estimate_clocks(payload)
                 if isinstance(payload, dict):
                     trade_estimate_clocks(payload.get("preview"))
+                    preview = payload.get("preview", payload)
+                    if case.name == "mcp-trade-leverage-confirmation" and isinstance(
+                        preview, dict
+                    ):
+                        # The fixture checks each runtime's display before
+                        # comparing the shared base-unit binding and digest.
+                        preview.pop("collateral", None)
     stderr = stderr_category(result.stderr)
     if case.accepted_divergence == "uninstall-read-only":
         check_read_only_uninstall(case, result.returncode, output, stderr, candidate)

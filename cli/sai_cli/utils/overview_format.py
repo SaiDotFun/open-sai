@@ -5,6 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
+from ..core.overview import is_usdc_balance
 from ..core.session import expiry_notice_text
 from .repl_skin import ReplSkin
 
@@ -64,8 +65,8 @@ def show_balances(rows: list[dict[str, Any]]) -> None:
         [
             [
                 row["token_info"]["name"],
-                _token_quantity(row),
-                _value(row["usd_value"]),
+                "-" if is_usdc_balance(row) else _token_quantity(row),
+                _value(row.get("usd_value")),
                 _balance_source(row),
             ]
             for row in rows

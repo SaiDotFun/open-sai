@@ -457,8 +457,9 @@ your Sai account in Sai Web before trading. Use `--dry-run` to inspect
 the intent and any available estimates. Some previews need a session and
 live position data. To preview an open without signing in, omit `--as`.
 
-The `account overview` and `account balances ADDR` commands show the
-source block and age beside each balance. Sai marks a source more than
+The `account overview` and `account balances ADDR` commands value USDC
+balances at $1 per USDC from the raw balance. They show the source block
+and age beside each balance. Sai marks a source more than
 five minutes old as stale. This age describes the last balance update.
 If Sai cannot verify the block time, it displays an unknown age.
 
@@ -498,10 +499,9 @@ the direction. When the after-hours guard is pending,
 before the leverage change. Keeper submits the target leverage. Perp uses
 effective leverage at execution to determine the direction and amount.
 `--dry-run` reads live state and prints the quote without submitting an
-intent. The preview shows collateral before and after in USDC and USD. In
-JSON, those values appear in `collateral.beforeUsdc`, `collateral.afterUsdc`,
-`collateral.beforeUsd`, and `collateral.afterUsd`. The USD fields are null
-when the collateral oracle price is unavailable.
+intent. The preview shows collateral before and after in USD at $1 per
+USDC. In JSON, those values appear in `collateral.beforeUsd` and
+`collateral.afterUsd`.
 
 Use `--max-collateral-usd 5` with `trade margin --direction add --amount 1`
 to quote an add of up to 1 USDC with at most $5 of estimated total
