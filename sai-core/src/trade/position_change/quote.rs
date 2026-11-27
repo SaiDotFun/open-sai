@@ -181,7 +181,6 @@ pub(super) fn partial(
     percent: u8,
     delta: &BigUint,
     effective: Option<&ContractDecimal>,
-    price: Option<&ContractDecimal>,
     mut inputs: Value,
 ) -> Result<TradePreview, SaiError> {
     let stored = field(raw, "leverage")?;
@@ -193,10 +192,11 @@ pub(super) fn partial(
     inputs["percent"] = json!(percent);
     inputs["collateralBefore"] = json!(number_text(field(raw, "collateral_amount")?)?);
     inputs["leverageBefore"] = json!(number_text(stored)?);
-    inputs["closedNotionalUsdc"] = json!(fixed(&size, 6));
-    inputs["closedNotionalUsd"] =
-        json!(price.map(|price| fixed(&(&size * price.units / SCALE), 6)));
-    inputs["closedNotionalIsEstimate"] = json!(effective.is_none() || price.is_none());
+    let size = fixed(&size, 6);
+    inputs["collateralPriceUsd"] = json!("1");
+    inputs["closedNotionalUsdc"] = json!(size);
+    inputs["closedNotionalUsd"] = json!(size);
+    inputs["closedNotionalIsEstimate"] = json!(effective.is_none());
 
     let mut preview = TradePreview::new(TradeIntent::new(
         "DECREASE_POSITION_SIZE",
@@ -331,7 +331,6 @@ mod tests {
 
     #[test]
     fn partial_close_digest_binds_leverage_with_the_same_intent() {
-        let price = ContractDecimal::parse(&json!("1")).unwrap();
         let confirmation = |leverage| {
             let raw = json!({"collateral_amount": "10000000", "leverage": leverage});
             let effective = ContractDecimal::parse(&raw["leverage"]).unwrap();
@@ -341,19 +340,10 @@ mod tests {
                 "collateralIndex": "TokenIndex(1)",
                 "afterHoursMarket": false,
                 "effectiveLeverage": leverage,
-                "collateralPriceUsd": "1",
             });
-            partial(
-                &json!(7),
-                &raw,
-                50,
-                &delta,
-                Some(&effective),
-                Some(&price),
-                inputs,
-            )
-            .unwrap()
-            .confirmed_output(Some(ACCOUNT))
+            partial(&json!(7), &raw, 50, &delta, Some(&effective), inputs)
+                .unwrap()
+                .confirmed_output(Some(ACCOUNT))
         };
         let initial = confirmation("2.0");
         let changed = confirmation("3.0");
