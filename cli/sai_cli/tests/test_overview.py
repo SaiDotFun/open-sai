@@ -190,10 +190,9 @@ def replay():
         connection.send(json.dumps({"type": "connection_ack"}))
         request = json.loads(connection.recv())
         assert request["type"] == "subscribe"
-        assert request["payload"]["query"] == stream.BALANCES_WITH_BLOCK
-        state["calls"].append(
-            (stream.BALANCES_WITH_BLOCK, request["payload"]["variables"])
-        )
+        query = request["payload"]["query"]
+        assert query in (stream.BALANCES, stream.BALANCES_WITH_BLOCK)
+        state["calls"].append((query, request["payload"]["variables"]))
         connection.send(json.dumps({"id": "1", "type": "next", "payload": state["ws"]}))
 
     http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -988,7 +987,7 @@ def test_overview_includes_unsettled_teller_funds(replay):
             "userBalances": [
                 {
                     "amount": "100000000",
-                    "usd_value": 100,
+                    "usd_value": 99,
                     "lastUpdatedBlock": 49819589,
                     "token_info": {"type": "sai", "name": "USDC Unsettled on Sai"},
                 }
@@ -1665,3 +1664,53 @@ def test_text_balances_show_unpriced_token_quantities(replay):
     assert "Quantity" in result.stdout
     assert "123456789012.345678901234567891 UP" in result.stdout
     assert f"block {RISK_BLOCK}" in result.stdout
+
+
+def test_cli_and_mcp_use_usdc_base_units_for_balances(replay):
+    rows = replay["ws"]["data"]["userBalances"]
+    by_name = {row["token_info"]["name"]: row for row in rows}
+    balance = by_name["USDC on Sai"]
+    balance.update(amount="12345678", usd_value=99)
+    credits = by_name["USDC Credits on Sai"]
+    credits.update(amount="1", usd_value=None)
+    by_name["USDC (Sai Teller)"].update(amount="0", usd_value=99)
+
+    machine = cli(replay, "--json", "account", "balances", ADDR)
+    assert machine.exit_code == 0, machine.output
+    cli_rows = json.loads(machine.stdout)["data"]["userBalances"]
+
+    server = create_server(replay["config"])
+    mcp_rows = decode_mcp(
+        asyncio.run(server.call_tool("account_balances", {"addr": ADDR}))
+    )["data"]["userBalances"]
+    for output_rows in (cli_rows, mcp_rows):
+        assert [row["usd_value"] for row in output_rows] == [
+            by_name["Nibiru"]["usd_value"],
+            0,
+            0.000001,
+            12.345678,
+        ]
+        assert output_rows[-1]["amount"] == "12345678"
+
+    mcp_overview = mcp(replay, addr=ADDR)["balances"]["data"]
+    assert mcp_overview["balance"]["usd"] == 12.345678
+    assert mcp_overview["credits"]["usd"] == 0.000001
+
+    for command in (("balances", ADDR), ("overview", "--as", ADDR)):
+        human = cli(replay, "account", *command)
+        assert human.exit_code == 0, human.output
+        assert "12.345678" in human.stdout
+        assert "12.345678 USDC" not in human.stdout
+
+
+def test_usdc_balance_without_base_units_is_unknown(replay):
+    rows = replay["ws"]["data"]["userBalances"]
+    balance = next(row for row in rows if row["token_info"]["name"] == "USDC on Sai")
+    del balance["amount"]
+
+    result = cli(replay, "--json", "account", "balances", ADDR)
+    assert result.exit_code == 0, result.output
+    rows = json.loads(result.stdout)["data"]["userBalances"]
+    actual = next(row for row in rows if row["token_info"]["name"] == "USDC on Sai")
+    assert actual["usd_value"] is None
+    assert mcp(replay, addr=ADDR)["balances"]["data"]["balance"]["usd"] is None

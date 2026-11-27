@@ -35,4 +35,4 @@ signature = "b64337407377e1113dc12c29f0ef467a3b4f5c288cb62de3bd33a4f4313afc1c"
 [gap."case:trade-margin-capped-add"]
 owner = "#231"
 title = "Python sizes margin adds with --max-collateral-usd and shows the result."
-signature = "05e696687974b12350d127d3b85050843d23e824bb515f1a7ddf2a48e233a85c"
+signature = "6b735e3782464e31e2030a5dbcbbbde150654ff792195a7c58586a88406b2088"
