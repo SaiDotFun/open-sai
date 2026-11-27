@@ -419,9 +419,13 @@ preview the tag commands.
 
 The Release workflow also stages both release modes on pull requests that
 change the release inputs. The native candidate is `sai-release-candidate`.
-The Python-only candidate is `sai-python-release-candidate`. GitHub withholds
-the `NIBIRU_PM` secret from fork pull requests, so use a manual rehearsal on a
-branch in `SaiDotFun/open-sai` to verify the setting for a fork contribution.
+The Python-only candidate is `sai-python-release-candidate`.
+
+Fork pull requests run only the checks that do not require the organization
+secret. For a fork contribution, run the manual rehearsal only after the
+change passes normal review and merges into a branch in `SaiDotFun/open-sai`.
+Dispatching an unreviewed workflow from an upstream branch exposes the
+`NIBIRU_PM` secret to that workflow.
 
 ### Rehearse an Upgrade and Downgrade
 
