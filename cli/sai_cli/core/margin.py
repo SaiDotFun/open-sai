@@ -748,6 +748,21 @@ def collateral_amounts(
 
 
 def perp_prices(lcd: str, state: PositionSnapshot, height: str) -> Any:
+    # V2: Completely decouple USDC collateral from get_perp_prices
+    if state.raw.get("collateral_index") == "TokenIndex(1)":
+        oracle_addr = smart_value(lcd, state.contract, {"get_oracle_address": {}}, height=height)
+        market = smart_value(lcd, state.contract, {"get_market": {"index": state.raw["market_index"]}}, height=height)
+        
+        base_id = int(market["base"].replace("TokenIndex(", "").replace(")", ""))
+        quote_id = int(market["quote"].replace("TokenIndex(", "").replace(")", ""))
+        
+        oracle_rate = smart_value(lcd, oracle_addr, {"get_exchange_rate_stamped": {"base": base_id, "quote": quote_id}}, height=height)
+        
+        return {
+            "market": oracle_rate,
+            "collateral": {"rate": "1000000000000000000"}  # Hardcoded $1 (1e18)
+        }
+
     return smart_value(
         lcd,
         state.contract,
