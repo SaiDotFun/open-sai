@@ -228,20 +228,22 @@ jobs:
             --built "$(git rev-parse HEAD)" --tag-object "$TAG_OBJECT" \
             --remote "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
 
-      - name: Require immutable releases
+      - &require-immutable-releases
+        name: Require immutable releases
         env:
-          GH_TOKEN: ${{ secrets.SAI_RELEASE_SETTINGS_TOKEN }}
+          GH_TOKEN: ${{ secrets.NIBIRU_PM }}
         shell: bash
         run: |
-          if [[ -z "$GH_TOKEN" ]]; then
-            echo "::error::Set SAI_RELEASE_SETTINGS_TOKEN with repository Administration read access."
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::The NIBIRU_PM Actions secret is unavailable. The check requires repository Administration read access."
             exit 1
           fi
           if ! enabled="$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq '.enabled == true')" ||
              [[ "$enabled" != true ]]; then
-            echo "::error::GitHub did not confirm that immutable releases are enabled."
+            echo "::error::GitHub did not confirm that immutable releases are enabled. Check the repository setting and NIBIRU_PM access."
             exit 1
           fi
+          echo "GitHub confirmed that immutable releases are enabled using NIBIRU_PM."
 
       # gh creates a draft, attaches every asset, then publishes it.
       - name: Create the GitHub Release
@@ -268,6 +270,17 @@ jobs:
           fi
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "sai-cli $version" --generate-notes "${flags[@]}" dist/release/*
+
+  dry-run-immutability:
+    name: Check release immutability for dry run
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - *require-immutable-releases
 
   verify:
     name: Verify immutable release
