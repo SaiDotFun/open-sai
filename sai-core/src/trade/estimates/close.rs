@@ -165,13 +165,6 @@ impl Trading<'_> {
         let Some(Some(published_at)) = oracle_publication_time(&oracle) else {
             return unknown_oracle_time(result);
         };
-        let Some(market) = oracle
-            .get("base_per_quote")
-            .and_then(Value::as_str)
-            .and_then(|price| Price::new(price, "Sai Perp market oracle", Some(now())))
-        else {
-            return unknown_oracle_time(result);
-        };
         let config = lcd
             .smart(json!({"market_order_config": {}}), Some(height))
             .await
@@ -210,6 +203,11 @@ impl Trading<'_> {
             )
             .await
             .ok()?;
+        let market = Price::new(
+            oracle.get("base_per_quote")?.as_str()?,
+            "Sai Perp market oracle",
+            Some(now()),
+        )?;
         let trigger = decimal(&threshold["liquidation_price"])?;
         let collateral = integer(&raw["collateral_amount"])?;
         if (long && market.units <= trigger) || (!long && market.units >= trigger) {
