@@ -486,18 +486,9 @@ def test_mcp_install_rejects_unusable_absolute_launcher(
             overrides=overrides,
         )
         error = json.loads(result.stdout)["error"]
-        if index == 0:
-            assert result.returncode == 1
-            [cursor] = error["details"]["results"]
-            assert (
-                cursor["error"]
-                == "The requested server launcher is missing or not executable"
-            )
-            assert cursor["changed"] is False
-        else:
-            assert result.returncode == 2
-            assert error["code"] == "INVALID_REQUEST"
-            assert str(launcher) not in result.stdout + result.stderr
+        assert result.returncode == 2
+        assert error["code"] == "INVALID_REQUEST"
+        assert str(launcher) not in result.stdout + result.stderr
         assert (home / ".cursor/mcp.json").read_bytes() == original[".cursor/mcp.json"]
 
 
