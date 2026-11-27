@@ -353,6 +353,7 @@ mod tests {
             &snapshot,
             MarginDirection::Add,
             "1",
+            None,
             &effective,
             inputs,
         )
