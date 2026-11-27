@@ -58,6 +58,12 @@ pub(super) fn arguments<'a>(
             Some("string") if !value.is_string() => {
                 Err(("Input should be a valid string", "string_type"))
             }
+            Some("integer")
+                if matches!(name.as_str(), "market_id" | "trade_id" | "percent")
+                    && super::trade::Action::named(&tool.name).is_some() =>
+            {
+                trade_integer(value)
+            }
             Some("integer") => integer(value),
             Some("number") => number(value),
             Some("boolean") => boolean(value),
@@ -153,6 +159,22 @@ fn is_integer(value: &Value) -> bool {
 }
 
 type Conversion = Result<Option<Value>, (&'static str, &'static str)>;
+
+fn trade_integer(value: &Value) -> Conversion {
+    match value {
+        Value::Number(number) if number.as_str() == "-0" => Ok(Some(Value::from(0))),
+        Value::Number(number) if is_integer(value) && !number.as_str().starts_with('-') => Ok(None),
+        Value::String(text)
+            if !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            integer(value)
+        }
+        _ => Err((
+            "Value error, Expected a nonnegative integer or a string of ASCII digits",
+            "value_error",
+        )),
+    }
+}
 
 fn integer(value: &Value) -> Conversion {
     match value {

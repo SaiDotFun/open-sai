@@ -72,6 +72,7 @@ class PositionKeeperHandler(KeeperHandler):
                 "data": {
                     "user": trade["trader"],
                     "user_trade_index": f"UserTradeIndex({trade['index']})",
+                    "collateral_amount": "4000000",
                 }
             }
         )

@@ -116,11 +116,13 @@ fn check_open_pending(
     allow_concurrent_open: bool,
     storage: &Storage<'_>,
 ) -> Result<(), StorageError> {
-    let key: Option<String> = connection
-        .query_row(
-            "SELECT id FROM intents WHERE endpoint=?1 AND account=?2 AND kind=?3
+    let mut statement = connection.prepare(
+        "SELECT id FROM intents WHERE endpoint=?1 AND account=?2 AND kind=?3
              AND (keeper_status='pending' OR (NOT ?4 AND status IN ('unknown', 'accepted')))
-             ORDER BY rowid DESC LIMIT 1",
+             ORDER BY rowid DESC",
+    )?;
+    let keys: Vec<String> = statement
+        .query_map(
             params![
                 endpoint,
                 account.to_lowercase(),
@@ -128,16 +130,23 @@ fn check_open_pending(
                 allow_concurrent_open
             ],
             |row| row.get(0),
-        )
-        .optional()?;
-    if let Some(key) = key {
-        let hint = storage.intent_status_hint(endpoint, account, &key);
-        storage.emit(StorageEvent::OpenBlocked {
-            key: &key,
-            addr: account,
-            endpoint: &endpoint_origin(endpoint),
+        )?
+        .collect::<Result<_, _>>()?;
+    if let Some(key) = keys.first() {
+        let hint = storage.intent_status_hint(endpoint, account, key);
+        let origin = endpoint_origin(endpoint);
+        for blocked_key in &keys {
+            storage.emit(StorageEvent::OpenBlocked {
+                key: blocked_key,
+                addr: account,
+                endpoint: &origin,
+            });
+        }
+        return Err(StorageError::RecentOpenPending {
+            key: key.clone(),
+            hint,
+            keys,
         });
-        return Err(StorageError::RecentOpenPending { key, hint });
     }
     Ok(())
 }

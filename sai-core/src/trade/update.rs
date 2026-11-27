@@ -139,7 +139,7 @@ impl Trading<'_> {
             &id,
             verified.map(|(route, raw)| (route, Some(raw))),
             indexed,
-            !confirmed,
+            true,
         )
         .await?;
         Ok(if confirmed {
@@ -173,7 +173,7 @@ impl Trading<'_> {
                 &id,
                 Some((route, Some(raw))),
                 indexed.clone(),
-                false,
+                confirming,
             )
             .await?;
         }

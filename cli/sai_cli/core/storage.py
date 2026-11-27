@@ -62,6 +62,12 @@ class UnresolvedIntent(SaiError, ValueError):
 
     code = Code.INVALID_REQUEST
 
+    def __init__(
+        self, message: str, *, intent_key: str, hint: str, account: str
+    ) -> None:
+        super().__init__(message, intent_key=intent_key, hint=hint)
+        self.account = account
+
 
 class RecentOpenPending(UnresolvedIntent):
     """An earlier open on the same account may still execute."""
@@ -76,6 +82,7 @@ class RecentOpenPending(UnresolvedIntent):
             f" Check its status with `{hint}` before retrying.",
             intent_key=key,
             hint=hint,
+            account=account,
         )
         self.keys = keys
 
@@ -620,6 +627,7 @@ def pending(
                 f"Reconcile uncertain intent {blocked_key} before submitting another trade",
                 intent_key=blocked_key,
                 hint=intent_status_hint(endpoint, account, blocked_key),
+                account=account,
             )
         connection.execute(
             "INSERT INTO intents (id, endpoint, account, kind, status, entity, created_at) VALUES (?, ?, ?, ?, 'unknown', ?, ?)",
