@@ -14,7 +14,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import shlex
 import shutil
 import stat
@@ -25,6 +24,7 @@ import tomllib
 from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +47,12 @@ UNINSTALL_SCOPES = ("user", "project", "local")
 SUBPROCESS_TIMEOUT = 60
 INSTALL_URL = "git+https://github.com/SaiDotFun/open-sai"
 ENDPOINT_FLAGS = {spec.flag: spec.key for spec in settings.SETTINGS if spec.flag}
+SAI_ENV_NAMES = frozenset(
+    resources.files("sai_cli")
+    .joinpath("mcp_env_names.txt")
+    .read_text(encoding="utf-8")
+    .splitlines()
+)
 CLAUDE_ARG_PLACEHOLDER = "<original-argument>"
 CLAUDE_HOME_PLACEHOLDER = "<original-SAI_HOME>"
 INSTALL_PROFILE_PLACEHOLDER = "<profile>"
@@ -458,7 +464,7 @@ def reported_env_names(entries: tuple[str, ...]) -> list[str]:
     other = 0
     for entry in entries:
         name = entry.partition("=")[0]
-        if re.fullmatch(r"SAI_[A-Za-z0-9_]*", name):
+        if name in SAI_ENV_NAMES:
             names.add(name)
         else:
             other += 1

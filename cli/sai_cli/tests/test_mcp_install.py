@@ -2366,6 +2366,7 @@ def test_mcp_listings_report_sai_environment_names_and_count_other_entries(
     command = [str(launcher), "mcp", "serve"]
     marker = "fixture-env-value"
     bare_token = "fixtureBareToken_71"
+    prefixed_token = "SAI_FIXTURE_WRAPPER_71"
     profile = str(root / "sai-home")
     json_entry = claude_entry(
         command,
@@ -2376,6 +2377,7 @@ def test_mcp_listings_report_sai_environment_names_and_count_other_entries(
             "APP_TOKEN": marker,
             f"invalid name={marker}": marker,
             bare_token: marker,
+            prefixed_token: marker,
             "SAI_WS_ENDPOINT": marker,
             f"SAI_ENDPOINT={marker}": marker,
         },
@@ -2389,7 +2391,10 @@ def test_mcp_listings_report_sai_environment_names_and_count_other_entries(
         f"={marker}",
         bare_token,
         bare_token,
+        prefixed_token,
+        f"{prefixed_token}={marker}",
         f"SAI_LCD_ENDPOINT={marker}",
+        f"SAI_NATIVE_UV_PREFIX={marker}",
     ]
     files = {
         root / ".claude.json": json.dumps({"mcpServers": {"sai": json_entry}}),
@@ -2412,13 +2417,14 @@ def test_mcp_listings_report_sai_environment_names_and_count_other_entries(
         assert result.exit_code == 0, result.output
         assert marker not in result.output
         assert bare_token not in result.output
+        assert prefixed_token not in result.output
         rows = payload(result)["clients"]
         assert {row["client"] for row in rows} == {"claude", "codex", "cursor"}
         for row in rows:
             expected = (
-                ["SAI_LCD_ENDPOINT", "7 other entries"]
+                ["SAI_LCD_ENDPOINT", "SAI_NATIVE_UV_PREFIX", "9 other entries"]
                 if row["client"] == "codex"
-                else ["SAI_ENDPOINT", "SAI_WS_ENDPOINT", "5 other entries"]
+                else ["SAI_ENDPOINT", "SAI_WS_ENDPOINT", "6 other entries"]
             )
             assert row["registered"] and not row["current"]
             assert row["staleEnv"] == expected
