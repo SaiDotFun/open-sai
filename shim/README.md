@@ -13,6 +13,7 @@ a persistent tool install from an isolated `uvx` run.
 
 The Native Distribution workflow builds the shim, the four native archives,
 and `SHA256SUMS` as the `sai-native-ci` Actions artifact. The Release workflow
-uses that same build and smoke test matrix. Release tags ship the native
-archives alongside the full Python packages. The shim uses the same wheel
-and sdist filenames and stays in CI until the Python package handoff.
+uses that build and smoke test matrix. On native releases, the shim uses the
+standard `sai-cli` wheel and sdist filenames. The full Python wheel and sdist
+are inside `sai-cli-VERSION-full-python.zip`. Python-only release tags publish
+the full Python packages under the standard filenames.

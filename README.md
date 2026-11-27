@@ -345,11 +345,11 @@ the planned tag before publishing.
 
 Run `just release X.Y.Z` on `main` to check the tree and preview the Git
 commands. Add `--run` to create and push the tag. The tag workflow checks that
-the tagged commit is on main's first-parent history. It publishes the full
-Python wheel and sdist, four native archives, and one `SHA256SUMS` file in
-one immutable release. After publication, it checks the tag and every file
-against GitHub's signed release attestation. Sai does not sign the binaries
-separately.
+the tagged commit is on main's first-parent history. It publishes four native
+archives, the shim wheel and sdist, a ZIP containing the full Python wheel and
+sdist, and one `SHA256SUMS` file in one immutable release. After publication,
+it checks the tag and every file against GitHub's signed release attestation.
+Sai does not sign the binaries separately.
 
 Before tagging, enable immutable releases in the repository settings and set
 the Actions secret `SAI_RELEASE_SETTINGS_TOKEN` to a fine-grained token scoped
@@ -359,10 +359,14 @@ cannot confirm it is enabled. The usual Actions token publishes the release.
 
 Native Linux builds and smoke tests use glibc 2.35 on x86_64 and arm64.
 Native macOS builds target macOS 11 on Intel and Apple silicon. The hosted
-smoke tests run on macOS 15, the tested support floor. The full Python
-package remains the published Python distribution during this stage of the
-handoff. The shim keeps the same package name and is exercised in CI until
-the handoff release can use that filename for the shim.
+smoke tests run on macOS 15, the tested support floor.
+
+The shim keeps the `sai-cli` package name and takes the standard wheel and
+sdist filenames on native releases. The Python bridge downloads the wheel
+by that filename and keeps the uv-managed `sai` launcher. The full Python
+build keeps both original filenames inside `sai-cli-X.Y.Z-full-python.zip`.
+For example, verify the ZIP against `SHA256SUMS` and extract it to install
+the full Python wheel from that version.
 
 ### Release Python Only
 
@@ -381,9 +385,10 @@ release.
 ### Rehearse a Release Candidate
 
 Use `sai-cli/vX.Y.Z-rc.N` as the planned tag for the manual run. After it
-passes, download its candidate
-artifact. From the artifact directory, verify the checksums and start the
-full Python wheel in an isolated uv environment. The version output should
+passes, download its candidate artifact and verify the checksums. On a
+native candidate, extract the full Python packages into a separate directory
+with `unzip sai-cli-X.Y.Z-rc.N-full-python.zip -d full-python`. Use
+`./full-python/` in the wheel path below. The full Python wheel should
 report `X.Y.ZrcN`.
 
 ```bash
@@ -394,6 +399,10 @@ SAI_HOME="$(mktemp -d)" uv run --isolated --no-project \
 
 On `main`, run `just release X.Y.Z-rc.N` to check the package versions and
 preview the tag commands.
+
+The Release workflow also stages both release modes on pull requests that
+change the release inputs. The native candidate is `sai-release-candidate`.
+The Python-only candidate is `sai-python-release-candidate`.
 
 ### Rehearse an Upgrade and Downgrade
 
