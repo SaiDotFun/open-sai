@@ -1380,3 +1380,90 @@ def test_windows_refuses_a_replaced_uv_launcher(
     assert "runs another install" in message
     assert str(install.launcher) in message and str(inside) in message
     assert install.launcher.read_bytes() == contents
+
+
+@pytest.fixture(scope="module")
+def windows_python_bundle(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[Path, bytes]:
+    version = wheel_version(wheel_artifact("SHIM"))
+    output = tmp_path_factory.mktemp("full-python-wheel")
+    ok(
+        subprocess.run(
+            [
+                sys.executable,
+                ROOT / "scripts/build-bridge.py",
+                "--version",
+                version,
+                "--out-dir",
+                output,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    )
+    wheel = only_wheel(output)
+    bundle = io.BytesIO()
+    with zipfile.ZipFile(bundle, "w") as archive:
+        archive.write(wheel, wheel.name)
+    return wheel, bundle.getvalue()
+
+
+@pytest.mark.skipif(not WINDOWS, reason="requires Windows uv launcher copies")
+@pytest.mark.parametrize(
+    ("entry", "corrupt"), [("install", False), ("update", False), ("update", True)]
+)
+def test_windows_uses_the_verified_full_python_bundle(
+    install: Install,
+    replay: Replay,
+    windows_python_bundle: tuple[Path, bytes],
+    entry: str,
+    corrupt: bool,
+) -> None:
+    bridge = wheel_artifact("BRIDGE")
+    prepare_uv(install, bridge, replay)
+    profile, contents = save_profile(install, replay)
+    launcher = install.launcher.read_bytes()
+    if entry == "install":
+        ok(install.run("uv", "tool", "uninstall", "sai-cli"))
+        assert not install.launcher.exists()
+    shim = wheel_artifact("SHIM")
+    version = wheel_version(shim)
+    wheel, bundle = windows_python_bundle
+    bundle_name = f"sai-cli-{version}-full-python.zip"
+    folder = f"{REPO}/releases/download/sai-cli/v{version}"
+    replay.add(version, {shim.name: shim.read_bytes(), bundle_name: bundle})
+    if corrupt:
+        replay.assets[f"{folder}/{bundle_name}"] += b"unverified bytes"
+
+    result = install.install(replay) if entry == "install" else install.update(replay)
+    assert f"{folder}/{bundle_name}" in replay.requests
+    assert f"{folder}/{shim.name}" not in replay.requests
+    if corrupt:
+        assert result.returncode == 1, (result.stdout, result.stderr)
+        assert "does not match its SHA256SUMS entry" in result.stdout
+        install.pin(wheel_version(bridge))
+    else:
+        ok(result)
+        install.pin(version)
+        cached = install.profile / "cache/wheels" / wheel.name
+        assert cached.read_bytes() == wheel.read_bytes()
+        record = json.loads((install.tools / ".sai-cli-release.json").read_text())
+        assert record["sha256"] == hashlib.sha256(wheel.read_bytes()).hexdigest()
+    if entry == "update":
+        assert install.launcher.read_bytes() == launcher
+    assert profile.read_bytes() == contents
+
+
+@pytest.mark.skipif(not WINDOWS, reason="requires Windows uv launcher copies")
+def test_windows_installer_refuses_a_shim_only_release(
+    install: Install,
+    replay: Replay,
+) -> None:
+    add_shim(replay, wheel_artifact("SHIM"))
+    result = install.install(replay)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "full Python" in result.stderr
+    assert not install.launcher.exists()

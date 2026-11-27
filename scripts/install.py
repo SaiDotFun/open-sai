@@ -44,6 +44,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zipfile
 import zlib
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
@@ -61,6 +62,7 @@ PAGE_SIZE = 100
 MAX_PAGES = 10
 MAX_BODY = 16 << 20
 MAX_WHEEL = 64 << 20
+MAX_PYTHON_BUNDLE = 128 << 20
 MAX_SUMS = 1 << 16
 REQUEST_TIMEOUT = 10.0
 # Wall-clock limits for the release lookup and for the two downloads.
@@ -303,6 +305,10 @@ def wheel_name(version: str) -> str:
     return f"sai_cli-{version}-py3-none-any.whl"
 
 
+def full_python_bundle_name(version: str) -> str:
+    return f"sai-cli-{version}-full-python.zip"
+
+
 def download_base(tag: str, web_base: str = WEB_BASE) -> str:
     return f"{web_base.rstrip('/')}/{REPO}/releases/download/{quote(tag)}"
 
@@ -389,22 +395,63 @@ def fetch_wheel(
 ) -> tuple[Path, str]:
     """Download TAG's wheel and SHA256SUMS into DIRECTORY, check the hash,
     and return the wheel and its SHA-256."""
-    name = wheel_name(version_of(tag))
+    version = version_of(tag)
+    name = wheel_name(version)
     wheel, sums = directory / name, directory / "SHA256SUMS"
     base = download_base(tag, web_base)
 
-    def work(deadline: float) -> None:
+    def work(deadline: float) -> str:
         download(f"{base}/SHA256SUMS", sums, MAX_SUMS, deadline)
-        download(f"{base}/{name}", wheel, MAX_WHEEL, deadline)
+        manifest = sums.read_text(errors="replace")
+        bundle = full_python_bundle_name(version)
+        archive = os.name == "nt" and native_digest(manifest, bundle) is not None
+        asset = directory / bundle if archive else wheel
+        expected = expected_hash(manifest, asset.name)
+        if expected is None:
+            raise LookupFailed(f"SHA256SUMS does not list {asset.name}")
+        download(
+            f"{base}/{asset.name}",
+            asset,
+            MAX_PYTHON_BUNDLE if archive else MAX_WHEEL,
+            deadline,
+        )
+        digest = file_digest(asset)
+        if digest != expected:
+            raise LookupFailed(f"{asset.name} does not match its SHA256SUMS entry")
+        if archive:
+            unpack_python_wheel(asset, wheel)
+            digest = file_digest(wheel)
+        if os.name == "nt":
+            try:
+                with zipfile.ZipFile(wheel) as package:
+                    if "sai_cli/_release_source.py" in package.namelist():
+                        raise LookupFailed(
+                            f"Sai {version} has no full Python wheel for Windows"
+                        )
+            except zipfile.BadZipFile as error:
+                raise LookupFailed(f"{name} is not a valid wheel") from error
+        return digest
 
-    within(timeout, "downloading the release", work)
-    expected = expected_hash(sums.read_text(errors="replace"), name)
-    if expected is None:
-        raise LookupFailed(f"SHA256SUMS does not list {name}")
-    actual = hashlib.sha256(wheel.read_bytes()).hexdigest()
-    if actual != expected:
-        raise LookupFailed(f"{name} does not match its SHA256SUMS entry")
-    return wheel, actual
+    return wheel, within(timeout, "downloading the release", work)
+
+
+def unpack_python_wheel(bundle: Path, wheel: Path) -> None:
+    # Keep in step with the packaged updater. Copy only the fixed wheel entry.
+    try:
+        with zipfile.ZipFile(bundle) as archive:
+            members = [
+                entry for entry in archive.infolist() if entry.filename == wheel.name
+            ]
+            if len(members) != 1 or members[0].file_size > MAX_WHEEL:
+                raise LookupFailed(
+                    f"{bundle.name} must contain one bounded {wheel.name}"
+                )
+            with archive.open(members[0]) as source, wheel.open("xb") as output:
+                shutil.copyfileobj(source, output)
+    except (zipfile.BadZipFile, EOFError, RuntimeError, zlib.error) as error:
+        raise LookupFailed(
+            f"could not read the full Python wheel from {bundle.name}"
+        ) from error
 
 
 def wheel_cache() -> Path:
@@ -1255,8 +1302,11 @@ def main(argv: list[str]) -> int:
     else:
         print(f"Installing sai-cli {version_of(tag)} from its release wheel.")
         if args.dry_run:
+            asset = wheel_url(tag, args.web_base)
+            if os.name == "nt":
+                asset = f"the full Python wheel for {tag} (from its ZIP when available)"
             print(
-                f"Would download {wheel_url(tag, args.web_base)}, check it against"
+                f"Would download {asset}, check it against"
                 " the release's SHA256SUMS, and run `uv tool install` on the file."
             )
             print("Dry run: nothing was installed.")

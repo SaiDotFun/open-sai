@@ -43,6 +43,7 @@ import threading
 import time
 import tomllib
 import zipfile
+import zlib
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -60,6 +61,7 @@ EXIT_FAILED = ExitCode.ERROR
 EXIT_UNSUPPORTED = ExitCode.UNSUPPORTED
 
 MAX_WHEEL = 64 << 20
+MAX_PYTHON_BUNDLE = 128 << 20
 MAX_SUMS = 1 << 16
 DOWNLOAD_HOSTS = {
     "github.com",
@@ -110,6 +112,10 @@ Runner = Callable[[Sequence[str], float], tuple[int, str]]
 
 class UpdateFailed(Exception):
     """A step of the update failed; the message says which."""
+
+
+class WindowsShim(UpdateFailed):
+    """The release only supplied a native shim for this Windows download."""
 
 
 # State and locks
@@ -331,15 +337,32 @@ def fetch_wheel(
     """
     name = update.wheel_name(release.version)
     wheel, sums = directory / name, directory / "SHA256SUMS"
+    bundle = directory / update.full_python_bundle_name(release.version)
+    asset = wheel
     deadline = time.monotonic() + timeout
     outcome: dict[str, Exception] = {}
 
     def work() -> None:
+        nonlocal asset
         try:
             headers = {"User-Agent": "sai-cli"}
             with httpx.Client(headers=headers) as client:
                 _download(client, release.sums_url, sums, MAX_SUMS, deadline)
-                _download(client, release.wheel_url, wheel, MAX_WHEEL, deadline)
+                if (
+                    os.name == "nt"
+                    and expected_hash(sums.read_text(errors="replace"), bundle.name)
+                    is not None
+                ):
+                    asset = bundle
+                    _download(
+                        client,
+                        release.full_python_url,
+                        bundle,
+                        MAX_PYTHON_BUNDLE,
+                        deadline,
+                    )
+                else:
+                    _download(client, release.wheel_url, wheel, MAX_WHEEL, deadline)
         except Exception as exc:  # noqa: BLE001 - re-raised in the caller
             outcome["error"] = exc
 
@@ -355,13 +378,44 @@ def fetch_wheel(
         raise UpdateFailed(f"download failed: {type(error).__name__}") from error
     if error is not None:
         raise error
-    expected = expected_hash(sums.read_text(errors="replace"), name)
+    expected = expected_hash(sums.read_text(errors="replace"), asset.name)
     if expected is None:
-        raise UpdateFailed(f"SHA256SUMS does not list {name}")
-    actual = sha256(wheel)
+        raise UpdateFailed(f"SHA256SUMS does not list {asset.name}")
+    actual = sha256(asset)
     if actual != expected:
-        raise UpdateFailed(f"{name} does not match its SHA256SUMS entry")
+        raise UpdateFailed(f"{asset.name} does not match its SHA256SUMS entry")
+    if asset == bundle:
+        unpack_python_wheel(bundle, wheel)
+        actual = sha256(wheel)
+    if os.name == "nt":
+        try:
+            if native_bridge.is_shim(wheel):
+                raise WindowsShim(
+                    f"Sai {release.version} has no full Python wheel for Windows"
+                )
+        except zipfile.BadZipFile:
+            # Preserve uv's trial-install diagnostic for a malformed wheel.
+            pass
     return wheel, actual
+
+
+def unpack_python_wheel(bundle: Path, wheel: Path) -> None:
+    # Keep in step with the standalone installer. Copy only the fixed wheel entry.
+    try:
+        with zipfile.ZipFile(bundle) as archive:
+            members = [
+                entry for entry in archive.infolist() if entry.filename == wheel.name
+            ]
+            if len(members) != 1 or members[0].file_size > MAX_WHEEL:
+                raise UpdateFailed(
+                    f"{bundle.name} must contain one bounded {wheel.name}"
+                )
+            with archive.open(members[0]) as source, wheel.open("xb") as output:
+                shutil.copyfileobj(source, output)
+    except (zipfile.BadZipFile, EOFError, RuntimeError, zlib.error) as error:
+        raise UpdateFailed(
+            f"could not read the full Python wheel from {bundle.name}"
+        ) from error
 
 
 # Install, verify, roll back
@@ -1223,6 +1277,14 @@ def _install(
         message = f"sai {target} is available. Run `sai update` to install it."
         return Outcome(AVAILABLE, message, installed, target), False
 
+    def unsupported_shim() -> tuple[Outcome, bool]:
+        discard()
+        message = (
+            f"Sai {target} requires a native binary for a supported platform. "
+            f"Keep your full Python release `sai-cli=={installed}`."
+        )
+        return Outcome(UNSUPPORTED, message, installed, target), False
+
     try:
         expected_launcher = current.launcher.lstat()
     except OSError as error:
@@ -1235,6 +1297,8 @@ def _install(
     else:
         try:
             kept, digest, created = _download_to_cache(release, options)
+        except WindowsShim:
+            return unsupported_shim()
         except (UpdateFailed, OSError) as exc:
             return unchanged(
                 str(exc) if isinstance(exc, UpdateFailed) else type(exc).__name__
@@ -1250,12 +1314,7 @@ def _install(
                 f"could not inspect the release wheel: {type(error).__name__}"
             )
         if native and not native_bridge.supported():
-            discard()
-            message = (
-                f"Sai {target} requires a native binary for a supported platform. "
-                f"Keep your full Python release `sai-cli=={installed}`."
-            )
-            return Outcome(UNSUPPORTED, message, installed, target), False
+            return unsupported_shim()
         if native and current.install.kind == update.UV_TOOL_GIT:
             return unchanged(
                 "this uv Git install needs a verified full-Python bridge wheel first."
