@@ -52,6 +52,7 @@ pub enum PositionAction<'a> {
 pub enum PositionMode<'a> {
     DryRun,
     Preview,
+    McpPreview,
     Submit(SubmitOptions<'a>),
 }
 
@@ -78,6 +79,7 @@ struct PositionQuote {
     snapshot: Snapshot,
     inputs: Value,
     preview: TradePreview,
+    fixed_usdc_price: bool,
 }
 
 struct RecheckedPosition {
@@ -118,13 +120,23 @@ impl Trading<'_> {
         let lcd = Lcd(lcd_endpoint);
         let confirming =
             matches!(&mode, PositionMode::Submit(options) if options.confirmation.is_some());
+        let fixed_usdc_price = match &mode {
+            PositionMode::McpPreview => true,
+            PositionMode::Submit(options) => options
+                .confirmation
+                .as_ref()
+                .is_some_and(Confirmation::is_mcp),
+            _ => false,
+        };
         let mut first = self
-            .quote_for_position(&lcd, addr, &id, action, confirming)
+            .quote_for_position(&lcd, addr, &id, action, confirming, fixed_usdc_price)
             .await?;
         let PositionMode::Submit(options) = mode else {
             first.estimate_execution(&lcd, &id, action, None).await?;
             return Ok(match mode {
-                PositionMode::Preview => first.preview.cli_preview_output(Some(addr)),
+                PositionMode::Preview | PositionMode::McpPreview => {
+                    first.preview.cli_preview_output(Some(addr))
+                }
                 _ => first.preview.output(Some(addr)),
             });
         };
@@ -134,12 +146,12 @@ impl Trading<'_> {
             .as_ref()
             .is_none_or(Confirmation::is_cli);
         let mut current = self
-            .quote_for_position(&lcd, addr, &id, action, confirming)
+            .quote_for_position(&lcd, addr, &id, action, confirming, fixed_usdc_price)
             .await?;
         let rechecked = current.recheck(&lcd, &id).await?;
         let Some(rechecked) = rechecked else {
             let latest = async {
-                let mut latest = self.quote_for_position(&lcd, addr, &id, action, confirming).await?;
+                let mut latest = self.quote_for_position(&lcd, addr, &id, action, confirming, fixed_usdc_price).await?;
                 let checked = if latest.preview.collateral_price_unverified() {
                     None
                 } else {
@@ -181,15 +193,19 @@ impl Trading<'_> {
         trade_id: &Value,
         action: PositionAction<'_>,
         confirming: bool,
+        fixed_usdc_price: bool,
     ) -> Result<PositionQuote, SaiError> {
-        let error = match self.quote_position(lcd, addr, trade_id, action).await {
+        let error = match self
+            .quote_position(lcd, addr, trade_id, action, fixed_usdc_price)
+            .await
+        {
             Err(error) if is_network_mismatch(&error) => error,
             result => return result,
         };
         if !confirming {
             return Err(invalid(&error.message));
         }
-        let message = match self.quote_position(lcd, addr, trade_id, action).await {
+        let message = match self.quote_position(lcd, addr, trade_id, action, fixed_usdc_price).await {
             Ok(mut fresh) => {
                 let checked = if fresh.preview.collateral_price_unverified() {
                     None
@@ -222,6 +238,7 @@ impl Trading<'_> {
         addr: &str,
         trade_id: &Value,
         action: PositionAction<'_>,
+        fixed_usdc_price: bool,
     ) -> Result<PositionQuote, SaiError> {
         let snapshot = self
             .read_position_change_snapshot(
@@ -238,6 +255,8 @@ impl Trading<'_> {
         };
 
         let (effective, mut inputs) = snapshot.leverage(lcd, trade_id, None).await?;
+        let fixed_usdc_price =
+            fixed_usdc_price && snapshot.market["collateralToken"]["symbol"] == "USDC";
         let mut preview = match action {
             PositionAction::Margin { direction, amount } => {
                 let leverage = effective.as_ref().ok_or_else(|| {
@@ -253,7 +272,11 @@ impl Trading<'_> {
                 )?
             }
             PositionAction::PartialClose { percent } => {
-                let price = snapshot.price(lcd, None).await.ok();
+                let price = if fixed_usdc_price {
+                    Some(ContractDecimal::parse(&json!("1"))?)
+                } else {
+                    snapshot.price(lcd, None).await.ok()
+                };
                 inputs["collateralPriceUsd"] = json!(price.as_ref().map(ContractDecimal::display));
                 quote::partial(
                     trade_id,
@@ -271,6 +294,7 @@ impl Trading<'_> {
             snapshot,
             inputs,
             preview,
+            fixed_usdc_price,
         })
     }
 
@@ -494,10 +518,12 @@ impl PositionQuote {
                     Read::At(height),
                 )
                 .await?;
-            if quoted_price.is_null() || prices["collateral"].is_null() {
-                return Ok(None);
+            if !self.fixed_usdc_price {
+                if quoted_price.is_null() || prices["collateral"].is_null() {
+                    return Ok(None);
+                }
+                ContractDecimal::parse(&prices["collateral"])?;
             }
-            ContractDecimal::parse(&prices["collateral"])?;
             Some(prices)
         } else {
             None

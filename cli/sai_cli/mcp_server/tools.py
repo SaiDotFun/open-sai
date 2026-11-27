@@ -824,5 +824,6 @@ def partial_close(
         lcd_endpoint=settings.lcd_endpoint,
         dry_run=dry_run,
         before_submit=check,
+        fixed_usdc_price=True,
     )
     return finish(load, dry_run, result)

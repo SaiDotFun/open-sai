@@ -87,7 +87,7 @@ impl<'a> Action<'a> {
             None
         };
         if matches!(self.kind, "margin" | "partial_close") {
-            let mode = options.map_or(PositionMode::Preview, PositionMode::Submit);
+            let mode = options.map_or(PositionMode::McpPreview, PositionMode::Submit);
             let action = if self.kind == "margin" {
                 PositionAction::Margin {
                     direction: match required("direction") {
