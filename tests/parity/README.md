@@ -79,7 +79,32 @@ includes tool metadata and requires a matching `tools/call` transcript.
 each reviewed difference signature. An exact match reports `XFAIL`. A changed
 signature, unexpected pass, or unused entry fails the required job. Owners
 remove their entries in the same change that repairs the corresponding gaps.
-`M2-unassigned` entries include proposed issue titles for triage.
+Titles that mention Python main use the same fixtures and strict comparison
+against Python at `a48e7775`. The 23 rows that match main are tracked under
+#171. Remove each row when the release reference advances and the row passes
+against that reference.
+
+| Difference against Python main | Manifest rows | Focused cases | Owner |
+| --- | ---: | ---: | --- |
+| Log error redaction, Keeper probe fields, and WebSocket reconnect log context | 45 | 12 | [#49](https://github.com/SaiDotFun/open-sai/issues/49) |
+| MCP uninstall reports and client config safeguards | 5 | 0 | [#49](https://github.com/SaiDotFun/open-sai/issues/49) |
+| Signed-out overview JSON and auth hint, and unknown Doctor option output | 3 | 0 | [#49](https://github.com/SaiDotFun/open-sai/issues/49) |
+| Overview freshness fields and margin preview output | 9 | 0 | [#231](https://github.com/SaiDotFun/open-sai/issues/231) |
+| Doctor's MCP repair hints | 5 | 0 | [#215](https://github.com/SaiDotFun/open-sai/issues/215) |
+| Rejected argument diagnostics for MCP scope, trade ID, and watch token | 4 | 0 | [#205](https://github.com/SaiDotFun/open-sai/issues/205) |
+| Trade validation order, request traces, quote rechecks, and partial-close refusals | 10 | 0 | [#174](https://github.com/SaiDotFun/open-sai/issues/174) |
+| `mcp_info` trading availability on session reload and validation text | 1 | 0 | [#176](https://github.com/SaiDotFun/open-sai/issues/176) |
+
+Rust intentionally redacts free-form log errors and saved launcher arguments
+to keep untrusted text and private arguments out of diagnostics. During
+uninstall it also preserves read-only client files and restores the original
+Codex config if verification fails.
+
+Two of the #174 rows need dedicated follow-up. In `trade-partial-close-market-minimum`,
+Python previews a 99% partial close. Rust rejects the preview because the
+remainder falls below the fee-schedule minimum. In
+`trade-partial-close-scientific-reduction`, Python previews a reduction that
+Rust rejects while parsing an integer formatted in scientific notation.
 
 [`python-main-gaps.toml`](python-main-gaps.toml) records Python CLI changes
 that landed after the release reference. The runner checks these signatures
