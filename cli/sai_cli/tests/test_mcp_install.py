@@ -1034,9 +1034,9 @@ def test_codex_install_rejects_a_matching_broken_explicit_launcher(env: Env):
 
     result = invoke("mcp", "install", "codex", "--", *argv)
 
-    assert "requested server launcher is missing or not executable" in failure(result)
-    [row] = payload(result)["error"]["details"]["results"]
-    assert row["action"] == "failed" and not row["changed"]
+    assert "existing executable" in failure(result, 2)
+    assert str(launcher) not in result.output
+    assert "details" not in payload(result)["error"]
     assert env.codex_path().read_bytes() == original
     assert not env.calls()
 
@@ -1381,6 +1381,7 @@ def test_claude_install_reports_an_explicit_command_blocked_by_a_legacy_alias(
         )
     )
     before = config.read_bytes()
+    write_exe(env.bin / "uv", "")
     command = ["uv", "run", "--directory", f"/src/{SECRET}", "sai", "mcp", "serve"]
     if not different:
         command = serve(env)
@@ -1407,11 +1408,16 @@ def test_claude_install_reports_an_explicit_command_blocked_by_a_legacy_alias(
     assert not env.calls()
 
 
-def claude_add_command(hint: str) -> str:
+def claude_add_command(hint: str, *, profile: Path | str | None = None) -> str:
     [command] = [
         part for part in hint.split("`")[1::2] if part.startswith("claude mcp add ")
     ]
-    return command
+    if profile is None:
+        return command
+    return command.replace(
+        shlex.quote("--env=SAI_HOME=<profile>"),
+        shlex.quote(f"--env=SAI_HOME={profile}"),
+    )
 
 
 def test_claude_manual_commands_are_copyable(env: Env, monkeypatch: pytest.MonkeyPatch):
@@ -1429,7 +1435,7 @@ def test_claude_manual_commands_are_copyable(env: Env, monkeypatch: pytest.Monke
     [row] = payload(result)["error"]["details"]["results"]
     assert config.read_bytes() == before
     assert not env.calls()
-    command = claude_add_command(row["fix"])
+    command = claude_add_command(row["fix"], profile=profile)
     shell = shutil.which("sh", path=os.defpath)
     assert shell is not None
     assert f"The user sai entry in {config} differs in env, cwd." in row["fix"]
@@ -1453,15 +1459,13 @@ def test_claude_printed_profile_matches_normal_install(
     result = invoke("mcp", "install", "claude")
     failure(result)
     [row] = payload(result)["error"]["details"]["results"]
-    commands = row["fix"].split("`")[1::2]
-    assert any(
-        shlex.quote(f"--env=SAI_HOME={expected_home}") in cmd for cmd in commands
-    )
+    assert "--env=SAI_HOME=<profile>" in claude_add_command(row["fix"])
+    assert expected_home not in result.output
     shell = shutil.which("sh", path=os.defpath)
     assert shell
     monkeypatch.delenv("SAI_HOME")
     config.write_text('{"mcpServers": {}}')
-    command = claude_add_command(row["fix"])
+    command = claude_add_command(row["fix"], profile=expected_home)
     subprocess.run([shell, "-c", command], cwd=env.home, check=True)
     assert env.claude_json()["mcpServers"]["sai"]["env"] == {"SAI_HOME": expected_home}
     monkeypatch.setenv("SAI_HOME", profile)
@@ -1518,7 +1522,7 @@ def test_claude_printed_add_uses_the_absolute_launcher_and_inline_profile(
         "--scope",
         "user",
         "sai",
-        f"--env=SAI_HOME={profile}",
+        "--env=SAI_HOME=<profile>",
         "--",
         *serve(env),
     ]
@@ -1532,6 +1536,7 @@ def test_claude_printed_add_uses_the_absolute_launcher_and_inline_profile(
     monkeypatch.delenv("SAI_HOME")
     monkeypatch.setenv("PATH", str(client_bin))
     config.write_text('{"mcpServers": {}}')
+    command = claude_add_command(row["fix"], profile=profile)
     subprocess.run([shell, "-c", command], cwd=env.project, check=True)
     assert env.claude_json()["mcpServers"]["sai"] == claude_entry(
         serve(env), {"SAI_HOME": str(profile)}
@@ -1888,7 +1893,11 @@ def test_claude_replacement_advice_preserves_saved_server_options(
     assert all(
         value not in diagnostic for value in (SECRET, private_key, "private.example")
     )
-    redacted_profile = profile if surface == "background" else "<original-SAI_HOME>"
+    redacted_profile = {
+        "background": profile,
+        "doctor": "<original-SAI_HOME>",
+        "install": "<profile>",
+    }[surface]
     if surface != "background":
         assert profile not in diagnostic
     assert (
@@ -1917,7 +1926,7 @@ def test_claude_replacement_advice_preserves_saved_server_options(
         "--ws-endpoint=<original-argument>",
     ]
     replacements = {
-        "--env=SAI_HOME=<original-SAI_HOME>": f"--env=SAI_HOME={profile}",
+        f"--env=SAI_HOME={redacted_profile}": f"--env=SAI_HOME={profile}",
         "--env=<NAME>=<value>": f"--env={private_key}={SECRET}",
         "<original-argument>": endpoint,
         "--ws-endpoint=<original-argument>": f"--ws-endpoint={ws_endpoint}",
@@ -2080,6 +2089,415 @@ def test_dry_run_runs_no_client_and_writes_nothing(env: Env):
     assert not env.cursor_path().exists()
 
 
+@pytest.fixture
+def install_preview(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    profile = tmp_path / "sai-home"
+    profile.mkdir(mode=0o700)
+    monkeypatch.setenv("SAI_HOME", str(profile))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("FAKE_LOG", str(tmp_path / "argv.log"))
+    monkeypatch.chdir(tmp_path)
+    return write_exe(tmp_path / "claude", FAKE_CLAUDE)
+
+
+@pytest.mark.parametrize(
+    "kind", ["assignment", "option", "missing", "missing-path", "non-executable"]
+)
+def test_install_refuses_invalid_launcher_before_reporting(
+    install_preview: Path, kind: str
+) -> None:
+    root = install_preview.parent
+    marker = "fixture-launcher"
+    if kind in {"assignment", "option"}:
+        launcher = f"MODE={marker}" if kind == "assignment" else f"-{marker}"
+    elif kind == "missing":
+        launcher = marker
+    else:
+        launcher = str(root / marker)
+        if kind == "non-executable":
+            Path(launcher).touch(mode=0o600)
+
+    args = ("mcp", "install")
+    for options in (("claude", "--dry-run"), ("--dry-run",), ("claude",)):
+        result = invoke(*args, *options, "--", launcher, "mcp", "serve")
+        assert "existing executable" in failure(result, 2)
+        assert marker not in result.output
+        assert "details" not in payload(result)["error"]
+
+    text = CliRunner().invoke(main, [*args, "claude", "--dry-run", "--", launcher])
+    assert text.exit_code == 2
+    assert not text.stdout
+    assert "existing executable" in text.stderr
+    assert marker not in text.stderr
+    assert not (root / ".claude.json").exists()
+    assert not (root / "argv.log").exists()
+
+
+@pytest.mark.parametrize(
+    "name", ["slot=staging/launcher", "MODE=fixture-launcher", "-fixture-launcher"]
+)
+def test_install_accepts_resolvable_launcher_with_assignment_or_dash(
+    install_preview: Path, name: str
+) -> None:
+    root = install_preview.parent
+    path = root / name
+    path.parent.mkdir(exist_ok=True)
+    write_exe(path, "")
+    launcher = str(path) if "/" in name else name
+    args = ["mcp", "serve"]
+
+    result = invoke("mcp", "install", "cursor", "--", launcher, *args)
+
+    assert result.exit_code == 0, result.output
+    config = json.loads((root / ".cursor/mcp.json").read_text())
+    entry = config["mcpServers"]["sai"]
+    assert (entry["command"], entry["args"]) == (launcher, args)
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_claude_install_masks_profile_in_success_report(
+    install_preview: Path, json_output: bool
+) -> None:
+    root = install_preview.parent
+    profile = str(root / "sai-home")
+    write_exe(root / "sai", "")
+    flags = ["--json"] if json_output else []
+
+    result = CliRunner().invoke(main, [*flags, "mcp", "install", "claude"])
+
+    assert result.exit_code == 0, result.output
+    assert profile not in result.output
+    [row] = payload(result)["results"]
+    assert "--env=SAI_HOME=<profile>" in row["argv"][0]
+    config = json.loads((root / ".claude.json").read_text())
+    assert config["mcpServers"]["sai"]["env"] == {"SAI_HOME": profile}
+
+
+@pytest.mark.parametrize("repair_existing", [False, True], ids=["install", "repair"])
+@pytest.mark.parametrize("dry_run", [False, True], ids=["apply", "dry-run"])
+def test_claude_install_masks_profile_in_repair_hint(
+    install_preview: Path, repair_existing: bool, dry_run: bool
+) -> None:
+    root = install_preview.parent
+    profile = str(root / "sai-home")
+    launcher = write_exe(root / "sai", "")
+    argv = [str(launcher), "mcp", "serve", "--endpoint", "http://127.0.0.1:8765"]
+    config = root / ".claude.json"
+    original = json.dumps(
+        {"mcpServers": {"sai": claude_entry(argv, {"SAI_HOME": profile})}}
+    )
+    config.write_text(original)
+    args = ["mcp", "install", "claude"]
+    if dry_run:
+        args.append("--dry-run")
+    if repair_existing:
+        args.extend(["--repair-existing", "sai"])
+
+    result = invoke(*args)
+
+    assert "differs from the requested settings" in failure(result)
+    [row] = payload(result)["error"]["details"]["results"]
+    assert "--env=SAI_HOME=<profile>" in row["fix"]
+    assert profile not in result.output
+
+    text = CliRunner().invoke(main, args)
+    assert text.exit_code == 1
+    assert "--env=SAI_HOME=<profile>" in text.stderr
+    assert profile not in text.output
+    assert config.read_text() == original
+    assert not (root / "argv.log").exists()
+
+
+@pytest.mark.parametrize(
+    ("launcher", "args", "reported_args"),
+    [
+        ("env", ["APP_MODE=fixture-value", "sai", "mcp", "serve"], None),
+        ("docker", ["run", "--env=APP_MODE=fixture-value"], None),
+        ("docker", ["run", "-ieAPP_MODE=fixture-value"], None),
+        ("sh", ["-c", "APP_MODE='fixture value' exec sai mcp serve"], None),
+        (
+            "sai",
+            ["mcp", "serve", "--endpoint", "http://127.0.0.1:8765/api?key=fixture"],
+            ["mcp", "serve", "--endpoint", "http://127.0.0.1:8765"],
+        ),
+        (
+            "sai",
+            ["--endpoint=http://127.0.0.1:8765/api?key=fixture", "mcp", "serve"],
+            ["--endpoint=http://127.0.0.1:8765", "mcp", "serve"],
+        ),
+    ],
+    ids=[
+        "assignment",
+        "inline-env",
+        "short-flags",
+        "shell",
+        "endpoint",
+        "root-endpoint",
+    ],
+)
+def test_dry_run_displays_launcher_and_argument_placeholders(
+    install_preview: Path,
+    launcher: str,
+    args: list[str],
+    reported_args: list[str] | None,
+) -> None:
+    root = install_preview.parent
+    write_exe(root / launcher, "")
+    command = [launcher, *args]
+    shown = [
+        launcher,
+        *(
+            reported_args
+            if reported_args is not None
+            else [
+                f"<argument hidden {i} of {len(args)}>" for i in range(1, len(args) + 1)
+            ]
+        ),
+    ]
+    prefix = ("mcp", "install", "claude", "--scope", "project")
+    config = root / ".mcp.json"
+    log_path = root / "argv.log"
+
+    planned = invoke(*prefix, "--dry-run", "--", *command)
+
+    assert planned.exit_code == 0, planned.output
+    [row] = payload(planned)["results"]
+    assert row["command"] == shown
+    assert row["argv"] == [
+        [
+            str(install_preview),
+            "mcp",
+            "add",
+            "--scope",
+            "project",
+            "sai",
+            "--env=SAI_HOME=<profile>",
+            "--",
+            *shown,
+        ]
+    ]
+    assert not config.exists()
+    assert not log_path.exists()
+
+    installed = invoke(*prefix, "--", *command)
+
+    assert installed.exit_code == 0, installed.output
+    [row] = payload(installed)["results"]
+    assert row["command"] == shown
+    assert row["argv"][0][-len(shown) :] == shown
+    entry = json.loads(config.read_text())["mcpServers"]["sai"]
+    assert entry["command"] == launcher
+    assert entry["args"] == args
+    assert entry["env"] == {"SAI_HOME": str(root / "sai-home")}
+
+
+def test_dry_run_hides_arguments_of_a_matching_legacy_entry(
+    install_preview: Path,
+) -> None:
+    launcher = write_exe(install_preview.parent / "sh", "")
+    command = ["sh", "-c", "exec sai mcp serve"]
+    shown = [str(launcher), "<argument hidden 1 of 2>", "<argument hidden 2 of 2>"]
+    config = install_preview.parent / ".mcp.json"
+    config.write_text(json.dumps({"mcpServers": {OLD_COMMAND: claude_entry(command)}}))
+
+    result = invoke("mcp", "install", "--dry-run", "--", *command)
+
+    assert result.exit_code == 0, result.output
+    report = payload(result)
+    assert report["command"] == ["sh", *shown[1:]]
+    claude = next(row for row in report["clients"] if row["client"] == "claude")
+    assert claude["registeredCommand"] == shown
+    [registration] = claude["registrations"]
+    assert registration["command"] == shown
+
+    result = invoke(
+        "mcp", "install", "claude", "--scope", "project", "--dry-run", "--", *command
+    )
+
+    assert result.exit_code == 0, result.output
+    [row] = payload(result)["results"]
+    assert row["name"] == OLD_COMMAND
+    assert row["action"] == "unchanged"
+    assert row["command"] == shown
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_noninteractive_install_listing_hides_matching_cursor_arguments(
+    install_preview: Path, json_output: bool
+) -> None:
+    root = install_preview.parent
+    launcher = write_exe(root / "sh", "")
+    script = "APP_MODE='fixture-wrapper-value' exec sai mcp serve"
+    command = [str(launcher), "-c", script]
+    config = root / ".cursor/mcp.json"
+    config.parent.mkdir()
+    entry = claude_entry(command, {"SAI_HOME": str(root / "sai-home")})
+    original = json.dumps({"mcpServers": {"sai": entry}})
+    config.write_text(original)
+
+    flags = ["--json"] if json_output else []
+    result = CliRunner().invoke(main, [*flags, "mcp", "install", "--", *command])
+
+    assert result.exit_code == 0, result.output
+    assert "fixture-wrapper-value" not in result.output
+    report = payload(result)
+    shown = [str(launcher), "<argument hidden 1 of 2>", "<argument hidden 2 of 2>"]
+    assert report["command"] == shown
+    cursor = next(row for row in report["clients"] if row["client"] == "cursor")
+    assert cursor["current"]
+    assert cursor["registeredCommand"] == shown
+    assert cursor["registrations"]
+    assert all(reg["command"] == shown for reg in cursor["registrations"])
+    assert config.read_text() == original
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_mcp_listings_report_sai_environment_names_and_count_other_entries(
+    install_preview: Path, json_output: bool
+) -> None:
+    root = install_preview.parent
+    launcher = write_exe(root / "sai", "")
+    write_exe(root / "codex", FAKE_CODEX)
+    (root / "codex-home").mkdir()
+    (root / ".cursor").mkdir()
+    command = [str(launcher), "mcp", "serve"]
+    marker = "fixture-env-value"
+    bare_token = "fixtureBareToken_71"
+    prefixed_token = "SAI_FIXTURE_WRAPPER_71"
+    profile = str(root / "sai-home")
+    json_entry = claude_entry(
+        command,
+        {
+            "SAI_HOME": profile,
+            "APP_MODE": marker,
+            f"APP_TOKEN={marker}=suffix": marker,
+            "APP_TOKEN": marker,
+            f"invalid name={marker}": marker,
+            bare_token: marker,
+            prefixed_token: marker,
+            "SAI_WS_ENDPOINT": marker,
+            f"SAI_ENDPOINT={marker}": marker,
+        },
+    )
+    codex_entry = claude_entry(command, {"SAI_HOME": profile})
+    codex_entry["env_vars"] = [
+        f"CODEX_TOKEN={marker}=suffix",
+        "CODEX_TOKEN",
+        "_APP_MODE_2",
+        f"invalid name {marker}",
+        f"={marker}",
+        bare_token,
+        bare_token,
+        prefixed_token,
+        f"{prefixed_token}={marker}",
+        f"SAI_LCD_ENDPOINT={marker}",
+        f"SAI_NATIVE_UV_PREFIX={marker}",
+    ]
+    files = {
+        root / ".claude.json": json.dumps({"mcpServers": {"sai": json_entry}}),
+        root / ".cursor/mcp.json": json.dumps({"mcpServers": {"sai": json_entry}}),
+        root / "codex-home/config.toml": tomlkit.dumps(
+            {"mcp_servers": {"sai": codex_entry}}
+        ),
+    }
+    for path, data in files.items():
+        path.write_text(data)
+
+    flags = ["--json"] if json_output else []
+    for invocation in (
+        ["list"],
+        ["install", "--", *command],
+        ["install", "--dry-run", "--", *command],
+    ):
+        result = CliRunner().invoke(main, [*flags, "mcp", *invocation])
+
+        assert result.exit_code == 0, result.output
+        assert marker not in result.output
+        assert bare_token not in result.output
+        assert prefixed_token not in result.output
+        rows = payload(result)["clients"]
+        assert {row["client"] for row in rows} == {"claude", "codex", "cursor"}
+        for row in rows:
+            expected = (
+                ["SAI_LCD_ENDPOINT", "SAI_NATIVE_UV_PREFIX", "9 other entries"]
+                if row["client"] == "codex"
+                else ["SAI_ENDPOINT", "SAI_WS_ENDPOINT", "6 other entries"]
+            )
+            assert row["registered"] and not row["current"]
+            assert row["staleEnv"] == expected
+            assert row["registrations"]
+            assert all(reg["staleEnv"] == expected for reg in row["registrations"])
+        assert {path: path.read_text() for path in files} == files
+
+
+@pytest.mark.parametrize(
+    ("launcher", "executable"),
+    [
+        ("sai", True),
+        ("bin/wrapper", True),
+        ("slot=staging/wrapper", True),
+        ("opaque-fixture-saved", False),
+        ("MODE=fixture-saved", False),
+        ("-fixture-saved", False),
+        ("sh -c /saved/fixture-saved", False),
+    ],
+    ids=[
+        "matching",
+        "path",
+        "path-assignment",
+        "opaque",
+        "assignment",
+        "option",
+        "shell",
+    ],
+)
+def test_dry_run_lists_saved_commands_for_all_clients(
+    install_preview: Path, launcher: str, executable: bool
+) -> None:
+    root = install_preview.parent
+    write_exe(root / "sai", "")
+    resolved = None
+    if executable:
+        path = root / launcher
+        path.parent.mkdir(exist_ok=True)
+        resolved = str(write_exe(path, ""))
+        if "/" in launcher:
+            launcher = resolved
+    write_exe(root / "codex", FAKE_CODEX)
+    (root / "codex-home").mkdir()
+    (root / ".cursor").mkdir()
+    args = ["mcp", "serve", "--endpoint", "http://127.0.0.1:8765/api?key=fixture-saved"]
+    entry = {"sai": claude_entry([launcher, *args])}
+    files = {
+        root / ".claude.json": json.dumps({"mcpServers": entry}),
+        root / "codex-home/config.toml": tomlkit.dumps({"mcp_servers": entry}),
+        root / ".cursor/mcp.json": json.dumps({"mcpServers": entry}),
+    }
+    for path, data in files.items():
+        path.write_text(data)
+
+    result = invoke("mcp", "install", "--dry-run", "--", "sai", *args)
+
+    assert result.exit_code == 0, result.output
+    assert "fixture-saved" not in result.output
+    report = payload(result)
+    assert report["command"] == ["sai", *args[:-1], "http://127.0.0.1:8765"]
+    assert {row["client"] for row in report["clients"]} == {"claude", "codex", "cursor"}
+    hidden = len(args) + (resolved is None)
+    shown = [
+        *([resolved] if resolved is not None else []),
+        *(f"<argument hidden {i} of {hidden}>" for i in range(1, hidden + 1)),
+    ]
+    for row in report["clients"]:
+        assert row["registeredCommand"] == shown
+        assert row["registrations"]
+        assert all(reg["command"] == shown for reg in row["registrations"])
+    assert {path: path.read_text() for path in files} == files
+
+
 def test_cursor_keeps_other_servers_and_the_file_mode(env: Env):
     path = env.cursor_path()
     path.parent.mkdir()
@@ -2148,13 +2566,18 @@ def test_default_uv_cache_is_refused_without_variables(env: Env, monkeypatch):
 
 
 def test_argv_after_dash_overrides_the_sai_on_path(env: Env):
+    write_exe(env.bin / "uv", "")
     dev = ["uv", "run", "--directory", "/src/open-sai", "sai", "mcp", "serve"]
     result = invoke("mcp", "install", "claude", "--", *dev)
     assert result.exit_code == 0, result.output
     assert env.calls() == [
         ["mcp", "add", "--scope", "user", "sai", "--", *dev],
     ]
-    assert payload(result)["results"][0]["command"] == dev
+    [row] = payload(result)["results"]
+    assert row["command"] == [
+        "uv",
+        *(f"<argument hidden {i} of 6>" for i in range(1, 7)),
+    ]
 
 
 def test_install_warns_about_a_different_install(env: Env, monkeypatch):
@@ -2316,7 +2739,7 @@ def test_list_reads_only_the_sai_entry_and_prints_no_secrets(env: Env):
     assert rows["claude"]["scope"] == "user"
     # The codex entry runs the right command but carries an extra env name.
     assert rows["codex"]["current"] is False
-    assert rows["codex"]["staleEnv"] == ["TOKEN"]
+    assert rows["codex"]["staleEnv"] == ["1 other entry"]
     assert rows["cursor"]["registered"] is False
     assert set(rows["claude"]) == {
         "client",
@@ -2857,12 +3280,13 @@ def test_claude_install_reports_scoped_commands_without_credentials(
     assert f"Remove the existing {scope} sai entry" in row["fix"]
     assert f"The {scope} sai entry in {config} differs in env." in row["fix"]
     assert (
-        f"claude mcp add --scope {scope} sai {shlex.quote(f'--env=SAI_HOME={profile}')}"
+        f"claude mcp add --scope {scope} sai '--env=SAI_HOME=<profile>'"
         f" '--env=<NAME>=<value>' -- {shlex.quote(str(env.sai))}"
         " '<original-argument>' '<original-argument>'"
     ) in row["fix"]
     assert "substitute your requested command" in row["fix"]
     assert SECRET not in output and OTHER not in output
+    assert str(profile) not in output
     assert config.read_bytes() == before
     assert not env.calls()
 

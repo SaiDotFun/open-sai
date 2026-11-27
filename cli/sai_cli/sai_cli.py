@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import shlex
+import shutil
 import sqlite3
 import sys
 import time
@@ -2390,11 +2391,16 @@ def mcp_install_command(
     With no CLIENT and no --all, a terminal asks which clients to register;
     without a terminal, this lists detected clients and changes nothing.
     """
+    server_argv = ctx.meta.get("server_argv")
+    if server_argv and shutil.which(server_argv[0]) is None:
+        raise click.UsageError(
+            "Give an existing executable as the server launcher after `--`.", ctx
+        )
     names = chosen_clients((*clients, *client_options))
     if reset_args and repair_existing is None:
         raise click.UsageError("--reset-args requires --repair-existing.")
     if repair_existing is not None and (
-        names != ["claude"] or all_clients or ctx.meta.get("server_argv")
+        names != ["claude"] or all_clients or server_argv
     ):
         raise click.UsageError(
             "--repair-existing requires --client claude and the default server command."
@@ -2426,8 +2432,10 @@ def mcp_install_command(
             emit(
                 ctx,
                 {
-                    "command": target.argv,
-                    "clients": mcp_install.list_clients(found, target),
+                    "command": target.reported_argv(),
+                    "clients": mcp_install.list_clients(
+                        found, target, install_report=True
+                    ),
                 },
             )
             warn(
