@@ -63,6 +63,29 @@ def test_remove_margin_when_index_lags_or_changes(scenario):
                         }
                     }
                 )
+            elif "get_market" in query:
+                self.reply(
+                    {
+                        "data": {
+                            "base": "TokenIndex(7)",
+                            "quote": "TokenIndex(0)",
+                            "group_index": "GroupIndex(0)",
+                        }
+                    }
+                )
+            elif "get_oracle_address" in query:
+                self.reply({"data": "nibi1fixtureoracle"})
+            elif "get_exchange_rate" in query:
+                assert query["get_exchange_rate"] == {"base": 7, "quote": 0}
+                assert "/nibi1fixtureoracle/smart/" in path
+                assert self.headers.get("x-cosmos-block-height") == "900"
+                self.reply(
+                    {"data": {"base_per_quote": "100", "base_last_update_time": 1}}
+                )
+            elif "market_order_config" in query:
+                self.reply({"data": {"fill_at_next_oracle_price": False}})
+            elif "get_group" in query:
+                self.reply({"data": {"stale_price_expiration_secs": 0}})
             elif "is_after_hours_market" in query:
                 assert query["is_after_hours_market"] == {
                     "market_index": "MarketIndex(0)"
