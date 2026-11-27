@@ -715,16 +715,6 @@ def collateral_price(
     )
 
 
-def optional_collateral_price(
-    lcd: str, state: PositionSnapshot, *, height: str | None = None
-) -> Decimal | None:
-    try:
-        price = collateral_price(lcd, state, height=height)
-        return price if price > 0 else None
-    except (ValueError, TypeError, KeyError):
-        return None
-
-
 def collateral_usd(before: int, after: int) -> dict[str, str]:
     def usd(amount: int) -> str:
         return format(Decimal(f"{amount}e-6"), "f").rstrip("0").rstrip(".")
