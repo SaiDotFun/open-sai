@@ -495,32 +495,47 @@ def test_mcp_partial_close_withholds_digest_when_leverage_is_unknown(
     assert previews[0] == previews[1]
 
 
-def test_mcp_partial_close_confirms_without_usdc_oracle_price(
-    mcp_pair: tuple[Path, Path], tmp_path: Path
+@pytest.mark.parametrize(
+    ("action", "kind", "args", "scenario"),
+    [
+        ("close", "CLOSE_POSITION", POSITION, "quote-usdc-oracle-outage"),
+        (
+            "partial_close",
+            "DECREASE_POSITION_SIZE",
+            {**POSITION, "percent": 50},
+            "partial-usdc-oracle-outage",
+        ),
+    ],
+)
+def test_mcp_close_confirms_without_usdc_oracle_price(
+    mcp_pair: tuple[Path, Path],
+    tmp_path: Path,
+    action: str,
+    kind: str,
+    args: dict[str, Any],
+    scenario: str,
 ) -> None:
-    python = Path(sys.executable).with_name("sai")
-    args = {**POSITION, "percent": 50}
-    digests = []
-    for index, cli in enumerate((python, mcp_pair[1])):
+    # Python main needs the USDC rate or the combined Perp price query
+    # (README "Fixed USDC Price"), so only the native server runs.
+    for index, cli in [(1, mcp_pair[1])]:
         home = tmp_path / str(index)
-        replay = TradeReplay("DECREASE_POSITION_SIZE", "7")
+        replay = TradeReplay(kind, "7")
         with (
-            loopback("partial-usdc-oracle-outage", trade_replay=replay) as endpoints,
+            loopback(scenario, trade_replay=replay) as endpoints,
             server(cli, home, endpoints, seed="session", receive_timeout=15) as stdio,
         ):
-            preview = result(stdio.call(2, "preview_partial_close", **args))
+            preview = result(stdio.call(2, f"preview_{action}", **args))
             assert preview.get("previewDigest"), cli
-            assert preview["quote"]["collateralPriceUsd"] == "1"
-            assert (
-                preview["quote"]["closedNotionalUsd"]
-                == preview["quote"]["closedNotionalUsdc"]
-            )
-            assert preview["quote"]["closedNotionalIsEstimate"] is False
+            if action == "partial_close":
+                quote = preview["quote"]
+                assert quote["collateralPriceUsd"] == "1"
+                assert quote["closedNotionalUsd"] == quote["closedNotionalUsdc"]
+                assert quote["closedNotionalIsEstimate"] is False
             assert not replay.attempts()
             assert not rows(home)
 
             accepted = result(
-                stdio.call(3, "trade_partial_close", **trade_args(preview, args))
+                stdio.call(3, f"trade_{action}", **trade_args(preview, args))
             )
             assert accepted["status"] == "accepted"
             key = accepted["intentKey"]
@@ -528,12 +543,17 @@ def test_mcp_partial_close_confirms_without_usdc_oracle_price(
             [row] = rows(home)
             assert (row[0], row[2]) == (key, "accepted")
             assert not endpoints.errors
-            assert any(request.label == "get_perp_prices" for request in endpoints.wire)
-            assert all(
-                request.label != "get_collateral_price" for request in endpoints.wire
-            )
-            digests.append(preview["previewDigest"])
-    assert digests[0] == digests[1]
+            labels = {request.label for request in endpoints.wire}
+            assert "get_exchange_rate" in labels
+            assert not labels & {"get_perp_prices", "get_collateral_price"}
+            [intent] = [
+                entry.variables["input"]["intent"]
+                for entry in endpoints.wire
+                if entry.label == "recordUserIntent"
+            ]
+            assert {field: intent[field] for field in preview["intent"]} == preview[
+                "intent"
+            ]
 
 
 def test_mcp_open_binds_the_selected_account(

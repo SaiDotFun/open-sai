@@ -40,6 +40,7 @@ OTHER_ADDRESS = "0x" + "2" * 40
 INTENT = "parity-close-7"
 HISTORY_SESSION_TOKEN = "e7" * 32
 CONTRACT = "nibi1syntheticfixture"
+ORACLE_CONTRACT = "nibi1fixtureoracle"
 TRADE_REQUEST_HASH = "AB" * 32
 NODE_INFO = "/cosmos/base/tendermint/v1beta1/node_info"
 HEIGHT_HEADER = "x-cosmos-block-height"
@@ -435,6 +436,8 @@ def loopback(
     balance_block_reads: bool = False,
     overview_delay: float = 0,
     wrong_balance_at: Literal["snapshot", "pinned"] | None = None,
+    market_oracle: Literal["unavailable", "stale"] | None = None,
+    queued: bool = False,
 ) -> Generator[Endpoints]:
     errors: list[str] = []
     wire: list[WireRequest] = []
@@ -685,8 +688,18 @@ def loopback(
         },
         "get_liquidation_price": {"liquidation_price": "60"},
         "quote_trade": {"data": None, "attributes": [], "events": [], "messages": []},
-        "get_market": {"fee_index": "FeeIndex(0)", "group_index": "GroupIndex(0)"},
-        "get_group": {"min_leverage": "1", "max_leverage": "100"},
+        "get_market": {
+            "base": "TokenIndex(7)",
+            "quote": "TokenIndex(0)",
+            "fee_index": "FeeIndex(0)",
+            "group_index": "GroupIndex(0)",
+        },
+        "get_oracle_address": ORACLE_CONTRACT,
+        "get_group": {
+            "min_leverage": "1",
+            "max_leverage": "100",
+            "stale_price_expiration_secs": 0,
+        },
         "get_pair_custom_max_leverage": "0",
         "get_fees": {
             "min_position_size_usd": str(market["minPositionSizeUSD"]),
@@ -711,7 +724,19 @@ def loopback(
         contracts["get_collateral_price"] = "0.987654321098765432"
     if scenario in {"position-index-lag", "position-index-lag-recovers"}:
         contracts["get_trade_raw"]["collateral_amount"] = "10000001"
-    if scenario in POSITION_SCENARIOS:
+    if (
+        scenario in POSITION_SCENARIOS
+        or close_target == "verified"
+        or scenario == "concurrent-close"
+    ):
+        contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
+    if close_target == "verified" or scenario == "concurrent-close":
+        # These synthetic admission fixtures do not model liquidation.
+        contracts["market_order_config"]["fill_at_next_oracle_price"] = True
+    if scenario in POSITION_SCENARIOS - {
+        "partial-price-changed",
+        "partial-usdc-oracle-outage",
+    }:
         contracts["get_trade_raw"].pop("long", None)
     if scenario.startswith("position-execution-"):
         contracts["get_group"]["stale_price_expiration_secs"] = 0
@@ -733,7 +758,11 @@ def loopback(
     if scenario in {"position-after-hours", "position-malformed-after-hours-cap"}:
         contracts.update(
             is_after_hours_market=True,
-            get_market={"block_last_opened": 110, "block_last_closed": 100},
+            get_market={
+                **contracts["get_market"],
+                "block_last_opened": 110,
+                "block_last_closed": 100,
+            },
             get_trade_infos=[{"created_block": 90}],
             get_after_hours_leverage=(
                 "malformed"
@@ -765,12 +794,24 @@ def loopback(
     }:
         contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
         contracts["get_group"]["stale_price_expiration_secs"] = 0
+    if scenario in {"quote-usdc-oracle-outage", "quote-usdc-oracle-off-peg"}:
+        contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
+        contracts["get_group"]["stale_price_expiration_secs"] = 0
+        if scenario == "quote-usdc-oracle-off-peg":
+            contracts["get_collateral_price"] = "0.75"
+            contracts["get_perp_prices"]["collateral"] = "0.75"
     if scenario in {"quote-stale", "quote-queued"}:
         contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
         contracts["get_group"]["stale_price_expiration_secs"] = 30
         contracts["market_order_config"] = {
             "fill_at_next_oracle_price": scenario == "quote-queued"
         }
+    if scenario == "quote-queued":
+        contracts["get_group"]["stale_price_expiration_secs"] = 0
+    if market_oracle is not None:
+        contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
+        contracts["get_group"]["stale_price_expiration_secs"] = 30
+        contracts["market_order_config"]["fill_at_next_oracle_price"] = queued
     if scenario == "quote-after-hours":
         contracts.update(is_after_hours_market=True, get_after_hours_leverage="1.1")
         contracts["get_market"].update(block_last_opened=50, block_last_closed=100)
@@ -795,6 +836,8 @@ def loopback(
         "market_order_config": {},
         "get_collateral_price": {"collateral_index": token_index},
         "get_market": {"index": market_index},
+        "get_oracle_address": {},
+        "get_exchange_rate": {"base": 7, "quote": 0},
         "get_trade_infos": {
             "trader": trader,
             "start_idx": 7,
@@ -840,7 +883,11 @@ def loopback(
     }.get(scenario)
 
     def contract_data(name: str, *, pinned: bool) -> Any:
-        data = contracts[name]
+        data = (
+            contracts["get_perp_prices"]["market"]
+            if name == "get_exchange_rate"
+            else contracts[name]
+        )
         if name == "get_exchange_balance" and wrong_balance_at == (
             "pinned" if pinned else "snapshot"
         ):
@@ -1454,12 +1501,19 @@ def loopback(
                     self.releases()
                     return
                 prefix = f"/cosmwasm/wasm/v1/contract/{contract}/smart/"
+                oracle_prefix = f"/cosmwasm/wasm/v1/contract/{ORACLE_CONTRACT}/smart/"
+                oracle_read = path.startswith(oracle_prefix)
+                if oracle_read:
+                    prefix = oracle_prefix
                 if path.startswith(prefix):
                     try:
                         query = json.loads(
                             base64.b64decode(unquote(path.removeprefix(prefix)))
                         )
                         [name] = query
+                        if oracle_read != (name == "get_exchange_rate"):
+                            self.reject(f"Wrong contract for {name}")
+                            return
                         expected = contract_args[name]
                         if (
                             scenario == "position-equivalent-owner"
@@ -1500,9 +1554,13 @@ def loopback(
                                 -1,
                             )
                             quote_reads = wire[last_position + 1 :]
-                            pinned = name == "get_perp_prices" or any(
-                                request.label == "get_perp_prices"
-                                for request in quote_reads
+                            market_reads = {
+                                "get_perp_prices",
+                                "get_oracle_address",
+                                "get_exchange_rate",
+                            }
+                            pinned = name in market_reads or any(
+                                request.label in market_reads for request in quote_reads
                             )
                             anchor = name == "get_trade_raw" and any(
                                 request.label == "get_exchange_balance"
@@ -1522,6 +1580,14 @@ def loopback(
                                 self.reject(f"Expected a fresh {name} query")
                                 return
                         wire.append(WireRequest(name, variables=query))
+                        if market_oracle == "unavailable" and name in {
+                            "get_exchange_rate",
+                            "get_perp_prices",
+                        }:
+                            self.reply(
+                                {"message": "Market exchange rate unavailable"}, 503
+                            )
+                            return
                         if scenario in POSITION_SCENARIOS or scenario.startswith(
                             "position-execution-"
                         ):
@@ -1536,6 +1602,15 @@ def loopback(
                                     "message": "type: cosmwasm_std::math::decimal::Decimal; key: [00] not found"
                                 },
                                 500,
+                            )
+                            return
+                        if scenario == "quote-usdc-oracle-outage" and name in {
+                            "get_collateral_price",
+                            "get_perp_prices",
+                            "get_liquidation_price",
+                        }:
+                            self.reply(
+                                {"message": "USDC exchange rate unavailable"}, 503
                             )
                             return
                         if name == "get_fees" and scenario == "quote-fee-read-error":
@@ -1647,15 +1722,13 @@ def loopback(
             ):
                 self.reply({}, 503)
                 return
-            if (
-                scenario == "partial-usdc-oracle-outage"
-                and name == "get_collateral_price"
-            ):
-                self.reply({}, 503)
+            if scenario == "partial-usdc-oracle-outage" and name in {
+                "get_collateral_price",
+                "get_perp_prices",
+            }:
+                self.reply({"message": "USDC exchange rate unavailable"}, 503)
                 return
             data = contract_data(name, pinned=pinned)
-            if scenario == "partial-usdc-oracle-outage" and name == "get_perp_prices":
-                data = {**data, "collateral": None}
             if name == "get_exchange_balance" and (
                 scenario == "position-execution-unfunded"
                 or (scenario == "position-execution-pinned-unfunded" and pinned)

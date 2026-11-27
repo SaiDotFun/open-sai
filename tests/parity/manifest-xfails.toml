@@ -515,12 +515,12 @@ signature = "5ae8c49462c0c2a01cfe44d95295174f5bdfb9bfc2899af7198e98a42bd0de7d"
 [gap."case:skill-install"]
 owner = "#171"
 title = "Matches Python main. Both install the same bundled skill files and report the same source metadata."
-signature = "4cd6006cfdd5d5873e75e4be8435d6a87e534421f8152270b4eba8a256b6fe94"
+signature = "fb681b9ad14402cd87ce65e4c033e13d1f2cdebd868464ae0594f8307405c294"
 
 [gap."case:skill-page"]
 owner = "#171"
 title = "Matches Python main. Both emit the same bundled skill text."
-signature = "bbba576bda87b5f0db4d7b22ea601921f457ad8f1a279f2274bf67a9afa389fa"
+signature = "ac694c3a6e5b6e62071e1748a1562ffbf49a6c028c01344aacbd4183fe3e4bbb"
 
 [gap."case:skill-show"]
 owner = "#171"
@@ -550,7 +550,7 @@ signature = "866e192520eeeb1c7bc98f00573be7158e9f797c43a29d596c42d42fa157aa95"
 
 [gap."case:trade-concurrent-close"]
 owner = "#174"
-signature = "128757aa7c8cd1da9b691ce38413eac6610dee99bf0b5ef1b234bb2bb4b357bd"
+signature = "ee620d557b9aaa98d05641bce515e6448d93d04c21e87294ba2c2592e40bc8fb"
 
 [gap."case:trade-leverage"]
 owner = "#174"
@@ -562,7 +562,7 @@ signature = "4269bbfb0e53923bd9134fb0b5e9767e03a1effdf2689e72597fd0f705e8f07e"
 
 [gap."case:trade-margin-accepted"]
 owner = "#174"
-signature = "a3060825112094e10969fa43db75eb358edbf8a4f997f16ed9aecff91e92849a"
+signature = "a9efbdd68197dad827008734d01c42ea68fb48edc3b0f8498de32189aa025b2f"
 
 [gap."case:trade-margin-add-rounding"]
 owner = "#231"
@@ -587,7 +587,7 @@ signature = "3e39c6cc4d1f37a135e532a47b5a1e0dde6d6d73fd2e67e53b0933f340a0634b"
 [gap."case:trade-margin-equivalent-owner"]
 owner = "#174"
 title = "Differs from Python main. Rust makes extra validation reads before submitting for an equivalent owner."
-signature = "6b842ebc30bada8cd41aa9045ba28aebf0ff35b8677dc6f9befd9f8962264ac6"
+signature = "80e9822f1ef14861aee9efc7d13305e17ff07d0844a930c103f3305884d7a168"
 
 [gap."case:trade-margin-foreign-contract-owner"]
 owner = "#49"
@@ -616,7 +616,7 @@ signature = "c31c076f2a5480bc0a961f1f557b80545ac070b45ca9e508b916596bdb894d46"
 
 [gap."case:trade-margin-rejected"]
 owner = "#174"
-signature = "1d33714dd23a06abaa909bb5e5d76016d764ffe619e576a4812ffdd953cb72a0"
+signature = "754f7e213433010b6dd71c125b75c074c5c654b94cfcffb8e399f4946c254a6c"
 
 [gap."case:trade-margin-remove-rounding"]
 owner = "#231"
@@ -630,7 +630,7 @@ signature = "3290d000c84dce5128ae890bde3c57928de183ecd2c6dfdc33b37bbab775b414"
 
 [gap."case:trade-margin-unknown-blocks-retry"]
 owner = "#174"
-signature = "51827945d31a077108bd9083d38ccfae47712825be2ae9009cd8191168826080"
+signature = "f696b876c747f2f3f25d5ca582911af9f06442992f6fdddf58ce35ffa988022c"
 
 [gap."case:trade-margin-wrong-contract-index"]
 owner = "#49"
@@ -644,7 +644,7 @@ signature = "6f14fe32d261f14c6bb0ff659fcdefe89f62840b9caf2a83fd2e383c8bb4ff7b"
 
 [gap."case:trade-open-market"]
 owner = "#174"
-signature = "3c5f48337554226c928feab80fac67ea1a5df8fd22a4c0bf7639bb5cb9339446"
+signature = "28c31ae3c1844dbd7d085ab020635499fd074820255fbb2f23f86f61649bd715"
 
 [gap."case:trade-open-missing-side-json"]
 owner = "#172"
@@ -664,20 +664,20 @@ signature = "61313b81f4af139bb27ef9b7f77355143aa3fd54393c87e47eec75ed0258536c"
 
 [gap."case:trade-partial-close"]
 owner = "#140"
-signature = "6a2812254a046e26521d96b97c60fbb5238777ea600cf446683c467ea3590c36"
+signature = "ca7d701bbf3e8d21f85473bfcf8578da436d9a454dbd0943e7046366702d83c4"
 
 [gap."case:trade-partial-close-accepted"]
 owner = "#174"
-signature = "d38977cc7792bdac5ee5aa123aa4245965cf4b041ff5aaae906598720c36bc08"
+signature = "5043b94aa261baeedcb8d0e87719a415d669d761f02e0d3149c3ddc157a89521"
 
 [gap."case:trade-partial-close-after-hours"]
 owner = "#174"
 title = "Matches Python main for the after-hours partial-close preview."
-signature = "4c6b9c00eddd5113c61fda62f83311ce1e97913dec9146f9ab9048c228f9a13f"
+signature = "9128d43d51121a02ba0037e0ebfa31da5219ccbb17811a64a1ed2000725f8cbd"
 
 [gap."case:trade-partial-close-confirm-current-route"]
 owner = "#174"
-signature = "2266b65d07efc78298b68211c400100eb15bf335dcdb955d32d9e04e699c0f75"
+signature = "e361732f3294c8bf331fe72a37a27b886edf99cef1b0c3150efc6fcf45a8430d"
 
 [gap."case:trade-partial-close-index-lag-before-minimum"]
 owner = "#174"
@@ -697,7 +697,7 @@ signature = "56a6650730701052d1895a5c7b06591a0faed6885b30a4a64b3f4e8d146e8c43"
 [gap."case:trade-partial-close-live-leverage-change"]
 owner = "#174"
 title = "Differs from Python main in the error log. Both reject the stale preview after rechecking the position."
-signature = "eb68d65d0845603f9b0576fbe973dcd50ade8ae3e6aab7ea64f8d11d722b01af"
+signature = "ad7670fb451638dc7b6aa9db6dbfaacd2df042c149229042a8daded4d1c0d48b"
 
 [gap."case:trade-partial-close-malformed-percent"]
 owner = "#49"
@@ -707,20 +707,20 @@ signature = "4f264b3264ad84549e26b00b867dde006e21ebbbf3db9a775a0569f29b186228"
 [gap."case:trade-partial-close-market-minimum"]
 owner = "#174"
 title = "Matches Python main for the 99% partial-close preview."
-signature = "7e1ec85b7dea610dbf3e800d1f5cda38d559a5999043874b860e22092eba362a"
+signature = "121bed116fd50c2ff4e91c8b43382f0ed5344b28e5c0b2658ee1642b0989516a"
 
 [gap."case:trade-partial-close-no-oracle"]
 owner = "#174"
-title = "Differs from Python main. Rust withholds the partial-close digest when the collateral price is unavailable."
-signature = "6d1f1fdd8a01211587ee71a9c696742adbcefb127187b8e255677c3b9235e5a4"
+title = "Released Python still reads the USDC rate. The current preview quotes one dollar per USDC."
+signature = "4648add5baef78f31e1b85dbafd6b2691df7a1dec6f316ea6e02b00de22eeb97"
 
 [gap."case:trade-partial-close-refuse-stale-chain"]
 owner = "#174"
-signature = "bea5866d3806e635e313f31d71513f94c0a2ea8a660cba286ba673e041851cd7"
+signature = "be7046609cc95470fdc8d83d715121bd221ba145503e247a3af6b6876088ff0e"
 
 [gap."case:trade-partial-close-refuse-stale-contract"]
 owner = "#174"
-signature = "bea5866d3806e635e313f31d71513f94c0a2ea8a660cba286ba673e041851cd7"
+signature = "be7046609cc95470fdc8d83d715121bd221ba145503e247a3af6b6876088ff0e"
 
 [gap."case:trade-partial-close-refuse-wrong-lcd-on-confirm"]
 owner = "#174"
@@ -729,12 +729,12 @@ signature = "15b880ff6d30e09b3dd13222889d760bc53304aeb57e00436331a1a06acc73a3"
 [gap."case:trade-partial-close-rounding"]
 owner = "#174"
 title = "Matches Python main for the partial-close rounding preview."
-signature = "935cd5283de28535cf0bbe6e62dfebb5dff87e027904144e4b3485a1297434eb"
+signature = "9e4872eab774530da699cd141de65bac3ae75d12663eed5c21aa1be0f2518aa9"
 
 [gap."case:trade-partial-close-scientific-reduction"]
 owner = "#174"
 title = "Matches Python main for the partial-close preview with a reduction in scientific notation."
-signature = "42a8fcab94344028ba1b214addab6cf937da48ead8445f9af1083e0db5b80b58"
+signature = "172e977a334b74eabefc8c2a70a35650234bd7e2ab1bd3dde73cd60756eb1e34"
 
 [gap."case:trade-partial-close-unicode-percent"]
 owner = "#139"
@@ -742,7 +742,7 @@ signature = "5b545493cbedb49797318e5516595b2029764cc350bda78b5c3493f002389a5e"
 
 [gap."case:trade-partial-close-unknown-blocks-retry"]
 owner = "#174"
-signature = "1f8e56f0faec6780a8460e01f522c6aac03467f89b72297ac69cb9779b369abc"
+signature = "150574bac35091d382a56d0cd347903b0d46de79a128f2cf8044709568be8f06"
 
 [gap."case:trade-tpsl"]
 owner = "#174"

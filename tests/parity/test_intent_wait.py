@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import signal
 import sqlite3
 import subprocess
@@ -12,6 +13,7 @@ import time
 from contextlib import closing
 from copy import deepcopy
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +35,19 @@ from test_intent_status import (
     seed,
 )
 
+# Rust adds a dollar field beside each receipt collateral amount in base
+# units. The pinned Python reports base units only (#231).
+RECEIPT_USD = re.compile(
+    rb', "(?:sizeCollateralUsd|escrowedCollateralUsd|collateralUsd|openCollateralUsd)"'
+    rb': (?:null|"[0-9.]+")'
+)
 REQUEST_BLOCK = 50109595
+
+
+def usd(units: int) -> str:
+    return format(Decimal(units).scaleb(-6), "f").rstrip("0").rstrip(".")
+
+
 FILL_BLOCK = 50109596
 OPAQUE = "fixture-upstream-private-text"
 PRIVATE_KEEPER_HINT = (
@@ -296,7 +310,7 @@ def ledger_state(home: Path) -> list[tuple[str, str, str | None]]:
 
 
 def assert_wait_keeps_interrupted_fill(
-    cli: CLI, home: Path, monkeypatch: pytest.MonkeyPatch
+    cli: CLI, home: Path, monkeypatch: pytest.MonkeyPatch, *, native: bool = False
 ) -> None:
     lookup_started = threading.Event()
     release_lookup = threading.Event()
@@ -345,6 +359,9 @@ def assert_wait_keeps_interrupted_fill(
         receipt = document["receipt"]
         assert receipt["execution"]["block"] == FILL_BLOCK
         assert receipt["execution"]["historyId"] == fill["id"]
+        if native:
+            assert receipt["fill"].pop("sizeCollateralUsd") is None
+            assert receipt["fill"].pop("escrowedCollateralUsd") == "4"
         assert receipt["fill"] == {
             "price": None,
             "sizeCollateralBaseUnits": None,
@@ -367,7 +384,9 @@ def test_python_wait_keeps_interrupted_fill(
 def test_rust_wait_keeps_interrupted_fill(
     cli_pair: tuple[CLI, CLI], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    assert_wait_keeps_interrupted_fill(cli_pair[1], tmp_path / "sai", monkeypatch)
+    assert_wait_keeps_interrupted_fill(
+        cli_pair[1], tmp_path / "sai", monkeypatch, native=True
+    )
 
 
 def test_wait_scrubs_a_stored_token_shaped_like_a_history_hash(
@@ -496,12 +515,18 @@ def test_wait_requires_execution_block_position_for_fill(
             assert OPAQUE.encode() not in result.stdout
             document = json.loads(result.stdout)
             assert document["outcome"] == "filled"
-            assert document["receipt"]["fill"] == {
+            expected = {
                 "price": price,
                 "sizeCollateralBaseUnits": size,
                 "oraclePrice": "81000.50",
                 "escrowedCollateralBaseUnits": 4_000_000,
             }
+            if index:
+                expected |= {
+                    "sizeCollateralUsd": None if size is None else usd(size),
+                    "escrowedCollateralUsd": "4",
+                }
+            assert document["receipt"]["fill"] == expected
             assert len(requests) == 3
             query = json.loads(requests[-1].body)
             assert "lastUpdatedBlock { block }" in query["query"]
@@ -599,13 +624,17 @@ def test_intent_wait(
                 assert document["receipt"]["requestTxHash"] == "a" * 64
                 assert document["receipt"]["execution"]["block"] == FILL_BLOCK
                 assert document["receipt"]["positionNow"]["openPrice"] == 87_000
-                assert document["receipt"]["fill"] == {
+                fill = document["receipt"]["fill"]
+                if index:
+                    assert fill.pop("sizeCollateralUsd") is None
+                    assert fill.pop("escrowedCollateralUsd") == "4"
+                assert fill == {
                     "price": None,
                     "sizeCollateralBaseUnits": None,
                     "oraclePrice": "81000.50",
                     "escrowedCollateralBaseUnits": 4_000_000,
                 }
-            output = result.stdout
+            output = RECEIPT_USD.sub(b"", result.stdout) if index else result.stdout
             if case.outcome == "unknown":
                 output = document if index else with_timeout_warning(document)
             observed.append((output, wire, ledger))
@@ -660,7 +689,14 @@ def test_wait_account_first_matches_python(
             assert result.returncode == 0, result
             assert result.stderr == b""
             assert len(requests) == 2
-            results.append(json.loads(result.stdout))
+            document = json.loads(result.stdout)
+            if index:
+                receipt = document["receipt"]
+                assert receipt["fill"].pop("sizeCollateralUsd") is None
+                assert receipt["fill"].pop("escrowedCollateralUsd") == "4"
+                for field in ("collateralUsd", "openCollateralUsd"):
+                    receipt["positionNow"].pop(field, None)
+            results.append(document)
     assert results[0] == results[1]
 
 

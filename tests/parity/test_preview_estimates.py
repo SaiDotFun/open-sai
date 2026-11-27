@@ -9,18 +9,38 @@ import sys
 from pathlib import Path
 
 import pytest
+from python_main_usdc import fixed_usdc_price
 from scenarios import child_env, loopback, seed_home
 from test_trade import CANCEL, CLI, CLOSE, OBSERVED_AT, OPEN, rows, run
 
 OPEN_READS = (
     "borrowings oneClickTrading node_info get_market get_group "
-    "get_pair_custom_max_leverage get_fees get_collateral_price"
+    "get_pair_custom_max_leverage get_fees"
 )
 OWNER_READS = "trade oneClickTrading node_info get_trade_raw borrowing"
-POSITION_READS = OWNER_READS + " get_exchange_balance get_trade_raw get_perp_prices"
-FRESH_READS = POSITION_READS + " market_order_config get_market get_group"
+POSITION_READS = OWNER_READS + " get_exchange_balance get_trade_raw get_market"
+ORACLE_READS = POSITION_READS + " get_oracle_address get_exchange_rate"
+FRESH_READS = ORACLE_READS + " market_order_config get_group"
 CLOSE_READS = FRESH_READS + " get_liquidation_price is_after_hours_market"
 STALE_READS = FRESH_READS + " block"
+# Python main reads the combined Perp price query and the USDC oracle rate.
+PYTHON_POSITION_READS = (
+    OWNER_READS + " get_exchange_balance get_trade_raw get_perp_prices"
+)
+PYTHON_FRESH_READS = PYTHON_POSITION_READS + " market_order_config get_market get_group"
+
+
+def python_main_reads(wire: str, scenario: str) -> str:
+    """Translate the native reads to Python main's USDC-priced reads."""
+    if wire == OPEN_READS and scenario != "quote-fee-read-error":
+        return wire + " get_collateral_price"
+    if scenario == "quote-queued":
+        return PYTHON_POSITION_READS + " market_order_config"
+    if wire == POSITION_READS:
+        return PYTHON_POSITION_READS
+    if wire.startswith(FRESH_READS):
+        return PYTHON_FRESH_READS + wire.removeprefix(FRESH_READS)
+    return wire
 
 
 @pytest.fixture
@@ -35,6 +55,8 @@ def estimate_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
     ("args", "seed", "scenario", "wire", "status_field", "status"),
     [
         (OPEN, "empty", "quote-market", OPEN_READS, "fees", "estimate"),
+        (OPEN, "empty", "quote-usdc-oracle-outage", OPEN_READS, "fees", "estimate"),
+        (OPEN, "empty", "quote-usdc-oracle-off-peg", OPEN_READS, "fees", "estimate"),
         (OPEN[:-2], "empty", "quote-market", OPEN_READS, "worstCaseFill", "bound"),
         (
             (*OPEN, "--type", "limit"),
@@ -74,7 +96,7 @@ def estimate_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
             OPEN,
             "empty",
             "quote-fee-read-error",
-            OPEN_READS.removesuffix(" get_collateral_price"),
+            OPEN_READS,
             "fees",
             "unavailable",
         ),
@@ -157,7 +179,7 @@ def estimate_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
             CLOSE,
             "session",
             "quote-queued",
-            POSITION_READS + " market_order_config",
+            FRESH_READS,
             "execution",
             "unavailable",
         ),
@@ -180,6 +202,8 @@ def estimate_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
     ],
     ids=[
         "market-explicit-price",
+        "market-usdc-oracle-outage",
+        "market-usdc-oracle-off-peg",
         "market-keeper-price",
         "limit-trigger-fee",
         "stop-short",
@@ -215,10 +239,15 @@ def test_dry_run_estimates(
     status_field: str,
     status: str,
 ) -> None:
-    if args != CLOSE or seed != "empty":
+    python_main = args != CLOSE or seed != "empty"
+    if python_main:
         estimate_pair = (str(Path(sys.executable).with_name("sai")),), estimate_pair[1]
+    implementations = list(enumerate(estimate_pair))
+    if scenario.startswith("quote-usdc-oracle-"):
+        # Python main prices the fee at the failing or off-peg USDC rate.
+        implementations = implementations[1:]
     outputs = []
-    for index, cli in enumerate(estimate_pair):
+    for index, cli in implementations:
         cli_args = (*CLOSE, "--cancel-order") if index == 0 and args == CANCEL else args
         with loopback(scenario) as endpoints:
             home = tmp_path / str(index)
@@ -235,13 +264,25 @@ def test_dry_run_estimates(
             assert (completed.returncode, completed.stderr) == (0, b"")
             preview = json.loads(completed.stdout)
             assert preview["estimates"][status_field]["status"] == status
-            assert [request.label for request in endpoints.wire] == wire.split()
+            if scenario.startswith("quote-usdc-oracle-"):
+                assert preview["estimates"]["fees"]["collateralPriceUsd"] == {
+                    "price": "1",
+                    "source": "Fixed USDC price",
+                    "observedAt": None,
+                }
+            expected = wire
+            if index == 0 and python_main:
+                expected = python_main_reads(wire, scenario)
+            assert [request.label for request in endpoints.wire] == expected.split()
             assert not endpoints.errors
             assert not rows(home)
-            outputs.append(
-                json.loads(OBSERVED_AT.sub(b'"observedAt": "<time>"', completed.stdout))
+            output = json.loads(
+                OBSERVED_AT.sub(b'"observedAt": "<time>"', completed.stdout)
             )
-    assert outputs[0] == outputs[1]
+            if index == 0 and python_main:
+                output = fixed_usdc_price(output)
+            outputs.append(output)
+    assert all(output == outputs[-1] for output in outputs)
 
 
 @pytest.mark.parametrize(
