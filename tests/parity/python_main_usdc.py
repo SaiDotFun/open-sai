@@ -55,3 +55,16 @@ def usd(units: int) -> str:
     """Format USDC base units as dollars."""
     whole, fraction = divmod(units, 1_000_000)
     return f"{whole}.{fraction:06d}".rstrip("0").rstrip(".")
+
+
+def without_receipt_usd(native: dict[str, Any]) -> dict[str, Any]:
+    """Drop the dollar fields the native receipt adds beside base units."""
+    result = deepcopy(native)
+    receipt = result.get("receipt") or {}
+    for section, fields in (
+        ("fill", ("sizeCollateralUsd", "escrowedCollateralUsd")),
+        ("positionNow", ("collateralUsd", "openCollateralUsd")),
+    ):
+        for field in fields:
+            (receipt.get(section) or {}).pop(field, None)
+    return result

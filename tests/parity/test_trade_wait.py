@@ -25,6 +25,7 @@ from unittest.mock import Mock
 from urllib.parse import unquote, urlsplit
 
 import pytest
+from python_main_usdc import without_receipt_usd
 from sai_cli.core import keeper, log, storage
 from scenarios import ADDRESS, loopback, seed_home
 from test_intent_status import (
@@ -41,6 +42,7 @@ from test_intent_status import (
 )
 from test_intent_wait import (
     FILL_BLOCK,
+    RECEIPT_USD,
     REQUEST_BLOCK,
     history,
     indexed,
@@ -458,6 +460,8 @@ def test_position_size_wait_v012(
                 "waitUserIntents",
                 "intentTradeHistory",
             ]
+            if index:
+                result = without_receipt_usd(result)
             observations.append(normalized(result, key))
     assert observations[0] == observations[1]
 
@@ -664,9 +668,11 @@ def test_trade_wait(
                     submission = item["variables"]["input"]
                     stamp = submission["intent"].pop("tsIntentInit")
                     assert submission["lifecycle"].pop("tsLifecycleStep") == stamp
+            # Python main reports receipt collateral in base units only (#231).
+            stdout = RECEIPT_USD.sub(b"", result.stdout) if index else result.stdout
             documents.append(
                 (
-                    result.stdout.replace(key.encode(), b"<intent>"),
+                    stdout.replace(key.encode(), b"<intent>"),
                     normalized([wire, ledger], key),
                 )
             )
