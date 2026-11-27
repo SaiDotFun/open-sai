@@ -111,8 +111,8 @@ class Position:
     switch_contract_on_perp_market_read: str | None = None
     prices_on_position_read: deque[str | None] = field(default_factory=deque)
     price_query_heights: list[str | None] = field(default_factory=list)
-    perp_price_query_heights: list[str | None] = field(default_factory=list)
-    collateral_price_on_perp_read: str | None = None
+    market_price_query_heights: list[str | None] = field(default_factory=list)
+    collateral_price_on_market_price_read: str | None = None
     lose_admission_ack: bool = False
     reject_admission: bool = False
     submitted: list[dict[str, Any]] = field(default_factory=list)
@@ -259,8 +259,13 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 )
                 return
             prefix = f"/cosmwasm/wasm/v1/contract/{position.contract_address}/smart/"
+            oracle_prefix = "/cosmwasm/wasm/v1/contract/nibi1oracle/smart/"
+            oracle_read = path.startswith(oracle_prefix)
+            if oracle_read:
+                prefix = oracle_prefix
             assert path.startswith(prefix)
             message = json.loads(base64.b64decode(unquote(path[len(prefix) :])))
+            assert oracle_read == ("get_exchange_rate" in message)
             if "get_trade_raw" in message:
                 position.position_reads += 1
                 if position.contract_position_unavailable:
@@ -311,22 +316,27 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 }
                 if position.preview_inputs:
                     data.update(open_price="100", long=True)
-            elif "get_perp_prices" in message:
-                assert message["get_perp_prices"] == {
-                    "market_index": "MarketIndex(0)",
-                    "collateral_index": "TokenIndex(1)",
-                }
+            elif "get_oracle_address" in message:
+                assert message["get_oracle_address"] == {}
                 assert self.headers.get("x-cosmos-block-height") == str(
                     position.reported_height
                 )
-                position.perp_price_query_heights.append(
+                data = "nibi1oracle"
+            elif "get_exchange_rate" in message:
+                assert message["get_exchange_rate"] == {"base": 7, "quote": 0}
+                assert self.headers.get("x-cosmos-block-height") == str(
+                    position.reported_height
+                )
+                position.market_price_query_heights.append(
                     self.headers.get("x-cosmos-block-height")
                 )
-                if position.collateral_price_on_perp_read is not None:
-                    position.collateral_price = position.collateral_price_on_perp_read
-                    position.collateral_price_on_perp_read = None
-                data = {
-                    "market": None
+                if position.collateral_price_on_market_price_read is not None:
+                    position.collateral_price = (
+                        position.collateral_price_on_market_price_read
+                    )
+                    position.collateral_price_on_market_price_read = None
+                data = (
+                    None
                     if position.null_market_price
                     else {
                         "base_per_quote": str(position.price),
@@ -338,9 +348,8 @@ def position_service() -> Iterator[tuple[Position, str]]:
                         - position.oracle_quote_age
                         if position.oracle_quote_age is not None
                         else None,
-                    },
-                    "collateral": position.collateral_price,
-                }
+                    }
+                )
             elif "market_order_config" in message:
                 assert message["market_order_config"] == {}
                 assert self.headers.get("x-cosmos-block-height") == str(
@@ -417,6 +426,8 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     )
                     position.switch_contract_on_perp_market_read = None
                 data = {
+                    "base": "TokenIndex(7)",
+                    "quote": "TokenIndex(0)",
                     "block_last_opened": 110,
                     "block_last_closed": 100,
                     "fee_index": "FeeIndex(0)",
@@ -1799,6 +1810,7 @@ def test_partial_close_rechecks_oracle_at_the_final_position_height(
     position_service: tuple[Position, str],
 ) -> None:
     position, base_url = position_service
+    position.preview_inputs = True
     position.collateral = 100_000_000
     position.leverage = "10"
     position.after_hours = True
@@ -1819,7 +1831,7 @@ def test_partial_close_rechecks_oracle_at_the_final_position_height(
             (submitted,) = position.submitted
             assert submitted["body"] == preview["intent"]["body"]
             assert position.price_query_heights == []
-            assert position.perp_price_query_heights == ["121"]
+            assert position.market_price_query_heights == ["120", "121"]
             fresh = await call(client, "preview_partial_close", args)
             assert fresh["quote"]["collateralPriceUsd"] == "1"
             assert fresh["quote"]["closedNotionalUsd"] == "250"
@@ -1843,7 +1855,7 @@ def test_partial_close_accepts_collateral_price_update_at_publication_time_read(
             preview = await call(client, "preview_partial_close", args)
             assert preview["quote"]["closedNotionalUsd"] == "250"
             position.reported_height = 121
-            position.collateral_price_on_perp_read = "0.98"
+            position.collateral_price_on_market_price_read = "0.98"
 
             accepted = await call(
                 client,
@@ -1853,7 +1865,7 @@ def test_partial_close_accepts_collateral_price_update_at_publication_time_read(
             assert accepted["status"] == "accepted", accepted
             (submitted,) = position.submitted
             assert submitted["body"] == preview["intent"]["body"]
-            assert position.perp_price_query_heights == ["120", "121"]
+            assert position.market_price_query_heights == ["120", "121"]
             assert position.price_query_heights == []
             fresh = await call(client, "preview_partial_close", args)
             assert fresh["quote"]["closedNotionalUsd"] == "250"
@@ -2162,7 +2174,12 @@ def test_cli_preview_text_and_json_use_the_order_trigger(
     assert fees["amountUsdc"] == "0.08"
     assert fees["status"] == "estimate"
     assert fees["collateralPriceUsd"]["price"] == "1"
-    assert fees["collateralPriceUsd"]["observedAt"].endswith("Z")
+    assert fees["collateralPriceUsd"] == {
+        "price": "1",
+        "source": "Fixed USDC price",
+        "observedAt": None,
+    }
+    assert position.price_query_heights == []
     assert Decimal(estimates["liquidationPrice"]["price"]).quantize(
         Decimal(".0001")
     ) == Decimal(60)
@@ -2374,7 +2391,7 @@ def test_mcp_market_bound_and_moved_price_preview(
 
 
 @pytest.mark.parametrize(("side", "bound"), [("short", "99"), ("long", "101")])
-def test_mcp_stop_bounds_fill_even_without_a_collateral_price(
+def test_mcp_stop_estimates_without_a_usdc_oracle_price(
     position_service: tuple[Position, str],
     side: str,
     bound: str,
@@ -2401,8 +2418,8 @@ def test_mcp_stop_bounds_fill_even_without_a_collateral_price(
             estimates = preview["estimates"]
             assert estimates["worstCaseFill"]["status"] == "bound"
             assert estimates["worstCaseFill"]["price"] == bound
-            assert estimates["fees"]["status"] == "unavailable"
-            assert estimates["liquidationPrice"]["status"] == "unavailable"
+            assert estimates["fees"]["status"] == "estimate"
+            assert estimates["liquidationPrice"]["status"] == "estimate"
             assert len(preview["previewDigest"]) == 64
             assert position.submitted == []
 
@@ -2453,7 +2470,8 @@ def test_mcp_position_estimates_do_not_change_confirmed_terms(
             preview = await call(client, "preview_close", {"trade_id": 7})
             position.collateral_price = None
             fresh = await call(client, "preview_close", {"trade_id": 7})
-            assert fresh["estimates"]["fees"]["status"] == "unavailable"
+            assert preview["estimates"]["fees"] == fresh["estimates"]["fees"]
+            assert position.price_query_heights == []
             assert fresh["previewDigest"] == preview["previewDigest"]
             accepted = await call(
                 client,
@@ -3597,7 +3615,7 @@ def test_margin_checks_perps_borrowing_inclusive_leverage_quote(
                 "--max-collateral-usd",
                 "5",
             ],
-            "4.950494",
+            "5.000000",
         ),
         (
             ["margin", "7", "--direction", "remove", "--amount", "1"],
@@ -3622,8 +3640,8 @@ def test_cli_collateral_preview(position_service, command, after):
     assert collateral == {
         "beforeUsdc": "4.000000",
         "afterUsdc": after,
-        "beforeUsd": "4.04",
-        "afterUsd": format((Decimal(after) * Decimal("1.01")).normalize(), "f"),
+        "beforeUsd": "4",
+        "afterUsd": after.rstrip("0").rstrip("."),
     }
     if "--max-collateral-usd" in command:
         assert preview["quote"]["maxCollateralUsd"] == "5"
@@ -3632,13 +3650,16 @@ def test_cli_collateral_preview(position_service, command, after):
     result = cli.invoke(main, args[1:])
     assert result.exit_code == 0, result.output
     assert (
-        f"Estimated collateral: 4.000000 USDC ($4.04) → "
+        f"Estimated collateral: 4.000000 USDC ($4) → "
         f"{after} USDC (${collateral['afterUsd']})"
     ) in result.stdout
     assert not position.submitted
 
 
-def test_cli_capped_margin_requotes_when_oracle_moves(position_service):
+@pytest.mark.parametrize("oracle_price", ["1.01", None])
+def test_cli_capped_margin_is_independent_of_usdc_oracle(
+    position_service, oracle_price
+):
     position, base_url = position_service
     position.preview_inputs = True
     position.fill_at_next_oracle_price = True
@@ -3661,19 +3682,14 @@ def test_cli_capped_margin_requotes_when_oracle_moves(position_service):
     assert result.exit_code == 0, result.output
     preview = json.loads(result.stdout)
 
-    position.collateral_price = "1.01"
-    result = cli.invoke(main, [*args, "--preview-digest", preview["previewDigest"]])
-    assert result.exit_code == ExitCode.REJECTED, result.output
-    assert json.loads(result.stdout)["error"]["code"] == "PREVIEW_MISMATCH"
-    assert not position.submitted
-
-    result = cli.invoke(main, [*args, "--dry-run"])
-    assert result.exit_code == 0, result.output
-    preview = json.loads(result.stdout)
+    position.collateral_price = oracle_price
+    assert preview["collateral"]["afterUsd"] == "5"
     result = cli.invoke(main, [*args, "--preview-digest", preview["previewDigest"]])
     assert result.exit_code == 0, result.output
     (submitted,) = position.submitted
     assert {key: submitted[key] for key in preview["intent"]} == preview["intent"]
+
+    assert position.price_query_heights == []
 
 
 def test_cli_market_symbol_and_compact_market_list(position_service):
@@ -3783,7 +3799,8 @@ def test_cli_leverage_confirmation_binds_only_collateral_quantities(
     dry_run = cli.invoke(main, [*args, "--dry-run"])
     assert dry_run.exit_code == 0, dry_run.output
     fresh = json.loads(dry_run.stdout)
-    assert fresh["collateral"]["afterUsd"] != original["collateral"]["afterUsd"]
+    assert fresh["collateral"]["afterUsd"] == ("10" if changes_position else "5")
+    assert position.price_query_heights == []
     result = cli.invoke(main, [*args, "--preview-digest", original["previewDigest"]])
 
     if changes_position:
