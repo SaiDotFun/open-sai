@@ -311,14 +311,17 @@ def open_estimates(
                 return refusal
             if row is None:
                 return {"fees": fees, "liquidationPrice": liq, "worstCaseFill": fill}
-            token_id = row["collateralToken"]["id"]
             leverage = Decimal(body["leverage"])
             within_leverage = leverage_allowed(
                 lcd, contract, pair, row["marketId"], leverage
             )
             schedule = fee_schedule(lcd, contract, pair)
-            token = f"TokenIndex({token_id})"
-            collateral_price = read_collateral_price(lcd, contract, token)
+            token = row["collateralToken"]
+            collateral_price = (
+                price_input(Decimal(1), USDC_PRICE_SOURCE, None)
+                if token["symbol"] == "USDC"
+                else read_collateral_price(lcd, contract, f"TokenIndex({token['id']})")
+            )
             collateral = int(Decimal(body["amountUsd"]).scaleb(6))
             notional = _notional(collateral, leverage)
             with localcontext() as context:
