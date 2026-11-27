@@ -355,7 +355,11 @@ ACTIONS = {
         outcome="filled",
     ),
     "close": Action(
-        ("close", "7"), "CLOSE_POSITION", "position_closed_user", outcome="filled"
+        ("close", "7"),
+        "CLOSE_POSITION",
+        "position_closed_user",
+        server="shared-confirmable-position",
+        outcome="filled",
     ),
     "cancel": Action(
         ("close", "7", "--cancel-order"),
@@ -372,6 +376,7 @@ ACTIONS = {
         ("partial-close", "7", "--percent", "50"),
         "DECREASE_POSITION_SIZE",
         "trade_size_decrease",
+        server="shared-confirmable-position",
         outcome="filled",
     ),
     "tpsl": Action(
