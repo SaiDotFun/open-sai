@@ -24,6 +24,7 @@ import tomllib
 from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,7 @@ import tomlkit
 from tomlkit.exceptions import TOMLKitError
 from tomlkit.items import InlineTable
 
-from .core import settings
+from .core import log, settings
 
 NAME = "sai"
 RETIRED_NAME = "sai-mcp"
@@ -46,8 +47,15 @@ UNINSTALL_SCOPES = ("user", "project", "local")
 SUBPROCESS_TIMEOUT = 60
 INSTALL_URL = "git+https://github.com/SaiDotFun/open-sai"
 ENDPOINT_FLAGS = {spec.flag: spec.key for spec in settings.SETTINGS if spec.flag}
+SAI_ENV_NAMES = frozenset(
+    resources.files("sai_cli")
+    .joinpath("mcp_env_names.txt")
+    .read_text(encoding="utf-8")
+    .splitlines()
+)
 CLAUDE_ARG_PLACEHOLDER = "<original-argument>"
 CLAUDE_HOME_PLACEHOLDER = "<original-SAI_HOME>"
+INSTALL_PROFILE_PLACEHOLDER = "<profile>"
 
 
 class InstallError(Exception):
@@ -66,13 +74,20 @@ class Target:
     env: dict[str, str] = field(default_factory=dict)
     explicit_command: bool = False
 
+    def reported_argv(self) -> list[str]:
+        """Show a launcher preview without its custom argument values."""
+        if not self.explicit_command:
+            return self.argv
+        launcher, *args = self.argv
+        return reported_command(launcher, args, show_sai_options=True)
+
 
 @dataclass(frozen=True)
 class Registration:
     """The `sai` entry found in a client.
 
-    Keeps argv, the SAI_HOME value (a path), and only the names of any other
-    environment settings. Install writes only SAI_HOME to canonical entries.
+    Keeps argv, the SAI_HOME path, and entries the client reports as other
+    environment names. Install writes only SAI_HOME to canonical entries.
     """
 
     argv: list[str]
@@ -89,15 +104,20 @@ class Registration:
     invalid_sai_home: bool = False
     stdio: bool = True
 
-    def shown(self, target: Target | None) -> dict[str, Any]:
-        """Show the expected argv when the saved command matches.
+    def shown(
+        self, target: Target | None, *, install_report: bool = False
+    ) -> dict[str, Any]:
+        """Describe a saved command, using numbered placeholders in install reports.
 
         Saved launcher names, directories, and args can contain private values.
         """
-        if target is not None and self.matches_command(target):
-            return {"command": target.argv}
         if not self.argv:
             return {"command": []}
+        if install_report:
+            launcher, *args = self.argv
+            return {"command": reported_command(shutil.which(launcher), args)}
+        if target is not None and self.matches_command(target):
+            return {"command": target.argv}
         out: dict[str, Any] = {"command": [HIDDEN]}
         if len(self.argv) > 1:
             out["args"] = HIDDEN
@@ -124,15 +144,17 @@ class Registration:
     def matches_sai_home(self, env: Mapping[str, str]) -> bool:
         return not self.invalid_sai_home and self.sai_home == env.get("SAI_HOME")
 
-    def to_json(self, target: Target | None, effective: bool) -> dict[str, Any]:
+    def to_json(
+        self, target: Target | None, effective: bool, *, install_report: bool = False
+    ) -> dict[str, Any]:
         out: dict[str, Any] = {
             "scope": self.scope,
-            **self.shown(target),
+            **self.shown(target, install_report=install_report),
             "current": target is not None and self.matches(target),
             "effective": effective,
         }
         if self.stale_env:
-            out["staleEnv"] = list(self.stale_env)
+            out["staleEnv"] = reported_env_names(self.stale_env)
         if self.extra_settings:
             out["extraSettings"] = list(self.extra_settings)
         if self.disabled:
@@ -256,6 +278,8 @@ def claude_repair_hint(entries: tuple[ClaudeRepair, ...]) -> str:
             )
             launcher = shlex.quote(entry.launcher)
             check = f"test -f {launcher} && test -x {launcher}"
+            if entry.sai_home == INSTALL_PROFILE_PLACEHOLDER:
+                hint += "\nReplace <profile> with the intended SAI_HOME path before removing the entry."
             if (
                 entry.sai_home == CLAUDE_HOME_PLACEHOLDER
                 or entry.extra_env
@@ -310,7 +334,10 @@ def claude_advice_home(
 
 
 def report_different_claude_entry(
-    client: Claude, result: Result, existing: Registration, target: Target
+    client: Claude,
+    result: Result,
+    existing: Registration,
+    target: Target,
 ) -> Result:
     launcher = target.argv[0]
     launcher_args: tuple[str, ...] = ()
@@ -329,11 +356,12 @@ def report_different_claude_entry(
             launcher = os.path.abspath(default_launcher or sys.argv[0])
     scope = existing.scope
     path = client.registration_path(scope)
+    sai_home = claude_advice_home(existing, target.env.get("SAI_HOME"))
     entry = ClaudeRepair(
         scope,
         NAME,
         replace_entry=True,
-        sai_home=claude_advice_home(existing, target.env.get("SAI_HOME")),
+        sai_home=INSTALL_PROFILE_PLACEHOLDER if sai_home is not None else None,
         config_path=path,
         fields=claude_differing_fields(existing, target),
         launcher=launcher,
@@ -397,6 +425,53 @@ def normalize_launcher(command: str) -> str:
 
 def missing_absolute_launcher(command: str) -> bool:
     return os.path.isabs(command) and shutil.which(command) is None
+
+
+def reported_command(
+    launcher: str | None, args: list[str], *, show_sai_options: bool = False
+) -> list[str]:
+    count = len(args) + (launcher is None)
+    reported = [
+        f"<argument hidden {index} of {count}>" for index in range(1, count + 1)
+    ]
+    if launcher is None:
+        return reported
+    if (
+        show_sai_options
+        and Path(launcher).name in {NAME, f"{NAME}.exe"}
+        and serves_mcp(args)
+    ):
+        tokens = iter(enumerate(args))
+        for index, arg in tokens:
+            flag, equals, value = arg.partition("=")
+            if flag in ENDPOINT_FLAGS:
+                if equals:
+                    reported[index] = f"{flag}={log.origin(value)}"
+                else:
+                    reported[index] = flag
+                    value_index, value = next(tokens)
+                    reported[value_index] = log.origin(value)
+            elif arg == "--as":
+                next(tokens)
+            elif arg in {"mcp", "serve", "--json", "--"}:
+                reported[index] = arg
+    return [launcher, *reported]
+
+
+def reported_env_names(entries: tuple[str, ...]) -> list[str]:
+    """Show Sai names and count the remaining saved environment entries."""
+    names = set()
+    other = 0
+    for entry in entries:
+        name = entry.partition("=")[0]
+        if name in SAI_ENV_NAMES:
+            names.add(name)
+        else:
+            other += 1
+    shown = sorted(names)
+    if other:
+        shown.append(f"{other} other {'entry' if other == 1 else 'entries'}")
+    return shown
 
 
 def launcher_target(launcher: str, environ: Mapping[str, str]) -> Target:
@@ -496,8 +571,8 @@ def entry_registration(
 ) -> Registration | None:
     """Keep command, args, SAI_HOME, and other env names from a `sai` entry.
 
-    Other env values are never kept. Codex `env_vars` (variables passed
-    through from the client's environment) count as other env too. The
+    Other values in the env mapping are discarded. Codex `env_vars`
+    (variables passed through from the client's environment) also count. The
     fingerprint hashes `whole`, everything the client reported for the
     server, or the entry itself when that is all there is.
     """
@@ -518,12 +593,12 @@ def entry_registration(
     env = entry.get("env")
     env = env if isinstance(env, dict) else {}
     home = env.get("SAI_HOME")
-    stale = {str(k) for k in env if k != "SAI_HOME"}
+    stale = [str(k) for k in env if k != "SAI_HOME"]
     passed = entry.get("env_vars")
     for item in passed if isinstance(passed, list) else []:
         name = item.get("name") if isinstance(item, dict) else item
         if isinstance(name, str):
-            stale.add(name)
+            stale.append(name)
     return Registration(
         argv,
         scope,
@@ -1050,7 +1125,7 @@ def make_clients(
 
 
 def list_clients(
-    clients: dict[str, Client], target: Target | None
+    clients: dict[str, Client], target: Target | None, *, install_report: bool = False
 ) -> list[dict[str, Any]]:
     rows = []
     for name, client in clients.items():
@@ -1071,7 +1146,11 @@ def list_clients(
             found = []
         row["registrations"] = [
             {
-                **reg.to_json(target, reg is client.effective(entries)),
+                **reg.to_json(
+                    target,
+                    reg is client.effective(entries),
+                    install_report=install_report,
+                ),
                 **({"name": server} if server != NAME else {}),
             }
             for server, entries in found
@@ -1082,7 +1161,7 @@ def list_clients(
         )
         if primary is not None:
             server, reg = primary
-            shown = reg.shown(target)
+            shown = reg.shown(target, install_report=install_report)
             row.update(
                 registered=True,
                 current=target is not None and reg.matches(target),
@@ -1094,7 +1173,7 @@ def list_clients(
             if "args" in shown:
                 row["args"] = shown["args"]
             if reg.stale_env:
-                row["staleEnv"] = list(reg.stale_env)
+                row["staleEnv"] = reported_env_names(reg.stale_env)
             if reg.extra_settings:
                 row["extraSettings"] = list(reg.extra_settings)
             if reg.disabled:
@@ -1109,7 +1188,7 @@ def report_legacy_install(client: Client, reg: Registration, target: Target) -> 
         "unchanged",
         scope=reg.scope,
         name=RETIRED_NAME,
-        **reg.shown(target),
+        **reg.shown(target, install_report=True),
     )
     if reg.disabled:
         result.error = (
@@ -1132,7 +1211,8 @@ def report_legacy_install(client: Client, reg: Registration, target: Target) -> 
 
 
 def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Result:
-    result = Result(client.name, "failed", command=target.argv, scope=scope)
+    command = target.reported_argv()
+    result = Result(client.name, "failed", command=command, scope=scope)
     try:
         if missing_absolute_launcher(target.argv[0]):
             raise ClientError(
@@ -1173,7 +1253,16 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
             steps: list[list[str]] = []
         else:
             steps = client.add_steps(scope, target)
-            result.argv = steps
+            # The server argv follows the client's own options.
+            result.argv = []
+            for step in steps:
+                options = [
+                    f"--env=SAI_HOME={INSTALL_PROFILE_PLACEHOLDER}"
+                    if arg.startswith("--env=SAI_HOME=")
+                    else arg
+                    for arg in step[: -len(target.argv)]
+                ]
+                result.argv.append([*options, *command])
         if dry_run:
             result.action, result.would = "planned", action
             return result

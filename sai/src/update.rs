@@ -30,7 +30,6 @@ pub(crate) use install::mcp_repair_launcher;
 
 const RUNNING: &str = env!("CARGO_PKG_VERSION");
 const LOCK_WAIT: Duration = Duration::from_secs(300);
-const NO_RELEASE: &str = "No sai-cli release is published yet; nothing to update to.";
 
 #[derive(Args)]
 pub(crate) struct UpdateCommand {
@@ -276,10 +275,10 @@ impl UpdateCommand {
             };
             target
         } else {
-            match latest(&releases, home, false).await {
+            match latest(&releases, install, home, false).await {
                 Ok(Some(target)) => target,
                 Ok(None) => {
-                    return Outcome::new("no-release", NO_RELEASE, &before, None);
+                    return Outcome::new("no-release", no_release(install), &before, None);
                 }
                 Err(error) => return failed_lookup(error),
             }
@@ -407,10 +406,13 @@ fn is_newer(latest: &Version, installed: &Version) -> bool {
 
 async fn latest(
     releases: &Releases,
+    install: &Install,
     home: &Path,
     warn: bool,
 ) -> Result<Option<Version>, release::ReleaseError> {
-    let latest = releases.latest().await?;
+    let latest = releases
+        .latest(matches!(install, Install::Standalone(_)))
+        .await?;
     let changes = json!({"latest": latest.as_ref().map(tag), "checkedAt": state::stamp()});
     if state::save(home, changes).await.is_err() && warn {
         eprintln!("Warning: could not save the update check.");
@@ -425,6 +427,15 @@ fn guidance(install: &Install) -> &'static str {
     }
 }
 
+fn no_release(install: &Install) -> &'static str {
+    match install {
+        Install::Standalone(_) => {
+            "No stable Sai release lists a checksum for this platform archive."
+        }
+        _ => "No sai-cli release is published yet; nothing to update to.",
+    }
+}
+
 async fn check(
     releases: Result<Releases, release::ReleaseError>,
     install: &Install,
@@ -433,7 +444,7 @@ async fn check(
     events: EventContext<'_>,
 ) -> Result<(), SaiError> {
     let release = match releases {
-        Ok(releases) => latest(&releases, home, true)
+        Ok(releases) => latest(&releases, install, home, true)
             .await
             .map(|latest| (releases, latest)),
         Err(error) => Err(error),
@@ -499,7 +510,7 @@ async fn check(
         println!("installed  {RUNNING} ({kind})");
         println!("latest     {}", latest_version.as_deref().unwrap_or("none"));
         if latest.is_none() {
-            println!("{NO_RELEASE}");
+            println!("{}", no_release(install));
         } else if newer {
             println!("A newer version is available. {}", guidance(install));
         } else {

@@ -72,6 +72,9 @@ def repo(tmp_path) -> Path:
     git(work, "config", "commit.gpgsign", "false")
     git(work, "config", "tag.gpgsign", "false")
     (work / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "1.2.3"\n')
+    (work / "Cargo.toml").write_text('[workspace.package]\nversion = "1.2.3"\n')
+    (work / "shim").mkdir()
+    (work / "shim/pyproject.toml").write_text('[project]\nversion = "1.2.3"\n')
     git(work, "add", ".")
     git(work, "commit", "-q", "-m", "init")
     git(work, "remote", "add", "origin", str(origin))
@@ -79,18 +82,62 @@ def repo(tmp_path) -> Path:
     return work
 
 
-def run(repo: Path, version: str, go: bool = False) -> int:
-    return release.release(version, go, release.git_runner(repo), repo)
+def run(
+    repo: Path, version: str, go: bool = False, *, python_only: bool = False
+) -> int:
+    return release.release(
+        version, go, release.git_runner(repo), repo, python_only=python_only
+    )
 
 
 def test_dry_run_checks_and_changes_nothing(repo, capsys):
     assert run(repo, "1.2.3") == 0
     out = capsys.readouterr().out
     assert "git tag --annotate sai-cli/v1.2.3" in out
+    assert "Sai-Release-Mode:" not in out
     assert "git push origin refs/tags/sai-cli/v1.2.3" in out
     assert "Dry run" in out
     assert git(repo, "tag", "--list") == ""
     assert git(repo, "ls-remote", "--tags", "origin") == ""
+
+
+def test_python_only_dry_run_accepts_a_python_bump(repo: Path, capsys):
+    config = repo / "pyproject.toml"
+    config.write_text(config.read_text().replace("1.2.3", "1.2.4"))
+    git(repo, "commit", "-qam", "bump Python only")
+    git(repo, "push", "-q", "origin", "main")
+
+    assert run(repo, "1.2.4") == 1
+    assert "does not match the Cargo and shim version" in capsys.readouterr().err
+    assert run(repo, "1.2.4", python_only=True) == 0
+    preview = capsys.readouterr().out
+    assert "git tag --annotate sai-cli/v1.2.4" in preview
+    assert "Sai-Release-Mode: python-only" in preview
+    assert "git push origin refs/tags/sai-cli/v1.2.4" in preview
+    assert run(repo, "1.2.5", python_only=True) == 1
+    assert "does not match pyproject.toml version 1.2.4" in capsys.readouterr().err
+    assert git(repo, "tag", "--list") == ""
+    assert git(repo, "ls-remote", "--tags", "origin") == ""
+
+
+def test_mode_comes_only_from_the_tag_annotation(repo: Path):
+    git(
+        repo,
+        "commit",
+        "--allow-empty",
+        "-qm",
+        "example\n\nSai-Release-Mode: python-only",
+    )
+    git(repo, "tag", "sai-cli/v1.2.3")
+    git(repo, "tag", "-am", "native", "sai-cli/v1.2.4")
+    git(repo, *release.commands("sai-cli/v1.2.5", python_only=True)[0])
+    git(repo, "tag", "-am", "example\n\nSai-Release-Mode: typo", "sai-cli/v1.2.6")
+
+    assert check_release.tag_mode("sai-cli/v1.2.3", repo) == "native"
+    assert check_release.tag_mode("sai-cli/v1.2.4", repo) == "native"
+    assert check_release.tag_mode("sai-cli/v1.2.5", repo) == "python-only"
+    with pytest.raises(ValueError, match="invalid Sai-Release-Mode"):
+        check_release.tag_mode("sai-cli/v1.2.6", repo)
 
 
 def test_run_tags_and_pushes(repo):
@@ -99,6 +146,47 @@ def test_run_tags_and_pushes(repo):
     assert "refs/tags/sai-cli/v1.2.3" in git(repo, "ls-remote", "--tags", "origin")
     # A second release of the same version is refused.
     assert run(repo, "1.2.3") == 1
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("pyproject.toml", "does not match the Cargo and shim version"),
+        ("Cargo.toml", "Cargo workspace and shim versions must name the same release"),
+        (
+            "shim/pyproject.toml",
+            "Cargo workspace and shim versions must name the same release",
+        ),
+    ],
+)
+def test_refuses_a_bump_in_only_one_package(
+    repo: Path, capsys, path: str, expected: str
+):
+    config = repo / path
+    config.write_text(config.read_text().replace("1.2.3", "1.2.4"))
+    git(repo, "add", path)
+    git(repo, "commit", "-qm", "bump one package")
+    git(repo, "push", "-q", "origin", "main")
+
+    version = "1.2.4" if path == "pyproject.toml" else "1.2.3"
+    for go in (False, True):
+        assert run(repo, version, go=go) == 1
+        assert expected in capsys.readouterr().err
+    assert git(repo, "tag", "--list") == ""
+    assert git(repo, "ls-remote", "--tags", "origin") == ""
+
+
+def test_accepts_matching_release_candidate_spellings(repo: Path, capsys):
+    for path in ("pyproject.toml", "Cargo.toml", "shim/pyproject.toml"):
+        config = repo / path
+        version = "1.2.4rc1" if path.startswith("shim/") else "1.2.4-rc.1"
+        config.write_text(config.read_text().replace("1.2.3", version))
+    git(repo, "commit", "-qam", "bump to release candidate")
+    git(repo, "push", "-q", "origin", "main")
+
+    assert run(repo, "1.2.4-rc.1") == 0
+    assert "git tag --annotate sai-cli/v1.2.4-rc.1" in capsys.readouterr().out
+    assert git(repo, "ls-remote", "--tags", "origin") == ""
 
 
 def test_refuses_version_mismatch_dirty_tree_and_unpushed_head(repo, capsys):
@@ -123,6 +211,15 @@ def test_remote_tag_commit_reads_annotated_and_lightweight_tags():
     assert check_release.remote_tag_commit(light, "sai-cli/v1.2.3") == "ccc"
     assert check_release.remote_tag_commit(light, "sai-cli/v9.9.9") is None
     assert check_release.remote_tag_commit("", "sai-cli/v1.2.3") is None
+
+
+def test_remote_tag_object_detects_a_changed_annotation_on_the_same_commit():
+    tag = "sai-cli/v1.2.3"
+    listing = f"aaa\trefs/tags/{tag}\nbbb\trefs/tags/{tag}^{{}}\n"
+    assert check_release.remote_tag_error(tag, "bbb", listing, "aaa") is None
+    assert check_release.remote_tag_error(tag, "bbb", listing, "ccc") == (
+        f"tag {tag} on the remote does not match the built tag object"
+    )
 
 
 def test_built_commit_must_still_be_the_remote_tag(repo, monkeypatch, capsys):
