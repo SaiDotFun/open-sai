@@ -40,6 +40,7 @@ pub enum TradeCommand {
     },
     /// Cancel a pending order.
     Cancel {
+        #[arg(allow_negative_numbers = true)]
         trade_id: String,
         #[arg(long)]
         dry_run: bool,
@@ -230,12 +231,7 @@ impl Open {
     }
 }
 
-pub fn group_help(show_cancel: bool) -> String {
-    let cancel = if show_cancel {
-        "  cancel         Cancel a pending order.\n"
-    } else {
-        ""
-    };
+pub fn group_help() -> String {
     format!(
         r#"{}
 
@@ -245,7 +241,8 @@ Options:
   --help  Show this message and exit.
 
 Commands:
-{cancel}  close          Close a position or cancel a pending order.
+  cancel         Cancel a pending order.
+  close          Close a position or cancel a pending order.
   leverage       Set target leverage without changing TP or SL.
   margin         Add or remove margin through a target-leverage intent.
   open           Open a market, limit, or stop trade.
@@ -258,6 +255,15 @@ Commands:
 // Render Click's help for the trade commands shared with Python.
 pub fn help(command: &str) -> Option<String> {
     let body = match command {
+        "trade cancel" => {
+            r#"  Cancel a pending order.
+
+Options:
+  --dry-run
+  --preview-digest TEXT  Submit only if the trade matches this dry-run digest.
+  --wait                 Wait up to 60 seconds for the intent outcome.
+  --help                 Show this message and exit."#
+        }
         "trade close" => {
             r#"  Close a position or cancel a pending order.
 

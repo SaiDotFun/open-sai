@@ -450,11 +450,11 @@ signature = "3befa3b1161431863c4ffc26972227acd032cca0133deaf4d7cc7861cb6d602a"
 
 [gap."case:trade-bare-group-json"]
 owner = "#172"
-signature = "756245c4c1189ce9cd300c9696329612a7c0a909d12bb8238e26a978feef6ee9"
+signature = "a0c138ea865c1f407580ea1b4684691f5e7fa7f17ec2e480a29e14f95c6d1609"
 
 [gap."case:trade-bare-group-text"]
 owner = "#172"
-signature = "756245c4c1189ce9cd300c9696329612a7c0a909d12bb8238e26a978feef6ee9"
+signature = "0ab484ba9da5d1a49257d39ecbc782aa64adfb12ab72f59ee565378023403be0"
 
 [gap."case:trade-cancel"]
 owner = "#174"

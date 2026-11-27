@@ -1238,7 +1238,6 @@ expect = 2
 
 [[case]]
 name = "trade-bare-group-text"
-accepted_difference = "Issue #231 lists cancel in bare Python trade help."
 args = ["trade"]
 mode = "text"
 expect = 2
@@ -1246,7 +1245,6 @@ exact_output = true
 
 [[case]]
 name = "trade-bare-group-json"
-accepted_difference = "Issue #231 lists cancel in bare Python trade help."
 args = ["--json", "trade"]
 expect = 2
 exact_output = true
@@ -1255,7 +1253,6 @@ exact_output = true
 name = "bare-help-trade-cancel"
 current_only = true
 reference_stderr_contains = ["Usage: sai trade cancel", "--preview-digest"]
-accepted_difference = "Issue #231 adds Click help and --preview-digest for cancel."
 args = ["trade", "cancel"]
 mode = "text"
 expect = 2
@@ -1787,6 +1784,14 @@ wire = ["oneClickTrading", "node_info", "get_trade_raw"]
 name = "trade-tpsl"
 args = ["--json","trade","tpsl","7","--take-profit","110","--clear-stop-loss","--dry-run"]
 expect = 6
+
+[[case]]
+name = "trade-cancel-alias"
+current_only = true
+args = ["--json","trade","cancel","7","--dry-run"]
+seed = "session"
+server = "pending-order"
+wire = ["oneClickTrading", "node_info", "get_trade_raw"]
 
 [[case]]
 name = "trade-leverage"

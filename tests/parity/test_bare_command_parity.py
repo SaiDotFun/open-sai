@@ -80,10 +80,6 @@ def test_bare_leaf_prints_full_help_and_json_usage(
 
     errors = []
     comparisons = (("python", python), ("rust", rust))
-    if args == ("trade", "cancel"):
-        # Rust uses Clap help and has no --preview-digest option on cancel.
-        comparisons = (("python", python),)
-        assert b"--preview-digest" in expected.stdout
     for label, binary in comparisons:
         home = tmp_path / label
         bare = invoke(binary, home, *args)
@@ -99,8 +95,6 @@ def test_bare_leaf_prints_full_help_and_json_usage(
         assert error["code"] == "INVALID_REQUEST"
         assert error["message"].startswith("Missing ")
         errors.append(error)
-    if args == ("trade", "cancel"):
-        return
     assert errors[0] == errors[1]
 
     help_result = invoke(rust, tmp_path / "rust", *args, "--help")
@@ -153,10 +147,8 @@ def test_bare_trade_group_matches_python(
         expected = invoke(python, tmp_path / "python", *args)
         actual = invoke(rust, tmp_path / "rust", *args)
         assert actual.returncode == expected.returncode == 2
-        # Rust's bare group help predates Python's cancel command.
-        cancel = b"  cancel         Cancel a pending order."
-        assert actual.stdout == expected.stdout.replace(cancel + rb"\n", b"", 1)
-        assert actual.stderr == expected.stderr.replace(cancel + b"\n", b"", 1)
+        assert actual.stdout == expected.stdout
+        assert actual.stderr == expected.stderr
 
     expected = invoke(python, tmp_path / "python", "trade", "--help")
     actual = invoke(rust, tmp_path / "rust", "trade", "--help")

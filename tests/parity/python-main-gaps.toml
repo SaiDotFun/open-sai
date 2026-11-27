@@ -22,11 +22,6 @@ owner = "#231"
 title = "Python includes balance freshness after a WebSocket redirect."
 signature = "0c6c09717aa97c5866132f1e0020d745530d9da7f38155739014b3c2479aa160"
 
-[gap."case:bare-help-trade-cancel"]
-owner = "#231"
-title = "Cancel help exposes the same confirmation flags in Click and Clap, with different formatting."
-signature = "6a2545d1828eec70547f4fbc6b32571e25b71a821708510e49e15021d670c64e"
-
 [gap."case:trade-open-market-symbol"]
 owner = "#231"
 title = "Python resolves case-insensitive symbols using Keeper's USDC borrowing rows."
