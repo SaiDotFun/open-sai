@@ -1351,13 +1351,9 @@ def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
         if warning := execution.get("warning"):
             click.echo(warning)
         if collateral:
-
-            def value(side: str) -> str:
-                usd = collateral[f"{side}Usd"]
-                dollars = f"${usd}" if usd is not None else "USD unavailable"
-                return f"{collateral[f'{side}Usdc']} USDC ({dollars})"
-
-            click.echo(f"Estimated collateral: {value('before')} → {value('after')}")
+            click.echo(
+                f"Estimated collateral: ${collateral['beforeUsd']} → ${collateral['afterUsd']}"
+            )
             if output.get("warning"):
                 click.echo(output["warning"])
     emit(ctx, output)
@@ -1729,7 +1725,7 @@ def trade_leverage(
                 trade_id=trade_id,
                 leverage=leverage,
                 dry_run=dry_run,
-                show_collateral=True,
+                bind_collateral=True,
                 lcd_endpoint=settings(ctx).lcd_endpoint,
                 before_submit=trade_submit_check(loader(ctx), preview_digest),
             ),
@@ -1796,7 +1792,6 @@ def trade_margin(
                 direction=direction,
                 amount=amount,
                 max_collateral_usd=max_collateral_usd,
-                show_collateral=True,
                 lcd_endpoint=resolved.lcd_endpoint,
                 dry_run=dry_run,
                 before_submit=trade_submit_check(loader(ctx), preview_digest),

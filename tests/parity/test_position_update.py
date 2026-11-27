@@ -591,12 +591,9 @@ def test_position_update_dry_run(
                 if implementation == "python":
                     # Issue 231 still tracks USD display in Rust.
                     assert document.pop("collateral") == {
-                        "beforeUsdc": "20.000000",
-                        "afterUsdc": "10.000000",
-                        "beforeUsd": "20.2",
-                        "afterUsd": "10.1",
+                        "beforeUsd": "20",
+                        "afterUsd": "10",
                     }
-                    expected_wire += ["get_collateral_price"]
                     output = (json.dumps(document, sort_keys=True) + "\n").encode()
             outputs.append(output)
             assert [entry.label for entry in endpoints.wire] == expected_wire

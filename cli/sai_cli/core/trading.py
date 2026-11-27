@@ -440,7 +440,7 @@ def set_leverage(
     dry_run: bool,
     lcd_endpoint: str | None = None,
     before_submit: SubmitCheck | None = None,
-    show_collateral: bool = False,
+    bind_collateral: bool = False,
 ) -> dict[str, Any]:
     """Set target leverage without changing TP or SL."""
     payload = intents.leverage_intent(trade_id, leverage)
@@ -454,7 +454,7 @@ def set_leverage(
         lcd_endpoint,
         trade_id,
         target=Decimal(leverage),
-        show_collateral=show_collateral,
+        bind_collateral=bind_collateral,
     )
 
 
@@ -469,7 +469,7 @@ def _position_intent(
     *,
     target: Decimal | None = None,
     updates_triggers: bool = False,
-    show_collateral: bool = False,
+    bind_collateral: bool = False,
 ) -> dict[str, Any]:
     addr = get_session()["evmAddress"]
     preview = {"dryRun": True, "intent": payload}
@@ -506,12 +506,13 @@ def _position_intent(
             verified,
             target,
             updates_triggers,
-            show_collateral=show_collateral and dry_run,
-            bind_collateral=show_collateral and (dry_run or before_submit is not None),
+            show_collateral=target is not None
+            and (dry_run or before_submit is not None),
+            bind_collateral=bind_collateral and (dry_run or before_submit is not None),
         )
         if collateral := values.pop("collateralBaseUnits", None):
             quoted_preview["collateralBaseUnits"] = collateral
-        elif show_collateral and not dry_run and before_submit is not None:
+        elif bind_collateral and not dry_run and before_submit is not None:
             # A definitive rejection may arrive before Perp can quote collateral.
             _reject_execution(quoted_preview, values, addr)
         return values
@@ -676,7 +677,6 @@ def change_margin(
     lcd_endpoint: str,
     dry_run: bool,
     before_submit: SubmitCheck | None = None,
-    show_collateral: bool = False,
     max_collateral_usd: str | None = None,
 ) -> dict[str, Any]:
     """Add or remove margin through a target-leverage intent.
@@ -699,11 +699,9 @@ def change_margin(
         leverage, inputs = margin.leverage_inputs(lcd_endpoint, state, trade_id)
         if leverage is None:
             raise ValueError("Cannot verify effective leverage for this margin change")
-        price = None
         quote_delta = delta
-        if (show_collateral and dry_run) or cap is not None:
-            price = margin.optional_collateral_price(lcd_endpoint, state)
         if cap is not None:
+            price = margin.optional_collateral_price(lcd_endpoint, state)
             if price is None:
                 raise ValueError(
                     "Cannot apply the USD collateral cap without an oracle price"
@@ -724,21 +722,14 @@ def change_margin(
         )
         if cap is not None:
             quote["maxCollateralUsd"] = format(cap, "f")
-        display = (
-            {
-                "collateral": margin.collateral_amounts(
-                    int(quote["collateralBefore"]), int(quote["collateralAfter"]), price
-                )
-            }
-            if show_collateral and dry_run
-            else {}
-        )
         return (
             state,
             inputs,
             {
                 "dryRun": True,
-                **display,
+                "collateral": margin.collateral_usd(
+                    int(quote["collateralBefore"]), int(quote["collateralAfter"])
+                ),
                 "positionRoute": state.route,
                 "quote": {
                     **quote,

@@ -581,7 +581,8 @@ async def preview_leverage(
     trade_id: TradeInteger, leverage: str, addr: str | None = None
 ) -> str:
     """Preview setting target leverage without changing TP or SL. Show the
-    user the result; trade_leverage needs its previewDigest.
+    user the collateral before and after in USD. trade_leverage needs the
+    previewDigest.
 
     Args:
         trade_id: Trade id from account_positions.
@@ -625,7 +626,8 @@ async def trade_leverage(
 async def preview_margin(
     trade_id: TradeInteger, direction: Direction, amount: str, addr: str | None = None
 ) -> str:
-    """Quote adding or removing margin from exact contract state.
+    """Quote adding or removing margin from exact contract state. The preview
+    shows collateral before and after in USD.
 
     The change is a target-leverage intent: the amount is a quote, not a
     cap, and the actual change may differ at execution. Uses effective

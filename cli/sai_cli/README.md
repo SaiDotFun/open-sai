@@ -498,10 +498,9 @@ the direction. When the after-hours guard is pending,
 before the leverage change. Keeper submits the target leverage. Perp uses
 effective leverage at execution to determine the direction and amount.
 `--dry-run` reads live state and prints the quote without submitting an
-intent. The preview shows collateral before and after in USDC and USD. In
-JSON, those values appear in `collateral.beforeUsdc`, `collateral.afterUsdc`,
-`collateral.beforeUsd`, and `collateral.afterUsd`. The USD fields are null
-when the collateral oracle price is unavailable.
+intent. The preview shows collateral before and after in USD at $1 per
+USDC. In JSON, those values appear in `collateral.beforeUsd` and
+`collateral.afterUsd`.
 
 Use `--max-collateral-usd 5` with `trade margin --direction add --amount 1`
 to quote an add of up to 1 USDC with at most $5 of estimated total

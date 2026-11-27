@@ -769,8 +769,5 @@ def _leverage_estimates(
             "after": str(collateral),
         }
     if show_collateral:
-        collateral_price = margin.optional_collateral_price(lcd, state, height=height)
-        result["collateral"] = margin.collateral_amounts(
-            before, collateral, collateral_price
-        )
+        result["collateral"] = margin.collateral_usd(before, collateral)
     return result
