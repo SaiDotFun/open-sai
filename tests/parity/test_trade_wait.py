@@ -1368,12 +1368,26 @@ def test_trade_wait_interrupts_a_full_stdout_pipe(
             assert not replies
 
 
+@pytest.fixture
+def native_wait_launcher(cli_pair: tuple[tuple[str, ...], tuple[str, ...]]) -> str:
+    return cli_pair[1][0]
+
+
+@pytest.mark.parametrize("launcher", ["python", "rust"])
 @pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
 def test_current_cli_wait_progress_precedes_the_receipt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, json_output: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    json_output: bool,
+    launcher: str,
 ) -> None:
     home = tmp_path / "sai"
-    python = str(Path(sys.executable).with_name("sai"))
+    binary = (
+        str(Path(sys.executable).with_name("sai"))
+        if launcher == "python"
+        else request.getfixturevalue("native_wait_launcher")
+    )
     first_poll = threading.Event()
     release = threading.Event()
     with replay(get=target_lcd) as (endpoint, replies, requests):
@@ -1394,7 +1408,7 @@ def test_current_cli_wait_progress_precedes_the_receipt(
             if json_output or arg != "--json"
         )
         with subprocess.Popen(
-            [python, *args],
+            [binary, *args],
             env=cli_environment(home),
             cwd=tmp_path,
             stdout=subprocess.PIPE,

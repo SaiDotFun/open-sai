@@ -661,6 +661,9 @@ impl WaitTrade<'_> {
                 Err(error) if error.code == Code::OutcomeUnknown => None,
                 Err(error) => return Err(error),
             };
+            if !self.json {
+                eprintln!("Waiting for intent {key} to confirm...");
+            }
             let remember_fill = |receipt| {
                 let _ = confirmed.set((receipt, metadata.clone(), false));
             };
