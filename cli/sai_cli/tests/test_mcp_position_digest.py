@@ -3626,7 +3626,7 @@ def test_margin_checks_perps_borrowing_inclusive_leverage_quote(
 @pytest.mark.parametrize(
     ("command", "after"),
     [
-        (["leverage", "7", "--leverage", "1.6"], "5.000000"),
+        (["leverage", "7", "--leverage", "1.6"], "5"),
         (
             [
                 "margin",
@@ -3635,17 +3635,15 @@ def test_margin_checks_perps_borrowing_inclusive_leverage_quote(
                 "add",
                 "--amount",
                 "2",
-                "--max-collateral-usd",
-                "5",
             ],
-            "5.000000",
+            "5.999999",
         ),
         (
             ["margin", "7", "--direction", "remove", "--amount", "1"],
-            "3.000000",
+            "3",
         ),
     ],
-    ids=["leverage", "capped-add", "remove"],
+    ids=["leverage", "add", "remove"],
 )
 def test_cli_collateral_preview(position_service, command, after):
     position, base_url = position_service
@@ -3659,30 +3657,68 @@ def test_cli_collateral_preview(position_service, command, after):
     result = cli.invoke(main, args)
     assert result.exit_code == 0, result.output
     preview = json.loads(result.stdout)
-    collateral = preview["collateral"]
-    assert collateral == {
-        "beforeUsdc": "4.000000",
-        "afterUsdc": after,
-        "beforeUsd": "4",
-        "afterUsd": after.rstrip("0").rstrip("."),
-    }
-    if "--max-collateral-usd" in command:
-        assert preview["quote"]["maxCollateralUsd"] == "5"
-        assert Decimal(collateral["afterUsd"]) <= 5
+    assert preview["collateral"] == {"beforeUsd": "4", "afterUsd": after}
 
     result = cli.invoke(main, args[1:])
     assert result.exit_code == 0, result.output
-    assert (
-        f"Estimated collateral: 4.000000 USDC ($4) → "
-        f"{after} USDC (${collateral['afterUsd']})"
-    ) in result.stdout
+    assert f"Estimated collateral: $4 → ${after}" in result.stdout.splitlines()
+    assert not position.price_query_heights
     assert not position.submitted
 
 
-@pytest.mark.parametrize("oracle_price", ["1.01", None])
-def test_cli_capped_margin_is_independent_of_usdc_oracle(
-    position_service, oracle_price
-):
+@pytest.mark.parametrize(
+    ("action", "args", "after"),
+    [
+        ("leverage", {"leverage": "1.6"}, "5"),
+        ("margin", {"direction": "remove", "amount": "1"}, "3"),
+    ],
+)
+def test_mcp_collateral_preview_without_oracle(position_service, action, args, after):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.fill_at_next_oracle_price = True
+    position.collateral_price = None
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            request = {"trade_id": 7, **args}
+            preview = await call(client, f"preview_{action}", request)
+            assert preview["collateral"] == {"beforeUsd": "4", "afterUsd": after}
+            material = {"addr": preview["addr"], "intent": preview["intent"]}
+            material["positionRoute"] = preview["positionRoute"]
+            if action == "margin":
+                material["quote"] = preview["quote"]
+            else:
+                material["collateralBaseUnits"] = {
+                    "before": "4000000",
+                    "after": "5000000",
+                }
+                assert preview["collateralBaseUnits"] == material["collateralBaseUnits"]
+            digest = confirmation.preview_digest(material)
+            assert preview["previewDigest"] == digest
+            confirmed = {**request, "preview_digest": digest}
+            if action == "leverage":
+                position.collateral = 8_000_000
+                refused = await call(client, "trade_leverage", confirmed)
+                assert refused["code"] == "PREVIEW_MISMATCH"
+                replacement = refused["preview"]
+                assert replacement["collateral"] == {"beforeUsd": "8", "afterUsd": "10"}
+                assert replacement["previewDigest"] != digest
+                assert not position.submitted
+                position.collateral = 4_000_000
+
+            await call(client, f"trade_{action}", confirmed)
+            (submitted,) = position.submitted
+            assert {key: submitted[key] for key in preview["intent"]} == preview[
+                "intent"
+            ]
+            assert not position.price_query_heights
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("next_price", ["1.01", None], ids=["moved", "missing"])
+def test_cli_capped_margin_uses_the_displayed_usd_value(position_service, next_price):
     position, base_url = position_service
     position.preview_inputs = True
     position.fill_at_next_oracle_price = True
@@ -3697,20 +3733,57 @@ def test_cli_capped_margin_is_independent_of_usdc_oracle(
             "--amount",
             "2",
             "--max-collateral-usd",
-            "5",
+            "5.0000009",
         ],
     )
     cli = CliRunner()
     result = cli.invoke(main, [*args, "--dry-run"])
     assert result.exit_code == 0, result.output
     preview = json.loads(result.stdout)
+    assert preview["collateral"] == {"beforeUsd": "4", "afterUsd": "5"}
+    assert preview["quote"]["maxCollateralUsd"] == "5.0000009"
+    assert preview["quote"]["collateralAfter"] == "5000000"
+    assert preview["quote"]["actualDeltaUsdc"] == "1000000"
 
-    position.collateral_price = oracle_price
-    assert preview["collateral"]["afterUsd"] == "5"
+    position.collateral_price = next_price
+    result = cli.invoke(main, [*args, "--dry-run"])
+    assert result.exit_code == 0, result.output
+    fresh = json.loads(result.stdout)
+    assert fresh["collateral"] == preview["collateral"]
+    assert fresh["previewDigest"] == preview["previewDigest"]
     result = cli.invoke(main, [*args, "--preview-digest", preview["previewDigest"]])
     assert result.exit_code == 0, result.output
     (submitted,) = position.submitted
     assert {key: submitted[key] for key in preview["intent"]} == preview["intent"]
+    assert not position.price_query_heights
+
+
+def test_cli_capped_margin_rejects_when_only_a_fractional_base_unit_remains(
+    position_service,
+):
+    position, base_url = position_service
+    position.collateral_price = None
+    save_session(f"{base_url}/query")
+    args = position_cli_args(
+        base_url,
+        [
+            "margin",
+            "7",
+            "--direction",
+            "add",
+            "--amount",
+            "1",
+            "--max-collateral-usd",
+            "4.0000009",
+            "--dry-run",
+        ],
+    )
+
+    result = CliRunner().invoke(main, args)
+    assert result.exit_code == ExitCode.ERROR, result.output
+    assert "USD collateral cap leaves no room to add margin" in result.stdout
+    assert not position.price_query_heights
+    assert not position.submitted
 
     assert position.price_query_heights == []
 
@@ -3822,11 +3895,10 @@ def test_cli_leverage_confirmation_binds_only_collateral_quantities(
     dry_run = cli.invoke(main, [*args, "--dry-run"])
     assert dry_run.exit_code == 0, dry_run.output
     fresh = json.loads(dry_run.stdout)
-    assert fresh["collateral"]["afterUsd"] == ("10" if changes_position else "5")
-    assert position.price_query_heights == []
     result = cli.invoke(main, [*args, "--preview-digest", original["previewDigest"]])
 
     if changes_position:
+        assert fresh["collateral"] == {"beforeUsd": "8", "afterUsd": "10"}
         assert fresh["collateralBaseUnits"] == {
             "before": "8000000",
             "after": "10000000",
@@ -3836,9 +3908,11 @@ def test_cli_leverage_confirmation_binds_only_collateral_quantities(
         assert json.loads(result.stdout)["error"]["code"] == "PREVIEW_MISMATCH"
         assert not position.submitted
     else:
+        assert fresh["collateral"] == original["collateral"]
         assert fresh["previewDigest"] == original["previewDigest"]
         assert result.exit_code == 0, result.output
         assert len(position.submitted) == 1
+    assert not position.price_query_heights
 
 
 def test_cli_margin_preview_reports_insufficient_funds_before_any_projection(
@@ -3889,7 +3963,7 @@ def test_cli_leverage_preview_reports_insufficient_funds(position_service, queue
         assert execution["warning"] == warning
         assert text.exit_code == 0, text.output
         assert warning in text.stdout.splitlines()[:2]
-        assert "Estimated collateral: 4.000000 USDC" in text.stdout
+        assert "Estimated collateral: $4 → $5" in text.stdout.splitlines()
     else:
         assert execution["code"] == "InsufficientDepositBalance"
         assert execution["reason"] == funding

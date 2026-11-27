@@ -436,7 +436,6 @@ def set_leverage(
     dry_run: bool,
     lcd_endpoint: str | None = None,
     before_submit: SubmitCheck | None = None,
-    show_collateral: bool = False,
 ) -> dict[str, Any]:
     """Set target leverage without changing TP or SL."""
     payload = intents.leverage_intent(trade_id, leverage)
@@ -450,7 +449,6 @@ def set_leverage(
         lcd_endpoint,
         trade_id,
         target=Decimal(leverage),
-        show_collateral=show_collateral,
     )
 
 
@@ -465,7 +463,6 @@ def _position_intent(
     *,
     target: Decimal | None = None,
     updates_triggers: bool = False,
-    show_collateral: bool = False,
 ) -> dict[str, Any]:
     addr = get_session()["evmAddress"]
     preview = {"dryRun": True, "intent": payload}
@@ -504,7 +501,7 @@ def _position_intent(
             verified,
             target,
             updates_triggers,
-            show_collateral=show_collateral and dry_run,
+            show_collateral=bind_collateral,
             bind_collateral=bind_collateral,
         )
         if collateral := values.pop("collateralBaseUnits", None):
@@ -703,7 +700,6 @@ def change_margin(
     lcd_endpoint: str,
     dry_run: bool,
     before_submit: SubmitCheck | None = None,
-    show_collateral: bool = False,
     max_collateral_usd: str | None = None,
 ) -> dict[str, Any]:
     """Add or remove margin through a target-leverage intent.
@@ -743,21 +739,11 @@ def change_margin(
         )
         if cap is not None:
             quote["maxCollateralUsd"] = format(cap, "f")
-        display = (
-            {
-                "collateral": margin.collateral_amounts(
-                    int(quote["collateralBefore"]), int(quote["collateralAfter"])
-                )
-            }
-            if show_collateral and dry_run
-            else {}
-        )
         return (
             state,
             inputs,
             {
                 "dryRun": True,
-                **display,
                 "positionRoute": state.route,
                 "quote": {
                     **quote,
@@ -770,6 +756,27 @@ def change_margin(
             },
         )
 
+    def estimate(
+        state: margin.PositionSnapshot,
+        inputs: dict[str, Any],
+        fresh: dict[str, Any],
+        _: margin.RecheckedPosition | None,
+    ) -> dict[str, Any]:
+        quote = fresh["quote"]
+        values = estimates.position_estimates(
+            lcd_endpoint,
+            state,
+            trade_id,
+            target=Decimal(quote["requestedLeverage"]),
+            quoted_effective=_quoted_leverage(inputs),
+            require_unchanged=not dry_run,
+        )
+        if dry_run or estimates.rejection_reason(values) is None:
+            values["collateral"] = margin.collateral_usd(
+                int(quote["collateralBefore"]), int(quote["collateralAfter"])
+            )
+        return values
+
     preview = _position_preview(
         build_preview,
         lcd_endpoint=lcd_endpoint,
@@ -778,14 +785,7 @@ def change_margin(
         dry_run=dry_run,
         before_submit=before_submit,
         changed_message="Position changed; review the margin change again",
-        estimate=lambda state, inputs, fresh, _: estimates.position_estimates(
-            lcd_endpoint,
-            state,
-            trade_id,
-            target=Decimal(fresh["quote"]["requestedLeverage"]),
-            quoted_effective=_quoted_leverage(inputs),
-            require_unchanged=not dry_run,
-        ),
+        estimate=estimate,
     )
     if dry_run:
         return preview

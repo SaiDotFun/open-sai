@@ -176,8 +176,6 @@ def test_cli_dry_run_matches_python_main(
             if index == 0 and args[1] in {"leverage", "margin"}:
                 # Issue 231 tracks the Python-only collateral display fields.
                 assert preview.pop("collateral") == {
-                    "beforeUsdc": "10.000000",
-                    "afterUsdc": "10.999999",
                     "beforeUsd": "10",
                     "afterUsd": "10.999999",
                 }

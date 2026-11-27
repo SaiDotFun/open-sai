@@ -594,8 +594,6 @@ def test_position_update_dry_run(
                 if implementation == "python":
                     # Issue 231 still tracks USD display in Rust.
                     assert document.pop("collateral") == {
-                        "beforeUsdc": "20.000000",
-                        "afterUsdc": "10.000000",
                         "beforeUsd": "20",
                         "afterUsd": "10",
                     }

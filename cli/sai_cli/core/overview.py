@@ -285,6 +285,31 @@ def balance_stale(age_seconds: float | None) -> bool | None:
     return age_seconds > BALANCE_STALE_SECONDS if age_seconds is not None else None
 
 
+def is_usdc_balance(row: dict[str, Any]) -> bool:
+    token = row.get("token_info")
+    if not isinstance(token, dict):
+        return False
+    name = token.get("name")
+    return token.get("symbol") == "USDC" or (
+        token.get("type") == "sai" and isinstance(name, str) and name in BALANCE_KEYS
+    )
+
+
+def _usdc_balance_usd(row: dict[str, Any]) -> float | None:
+    try:
+        return float(_base_units(row.get("amount")) / COLLATERAL_SCALE["USDC"])
+    except (TypeError, ValueError):
+        return None
+
+
+def value_balance_snapshot(response: dict[str, Any]) -> dict[str, Any]:
+    """Value USDC rows at par using the base units in the same snapshot."""
+    for row in response["data"]["userBalances"]:
+        if isinstance(row, dict) and is_usdc_balance(row):
+            row["usd_value"] = _usdc_balance_usd(row)
+    return response
+
+
 def balance_snapshot(
     settings: Settings | None, ws: str, addr: str, *, notify: Callable[[str], None]
 ) -> dict[str, Any]:
@@ -314,7 +339,7 @@ def balance_snapshot(
             {"block": row.get("lastUpdatedBlock")}, fetched, balance_lookup
         )
         row.update(stamp, stale=balance_stale(stamp["sourceAgeSeconds"]))
-    return response
+    return value_balance_snapshot(response)
 
 
 def _balances(
@@ -334,7 +359,7 @@ def _balances(
             if height is not None:
                 _uint(height)
             balances[BALANCE_KEYS[name]] = {
-                "usd": _number(row["usd_value"]),
+                "usd": _usdc_balance_usd(row),
                 "block": height,
             }
     return balances, connected

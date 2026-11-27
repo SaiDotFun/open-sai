@@ -474,7 +474,9 @@ def account_balances(settings: Settings, addr: str | None) -> dict[str, Any]:
     variables = {"user": account["addr"]}
     return {
         **account,
-        **stream.snapshot(settings.ws_endpoint, stream.BALANCES, variables),
+        **overview.value_balance_snapshot(
+            stream.snapshot(settings.ws_endpoint, stream.BALANCES, variables)
+        ),
     }
 
 

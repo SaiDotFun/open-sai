@@ -691,15 +691,11 @@ def contract_decimal(value: Any) -> Decimal:
     )
 
 
-def collateral_amounts(before: int, after: int) -> dict[str, str]:
-    before_usdc = format(Decimal(f"{before}e-6"), "f")
-    after_usdc = format(Decimal(f"{after}e-6"), "f")
-    return {
-        "beforeUsdc": before_usdc,
-        "afterUsdc": after_usdc,
-        "beforeUsd": before_usdc.rstrip("0").rstrip("."),
-        "afterUsd": after_usdc.rstrip("0").rstrip("."),
-    }
+def collateral_usd(before: int, after: int) -> dict[str, str]:
+    def usd(amount: int) -> str:
+        return format(Decimal(f"{amount}e-6"), "f").rstrip("0").rstrip(".")
+
+    return {"beforeUsd": usd(before), "afterUsd": usd(after)}
 
 
 def market_oracle_price(

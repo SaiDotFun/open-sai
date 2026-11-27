@@ -1714,7 +1714,8 @@ mcp_calls = [
 seed = "session"
 server = "quote-close"
 state = { "trader/intents.sqlite3#tables.intents.rows.0" = "<absent>" }
-output = { "1.result.content.0.text.previewDigest" = "d8f9ebbe79ae2a06786bdc51609d5d09de48ab07daa062b98971b2ad224dc0b5", "1.result.content.0.text.collateralBaseUnits" = { before = "10000000", after = "10999999" }, "2.result.content.0.text.code" = "PREVIEW_MISMATCH", "2.result.content.0.text.preview.previewDigest" = "d8f9ebbe79ae2a06786bdc51609d5d09de48ab07daa062b98971b2ad224dc0b5", "2.result.content.0.text.preview.collateralBaseUnits" = { before = "10000000", after = "10999999" } }
+output = { "1.result.content.0.text.previewDigest" = "d8f9ebbe79ae2a06786bdc51609d5d09de48ab07daa062b98971b2ad224dc0b5", "1.result.content.0.text.collateralBaseUnits" = { before = "10000000", after = "10999999" }, "1.result.content.0.text.collateral" = { beforeUsd = "10", afterUsd = "10.999999" }, "2.result.content.0.text.code" = "PREVIEW_MISMATCH", "2.result.content.0.text.preview.previewDigest" = "d8f9ebbe79ae2a06786bdc51609d5d09de48ab07daa062b98971b2ad224dc0b5", "2.result.content.0.text.preview.collateralBaseUnits" = { before = "10000000", after = "10999999" }, "2.result.content.0.text.preview.collateral" = { beforeUsd = "10", afterUsd = "10.999999" } }
+rust = { output = { "1.result.content.0.text.collateral" = "<absent>", "2.result.content.0.text.preview.collateral" = "<absent>" } }
 
 [[case]]
 name = "mcp-trade-margin-confirmation"
@@ -1898,7 +1899,7 @@ wire = [
     "get_pair_custom_max_leverage", "get_fees",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
-output = { "quote.maxCollateralUsd" = "10.5", "collateral.beforeUsdc" = "10.000003", "collateral.afterUsdc" = "10.499999" }
+output = { "quote.maxCollateralUsd" = "10.5", "collateral.beforeUsd" = "10.000003", "collateral.afterUsd" = "10.499999" }
 rust = { expect = 2, wire = [], output = { "error.code" = "INVALID_REQUEST" } }
 
 [[case]]
