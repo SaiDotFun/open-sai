@@ -132,7 +132,6 @@ impl TradePreview {
         }
         if self.execution_refusal(true).is_none()
             && !self.has_unknown_partial_leverage()
-            && !self.collateral_price_unverified()
             && !self.leverage_collateral_unverified()
         {
             output["previewDigest"] = json!(preview_digest(self, account));
@@ -173,7 +172,6 @@ impl TradePreview {
                 && (!self.requires_market_price_refresh() || self.reference_price.is_some())
                 && self.execution_refusal(true).is_none()
                 && !self.has_unknown_partial_leverage()
-                && !self.collateral_price_unverified()
                 && !self.leverage_collateral_unverified()
             {
                 output["previewDigest"] = json!(preview_digest(self, account));
@@ -201,13 +199,6 @@ impl TradePreview {
         self.is_standalone_position_update()
             && self.intent.body["requestedLeverage"].is_string()
             && self.leverage_collateral.is_none()
-    }
-
-    fn collateral_price_unverified(&self) -> bool {
-        self.quote
-            .as_ref()
-            .and_then(|quote| quote.get("collateralPriceUsd"))
-            .is_some_and(Value::is_null)
     }
 
     pub fn is_market_close(&self) -> bool {
