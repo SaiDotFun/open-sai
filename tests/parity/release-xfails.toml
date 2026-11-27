@@ -1,7 +1,9 @@
 # Signatures of normalized differences reproduced against sai-cli/v0.1.2.
-# Rust redacts free-form log errors in these scenarios. Each has one owner. Run without --release-xfails to inspect its paths.
+# Run without --release-xfails to inspect the difference paths.
 
 [issue."211"]
+# All 12 cases still differ from Python main at a48e7775 in their log error
+# fields. Rust redacts the free-form messages.
 "test_intent_status.py::test_history[service-unavailable]" = "dfcd2f372d6cb0e6dbb103bb6dff7c6e0bac722d0fa639661798142f7aaba789"
 "test_intent_status.py::test_history[body-timeout]" = "dfcd2f372d6cb0e6dbb103bb6dff7c6e0bac722d0fa639661798142f7aaba789"
 "test_intent_status.py::test_request_and_data_failures[redirect]" = "9771c7385b3f16f09e6c45498fcc114742588582ab005b85a08652ca17ede96c"

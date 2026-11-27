@@ -79,7 +79,10 @@ includes tool metadata and requires a matching `tools/call` transcript.
 each reviewed difference signature. An exact match reports `XFAIL`. A changed
 signature, unexpected pass, or unused entry fails the required job. Owners
 remove their entries in the same change that repairs the corresponding gaps.
-`M2-unassigned` entries include proposed issue titles for triage.
+The `#211` titles give the reason each release exception matches or differs
+from Python main at `a48e7775`, using the same fixtures and strict comparison.
+A title that says the row matches main is a candidate for removal when the
+release reference advances and the row passes against that reference.
 
 [`python-main-gaps.toml`](python-main-gaps.toml) records Python CLI changes
 that landed after the release reference. The runner checks these signatures
