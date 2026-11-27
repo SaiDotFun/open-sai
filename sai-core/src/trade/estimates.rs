@@ -23,6 +23,8 @@ const SCALE: u128 = 10u128.pow(18);
 const USDC_PLACES: u32 = 6;
 const QUOTE_TIMEOUT: Duration = Duration::from_secs(3);
 const FEE_UNAVAILABLE: &str = "Perp fee schedule or collateral oracle price is unavailable.";
+pub(super) const UNVERIFIED_MARKET_ORACLE: &str =
+    "Cannot verify the market oracle price at the position's block.";
 const COLLATERAL_ORACLE: &str = "Sai Perp collateral oracle";
 const KEEPER_PRICE: &str = "Sai Keeper market price";
 

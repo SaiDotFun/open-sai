@@ -130,7 +130,7 @@ impl TradePreview {
         if let Some(route) = &self.position_route {
             output["positionRoute"] = json!(route);
         }
-        if self.execution_refusal(true).is_none()
+        if self.execution_refusal().is_none()
             && !self.has_unknown_partial_leverage()
             && !self.leverage_collateral_unverified()
         {
@@ -170,7 +170,7 @@ impl TradePreview {
             }
             if self.position_owner_verified != Some(false)
                 && (!self.requires_market_price_refresh() || self.reference_price.is_some())
-                && self.execution_refusal(true).is_none()
+                && self.execution_refusal().is_none()
                 && !self.has_unknown_partial_leverage()
                 && !self.leverage_collateral_unverified()
             {
@@ -180,11 +180,14 @@ impl TradePreview {
         output
     }
 
-    fn execution_refusal(&self, require_oracle_time: bool) -> Option<&Value> {
+    fn execution_refusal(&self) -> Option<&Value> {
         let execution = &self.estimates.as_ref()?["execution"];
         (execution["status"] == "would_be_rejected"
-            || (require_oracle_time && execution["code"] == "OraclePublicationTimeUnknown"))
-            .then_some(execution)
+            || matches!(
+                execution["code"].as_str(),
+                Some("OraclePublicationTimeUnknown" | "OraclePriceUnavailable")
+            ))
+        .then_some(execution)
     }
 
     fn has_unknown_partial_leverage(&self) -> bool {
@@ -501,7 +504,7 @@ impl<'a> Trading<'a> {
             }
             return Err(error);
         }
-        preview.check_cli_execution(account, confirming)?;
+        preview.check_cli_execution(account)?;
 
         let (key, stamp) = intent_identity();
         let intent = &preview.intent;

@@ -224,6 +224,7 @@ async fn admission_requires_explicit_rejection_and_no_data() {
 #[tokio::test]
 async fn position_confirmation_rejects_a_new_contract_on_the_same_chain() {
     const ACCOUNT: &str = "0x1111111111111111111111111111111111111111";
+    const ORACLE: &str = "nibi1fixtureoracle";
     const OLD_CONTRACT: &str = "nibi1oldcontract";
     const NEW_CONTRACT: &str = "nibi1newcontract";
     let listener = listener();
@@ -279,6 +280,11 @@ async fn position_confirmation_rejects_a_new_contract_on_the_same_chain() {
                     let prefix = format!("/cosmwasm/wasm/v1/contract/{contract}/smart/");
                     let encoded = path
                         .strip_prefix(&prefix)
+                        .or_else(|| {
+                            path.strip_prefix(&format!(
+                                "/cosmwasm/wasm/v1/contract/{ORACLE}/smart/"
+                            ))
+                        })
                         .unwrap()
                         .split('?')
                         .next()
@@ -300,8 +306,20 @@ async fn position_confirmation_rejects_a_new_contract_on_the_same_chain() {
                         }),
                         "get_exchange_balance" => json!({"collateral_index": "TokenIndex(1)"}),
                         "is_after_hours_market" => json!(false),
-                        "get_collateral_price" => json!("1"),
-                        "get_perp_prices" => json!({"collateral": "1"}),
+                        "get_market" => json!({
+                            "base": "TokenIndex(7)", "quote": "TokenIndex(0)",
+                            "group_index": "GroupIndex(0)",
+                        }),
+                        "get_oracle_address" => json!(ORACLE),
+                        "get_exchange_rate" => {
+                            assert_eq!(
+                                request,
+                                json!({"get_exchange_rate": {"base": 7, "quote": 0}})
+                            );
+                            json!({"base_per_quote": "100", "base_last_update_time": 1})
+                        }
+                        "market_order_config" => json!({"fill_at_next_oracle_price": false}),
+                        "get_group" => json!({"stale_price_expiration_secs": 0}),
                         other => panic!("Unexpected LCD query: {other}"),
                     };
                     json!({"data": result})

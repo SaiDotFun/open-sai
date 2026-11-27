@@ -11,6 +11,8 @@ from sai_cli.core.confirmation import preview_digest
 from sai_cli.core.settings import load as load_settings
 from sai_cli.mcp_server.tools import partial_close as mcp_partial_close
 from scenarios import child_env, loopback, seed_home
+from test_mcp_stdio import server
+from test_mcp_trade import result as mcp_result
 from test_trade import CANCEL, CLI, CLOSE, OPEN, rows, run
 from trade_replay import TradeReplay
 
@@ -68,6 +70,101 @@ def test_unconfirmed_trade_checks_execution_before_reserving(
                 error["details"]["preview"]["estimates"]["execution"]["code"]
                 == execution_code
             )
+
+
+@pytest.mark.parametrize("surface", ["plain-cli", "confirmed-cli", "mcp"])
+@pytest.mark.parametrize("market_oracle", ["unavailable", "stale"])
+@pytest.mark.parametrize("queued", [False, True], ids=["immediate", "queued"])
+@pytest.mark.parametrize(
+    ("command", "action", "kind", "options"),
+    [
+        (CLOSE, "close", "CLOSE_POSITION", {}),
+        (PARTIAL, "partial_close", "DECREASE_POSITION_SIZE", {"percent": 50}),
+        (LEVERAGE, "leverage", "UPDATE_TRADE", {"leverage": LEVERAGE[-1]}),
+        (MARGIN, "margin", "UPDATE_TRADE", {"direction": "add", "amount": "1"}),
+    ],
+    ids=["close", "partial-close", "leverage", "margin"],
+)
+def test_market_oracle_failure_refuses_before_reservation(
+    pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    surface: str,
+    market_oracle: Literal["unavailable", "stale"],
+    queued: bool,
+    command: CLI,
+    action: str,
+    kind: str,
+    options: dict[str, Any],
+) -> None:
+    for index, cli in enumerate(pair):
+        home = tmp_path / f"submit-{index}"
+        submit = command
+        args = {"trade_id": 7, **options}
+        if surface != "plain-cli":
+            # Obtain confirmation while the market still has a healthy rate.
+            with loopback("quote-close") as endpoints:
+                preview_home = tmp_path / f"preview-{index}"
+                if surface == "mcp":
+                    with server(
+                        Path(cli[0]), preview_home, endpoints, seed="session"
+                    ) as stdio:
+                        preview = mcp_result(stdio.call(2, f"preview_{action}", **args))
+                else:
+                    seed_home(preview_home, endpoints, "session")
+                    code, preview, _ = run(
+                        cli,
+                        preview_home,
+                        endpoints,
+                        (*command, "--dry-run"),
+                        python=index == 0,
+                    )
+                    assert code == 0, preview
+                digest = preview["previewDigest"]
+                assert not endpoints.errors
+            args["preview_digest"] = digest
+            submit = (*command, "--preview-digest", digest)
+
+        replay = TradeReplay(kind)
+        with loopback(
+            "quote-close",
+            trade_replay=replay,
+            market_oracle=market_oracle,
+            queued=queued,
+        ) as endpoints:
+            if surface == "mcp":
+                with server(Path(cli[0]), home, endpoints, seed="session") as stdio:
+                    reply = mcp_result(stdio.call(2, f"trade_{action}", **args))
+                assert reply["code"] == "PREVIEW_MISMATCH"
+                assert reply["quoteStatus"] == "unavailable"
+                replacement = reply["preview"]
+            else:
+                seed_home(home, endpoints, "session")
+                code, reply, stderr = run(
+                    cli, home, endpoints, submit, python=index == 0
+                )
+                assert (code, reply["error"]["code"], stderr) == (
+                    4,
+                    "PREVIEW_MISMATCH",
+                    "",
+                )
+                replacement = reply["error"]["details"]["preview"]
+            if market_oracle == "stale":
+                expected = "OraclePriceStale"
+            else:
+                expected = (
+                    "OraclePublicationTimeUnknown"
+                    if action in {"close", "partial_close"}
+                    else "OraclePriceUnavailable"
+                )
+            assert replacement["estimates"]["execution"]["code"] == expected
+            assert "previewDigest" not in replacement
+            labels = [request.label for request in endpoints.wire]
+            assert "get_exchange_rate" in labels
+            assert "get_collateral_price" not in labels
+            assert "recordUserIntent" not in labels
+            assert not replay.attempts()
+            assert not (home / "sai/trader/intents.sqlite3").exists()
+            assert not endpoints.errors
 
 
 @pytest.mark.parametrize(

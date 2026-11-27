@@ -160,7 +160,7 @@ def estimate_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
             CLOSE,
             "session",
             "quote-queued",
-            ORACLE_READS + " market_order_config",
+            FRESH_READS,
             "execution",
             "unavailable",
         ),

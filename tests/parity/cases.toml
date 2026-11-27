@@ -1893,8 +1893,8 @@ seed = "session"
 server = "position-precision"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market",
-    "market_order_config", "get_oracle_address", "get_exchange_rate", "is_after_hours_market", "get_group",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market", "market_order_config",
+    "get_oracle_address", "get_exchange_rate", "get_group", "is_after_hours_market", "get_group",
     "get_pair_custom_max_leverage", "get_fees",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
@@ -1908,12 +1908,16 @@ seed = "session"
 server = "partial-preview"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market",
-    "get_trade_raw", "get_market", "get_oracle_address", "get_exchange_rate", "market_order_config",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market", "get_oracle_address",
+    "get_exchange_rate", "market_order_config", "get_group",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 
-rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market", "get_oracle_address", "get_exchange_rate", "market_order_config"] }
+rust = { wire = [
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market", "get_oracle_address",
+    "get_exchange_rate", "market_order_config", "get_group",
+] }
 output = { "positionRoute.chainId" = "cataclysm-1", "positionRoute.contractAddress" = "nibi1syntheticfixture", "previewDigest" = "639610d6417d78b973fc2d64c56f2c15d6b17c0673cb02ea623ec85dfa7567e8" }
 
 # C7b position cases use the Python ownership and confirmation contracts from PRs 148 and 150.
@@ -1979,10 +1983,9 @@ wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "node_info", "trade",
     "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
-    "is_after_hours_market",
-    "get_trade_raw", "get_market", "market_order_config", "get_oracle_address", "get_exchange_rate", "is_after_hours_market",
-    "get_group", "get_pair_custom_max_leverage", "get_fees",
-    "recordUserIntent",
+    "is_after_hours_market", "get_trade_raw", "get_market", "market_order_config", "get_oracle_address",
+    "get_exchange_rate", "get_group", "is_after_hours_market", "get_group", "get_pair_custom_max_leverage",
+    "get_fees", "recordUserIntent",
 ]
 state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted", "trader/intents.sqlite3#tables.intents.rows.0.kind" = "UPDATE_TRADE", "trader/intents.sqlite3#tables.intents.rows.0.entity" = "7", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }
 output = { "status" = "accepted", "intentKey" = "<intentKey 1>", "quote.requestedLeverage" = "1.818181818181818182", "txHash" = "<absent>" }
@@ -1993,7 +1996,8 @@ wire = [
     "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "trade", "node_info",
     "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
     "is_after_hours_market", "get_market", "market_order_config", "get_oracle_address", "get_exchange_rate",
-    "is_after_hours_market", "get_group", "get_pair_custom_max_leverage", "get_fees", "recordUserIntent",
+    "get_group", "is_after_hours_market", "get_group", "get_pair_custom_max_leverage", "get_fees",
+    "recordUserIntent",
 ]
 
 [[case]]
@@ -2049,16 +2053,16 @@ server = "position-precision"
 unset = ["SAI_LCD_ENDPOINT"]
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market",
-    "get_trade_raw", "get_market", "market_order_config", "get_oracle_address", "get_exchange_rate", "is_after_hours_market",
-    "get_group", "get_pair_custom_max_leverage", "get_fees",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market", "market_order_config",
+    "get_oracle_address", "get_exchange_rate", "get_group", "is_after_hours_market", "get_group",
+    "get_pair_custom_max_leverage", "get_fees",
 ]
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
     "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market", "market_order_config",
-    "get_oracle_address", "get_exchange_rate", "is_after_hours_market", "get_group", "get_pair_custom_max_leverage",
-    "get_fees",
+    "get_oracle_address", "get_exchange_rate", "get_group", "is_after_hours_market", "get_group",
+    "get_pair_custom_max_leverage", "get_fees",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "quote.requestedLeverage" = "1.930415139893933113", "quote.actualDeltaUsdc" = "1000000" }
@@ -2070,16 +2074,16 @@ seed = "session"
 server = "position-precision"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market",
-    "get_trade_raw", "get_market", "market_order_config", "get_oracle_address", "get_exchange_rate", "is_after_hours_market",
-    "get_group", "get_pair_custom_max_leverage", "get_fees",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market", "market_order_config",
+    "get_oracle_address", "get_exchange_rate", "get_group", "is_after_hours_market", "get_group",
+    "get_pair_custom_max_leverage", "get_fees",
 ]
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
     "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market", "market_order_config",
-    "get_oracle_address", "get_exchange_rate", "is_after_hours_market", "get_group", "get_pair_custom_max_leverage",
-    "get_fees",
+    "get_oracle_address", "get_exchange_rate", "get_group", "is_after_hours_market", "get_group",
+    "get_pair_custom_max_leverage", "get_fees",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "quote.requestedLeverage" = "2.359396615744510258", "quote.actualDeltaUsdc" = "1000001" }
@@ -2092,8 +2096,8 @@ server = "position-after-hours"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "is_after_hours_market", "get_market", "get_trade_infos", "get_after_hours_leverage",
-    "get_trade_raw", "get_market", "market_order_config", "get_oracle_address", "get_exchange_rate", "is_after_hours_market",
-    "get_market", "get_trade_infos", "get_after_hours_leverage",
+    "get_trade_raw", "get_market", "market_order_config", "get_oracle_address", "get_exchange_rate",
+    "get_group", "is_after_hours_market", "get_market", "get_trade_infos", "get_after_hours_leverage",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "quote.effectiveLeverage" = "1.234567890123456789", "quote.actualDeltaUsdc" = "999999", "quote.marginChangeIsEstimate" = true, "positionRoute.contractAddress" = "nibi1syntheticfixture", "previewDigest" = "6b4bcdb1cd79c56ff6f90e944a90c3c890f9fadd51569eb2b9875acd100824d4" }
@@ -2143,10 +2147,9 @@ wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "node_info", "trade",
     "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
-    "is_after_hours_market",
-    "get_trade_raw", "get_market", "market_order_config", "get_oracle_address", "get_exchange_rate", "is_after_hours_market",
-    "get_group", "get_pair_custom_max_leverage", "get_fees",
-    "recordUserIntent",
+    "is_after_hours_market", "get_trade_raw", "get_market", "market_order_config", "get_oracle_address",
+    "get_exchange_rate", "get_group", "is_after_hours_market", "get_group", "get_pair_custom_max_leverage",
+    "get_fees", "recordUserIntent",
 ]
 state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted", "trader/intents.sqlite3#tables.intents.rows.0.kind" = "UPDATE_TRADE", "trader/intents.sqlite3#tables.intents.rows.0.entity" = "7", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }
 output = { "status" = "accepted", "intentKey" = "<intentKey 1>", "quote.requestedLeverage" = "1.818181818181818182", "txHash" = "<absent>" }
@@ -2157,7 +2160,8 @@ wire = [
     "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "trade", "node_info",
     "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
     "is_after_hours_market", "get_market", "market_order_config", "get_oracle_address", "get_exchange_rate",
-    "is_after_hours_market", "get_group", "get_pair_custom_max_leverage", "get_fees", "recordUserIntent",
+    "get_group", "is_after_hours_market", "get_group", "get_pair_custom_max_leverage", "get_fees",
+    "recordUserIntent",
 ]
 
 [[case]]
@@ -2170,10 +2174,9 @@ wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "node_info", "trade",
     "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
-    "is_after_hours_market",
-    "get_trade_raw", "get_market", "market_order_config", "get_oracle_address", "get_exchange_rate", "is_after_hours_market",
-    "get_group", "get_pair_custom_max_leverage", "get_fees",
-    "recordUserIntent",
+    "is_after_hours_market", "get_trade_raw", "get_market", "market_order_config", "get_oracle_address",
+    "get_exchange_rate", "get_group", "is_after_hours_market", "get_group", "get_pair_custom_max_leverage",
+    "get_fees", "recordUserIntent",
 ]
 state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "rejected", "trader/intents.sqlite3#tables.intents.rows.0.kind" = "UPDATE_TRADE", "trader/intents.sqlite3#tables.intents.rows.0.entity" = "7", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }
 output = { "error.code" = "ADMISSION_REJECTED" }
@@ -2184,7 +2187,8 @@ wire = [
     "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "trade", "node_info",
     "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
     "is_after_hours_market", "get_market", "market_order_config", "get_oracle_address", "get_exchange_rate",
-    "is_after_hours_market", "get_group", "get_pair_custom_max_leverage", "get_fees", "recordUserIntent",
+    "get_group", "is_after_hours_market", "get_group", "get_pair_custom_max_leverage", "get_fees",
+    "recordUserIntent",
 ]
 
 [[case]]
@@ -2198,14 +2202,13 @@ wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "node_info", "trade",
     "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
-    "is_after_hours_market",
-    "get_trade_raw", "get_market", "market_order_config", "get_oracle_address", "get_exchange_rate", "is_after_hours_market",
-    "get_group", "get_pair_custom_max_leverage", "get_fees",
-    "recordUserIntent", "oneClickTrading", "node_info", "trade",
+    "is_after_hours_market", "get_trade_raw", "get_market", "market_order_config", "get_oracle_address",
+    "get_exchange_rate", "get_group", "is_after_hours_market", "get_group", "get_pair_custom_max_leverage",
+    "get_fees", "recordUserIntent", "oneClickTrading", "node_info", "trade",
     "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "oneClickTrading",
     "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "is_after_hours_market", "get_trade_raw", "is_after_hours_market",
-    "get_trade_raw", "get_market", "market_order_config", "get_oracle_address", "get_exchange_rate", "is_after_hours_market",
+    "is_after_hours_market", "get_trade_raw", "is_after_hours_market", "get_trade_raw", "get_market",
+    "market_order_config", "get_oracle_address", "get_exchange_rate", "get_group", "is_after_hours_market",
     "get_group", "get_pair_custom_max_leverage", "get_fees",
 ]
 state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "unknown", "trader/intents.sqlite3#tables.intents.rows.0.kind" = "UPDATE_TRADE", "trader/intents.sqlite3#tables.intents.rows.0.entity" = "7", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }
@@ -2217,12 +2220,13 @@ wire = [
     "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "trade", "node_info",
     "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
     "is_after_hours_market", "get_market", "market_order_config", "get_oracle_address", "get_exchange_rate",
-    "is_after_hours_market", "get_group", "get_pair_custom_max_leverage", "get_fees", "recordUserIntent",
-    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "trade", "node_info",
-    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
-    "is_after_hours_market", "get_market", "market_order_config", "get_oracle_address", "get_exchange_rate",
-    "is_after_hours_market", "get_group", "get_pair_custom_max_leverage", "get_fees",
+    "get_group", "is_after_hours_market", "get_group", "get_pair_custom_max_leverage", "get_fees",
+    "recordUserIntent", "oneClickTrading", "trade", "node_info", "borrowing",
+    "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "trade",
+    "node_info", "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market",
+    "get_trade_raw", "is_after_hours_market", "get_market", "market_order_config", "get_oracle_address",
+    "get_exchange_rate", "get_group", "is_after_hours_market", "get_group", "get_pair_custom_max_leverage",
+    "get_fees",
 ]
 
 [[case]]
@@ -2232,8 +2236,8 @@ seed = "session"
 server = "position-scientific-reduction"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance",
-    "is_after_hours_market",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market", "get_oracle_address",
+    "get_exchange_rate", "market_order_config", "get_group",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "intent.body.collateral.amountUsdc" = "50000000000000000000000000000" }
@@ -2241,7 +2245,8 @@ output = { "intent.body.collateral.amountUsdc" = "50000000000000000000000000000"
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market", "get_oracle_address",
+    "get_exchange_rate", "market_order_config", "get_group",
 ]
 
 [[case]]
@@ -2251,7 +2256,8 @@ seed = "session"
 server = "position-precision"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market", "get_oracle_address",
+    "get_exchange_rate", "market_order_config", "get_group",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "intent.body.collateral.amountUsdc" = "3300000", "quote.closedNotionalUsdc" = "7.007407", "quote.closedNotionalUsd" = "7.007407" }
@@ -2259,7 +2265,8 @@ output = { "intent.body.collateral.amountUsdc" = "3300000", "quote.closedNotiona
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market", "get_oracle_address",
+    "get_exchange_rate", "market_order_config", "get_group",
 ]
 
 [[case]]
@@ -2269,8 +2276,9 @@ seed = "session"
 server = "position-after-hours"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "get_market", "get_trade_infos",
-    "get_after_hours_leverage",
+    "get_exchange_balance", "is_after_hours_market", "get_market", "get_trade_infos", "get_after_hours_leverage",
+    "get_trade_raw", "get_market", "get_oracle_address", "get_exchange_rate", "market_order_config",
+    "get_group",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "quote.effectiveLeverage" = "1.234567890123456789", "quote.closedNotionalUsdc" = "4.074074", "quote.closedNotionalUsd" = "4.074074" }
@@ -2278,8 +2286,9 @@ output = { "quote.effectiveLeverage" = "1.234567890123456789", "quote.closedNoti
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "get_market", "get_trade_infos",
-    "get_after_hours_leverage", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_market", "get_trade_infos", "get_after_hours_leverage",
+    "get_trade_raw", "get_market", "get_oracle_address", "get_exchange_rate", "market_order_config",
+    "get_group",
 ]
 
 [[case]]
@@ -2289,7 +2298,8 @@ seed = "session"
 server = "position-no-oracle"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market", "get_oracle_address",
+    "get_exchange_rate", "market_order_config", "get_group",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "quote.closedNotionalIsEstimate" = false, "quote.collateralPriceUsd" = "1", "quote.closedNotionalUsd" = "10" }
@@ -2297,7 +2307,8 @@ output = { "quote.closedNotionalIsEstimate" = false, "quote.collateralPriceUsd" 
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market", "get_oracle_address",
+    "get_exchange_rate", "market_order_config", "get_group",
 ]
 
 [[case]]
@@ -2317,8 +2328,8 @@ seed = "session"
 server = "position-default"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance",
-    "is_after_hours_market",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market", "get_oracle_address",
+    "get_exchange_rate", "market_order_config", "get_group",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "intent.body.collateral.amountUsdc" = "9900000" }
@@ -2326,7 +2337,8 @@ output = { "intent.body.collateral.amountUsdc" = "9900000" }
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market", "get_oracle_address",
+    "get_exchange_rate", "market_order_config", "get_group",
 ]
 
 [[case]]
@@ -2337,10 +2349,10 @@ server = "partial-preview-changed"
 expect = 4
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market",
-    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market",
-    "get_trade_raw", "is_after_hours_market",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "node_info", "trade",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market", "get_market", "get_oracle_address", "get_exchange_rate", "market_order_config",
+    "get_group",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "error.message" = "Position changed; review the reduction again" }
@@ -2348,9 +2360,10 @@ output = { "error.message" = "Position changed; review the reduction again" }
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "oneClickTrading",
-    "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "is_after_hours_market", "get_trade_raw", "is_after_hours_market",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "trade", "node_info",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market", "get_market", "get_oracle_address", "get_exchange_rate", "market_order_config",
+    "get_group",
 ]
 
 [[case]]
@@ -2360,10 +2373,10 @@ seed = "session"
 server = "partial-accepted"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "oneClickTrading",
-    "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "is_after_hours_market", "get_trade_raw", "is_after_hours_market",
-    "recordUserIntent",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "node_info", "trade",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market", "get_market", "get_oracle_address", "get_exchange_rate", "market_order_config",
+    "get_group", "recordUserIntent",
 ]
 state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted" }
 output = { "status" = "accepted" }
@@ -2371,10 +2384,10 @@ output = { "status" = "accepted" }
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "oneClickTrading",
-    "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "is_after_hours_market", "get_trade_raw", "is_after_hours_market",
-    "recordUserIntent",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "trade", "node_info",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market", "get_market", "get_oracle_address", "get_exchange_rate", "market_order_config",
+    "get_group", "recordUserIntent",
 ]
 
 [[case]]
@@ -2385,9 +2398,10 @@ server = "position-chain-changed"
 expect = 4
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "oneClickTrading",
-    "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "is_after_hours_market", "get_trade_raw", "is_after_hours_market",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "node_info", "trade",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market", "get_market", "get_oracle_address", "get_exchange_rate", "market_order_config",
+    "get_group",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "error.code" = "PREVIEW_MISMATCH", "error.details" = "<absent>", "error.message" = "The trade no longer matches the confirmed preview. Run with --dry-run to review a new preview before submitting." }
@@ -2395,9 +2409,10 @@ output = { "error.code" = "PREVIEW_MISMATCH", "error.details" = "<absent>", "err
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "oneClickTrading",
-    "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "is_after_hours_market", "get_trade_raw", "is_after_hours_market",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "trade", "node_info",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market", "get_market", "get_oracle_address", "get_exchange_rate", "market_order_config",
+    "get_group",
 ]
 
 [[case]]
@@ -2408,9 +2423,10 @@ server = "position-contract-changed"
 expect = 4
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "oneClickTrading",
-    "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "is_after_hours_market", "get_trade_raw", "is_after_hours_market",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "node_info", "trade",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market", "get_market", "get_oracle_address", "get_exchange_rate", "market_order_config",
+    "get_group",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "error.code" = "PREVIEW_MISMATCH", "error.details" = "<absent>", "error.message" = "The trade no longer matches the confirmed preview. Run with --dry-run to review a new preview before submitting." }
@@ -2418,9 +2434,10 @@ output = { "error.code" = "PREVIEW_MISMATCH", "error.details" = "<absent>", "err
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "oneClickTrading",
-    "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "is_after_hours_market", "get_trade_raw", "is_after_hours_market",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "trade", "node_info",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market", "get_market", "get_oracle_address", "get_exchange_rate", "market_order_config",
+    "get_group",
 ]
 
 [[case]]
@@ -2444,10 +2461,10 @@ seed = "session"
 server = "partial-accepted"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "oneClickTrading",
-    "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "is_after_hours_market", "get_trade_raw", "is_after_hours_market",
-    "recordUserIntent",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "node_info", "trade",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market", "get_market", "get_oracle_address", "get_exchange_rate", "market_order_config",
+    "get_group", "recordUserIntent",
 ]
 state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted", "trader/intents.sqlite3#tables.intents.rows.0.kind" = "DECREASE_POSITION_SIZE", "trader/intents.sqlite3#tables.intents.rows.0.entity" = "7", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }
 output = { "status" = "accepted", "intentKey" = "<intentKey 1>", "quote" = "<absent>", "txHash" = "<absent>" }
@@ -2455,10 +2472,10 @@ output = { "status" = "accepted", "intentKey" = "<intentKey 1>", "quote" = "<abs
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "oneClickTrading",
-    "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "is_after_hours_market", "get_trade_raw", "is_after_hours_market",
-    "recordUserIntent",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "trade", "node_info",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market", "get_market", "get_oracle_address", "get_exchange_rate", "market_order_config",
+    "get_group", "recordUserIntent",
 ]
 
 [[case]]
@@ -2470,14 +2487,14 @@ expect = 5
 retry_expect = 1
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "oneClickTrading",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "node_info", "trade",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market", "get_market", "get_oracle_address", "get_exchange_rate", "market_order_config",
+    "get_group", "recordUserIntent", "oneClickTrading", "node_info", "trade",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "oneClickTrading",
     "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "is_after_hours_market", "get_trade_raw", "is_after_hours_market",
-    "recordUserIntent", "oneClickTrading", "node_info", "trade",
-    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market",
-    "oneClickTrading", "node_info", "trade", "borrowing",
-    "get_trade_raw", "get_exchange_balance", "is_after_hours_market",
-    "get_trade_raw", "is_after_hours_market",
+    "is_after_hours_market", "get_trade_raw", "is_after_hours_market", "get_market", "get_oracle_address",
+    "get_exchange_rate", "market_order_config", "get_group",
 ]
 state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "unknown", "trader/intents.sqlite3#tables.intents.rows.0.kind" = "DECREASE_POSITION_SIZE", "trader/intents.sqlite3#tables.intents.rows.0.entity" = "7", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }
 output = { "first.error.code" = "OUTCOME_UNKNOWN", "first.error.intentKey" = "<intentKey 1>", "retry.error.code" = "INVALID_REQUEST", "retry.error.intentKey" = "<intentKey 1>" }
@@ -2485,14 +2502,14 @@ output = { "first.error.code" = "OUTCOME_UNKNOWN", "first.error.intentKey" = "<i
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "oneClickTrading",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "trade", "node_info",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market", "get_market", "get_oracle_address", "get_exchange_rate", "market_order_config",
+    "get_group", "recordUserIntent", "oneClickTrading", "trade", "node_info",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "oneClickTrading",
     "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "is_after_hours_market", "get_trade_raw", "is_after_hours_market",
-    "recordUserIntent", "oneClickTrading", "trade", "node_info", "borrowing",
-    "get_trade_raw", "get_exchange_balance", "is_after_hours_market",
-    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
-    "is_after_hours_market",
+    "is_after_hours_market", "get_trade_raw", "is_after_hours_market", "get_market", "get_oracle_address",
+    "get_exchange_rate", "market_order_config", "get_group",
 ]
 
 [[case]]
@@ -2509,8 +2526,8 @@ server = "position-after-hours"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "is_after_hours_market", "get_market", "get_trade_infos", "get_after_hours_leverage",
-    "get_trade_raw", "get_market", "market_order_config", "get_oracle_address", "get_exchange_rate", "is_after_hours_market",
-    "get_market", "get_trade_infos", "get_after_hours_leverage",
+    "get_trade_raw", "get_market", "market_order_config", "get_oracle_address", "get_exchange_rate",
+    "get_group", "is_after_hours_market", "get_market", "get_trade_infos", "get_after_hours_leverage",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "1.result.content.0.text.previewDigest" = "6b4bcdb1cd79c56ff6f90e944a90c3c890f9fadd51569eb2b9875acd100824d4" }
@@ -2530,22 +2547,23 @@ seed = "session"
 server = "partial-preview-changed"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "oneClickTrading",
-    "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "is_after_hours_market", "oneClickTrading", "node_info",
-    "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "is_after_hours_market", "get_trade_raw", "is_after_hours_market",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market", "get_oracle_address",
+    "get_exchange_rate", "market_order_config", "get_group", "oneClickTrading", "node_info",
+    "trade", "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market",
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "is_after_hours_market", "get_market",
+    "get_oracle_address", "get_exchange_rate", "market_order_config", "get_group",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "1.result.content.0.text.previewDigest" = "639610d6417d78b973fc2d64c56f2c15d6b17c0673cb02ea623ec85dfa7567e8", "2.result.content.0.text.code" = "PREVIEW_MISMATCH", "2.result.content.0.text.preview.previewDigest" = "31871b2aa39eb00c7d14021f2af5fb65ed5795a7125cc2f1d7ac924ae8a20176" }
 rust = { wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market", "get_oracle_address",
+    "get_exchange_rate", "market_order_config", "get_group", "oneClickTrading", "trade",
+    "node_info", "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market",
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market",
-    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market",
-    "get_trade_raw", "is_after_hours_market",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "is_after_hours_market", "get_market",
+    "get_oracle_address", "get_exchange_rate", "market_order_config", "get_group",
 ] }
 
 [[case]]
@@ -2556,8 +2574,8 @@ server = "concurrent-close"
 wire = [
     "trade", "oneClickTrading", "node_info", "get_trade_raw", "borrowing",
     "get_exchange_balance", "get_trade_raw", "get_market", "get_oracle_address", "get_exchange_rate",
-    "recordUserIntent",
-    "trade", "oneClickTrading", "node_info", "get_trade_raw", "borrowing",
-    "get_exchange_balance", "get_trade_raw", "get_market", "get_oracle_address", "get_exchange_rate",
+    "market_order_config", "get_group", "recordUserIntent", "trade", "oneClickTrading",
+    "node_info", "get_trade_raw", "borrowing", "get_exchange_balance", "get_trade_raw",
+    "get_market", "get_oracle_address", "get_exchange_rate", "market_order_config", "get_group",
 ]
 state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }

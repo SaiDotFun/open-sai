@@ -485,7 +485,7 @@ def dry_run_bytes(cli: CLI, home: Path, endpoints: Endpoints, command: CLI) -> b
         (
             LEVERAGE,
             "queued",
-            LEVERAGE_MARKET_WIRE + LEVERAGE_LIMITS_WIRE + ["get_fees"],
+            LEVERAGE_WIRE + ["get_fees"],
             {**estimates(QUOTED_LIQUIDATION), "execution": unavailable(QUEUED)},
         ),
         (

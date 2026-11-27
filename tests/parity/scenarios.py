@@ -433,6 +433,8 @@ def loopback(
     balance_block_reads: bool = False,
     overview_delay: float = 0,
     wrong_balance_at: Literal["snapshot", "pinned"] | None = None,
+    market_oracle: Literal["unavailable", "stale"] | None = None,
+    queued: bool = False,
 ) -> Generator[Endpoints]:
     errors: list[str] = []
     wire: list[WireRequest] = []
@@ -690,7 +692,11 @@ def loopback(
             "group_index": "GroupIndex(0)",
         },
         "get_oracle_address": ORACLE_CONTRACT,
-        "get_group": {"min_leverage": "1", "max_leverage": "100"},
+        "get_group": {
+            "min_leverage": "1",
+            "max_leverage": "100",
+            "stale_price_expiration_secs": 0,
+        },
         "get_pair_custom_max_leverage": "0",
         "get_fees": {
             "min_position_size_usd": str(market["minPositionSizeUSD"]),
@@ -715,6 +721,15 @@ def loopback(
         contracts["get_collateral_price"] = "0.987654321098765432"
     if scenario in {"position-index-lag", "position-index-lag-recovers"}:
         contracts["get_trade_raw"]["collateral_amount"] = "10000001"
+    if (
+        scenario in POSITION_SCENARIOS
+        or close_target == "verified"
+        or scenario == "concurrent-close"
+    ):
+        contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
+    if close_target == "verified" or scenario == "concurrent-close":
+        # These synthetic admission fixtures do not model liquidation.
+        contracts["market_order_config"]["fill_at_next_oracle_price"] = True
     if scenario in POSITION_SCENARIOS - {
         "partial-price-changed",
         "partial-usdc-oracle-outage",
@@ -788,6 +803,12 @@ def loopback(
         contracts["market_order_config"] = {
             "fill_at_next_oracle_price": scenario == "quote-queued"
         }
+    if scenario == "quote-queued":
+        contracts["get_group"]["stale_price_expiration_secs"] = 0
+    if market_oracle is not None:
+        contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
+        contracts["get_group"]["stale_price_expiration_secs"] = 30
+        contracts["market_order_config"]["fill_at_next_oracle_price"] = queued
     if scenario == "quote-after-hours":
         contracts.update(is_after_hours_market=True, get_after_hours_leverage="1.1")
         contracts["get_market"].update(block_last_opened=50, block_last_closed=100)
@@ -1520,6 +1541,14 @@ def loopback(
                                 self.reject(f"Expected a fresh {name} query")
                                 return
                         wire.append(WireRequest(name, variables=query))
+                        if market_oracle == "unavailable" and name in {
+                            "get_exchange_rate",
+                            "get_perp_prices",
+                        }:
+                            self.reply(
+                                {"message": "Market exchange rate unavailable"}, 503
+                            )
+                            return
                         if scenario in POSITION_SCENARIOS or scenario.startswith(
                             "position-execution-"
                         ):
