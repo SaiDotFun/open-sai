@@ -483,7 +483,6 @@ def verified_position_height(lcd: str, state: PositionSnapshot, trade_id: int) -
 class RecheckedPosition:
     height: str
     effective_leverage: Decimal
-    close_prices: Any = None
 
 
 def recheck_position(
@@ -491,24 +490,20 @@ def recheck_position(
     state: PositionSnapshot,
     trade_id: int,
     quoted_inputs: dict[str, Any],
+    *,
+    partial_close: bool,
 ) -> RecheckedPosition | None:
     """Recheck the on-chain quote inputs at the final position's block."""
     latest, height = _latest_position(lcd, state, trade_id)
     if not _same_position(state.raw, latest):
         return None
-    check_collateral = "collateralPriceUsd" in quoted_inputs
-    if check_collateral and (
+    if partial_close and (
         latest.get("long") is not state.raw.get("long")
         or latest.get("open_price") != state.raw.get("open_price")
     ):
         return None
     effective_leverage, inputs = leverage_inputs(lcd, state, trade_id, height=height)
-    quoted_leverage = {
-        key: value
-        for key, value in quoted_inputs.items()
-        if key != "collateralPriceUsd"
-    }
-    if inputs != quoted_leverage:
+    if inputs != quoted_inputs:
         return None
     if height is None:
         raise ValueError(
@@ -520,10 +515,7 @@ def recheck_position(
             "Cannot verify effective leverage at the position's block."
             " Request a new preview once the leverage inputs are readable."
         )
-    prices = None
-    if check_collateral:
-        prices = perp_prices(lcd, state, height)
-    return RecheckedPosition(height, effective_leverage, prices)
+    return RecheckedPosition(height, effective_leverage)
 
 
 def block_timestamp(lcd: str, height: str) -> int:
@@ -745,6 +737,25 @@ def collateral_amounts(
         "beforeUsd": usd(before),
         "afterUsd": usd(after),
     }
+
+
+def market_oracle_price(
+    lcd: str, contract: str, pair: dict[str, Any], height: str
+) -> dict[str, Any]:
+    """Read Perp's market rate at the pinned block, independent of collateral."""
+    indexes = {}
+    for side in ("base", "quote"):
+        index = re.fullmatch(r"TokenIndex\(([0-9]{1,5})\)", pair[side])
+        if index is None or (value := int(index[1])) > 65535:
+            raise ValueError("Invalid Perp market token index")
+        indexes[side] = value
+    address = smart_value(lcd, contract, {"get_oracle_address": {}}, height=height)
+    if not isinstance(address, str) or not re.fullmatch(r"nibi1[a-zA-Z0-9]+", address):
+        raise ValueError("Perp oracle contract is unavailable")
+    rate = smart_value(lcd, address, {"get_exchange_rate": indexes}, height=height)
+    if not isinstance(rate, dict):
+        raise TypeError("Invalid Perp market oracle price")
+    return rate
 
 
 def perp_prices(lcd: str, state: PositionSnapshot, height: str) -> Any:

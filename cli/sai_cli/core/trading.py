@@ -602,6 +602,7 @@ def _position_preview(
     dry_run: bool,
     before_submit: SubmitCheck | None,
     changed_message: str,
+    partial_close: bool = False,
     estimate: Callable[
         [
             margin.PositionSnapshot,
@@ -615,7 +616,9 @@ def _position_preview(
     def recheck(
         state: margin.PositionSnapshot, inputs: dict[str, Any]
     ) -> margin.RecheckedPosition | None:
-        return margin.recheck_position(lcd_endpoint, state, trade_id, inputs)
+        return margin.recheck_position(
+            lcd_endpoint, state, trade_id, inputs, partial_close=partial_close
+        )
 
     def verify_replacement(
         state: margin.PositionSnapshot, inputs: dict[str, Any]
@@ -834,7 +837,7 @@ def partial_close(
         notional = partial.notional_quote(state, delta, leverage)
         return (
             state,
-            {**inputs, "collateralPriceUsd": notional["collateralPriceUsd"]},
+            inputs,
             {
                 "dryRun": True,
                 "positionRoute": state.route,
@@ -857,6 +860,7 @@ def partial_close(
         dry_run=dry_run,
         before_submit=before_submit,
         changed_message="Position changed; review the reduction again",
+        partial_close=True,
         estimate=lambda state, inputs, fresh, rechecked: estimates.close_estimates(
             lcd_endpoint,
             state,

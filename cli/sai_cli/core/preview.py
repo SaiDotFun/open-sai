@@ -8,6 +8,7 @@ from typing import Any
 from . import intents, keeper, margin
 
 QUOTE_TIMEOUT = 3
+USDC_PRICE_SOURCE = "Fixed USDC price"
 ATOM = Decimal("1e-18")
 LIQUIDATION_THRESHOLD = Decimal("0.90")
 LIQUIDATION_FEE_RATE = Decimal("0.05")
@@ -444,24 +445,17 @@ def close_estimates(
                 if rechecked is None
                 else rechecked.height
             )
-            prices = (
-                margin.perp_prices(lcd, state, height)
-                if rechecked is None
-                else rechecked.close_prices
+            pair = contract_market(
+                lcd, state.contract, raw["market_index"], height=height
             )
-            oracle = prices.get("market") if isinstance(prices, dict) else None
-            published_at = (
-                oracle_publication_time(oracle) if isinstance(oracle, dict) else None
-            )
+            oracle = margin.market_oracle_price(lcd, state.contract, pair, height)
+            published_at = oracle_publication_time(oracle)
+            market = margin.contract_decimal(oracle["base_per_quote"])
         except margin.PositionChanged:
             raise
         except READ_ERRORS:
-            prices, oracle, published_at = None, None, None
-        if (
-            not isinstance(prices, dict)
-            or not isinstance(oracle, dict)
-            or published_at is None
-        ):
+            published_at = None
+        if published_at is None or market <= 0:
             missing_time = unavailable("The oracle price publication time is unknown.")
             return {
                 **dict.fromkeys(result, missing_time),
@@ -472,20 +466,12 @@ def close_estimates(
                 result,
                 unavailable("Queued closes settle on a fresh oracle update."),
             )
-        pair = None
-        if published_at is not None:
-            pair = contract_market(
-                lcd, state.contract, raw["market_index"], height=height
+        if stale_oracle(lcd, state.contract, pair, height, published_at):
+            return rejected(
+                "OraclePriceStale",
+                "Perp rejects the close at the observed stale oracle price.",
             )
-            if stale_oracle(lcd, state.contract, pair, height, published_at):
-                return rejected(
-                    "OraclePriceStale",
-                    "Perp rejects the close at the observed stale oracle price.",
-                )
-        market = margin.contract_decimal(oracle["base_per_quote"])
         trigger = stored_liquidation_price(lcd, state, height)
-        if market <= 0:
-            return result
         observed_at = intents.now()
         collateral = int(raw["collateral_amount"])
         if past_liquidation(market, trigger, long):
@@ -539,20 +525,11 @@ def close_estimates(
         else:
             result["execution"] = {"status": "voluntary_close"}
 
-        result["fees"] = unavailable(
-            "Perp fee schedule or collateral oracle price is unavailable."
-        )
-        price = margin.contract_decimal(prices["collateral"])
-        if price <= 0:
-            return result
-        if pair is None:
-            pair = contract_market(
-                lcd, state.contract, raw["market_index"], height=height
-            )
+        result["fees"] = unavailable("Perp fee schedule is unavailable.")
         schedule = fee_schedule(lcd, state.contract, pair, height=height)
         _, result["fees"] = base_fees(
             schedule,
-            price_input(price, "Sai Perp collateral oracle", observed_at),
+            price_input(Decimal(1), USDC_PRICE_SOURCE, None),
             _notional(collateral if reduce_by is None else reduce_by, effective),
             opening=False,
             triggered=reduce_by is not None,
