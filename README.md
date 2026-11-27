@@ -14,8 +14,7 @@ On Linux or macOS (x86-64 and ARM64), use Python 3.10 or later to run the
 standalone installer. It verifies the release archive against `SHA256SUMS`,
 checks that Sai and its MCP server start, and installs the launcher at
 `~/.local/bin/sai`. Add `~/.local/bin` to your `PATH` to run the command. The
-installed binary runs on its own. Until a native release is available, use the
-Python installer below.
+installed binary runs on its own.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py | python3 - --native
