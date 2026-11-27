@@ -139,10 +139,9 @@ fn short(addr: &str) -> String {
         .map_or_else(|| addr.into(), |(index, _)| format!("{}…", &addr[..index]))
 }
 
-pub(crate) fn safe_log_path(env: &Environment) -> bool {
-    !env.home.is_symlink()
-        && !env.home.join("logs").is_symlink()
-        && files::verify_profile_owner(&env.home).is_ok()
+pub(crate) fn start_log_writer(env: Environment) -> Option<sai_core::log::LogWriter> {
+    let approved = files::diagnostic_log_dir(&env.home).ok()?;
+    sai_core::log::LogWriter::start_doctor_command(env, approved)
 }
 
 impl DoctorArgs {
@@ -162,13 +161,13 @@ impl DoctorArgs {
         let fix = !self.no_fix;
         let fix_profile = fix && files::verify_profile_owner(&env.home).is_ok();
         let config_env = env.clone();
-        let (config, settings, invalid_endpoint, log_settings) =
+        let (config, settings, invalid_setting, log_settings) =
             sai_core::files::read_before(Instant::now() + DEADLINE, move || {
-                let (check, settings, invalid_endpoint) = config_check(&flags, &config_env);
+                let (check, settings, invalid_setting) = config_check(&flags, &config_env);
                 Ok((
                     check,
                     settings,
-                    invalid_endpoint,
+                    invalid_setting,
                     doctor_log_settings(&config_env),
                 ))
             })
@@ -295,7 +294,7 @@ impl DoctorArgs {
                 render_text(&checks, overall)
             };
             let mut error = SaiError::new(code, message);
-            if invalid_endpoint {
+            if invalid_setting {
                 error.exit_code = ExitCode::Usage;
             }
             if json_output {
@@ -333,7 +332,7 @@ fn config_check(flags: &Flags, env: &Environment) -> (Check, Option<Settings>, b
             return (
                 Check::new("config", "fail", message).fix(edit),
                 None,
-                error.is_invalid_endpoint(),
+                error.is_invalid_setting(),
             );
         }
     };
@@ -344,7 +343,7 @@ fn config_check(flags: &Flags, env: &Environment) -> (Check, Option<Settings>, b
                 Check::new("config", "fail", error.to_string())
                     .fix("Check the settings listed by `sai config --help`"),
                 None,
-                error.is_invalid_endpoint(),
+                error.is_invalid_setting(),
             );
         }
     };
@@ -586,6 +585,17 @@ fn session_recovery(mut check: Check, command: Option<String>, guidance: Option<
     }
     check.fix = command;
     check
+}
+
+pub(crate) fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&b))
+    {
+        return arg.to_owned();
+    }
+    format!("'{}'", arg.replace('\'', "'\"'\"'"))
 }
 
 fn render_text(checks: &[Check], overall: &str) -> String {

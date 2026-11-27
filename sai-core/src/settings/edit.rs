@@ -217,6 +217,7 @@ fn uneditable(section: &str, path: &Path) -> SettingsError {
         ),
         uneditable: true,
         invalid_endpoint: false,
+        invalid_override: false,
     }
 }
 

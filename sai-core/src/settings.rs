@@ -181,6 +181,7 @@ impl Key {
             Kind::Url([secure, plain]) => {
                 self.expected(&format!("a URL starting with {secure}:// or {plain}://"))
             }
+            Kind::Bool if self == Self::UpdateAuto => self.expected("true or false"),
             Kind::Bool => self.expected("true, false, yes, no, on, off, 1, or 0"),
             Kind::Days => self.expected("a whole number, 1 or more"),
         }
@@ -310,6 +311,7 @@ pub struct SettingsError {
     message: String,
     uneditable: bool,
     invalid_endpoint: bool,
+    invalid_override: bool,
     malformed_toml: bool,
 }
 
@@ -319,6 +321,7 @@ impl SettingsError {
             message,
             uneditable: false,
             invalid_endpoint: false,
+            invalid_override: false,
             malformed_toml: false,
         }
     }
@@ -336,6 +339,10 @@ impl SettingsError {
 
     pub fn is_invalid_endpoint(&self) -> bool {
         self.invalid_endpoint
+    }
+
+    pub fn is_invalid_setting(&self) -> bool {
+        self.invalid_endpoint || self.invalid_override
     }
 
     pub fn is_malformed_toml(&self) -> bool {
@@ -360,7 +367,7 @@ impl From<SettingsError> for crate::errors::SaiError {
     fn from(error: SettingsError) -> Self {
         if error.is_uneditable() {
             Self::usage(error.to_string())
-        } else if error.invalid_endpoint {
+        } else if error.is_invalid_setting() {
             Self {
                 show_usage: false,
                 ..Self::usage(error.to_string())
@@ -460,7 +467,8 @@ pub struct Settings {
 
 impl Settings {
     pub fn load(flags: &Flags, env: &Environment) -> Result<Self, SettingsError> {
-        Self::resolve(flags, env, FileSettings::read(&env.path())?)
+        let file = FileSettings::read(&env.path(), env.raw(Key::UpdateAuto).is_some())?;
+        Self::resolve(flags, env, file)
     }
 
     /// Inspect the file even when flags or environment settings override it.
@@ -468,7 +476,11 @@ impl Settings {
         flags: &Flags,
         env: &Environment,
     ) -> Result<(Result<Self, SettingsError>, Vec<&'static str>), SettingsError> {
-        let file = FileSettings::read_for_diagnostics(&env.path())?;
+        let invalid_update_override = matches!(
+            pick(Key::UpdateAuto, flags, env, None),
+            (Err(_), Source::Env)
+        );
+        let file = FileSettings::read_for_diagnostics(&env.path(), invalid_update_override)?;
         let invalid = KEYS
             .into_iter()
             .filter(|key| {
@@ -530,12 +542,13 @@ impl Settings {
                     }
                     (key.default_value(), source)
                 }
-                Err(error) => {
+                Err(mut error) => {
                     let origin = if source == Source::Flag {
                         key.spec().flag.unwrap_or(key.spec().name)
                     } else {
                         key.spec().env
                     };
+                    error.invalid_override = matches!(source, Source::Flag | Source::Env);
                     return Err(error.with_context(origin));
                 }
             };
@@ -583,7 +596,7 @@ impl Settings {
 /// Effective logging settings, including the default when config cannot load.
 pub fn doctor_log_settings(env: &Environment) -> (bool, Value) {
     let flags = Flags::default();
-    let selected = FileSettings::read_for_diagnostics(&env.path())
+    let selected = FileSettings::read_for_diagnostics(&env.path(), false)
         .ok()
         .and_then(|file| {
             let value = |key: Key| {
@@ -610,8 +623,8 @@ struct FileSettings {
 }
 
 impl FileSettings {
-    fn read_for_diagnostics(path: &Path) -> Result<Self, SettingsError> {
-        let file = Self::read(path)?;
+    fn read_for_diagnostics(path: &Path, update_overridden: bool) -> Result<Self, SettingsError> {
+        let file = Self::read(path, update_overridden)?;
         for key in KEYS {
             if let Some(Ok(value)) = &file.entries[key as usize]
                 && let Some(url) = value.as_str()
@@ -623,7 +636,7 @@ impl FileSettings {
         Ok(file)
     }
 
-    fn read(path: &Path) -> Result<Self, SettingsError> {
+    fn read(path: &Path, update_overridden: bool) -> Result<Self, SettingsError> {
         let Some(text) = read_text(path)? else {
             return Ok(Self::default());
         };
@@ -640,6 +653,9 @@ impl FileSettings {
                             .push(format!("{path}: ignoring unknown setting {}", repr(&name)));
                         continue;
                     };
+                    if key == Key::UpdateAuto && update_overridden {
+                        continue;
+                    }
                     let entry = key.read_value(item, &parsed);
                     if let Err(ref error) = entry {
                         if !key.is_log() {
@@ -658,6 +674,8 @@ impl FileSettings {
                 file.warnings.push(format!(
                     "{path}: {message}; logging is off until it is fixed"
                 ));
+            } else if section == "update" && update_overridden {
+                continue;
             } else if KEYS.iter().any(|key| key.section_and_name().0 == section) {
                 return Err(SettingsError::invalid(format!(
                     "{path}: {}",
@@ -708,7 +726,7 @@ pub(crate) fn log_keep_days(env: &Environment) -> Option<u64> {
 }
 
 pub(crate) fn log_keep_value(env: &Environment) -> Option<Value> {
-    let file = FileSettings::read(&env.path()).ok()?;
+    let file = FileSettings::read(&env.path(), false).ok()?;
     let flags = Flags::default();
     let value = |key: Key| {
         pick(key, &flags, env, file.entries[key as usize].as_ref())

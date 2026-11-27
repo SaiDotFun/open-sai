@@ -1061,6 +1061,30 @@ def project_reference_doctor_keeper_log(left: Observation, right: Observation) -
             expected.pop("commandId", None)
 
 
+def hidden_arguments(count: int) -> list[str]:
+    return [f"<argument hidden {i} of {count}>" for i in range(1, count + 1)]
+
+
+def project_reference_saved_mcp_commands(case: Case, output: dict[str, Any]) -> None:
+    def project(row: dict[str, Any], key: str) -> None:
+        if argv := row.get(key):
+            if row.get("args") == "<hidden>":
+                # The shadowed Codex entries use a missing launcher and two operands.
+                if case.client_seed == "shadowed":
+                    row[key] = hidden_arguments(3)
+            else:
+                row[key] = [argv[0], *hidden_arguments(len(argv) - 1)]
+
+    if "error" in output:
+        output = output["error"].get("details", {})
+    for row in output.get("clients", []):
+        project(row, "registeredCommand")
+        for registration in row["registrations"]:
+            project(registration, "command")
+    for row in output.get("results", []):
+        project(row, "command")
+
+
 def run_case(
     case: Case,
     reference: list[str],
@@ -1133,6 +1157,32 @@ def run_case(
         project_reference_log_privacy(left, right)
         if case.name in {"mcp-install-invalid-scope", "mcp-install-empty-scope"}:
             left = project_reference_rejected_scope(left)
+        if case.accepted_divergence == "claude-env-report":
+            for result in left.output["results"]:
+                if result["client"] == "claude":
+                    result["argv"] = [
+                        [
+                            "--env=SAI_HOME=[redacted]"
+                            if arg.startswith("--env=SAI_HOME=")
+                            else arg
+                            for arg in argv
+                        ]
+                        for argv in result["argv"]
+                    ]
+        if case.accepted_divergence == "launcher-argument-report":
+            for result in left.output["results"]:
+                launcher, *args = result["command"]
+                result["command"] = [launcher, *hidden_arguments(len(args))]
+        if (
+            case.command in {"mcp list", "mcp uninstall"}
+            or case.name == "mcp-install-legacy"
+        ):
+            project_reference_saved_mcp_commands(case, left.output)
+        if case.name == "mcp-list-redacted" and isinstance(right.output, dict):
+            for client in right.output.get("clients", []):
+                for row in (client, *client.get("registrations", [])):
+                    if row.get("staleEnv") == ["FIXTURE_CREDENTIAL"]:
+                        row["staleEnv"] = ["1 other entry"]
     if (
         candidate != reference
         and case.accepted_divergence == "doctor-keeper-log-context"

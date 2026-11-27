@@ -193,11 +193,17 @@ impl Storage<'_> {
     /// Open and migrate the ledger.
     pub fn open_ledger(&self) -> Result<Connection, StorageError> {
         self.remaining_busy_timeout()?;
-        let path = self.directory()?.join(LEDGER_FILE);
-        // Closing a separate descriptor would release this process's SQLite
-        // POSIX locks. The enclosing directory is private even on first open.
-        let mut connection = Connection::open(&path)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        let mut connection = if self.preserve_ledger_modes {
+            let flags = OpenFlags::default() - OpenFlags::SQLITE_OPEN_CREATE;
+            Connection::open_with_flags(self.trader.join(LEDGER_FILE), flags)?
+        } else {
+            let path = self.directory()?.join(LEDGER_FILE);
+            // Closing a separate descriptor would release this process's SQLite
+            // POSIX locks. The enclosing directory is private even on first open.
+            let connection = Connection::open(&path)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            connection
+        };
         connection.busy_timeout(self.remaining_busy_timeout()?)?;
         migrate(&mut connection)?;
         connection.busy_timeout(self.remaining_busy_timeout()?)?;

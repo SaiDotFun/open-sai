@@ -537,10 +537,10 @@ compares their arguments, file modes, config values, Codex comments, and
 which files changed. It also checks that stdout and stderr omit the
 fixture credential.
 
-In `doctor-mcp-verification-failure`, Rust restores the Codex config when
-verification rejects the repaired entry. The case checks that Rust keeps the
-original bytes and mode. The pinned Python reference leaves the replacement
-on disk.
+In `doctor-mcp-verification-failure`, Rust asks Codex to check the proposed
+launcher using read-only overrides. When Codex rejects it, Rust reports the
+failure and leaves the original config in place. The pinned Python v0.1.2
+reference leaves the replacement on disk.
 
 In `mcp-uninstall-codex-query-failure`, both CLIs report the failed Codex
 query. Rust restores the original configuration bytes and mode, so the

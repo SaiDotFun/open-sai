@@ -178,7 +178,7 @@ impl Cli {
                 }
                 let environment = Ok(env.clone());
                 repl::run(&env.home, &flags, self.account.as_deref(), |args| {
-                    let _ = execute(args, &environment);
+                    execute(args, &environment).command_succeeded
                 })
             }
         }
@@ -188,13 +188,15 @@ impl Cli {
 
 fn main() -> process::ExitCode {
     let args: Vec<_> = env::args_os().collect();
-    execute(args, &Environment::from_process())
+    execute(args, &Environment::from_process()).status
 }
 
-fn execute(
-    args: Vec<OsString>,
-    environment: &Result<Environment, SettingsError>,
-) -> process::ExitCode {
+struct Execution {
+    status: process::ExitCode,
+    command_succeeded: bool,
+}
+
+fn execute(args: Vec<OsString>, environment: &Result<Environment, SettingsError>) -> Execution {
     let argv: Vec<_> = args
         .iter()
         .skip(1)
@@ -202,13 +204,15 @@ fn execute(
         .collect();
     let (command, operands) = command_path(&argv);
     let command = command.as_str();
-    let auth_attempt = command.split(' ').next() == Some("auth")
-        || (command.is_empty() && argv.iter().any(|arg| arg == "auth"));
+    let auth_attempt = is_auth_attempt(command, &argv);
     let home = environment.as_ref().ok().map(|env| env.home.as_path());
     let requested_json = json_requested(&argv);
     if eager_skill(&argv) {
         let outcome = complete(skill::show(None), Some("skill show"), requested_json, home);
-        return (outcome.0 as u8).into();
+        return Execution {
+            status: (outcome.0 as u8).into(),
+            command_succeeded: false,
+        };
     }
     let event_command = if argv.is_empty() {
         Some("repl")
@@ -224,11 +228,7 @@ fn execute(
     let writer = if command == "logs"
         || command.starts_with("logs ")
         || command == "skill show"
-        || command == "doctor"
-            && (operands.iter().any(|arg| arg == "--no-fix")
-                || environment
-                    .as_ref()
-                    .is_ok_and(|env| !doctor::safe_log_path(env)))
+        || command == "doctor" && operands.iter().any(|arg| arg == "--no-fix")
         || argv
             .iter()
             .any(|flag| matches!(flag.as_str(), "--help" | "--version" | "--skill"))
@@ -236,9 +236,8 @@ fn execute(
         None
     } else {
         let start = match command {
-            "doctor" | "mcp install" | "mcp list" | "mcp uninstall" => {
-                LogWriter::start_diagnostic_command
-            }
+            "doctor" => doctor::start_log_writer,
+            "mcp install" | "mcp list" | "mcp uninstall" => LogWriter::start_diagnostic_command,
             _ => LogWriter::start_command,
         };
         environment
@@ -271,7 +270,9 @@ fn execute(
     if command != "doctor" {
         start_log();
     }
-    let outcome = match Cli::try_parse_from(args) {
+    let parsed = Cli::try_parse_from(args);
+    let dispatched = parsed.is_ok();
+    let outcome = match parsed {
         Ok(cli) => {
             let json = cli.json || matches!(&cli.command, Some(Command::Intent { json: true, .. }));
             let usage_command =
@@ -286,12 +287,11 @@ fn execute(
                 });
             match result {
                 Ok(code) => (code, None),
-                Err(error) => complete(
-                    Err(error),
-                    usage_command,
-                    json && command != "mcp serve",
-                    home,
-                ),
+                Err(error) => {
+                    let json =
+                        json && (command != "mcp serve" || error.exit_code == ExitCode::Usage);
+                    complete(Err(error), usage_command, json, home)
+                }
             }
         }
         Err(error) => print_parse_error(
@@ -304,13 +304,16 @@ fn execute(
         ),
     };
     start_log();
-    finish(
-        writer.as_deref(),
-        surface,
-        command_field(),
-        started,
-        outcome,
-    )
+    Execution {
+        command_succeeded: dispatched && outcome.0 == ExitCode::Ok,
+        status: finish(
+            writer.as_deref(),
+            surface,
+            command_field(),
+            started,
+            outcome,
+        ),
+    }
 }
 
 fn eager_skill(argv: &[String]) -> bool {
@@ -503,17 +506,26 @@ fn finish(
     (code as u8).into()
 }
 
+fn is_auth_attempt(command: &str, argv: &[String]) -> bool {
+    command.split(' ').next() == Some("auth")
+        || (command.is_empty() && argv.iter().any(|arg| arg == "auth"))
+}
+
 // Recover the command name even when clap rejects its arguments.
 fn command_path(args: &[String]) -> (String, &[String]) {
     let mut skip = false;
+    let mut options = true;
     for (index, arg) in args.iter().enumerate() {
         if skip {
             skip = false;
             continue;
         }
         match arg.as_str() {
-            "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => skip = true,
-            _ if arg.starts_with('-') => {}
+            "--" if options => options = false,
+            "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" if options => {
+                skip = true;
+            }
+            _ if options && arg.starts_with('-') => {}
             _ => {
                 let tree = Cli::command();
                 let Some(mut node) = tree.find_subcommand(arg) else {

@@ -86,6 +86,39 @@ fn file_type_errors_are_reported_before_overrides_except_for_logging() {
 }
 
 #[test]
+fn update_override_wins_for_runtime_but_doctor_checks_the_stored_value() {
+    let home = tempdir().unwrap();
+    let env = fixture(home.path(), &[("SAI_UPDATE_AUTO", "invalid")]);
+    fs::write(env.path(), "[update]\nauto = \"invalid\"\n").unwrap();
+
+    let effective = Settings::load(&Flags::default(), &env).unwrap_err();
+    assert!(effective.is_invalid_setting());
+    assert_eq!(
+        effective.to_string(),
+        "SAI_UPDATE_AUTO: Invalid value for update.auto: expected true or false"
+    );
+
+    let (diagnostic, _) = Settings::for_doctor(&Flags::default(), &env).unwrap();
+    let diagnostic = diagnostic.unwrap_err();
+    assert!(diagnostic.is_invalid_setting());
+    assert_eq!(diagnostic.to_string(), effective.to_string());
+
+    let valid_env = fixture(home.path(), &[("SAI_UPDATE_AUTO", "false")]);
+    let stored = Settings::for_doctor(&Flags::default(), &valid_env).unwrap_err();
+    assert_eq!(
+        stored.to_string(),
+        format!(
+            "{}: Invalid value for update.auto: expected true or false",
+            env.path().display()
+        )
+    );
+
+    fs::write(env.path(), "[update]\nauto = \n").unwrap();
+    let syntax = Settings::for_doctor(&Flags::default(), &env).unwrap_err();
+    assert!(syntax.is_malformed_toml());
+}
+
+#[test]
 fn disabled_logging_ignores_bad_retention_from_env() {
     let home = tempdir().unwrap();
     let env = fixture(
