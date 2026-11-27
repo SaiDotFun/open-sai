@@ -2,18 +2,33 @@
 
 use std::io::{self, IsTerminal, Write as _};
 
-use sai_core::{errors::SaiError, session::ExpiryNotice};
-use serde_json::Value;
+use sai_core::{
+    errors::SaiError,
+    overview::{BALANCE_STALE_SECONDS, is_usdc_balance},
+    session::ExpiryNotice,
+};
+use serde_json::{Value, json};
 
 const UNKNOWN: &str = "unknown";
 
+pub(super) fn add_balance_freshness(overview: &mut Value) {
+    let balances = &mut overview["balances"];
+    let fetched = balances["fetchedAt"].clone();
+    if let Some(rows) = balances.get_mut("data").and_then(Value::as_object_mut) {
+        for row in rows.values_mut() {
+            if row["sourceAt"].is_null() && !row["usd"].is_null() {
+                row["sourceAt"] = fetched.clone();
+                row["sourceAtBasis"] = json!("fetchedAt");
+            }
+            let age = row["sourceAgeSeconds"].as_f64().map(|age| age.max(0.0));
+            row["sourceAgeSeconds"] = json!(age);
+            row["stale"] = json!(age.map(|age| age > BALANCE_STALE_SECONDS));
+        }
+    }
+}
+
 pub(super) fn show(result: &Value) -> Result<(), SaiError> {
-    let color = io::stdout().is_terminal()
-        && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
-    let mut display = Display {
-        out: String::new(),
-        color,
-    };
+    let mut display = Display::new();
     let session = &result["session"]["data"];
     let renewal = session["expiryWarning"].as_str().map(|warning| {
         ExpiryNotice {
@@ -46,7 +61,7 @@ pub(super) fn show(result: &Value) -> Result<(), SaiError> {
             .into_iter()
             .map(|(label, key)| {
                 let row = &balances[key];
-                vec![label.into(), number(&row["usd"], ""), source(row)]
+                vec![label.into(), number(&row["usd"], ""), balance_source(row)]
             }),
         );
     }
@@ -173,10 +188,93 @@ pub(super) fn show(result: &Value) -> Result<(), SaiError> {
             display.line("  No local session for this account");
         }
     }
-    io::stdout()
-        .lock()
-        .write_all(display.out.as_bytes())
-        .map_err(|_| SaiError::internal())
+    display.flush()
+}
+
+pub(super) fn show_balances(snapshot: &Value) -> Result<(), SaiError> {
+    let rows = items(&snapshot["data"]["userBalances"]);
+    if rows.is_empty() {
+        println!("No balance rows returned.");
+        return Ok(());
+    }
+    let rows = rows
+        .iter()
+        .map(|row| {
+            vec![
+                text(&row["token_info"]["name"]),
+                if is_usdc_balance(row) {
+                    "-".into()
+                } else {
+                    token_quantity(row)
+                },
+                number(&row["usd_value"], ""),
+                balance_source(row),
+            ]
+        })
+        .collect();
+    show_table(&["Balance", "Quantity", "USD", "Source (Age)"], rows, 72)
+}
+
+fn token_quantity(row: &Value) -> String {
+    let token = &row["token_info"];
+    let amount = text(&row["amount"]);
+    let Some(symbol) = token["symbol"].as_str().filter(|symbol| !symbol.is_empty()) else {
+        return UNKNOWN.into();
+    };
+    let Some(decimals) = token["decimals"].as_u64().filter(|d| *d <= 255) else {
+        return UNKNOWN.into();
+    };
+    if amount.is_empty() || !amount.bytes().all(|byte| byte.is_ascii_digit()) {
+        return UNKNOWN.into();
+    }
+    let decimals = decimals as usize;
+    let digits = format!("{amount:0>width$}", width = decimals + 1);
+    let (whole, fraction) = digits.split_at(digits.len() - decimals);
+    let whole = whole.trim_start_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        format!("{whole} {symbol}")
+    } else {
+        format!("{whole}.{fraction} {symbol}")
+    }
+}
+
+fn balance_source(row: &Value) -> String {
+    let height = if row["sourceBlock"].is_null() {
+        UNKNOWN.into()
+    } else {
+        text(&row["sourceBlock"])
+    };
+    let Some(age) = row["sourceAgeSeconds"].as_f64() else {
+        return format!("block {height} (age unknown)");
+    };
+    let total_seconds = age as u64;
+    let seconds = total_seconds % 60;
+    let total_minutes = total_seconds / 60;
+    let minutes = total_minutes % 60;
+    let hours = total_minutes / 60;
+    let elapsed = if hours == 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{hours}h {minutes}m")
+    };
+    let stale = if row["stale"] == true {
+        " · stale"
+    } else {
+        ""
+    };
+    format!("block {height} ({elapsed} old{stale})")
+}
+
+pub(super) fn show_table(
+    headers: &[&str],
+    rows: Vec<Vec<String>>,
+    max_col_width: usize,
+) -> Result<(), SaiError> {
+    let mut display = Display::new();
+    display.render_table(headers, rows, max_col_width);
+    display.flush()
 }
 
 struct Display {
@@ -185,6 +283,21 @@ struct Display {
 }
 
 impl Display {
+    fn new() -> Self {
+        Self {
+            out: String::new(),
+            color: io::stdout().is_terminal()
+                && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()),
+        }
+    }
+
+    fn flush(self) -> Result<(), SaiError> {
+        io::stdout()
+            .lock()
+            .write_all(self.out.as_bytes())
+            .map_err(|_| SaiError::internal())
+    }
+
     fn line(&mut self, text: impl AsRef<str>) {
         self.out.push_str(text.as_ref());
         self.out.push('\n');
@@ -247,6 +360,10 @@ impl Display {
             self.line("  None");
             return;
         }
+        self.render_table(headers, rows, 72);
+    }
+
+    fn render_table(&mut self, headers: &[&str], rows: Vec<Vec<String>>, max_col_width: usize) {
         let widths: Vec<_> = headers
             .iter()
             .enumerate()
@@ -256,7 +373,7 @@ impl Display {
                     .max()
                     .unwrap_or(0)
                     .max(header.len())
-                    .min(72)
+                    .min(max_col_width)
             })
             .collect();
         let separator = self.paint("38;5;240", " │ ");

@@ -96,6 +96,7 @@ impl<'a> Action<'a> {
                         _ => unreachable!("validated margin direction"),
                     },
                     amount: required("amount"),
+                    max_collateral_usd: None,
                 }
             } else {
                 let percent = integer("percent")

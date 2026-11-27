@@ -500,6 +500,47 @@ def normalize_overview_table(match: re.Match[str]) -> str:
     return "".join(f"  {line}\n" for line in lines)
 
 
+def project_historical_overview_balances(raw: str, mode: str) -> str:
+    """Render the native balance fields using the pinned Python overview format."""
+    if mode == "json":
+        value = json.loads(raw)
+        rows = value.get("balances", {}).get("data")
+        if rows is None:
+            return raw
+        for row in rows.values():
+            if row.pop("sourceAtBasis", None) == "fetchedAt":
+                row["sourceAt"] = None
+            row.pop("stale")
+        return json.dumps(value) + "\n"
+
+    def project_table(match: re.Match[str]) -> str:
+        header, _, *body = match[0].splitlines()
+        if not header.startswith("  Funds "):
+            return match[0]
+        rows = [[cell.strip() for cell in line[2:].split(" │ ")] for line in body]
+        if any(len(row) != 3 or not row[2].endswith(" (age unknown)") for row in rows):
+            return match[0]
+        for row in rows:
+            source = row[2].removesuffix(" (age unknown)")
+            row[2] = (
+                "unknown" if source == "block unknown" else f"{source} (time unknown)"
+            )
+        headings = [cell.strip() for cell in header[2:].split(" │ ")]
+        widths = [max(map(len, column)) for column in zip(headings, *rows, strict=True)]
+
+        def render(row: list[str]) -> str:
+            return " │ ".join(
+                cell.ljust(width) for cell, width in zip(row, widths, strict=True)
+            )
+
+        divider = "───".join("─" * width for width in widths)
+        return "".join(
+            f"  {line}\n" for line in (render(headings), divider, *map(render, rows))
+        )
+
+    return OVERVIEW_TABLE.sub(project_table, raw)
+
+
 def mask_overview_stdout(raw: str, mode: str) -> str:
     """Mask clock values in place so serialization and table layout stay comparable."""
     if mode == "json":

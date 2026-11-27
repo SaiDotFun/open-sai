@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 import json
 import os
+import select
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -424,6 +426,7 @@ def loopback(
     | None = None,
     leverage_target: str | None = None,
     market_price: float | None = None,
+    hold_read: tuple[str, int] | None = None,
     position_collateral: int | None = None,
     perp_prices: tuple[str, str] = ("100", "1"),
     cancel_target: str | None = None,
@@ -1225,6 +1228,17 @@ def loopback(
                             if not admission.release.wait(5):
                                 self.reject("Market session gate timed out")
                                 return
+                        if hold_read == (
+                            name,
+                            sum(item.label == name for item in wire),
+                        ):
+                            admission.arrived.set()
+                            if not admission.release.wait(10):
+                                self.reject("Trade preflight gate timed out")
+                                return
+                            with suppress(BrokenPipeError, ConnectionResetError):
+                                self.reply(responses[name])
+                            return
                         if (
                             scenario == "quote-concurrent-previews"
                             and name == "borrowings"
@@ -1312,6 +1326,31 @@ def loopback(
                     )
 
         def do_GET(self) -> None:
+            if (
+                scenario == "overview-balance-freshness"
+                and self.path == f"{scope}/query"
+                and self.headers.get("Upgrade", "").lower() == "websocket"
+            ):
+                # Serve the WebSocket and HTTP route on one origin for this fixture.
+                target = urlsplit(ws)
+                assert target.hostname is not None and target.port is not None
+                request = [
+                    self.requestline,
+                    *(f"{key}: {value}" for key, value in self.headers.items()),
+                ]
+                with socket.create_connection(
+                    (target.hostname, target.port), timeout=5
+                ) as upstream:
+                    upstream.sendall(
+                        ("\r\n".join(request) + "\r\n\r\n").encode("ascii")
+                    )
+                    peers = {self.connection: upstream, upstream: self.connection}
+                    while readable := select.select(list(peers), [], [], 5)[0]:
+                        for connection in readable:
+                            if not (chunk := connection.recv(65536)):
+                                return
+                            peers[connection].sendall(chunk)
+                return
             if not self.path.startswith("/"):
                 self.reject("Unexpected external HTTP GET")
                 return

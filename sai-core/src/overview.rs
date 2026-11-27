@@ -9,6 +9,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, FixedOffset, SecondsFormat, Timelike, Utc};
 use serde_json::{Map, Value, json};
 use tokio::sync::OnceCell;
+use url::Url;
 
 use crate::{
     endpoint::Endpoint,
@@ -29,6 +30,7 @@ use trades::TradeSections;
 const PAGE_SIZE: usize = 100;
 const MAX_PAGES: usize = 20;
 const PAGINATION_ERROR: &str = "The paginated list could not be confirmed and may be incomplete";
+pub const BALANCE_STALE_SECONDS: f64 = 300.0;
 const BALANCE_KEYS: [(&str, &str); 3] = [
     ("USDC on Sai", "balance"),
     ("USDC Credits on Sai", "credits"),
@@ -116,6 +118,68 @@ pub async fn read(
     }
 }
 
+/// Read balances and verify source block times for a socket on the Keeper chain.
+pub async fn read_balance_snapshot(
+    settings: Option<&Settings>,
+    endpoint: &str,
+    addr: String,
+    events: EventContext<'_>,
+    notify: impl Fn(),
+    interrupt: impl Future<Output = SaiError>,
+) -> Result<Value, SaiError> {
+    let subscription = Subscription::BalancesWithBlock(addr);
+    tokio::pin!(interrupt);
+    let (mut data, connected) =
+        stream::snapshot_with_endpoint(endpoint, &subscription, notify, interrupt.as_mut()).await?;
+    let fetched = now();
+    let keeper = settings
+        .filter(|settings| {
+            same_keeper(settings.endpoint(), endpoint) && same_socket(endpoint, &connected)
+        })
+        .map(|settings| (settings, Keeper::new(settings.endpoint(), events)));
+    let enrich = async {
+        let rows = data["data"]["userBalances"]
+            .as_array_mut()
+            .ok_or_else(invalid)?;
+        let chain = OnceCell::new();
+        for row in rows {
+            if !row.is_object() {
+                return Err(invalid());
+            }
+            let block = row["lastUpdatedBlock"].clone();
+            let mut at = None;
+            if let Some(height) = block.as_u64().filter(|height| *height > 0)
+                && let Some((settings, keeper)) = &keeper
+                && let Some(chain) = chain.get_or_init(|| Chain::open(settings, keeper)).await
+            {
+                at = chain.block_time(height).await;
+            }
+            row["sourceBlock"] = block;
+            add_age(row, at, fetched);
+            let age = row["sourceAgeSeconds"].as_f64().map(|age| age.max(0.0));
+            row["sourceAgeSeconds"] = json!(age);
+            row["stale"] = json!(age.map(|age| age > BALANCE_STALE_SECONDS));
+            if is_usdc_balance(row) {
+                row["usd_value"] = json!(usdc_balance_usd(row));
+            }
+        }
+        Ok(data)
+    };
+    tokio::select! {
+        biased;
+        error = &mut interrupt => Err(error),
+        result = enrich => result,
+    }
+}
+
+fn same_keeper(keeper: &str, socket: &str) -> bool {
+    Endpoint::split(keeper).is_some_and(|url| url.websocket() == socket)
+}
+
+fn same_socket(endpoint: &str, connected: &Url) -> bool {
+    Url::parse(endpoint).is_ok_and(|requested| requested == *connected)
+}
+
 impl Overview<'_> {
     async fn read_sections(
         &self,
@@ -188,31 +252,32 @@ impl Overview<'_> {
         source
     }
 
-    fn same_keeper(&self) -> bool {
-        Endpoint::split(self.settings.endpoint())
-            .is_some_and(|url| url.websocket() == self.settings.ws_endpoint())
-    }
-
     async fn balances(&self, interrupt: impl Future<Output = SaiError>) -> Result<Value, SaiError> {
         let endpoint = self.settings.ws_endpoint();
-        let payload = stream::snapshot(
+        let payload = stream::snapshot_with_endpoint(
             endpoint,
             &Subscription::BalancesWithBlock(self.addr.to_owned()),
             || {},
             interrupt,
         )
         .await;
+        let mut matches = same_keeper(self.settings.endpoint(), endpoint);
+        let mut origin = log::origin(endpoint);
         let mut section = match payload {
-            Ok(payload) => match parse_balances(payload) {
-                Ok(rows) => success(rows, now()),
+            Ok((payload, connected)) => match parse_balances(payload) {
+                Ok(rows) => {
+                    if !same_socket(endpoint, &connected) {
+                        matches = false;
+                        origin = log::origin(connected.as_str());
+                    }
+                    success(rows, now())
+                }
                 Err(error) => failed(error),
             },
-
             Err(error) if error.code != Code::StreamError => return Err(error),
             Err(error) => failed(error),
         };
-        let matches = self.same_keeper();
-        section["source"] = json!({"endpoint": log::origin(endpoint), "matchesKeeper": matches});
+        section["source"] = json!({"endpoint": origin, "matchesKeeper": matches});
         if !matches {
             section["warning"] =
                 json!("Balance WebSocket is independent. These funds may be on a different chain.");
@@ -239,7 +304,7 @@ impl Overview<'_> {
                     &rows[key]["block"],
                     &Value::Null,
                     fetched,
-                    self.same_keeper(),
+                    section["source"]["matchesKeeper"] == true,
                 )
                 .await,
             );
@@ -443,6 +508,23 @@ fn valid_queued_order(row: &Value) -> bool {
         && instant(&row["orderReqBlockTs"]).is_some()
 }
 
+/// Identify a USDC token or a Sai fund balance denominated in USDC.
+pub fn is_usdc_balance(row: &Value) -> bool {
+    let token = &row["token_info"];
+    token["symbol"] == "USDC"
+        || (token["type"] == "sai"
+            && token["name"]
+                .as_str()
+                .is_some_and(|name| BALANCE_KEYS.iter().any(|(label, _)| name == *label)))
+}
+
+fn usdc_balance_usd(row: &Value) -> Option<f64> {
+    let units = base_units(&row["amount"])?;
+    format!("{}.{:06}", units / 1_000_000, units % 1_000_000)
+        .parse()
+        .ok()
+}
+
 fn parse_balances(payload: Value) -> Result<Value, SaiError> {
     let mut selected = Object::new();
     for row in payload["data"]["userBalances"]
@@ -456,7 +538,7 @@ fn parse_balances(payload: Value) -> Result<Value, SaiError> {
         }
         let name = token["name"].as_str().ok_or_else(invalid)?;
         if let Some((_, key)) = BALANCE_KEYS.iter().find(|(label, _)| name == *label) {
-            let usd = number(&row["usd_value"]).ok_or_else(invalid)?;
+            let usd = usdc_balance_usd(row);
             let height = &row["lastUpdatedBlock"];
             if !valid_block(height, &Value::Null) {
                 return Err(invalid());
@@ -539,12 +621,15 @@ fn number(value: &Value) -> Option<f64> {
 }
 
 fn valid_base_units(value: &Value) -> bool {
+    base_units(value).is_some()
+}
+
+fn base_units(value: &Value) -> Option<u128> {
     value
         .as_str()
         .or_else(|| value.as_number().map(serde_json::Number::as_str))
-        .is_some_and(|text| {
-            text.bytes().all(|byte| byte.is_ascii_digit()) && text.parse::<u128>().is_ok()
-        })
+        .filter(|text| text.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|text| text.parse().ok())
 }
 
 fn valid_block(height: &Value, timestamp: &Value) -> bool {

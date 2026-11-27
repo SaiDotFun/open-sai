@@ -588,13 +588,7 @@ def test_position_update_dry_run(
                     "after": "10000000",
                 }
                 assert document["previewDigest"] == preview_digest(document)
-                if implementation == "python":
-                    # Issue 231 still tracks USD display in Rust.
-                    assert document.pop("collateral") == {
-                        "beforeUsd": "20",
-                        "afterUsd": "10",
-                    }
-                    output = (json.dumps(document, sort_keys=True) + "\n").encode()
+                assert document["collateral"] == {"beforeUsd": "20", "afterUsd": "10"}
             outputs.append(output)
             assert [entry.label for entry in endpoints.wire] == expected_wire
             assert not endpoints.errors

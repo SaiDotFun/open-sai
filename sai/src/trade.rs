@@ -1,5 +1,6 @@
 use std::{
     future::{Future, pending},
+    io::{self, IsTerminal as _, Write as _},
     sync::OnceLock,
     time::{Duration, Instant},
 };
@@ -7,6 +8,7 @@ use std::{
 use clap::{Args, Subcommand, ValueEnum};
 use sai_core::{
     errors::{Code, ExitCode, SaiError},
+    keeper::{self, Keeper},
     log::EventContext,
     settings::{Environment, Flags, Key, Settings, repr},
     storage::{Session, Storage, StorageEvent},
@@ -17,8 +19,9 @@ use sai_core::{
     wait,
 };
 use serde_json::{Value, json};
+use tokio::signal::unix::Signal;
 
-use crate::{load_settings, local};
+use crate::{load_settings, local, reads::usdc_markets};
 
 #[derive(Subcommand)]
 pub enum TradeCommand {
@@ -40,6 +43,7 @@ pub enum TradeCommand {
     },
     /// Cancel a pending order.
     Cancel {
+        #[arg(allow_negative_numbers = true)]
         trade_id: String,
         #[arg(long)]
         dry_run: bool,
@@ -95,6 +99,9 @@ pub enum TradeCommand {
         /// USDC amount for a leverage quote, not an execution cap.
         #[arg(long, allow_negative_numbers = true)]
         amount: String,
+        /// Cap the margin quote only. Actual collateral in USD can exceed this cap.
+        #[arg(long, allow_negative_numbers = true)]
+        max_collateral_usd: Option<String>,
     },
     /// Reduce an open USDC position by a whole percentage.
     PartialClose {
@@ -159,6 +166,7 @@ fn missing_enum_option<T: ValueEnum>(option: &str) -> SaiError {
 
 #[derive(Args)]
 pub struct Open {
+    /// Market ID or symbol, such as BTC.
     #[arg(long, allow_negative_numbers = true)]
     market: String,
     #[arg(long)]
@@ -193,9 +201,14 @@ pub struct Open {
 }
 
 impl Open {
-    fn preview(&self, price: Option<&str>, confirmed: bool) -> Result<TradePreview, SaiError> {
+    fn preview(
+        &self,
+        market: &str,
+        price: Option<&str>,
+        confirmed: bool,
+    ) -> Result<TradePreview, SaiError> {
         let trade = OpenTrade {
-            market: &self.market,
+            market,
             side: match self.side {
                 Side::Long => trade::Side::Long,
                 Side::Short => trade::Side::Short,
@@ -219,6 +232,55 @@ impl Open {
         }
     }
 
+    async fn resolve_market(
+        &self,
+        keeper: &Keeper<'_>,
+        signal: &mut Signal,
+    ) -> Result<String, SaiError> {
+        let market = &self.market;
+        if !market.is_ascii() || !market.bytes().any(|byte| byte.is_ascii_alphabetic()) {
+            return Ok(market.clone());
+        }
+        let response = keeper
+            .read_until(
+                keeper::MARKETS,
+                Default::default(),
+                keeper::TIMEOUT,
+                async {
+                    signal.recv().await;
+                    local::wait_aborted()
+                },
+            )
+            .await?;
+        let ids: std::collections::BTreeSet<_> = usdc_markets(&response)?
+            .filter(|row| {
+                row["baseToken"]["symbol"]
+                    .as_str()
+                    .is_some_and(|symbol| symbol.eq_ignore_ascii_case(market))
+            })
+            .map(|row| row["marketId"].as_u64().ok_or_else(SaiError::internal))
+            .collect::<Result<_, _>>()?;
+        match ids.len() {
+            0 => Err(SaiError::new(
+                Code::InvalidRequest,
+                "Invalid value for '--market': unknown market symbol. Run sai market list.",
+            )),
+            1 => Ok(ids.first().expect("one market ID").to_string()),
+            _ => {
+                let symbol = repr(market);
+                let ids = ids
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(SaiError::new(
+                    Code::InvalidRequest,
+                    format!("Ambiguous market symbol {symbol}. Pass a market ID: {ids}."),
+                ))
+            }
+        }
+    }
+
     fn confirmation(&self) -> Result<Option<trade::Confirmation<'_>>, SaiError> {
         let Some(digest) = self.preview_digest.as_deref().filter(|_| !self.dry_run) else {
             return Ok(None);
@@ -230,12 +292,7 @@ impl Open {
     }
 }
 
-pub fn group_help(show_cancel: bool) -> String {
-    let cancel = if show_cancel {
-        "  cancel         Cancel a pending order.\n"
-    } else {
-        ""
-    };
+pub fn group_help() -> String {
     format!(
         r#"{}
 
@@ -245,7 +302,8 @@ Options:
   --help  Show this message and exit.
 
 Commands:
-{cancel}  close          Close a position or cancel a pending order.
+  cancel         Cancel a pending order.
+  close          Close a position or cancel a pending order.
   leverage       Set target leverage without changing TP or SL.
   margin         Add or remove margin through a target-leverage intent.
   open           Open a market, limit, or stop trade.
@@ -258,6 +316,15 @@ Commands:
 // Render Click's help for the trade commands shared with Python.
 pub fn help(command: &str) -> Option<String> {
     let body = match command {
+        "trade cancel" => {
+            r#"  Cancel a pending order.
+
+Options:
+  --dry-run
+  --preview-digest TEXT  Submit only if the trade matches this dry-run digest.
+  --wait                 Wait up to 60 seconds for the intent outcome.
+  --help                 Show this message and exit."#
+        }
         "trade close" => {
             r#"  Close a position or cancel a pending order.
 
@@ -284,22 +351,24 @@ Options:
   The amount is a quote, not a cap: collateral can change before execution.
 
 Options:
-  --direction [add|remove]  [required]
-  --amount DECIMAL          USDC amount for a leverage quote, not an execution
-                            cap.  [required]
-  --lcd-endpoint TEXT       Nibiru REST endpoint for exact contract state.
-                            Defaults to the lcd.endpoint setting.
+  --direction [add|remove]      [required]
+  --amount DECIMAL              USDC amount for a leverage quote, not an
+                                execution cap.  [required]
+  --max-collateral-usd DECIMAL  Cap the margin quote only. Actual collateral
+                                in USD can exceed this cap.
+  --lcd-endpoint TEXT           Nibiru REST endpoint for exact contract state.
+                                Defaults to the lcd.endpoint setting.
   --dry-run
-  --preview-digest TEXT     Submit only if the trade matches this dry-run
-                            digest.
-  --wait                    Wait up to 60 seconds for the intent outcome.
-  --help                    Show this message and exit."#
+  --preview-digest TEXT         Submit only if the trade matches this dry-run
+                                digest.
+  --wait                        Wait up to 60 seconds for the intent outcome.
+  --help                        Show this message and exit."#
         }
         "trade open" => {
             r#"  Open a market, limit, or stop trade.
 
 Options:
-  --market INTEGER            [x<=None; required]
+  --market MARKET             Market ID or symbol, such as BTC.  [required]
   --side [long|short]         [required]
   --type [market|limit|stop]  [required]
   --amount DECIMAL            USDC amount in USD.  [required]
@@ -367,7 +436,14 @@ pub fn run(
             ("--take-profit", open.take_profit.as_deref()),
             ("--stop-loss", open.stop_loss.as_deref()),
         ])?,
-        TradeCommand::Margin { amount, .. } => check_ascii_decimals(&[("--amount", Some(amount))])?,
+        TradeCommand::Margin {
+            amount,
+            max_collateral_usd,
+            ..
+        } => check_ascii_decimals(&[
+            ("--amount", Some(amount)),
+            ("--max-collateral-usd", max_collateral_usd.as_deref()),
+        ])?,
         TradeCommand::Tpsl {
             take_profit,
             stop_loss,
@@ -404,6 +480,11 @@ pub fn run(
                 ..
             }
     );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| SaiError::internal())?;
+    let mut open_signal = None;
     let (preview, dry_run, wait_for_trade, allow_concurrent_open, supplied_price, confirmation) =
         match &command {
             TradeCommand::Open(open) => {
@@ -411,8 +492,18 @@ pub fn run(
                 let confirmed_market =
                     confirmation.is_some() && matches!(open.order_type, OrderType::Market);
                 let supplied = open.price.as_deref();
+                let keeper = Keeper::new(settings.endpoint(), events);
+                let (market, signal) = runtime.block_on(async {
+                    let mut signal = local::wait_signal()?;
+                    let market = open.resolve_market(&keeper, &mut signal).await?;
+                    Ok::<_, SaiError>((market, signal))
+                })?;
+                // Retain the receiver across lookup, refresh and dispatch so
+                // an interrupt queued between reads is still delivered.
+                open_signal = Some(signal);
                 (
                     open.preview(
+                        &market,
                         if confirmed_market { None } else { supplied },
                         open.dry_run || confirmation.is_some(),
                     )?,
@@ -454,6 +545,7 @@ pub fn run(
                 position,
                 direction,
                 amount,
+                max_collateral_usd,
             } => {
                 let direction = match direction.as_str() {
                     "add" => MarginDirection::Add,
@@ -469,7 +561,11 @@ pub fn run(
                     &trading,
                     &settings,
                     account,
-                    PositionAction::Margin { direction, amount },
+                    PositionAction::Margin {
+                        direction,
+                        amount,
+                        max_collateral_usd: max_collateral_usd.as_deref(),
+                    },
                     &waiting,
                 );
             }
@@ -529,10 +625,6 @@ pub fn run(
         }
         Err(error) => return Err(error),
     };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|_| SaiError::internal())?;
     if dry_run {
         if preview.is_standalone_position_update() {
             let output = runtime.block_on(trading.position_update_preview(
@@ -540,14 +632,21 @@ pub fn run(
                 session.as_ref(),
                 false,
             ))?;
-            local::emit(&output, json)?;
+            emit_preview(output, json)?;
             return Ok(ExitCode::Ok);
         }
-        let preview = runtime.block_on(trading.prepare_preview(
-            preview,
-            session.as_ref(),
-            PreviewMode::Cli,
-        ))?;
+        let prepare = trading.prepare_preview(preview, session.as_ref(), PreviewMode::Cli);
+        let preview = runtime.block_on(async {
+            if let Some(signal) = open_signal.as_mut() {
+                tokio::select! {
+                    biased;
+                    _ = signal.recv() => Err(local::wait_aborted()),
+                    preview = prepare => preview,
+                }
+            } else {
+                prepare.await
+            }
+        })?;
         local::emit(
             &preview.cli_preview_output(session.as_ref().map(Session::addr)),
             json,
@@ -564,14 +663,21 @@ pub fn run(
         confirmation,
         on_reserved: wait_for_trade.then_some(&track),
     };
+    let wait_signal = if wait_for_trade {
+        open_signal.take()
+    } else {
+        None
+    };
     let submit = async {
+        let interrupted = async {
+            if let Some(signal) = open_signal.as_mut() {
+                signal.recv().await;
+            } else {
+                trade_interrupt(wait_for_trade).await;
+            }
+        };
         let (result, reference_price) = trading
-            .submit_with_reference_price(
-                &session,
-                &preview,
-                options,
-                trade_interrupt(wait_for_trade),
-            )
+            .submit_with_reference_price(&session, &preview, options, interrupted)
             .await?;
         let mut output = json!({
             "addr": session.addr(), "intentKey": result.intent_key, "status": result.status,
@@ -583,10 +689,66 @@ pub fn run(
         Ok(output)
     };
     if wait_for_trade {
-        return runtime.block_on(waiting.finish(submit));
+        return runtime.block_on(waiting.finish(submit, wait_signal));
     }
     local::emit(&runtime.block_on(submit)?, json)?;
     Ok(ExitCode::Ok)
+}
+
+fn emit_preview(mut output: Value, json: bool) -> Result<(), SaiError> {
+    let execution = &output["estimates"]["execution"];
+    if !json
+        && execution["status"] == "would_be_rejected"
+        && execution["code"] == "InsufficientDepositBalance"
+        && let Some(reason) = execution["reason"].as_str()
+    {
+        return Err(SaiError::new(Code::PreviewMismatch, reason));
+    }
+    let quote = &output["quote"];
+    let base_units = &output["collateralBaseUnits"];
+    let (before, after) = if output["intent"]["body"]["requestedLeverage"].is_null() {
+        (None, None)
+    } else if quote.is_null() {
+        (base_units["before"].as_str(), base_units["after"].as_str())
+    } else {
+        (
+            quote["collateralBefore"].as_str(),
+            quote["collateralAfter"].as_str(),
+        )
+    };
+    if let (Some(before), Some(after)) = (before, after) {
+        let before = collateral_usd(before);
+        let after = collateral_usd(after);
+        if !json {
+            if let Some(warning) = execution["warning"].as_str() {
+                println!("{warning}");
+            }
+            println!("Estimated collateral: ${before} → ${after}");
+            if let Some(warning) = output["warning"].as_str() {
+                println!("{warning}");
+            }
+        }
+        if let Some(fields) = output.as_object_mut() {
+            fields.shift_insert(
+                2,
+                "collateral".into(),
+                json!({"beforeUsd": before, "afterUsd": after}),
+            );
+        }
+    }
+    local::emit(&output, json)
+}
+
+fn collateral_usd(units: &str) -> String {
+    // USDC has six decimals and uses a fixed price of one dollar.
+    let digits = format!("{units:0>7}");
+    let (whole, fraction) = digits.split_at(digits.len() - 6);
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        whole.into()
+    } else {
+        format!("{whole}.{fraction}")
+    }
 }
 
 fn check_ascii_decimals(fields: &[(&str, Option<&str>)]) -> Result<(), SaiError> {
@@ -617,6 +779,7 @@ impl WaitTrade<'_> {
     async fn finish(
         &self,
         submit: impl Future<Output = Result<Value, SaiError>>,
+        signal: Option<Signal>,
     ) -> Result<ExitCode, SaiError> {
         let recover = |interrupted, error: SaiError| {
             let Some((addr, key)) = self.reservation.get() else {
@@ -636,7 +799,10 @@ impl WaitTrade<'_> {
                 true,
             ))
         };
-        let mut signal = local::wait_signal()?;
+        let mut signal = match signal {
+            Some(signal) => signal,
+            None => local::wait_signal()?,
+        };
         let confirmed = OnceLock::new();
         let waited = async {
             let result = submit.await;
@@ -661,6 +827,12 @@ impl WaitTrade<'_> {
                 Err(error) if error.code == Code::OutcomeUnknown => None,
                 Err(error) => return Err(error),
             };
+            if !self.json && io::stderr().is_terminal() {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "Waiting for intent {key} to confirm..."
+                );
+            }
             let remember_fill = |receipt| {
                 let _ = confirmed.set((receipt, metadata.clone(), false));
             };
@@ -779,9 +951,14 @@ impl Position {
                 })
         };
         if wait_for_trade {
-            return runtime.block_on(waiting.finish(submit));
+            return runtime.block_on(waiting.finish(submit, None));
         }
-        local::emit(&runtime.block_on(submit)?, waiting.json)?;
+        let output = runtime.block_on(submit)?;
+        if self.dry_run {
+            emit_preview(output, waiting.json)?;
+        } else {
+            local::emit(&output, waiting.json)?;
+        }
         Ok(ExitCode::Ok)
     }
 }

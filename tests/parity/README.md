@@ -113,6 +113,12 @@ when it compares current Python against a candidate and reports
 `CURRENT_PYTHON_ROW` results. A changed signature or unexpected pass fails the
 comparison. Port the behavior and remove its entry in the same change.
 
+The trading UX cases in `test_manifest_gaps.py` and the leverage replays
+in `test_position_update.py` compare the current Python and Rust CLI
+collateral fields directly. The capped-margin fixture supplies a non-$1
+oracle price and checks that both CLIs calculate USD from USDC base units
+and skip the USDC oracle read.
+
 CI records the C3 storage replays against v0.1.2 and a separate C2/C3 replay
 against v0.1.1. The nine C2 config cases share their exact log-schema
 signatures across both releases. Each v0.1.1 config result appears as a
@@ -427,7 +433,10 @@ summation on Python 3.11, the package's minimum supported interpreter.
 Set `SAI_PARITY_OVERVIEW_PYTHON` to its `sai` executable for local runs.
 The cases validate height-pinned requests and compare section errors,
 source timestamps, risk values, and persisted state. Fetch timestamps and
-ages are checked against the invocation and then normalized.
+ages are checked against the invocation and then normalized. For the pinned
+reference, project the native balance freshness fields and unknown-age labels
+to the historical format. Separate loopback cases check the current labels
+and the stale field against Python main.
 
 ## C9b Python Reference
 

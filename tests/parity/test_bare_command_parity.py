@@ -2,7 +2,6 @@
 
 import json
 import os
-import re
 import subprocess
 import sys
 import tomllib
@@ -64,26 +63,8 @@ def test_bare_leaf_prints_full_help_and_json_usage(
     assert expected.stderr == b""
     assert expected.stdout.startswith(b"Usage:") and b"--help" in expected.stdout
 
-    def comparable(help_text: bytes) -> bytes:
-        if args == ("trade", "open"):
-            # Issue 231 tracks the --market help and symbol support.
-            return re.sub(rb"(?m)^  --market [^\n]*\n", b"", help_text)
-        if args == ("trade", "margin"):
-            # The new option widens the option column and wraps other help text.
-            without_cap = re.sub(
-                rb"(?m)^  --max-collateral-usd [^\n]*\n(?: {4,}[^\n]*\n)*",
-                b"",
-                help_text,
-            )
-            return b" ".join(without_cap.split())
-        return help_text
-
     errors = []
     comparisons = (("python", python), ("rust", rust))
-    if args == ("trade", "cancel"):
-        # Rust uses Clap help and has no --preview-digest option on cancel.
-        comparisons = (("python", python),)
-        assert b"--preview-digest" in expected.stdout
     for label, binary in comparisons:
         home = tmp_path / label
         bare = invoke(binary, home, *args)
@@ -91,22 +72,17 @@ def test_bare_leaf_prints_full_help_and_json_usage(
 
         assert bare.returncode == machine.returncode == 2
         assert bare.stdout == machine.stderr == b""
-        if label == "python":
-            assert bare.stderr == expected.stdout
-        else:
-            assert comparable(bare.stderr) == comparable(expected.stdout)
+        assert bare.stderr == expected.stdout
         error = json.loads(machine.stdout)["error"]
         assert error["code"] == "INVALID_REQUEST"
         assert error["message"].startswith("Missing ")
         errors.append(error)
-    if args == ("trade", "cancel"):
-        return
     assert errors[0] == errors[1]
 
     help_result = invoke(rust, tmp_path / "rust", *args, "--help")
     assert help_result.returncode == 0
     assert help_result.stderr == b""
-    assert comparable(help_result.stdout) == comparable(expected.stdout)
+    assert help_result.stdout == expected.stdout
 
 
 @pytest.mark.parametrize(
@@ -153,10 +129,8 @@ def test_bare_trade_group_matches_python(
         expected = invoke(python, tmp_path / "python", *args)
         actual = invoke(rust, tmp_path / "rust", *args)
         assert actual.returncode == expected.returncode == 2
-        # Rust's bare group help predates Python's cancel command.
-        cancel = b"  cancel         Cancel a pending order."
-        assert actual.stdout == expected.stdout.replace(cancel + rb"\n", b"", 1)
-        assert actual.stderr == expected.stderr.replace(cancel + b"\n", b"", 1)
+        assert actual.stdout == expected.stdout
+        assert actual.stderr == expected.stderr
 
     expected = invoke(python, tmp_path / "python", "trade", "--help")
     actual = invoke(rust, tmp_path / "rust", "trade", "--help")

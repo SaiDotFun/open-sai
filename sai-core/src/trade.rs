@@ -404,23 +404,19 @@ impl<'a> Trading<'a> {
             .map(|(accepted, _)| accepted)
     }
 
-    /// Return the submitted market price and report an interruption during dispatch as unknown.
-    pub async fn submit_with_reference_price(
+    async fn prepare_submission(
         &self,
         session: &Session,
         preview: &TradePreview,
-        options: SubmitOptions<'_>,
-        interrupted: impl Future<Output = ()>,
-    ) -> Result<(AcceptedTrade, Option<String>), SaiError> {
+        confirmation: Option<Confirmation<'_>>,
+        allow_concurrent_open: bool,
+    ) -> Result<(Option<TradePreview>, Option<Session>), SaiError> {
         let endpoint = self.keeper.endpoint();
         let account = session.addr();
         self.storage.check_active_trade(session, endpoint)?;
-        let confirming = options.confirmation.is_some();
-        let mcp_confirmation = options
-            .confirmation
-            .as_ref()
-            .is_some_and(Confirmation::is_mcp);
-        let live_confirmation = options.confirmation.as_ref().filter(|confirmation| {
+        let confirming = confirmation.is_some();
+        let mcp_confirmation = confirmation.as_ref().is_some_and(Confirmation::is_mcp);
+        let live_confirmation = confirmation.as_ref().filter(|confirmation| {
             (confirmation.is_cli() || confirmation.is_mcp())
                 && (matches!(
                     preview.intent.kind,
@@ -429,27 +425,22 @@ impl<'a> Trading<'a> {
         });
         let confirmed_preview = if let Some(confirmation) = live_confirmation {
             Some(
-                self.prepare_confirmation(
-                    session,
-                    preview,
-                    confirmation,
-                    options.allow_concurrent_open,
-                )
-                .await?,
+                self.prepare_confirmation(session, preview, confirmation, allow_concurrent_open)
+                    .await?,
             )
         } else {
             None
         };
         let close = if confirmed_preview.is_none() && preview.is_market_close() {
             Some(
-                self.prepare_close_submission(session, preview, options.confirmation.as_ref())
+                self.prepare_close_submission(session, preview, confirmation.as_ref())
                     .await?,
             )
         } else {
             None
         };
         let route = if confirmed_preview.is_none() && close.is_none() {
-            self.basic_trade_route(session, preview, confirming, options.confirmation.as_ref())
+            self.basic_trade_route(session, preview, confirming, confirmation.as_ref())
                 .await?
         } else {
             None
@@ -458,38 +449,35 @@ impl<'a> Trading<'a> {
         let open = preview.intent.kind == "OPEN_TRADE";
         let update = if confirmed_preview.is_none() && preview.is_standalone_position_update() {
             Some(
-                self.preflight_position_update(account, preview, options.confirmation.is_some())
+                self.preflight_position_update(account, preview, confirmation.is_some())
                     .await?,
             )
         } else {
             None
         };
-        let mut prepared;
-        let preview = if let Some(preview) = confirmed_preview.as_ref().or(close.as_ref()) {
-            preview
-        } else if open || confirming && checked_route {
-            prepared = preview.clone();
-            prepared.position_route = route;
+        let mut prepared = confirmed_preview.or(close);
+        if prepared.is_none() && (open || confirming && checked_route) {
+            let mut current = preview.clone();
+            current.position_route = route;
             if open {
-                self.prepare_open_submission(session, &mut prepared, confirming)
+                self.prepare_open_submission(session, &mut current, confirming)
                     .await?;
             }
-            &prepared
-        } else if let Some(update) = &update {
-            &update.preview
-        } else {
-            preview
-        };
+            prepared = Some(current);
+        }
+        let preview = prepared
+            .as_ref()
+            .or_else(|| update.as_ref().map(|update| &update.preview))
+            .unwrap_or(preview);
         // Live reads can outlast the session. Reload the pinned account
         // before confirmation and reserve with its current token.
-        let reloaded;
-        let session = if checked_route || open || update.is_some() || confirming {
-            reloaded = self.load_session(Some(account))?;
-            &reloaded
+        let reloaded = if checked_route || open || update.is_some() || confirming {
+            Some(self.load_session(Some(account))?)
         } else {
-            session
+            None
         };
-        if let Some(confirmation) = options.confirmation
+        let session = reloaded.as_ref().unwrap_or(session);
+        if let Some(confirmation) = confirmation
             && let Err(mut error) = confirmation.verify(preview, account)
         {
             if let Some(update) = update {
@@ -511,6 +499,37 @@ impl<'a> Trading<'a> {
             return Err(error);
         }
         preview.check_cli_execution(account, confirming)?;
+
+        Ok((
+            prepared.or_else(|| update.map(|update| update.preview)),
+            reloaded,
+        ))
+    }
+
+    /// Return the submitted market price and report an interruption during dispatch as unknown.
+    pub async fn submit_with_reference_price(
+        &self,
+        session: &Session,
+        preview: &TradePreview,
+        options: SubmitOptions<'_>,
+        interrupted: impl Future<Output = ()>,
+    ) -> Result<(AcceptedTrade, Option<String>), SaiError> {
+        let endpoint = self.keeper.endpoint();
+        let account = session.addr();
+        let mcp_confirmation = options
+            .confirmation
+            .as_ref()
+            .is_some_and(Confirmation::is_mcp);
+        tokio::pin!(interrupted);
+        let (prepared, reloaded) = tokio::select! {
+            biased;
+            () = &mut interrupted => return Err(SaiError::new(Code::InvalidRequest, "Aborted")),
+            prepared = self.prepare_submission(
+                session, preview, options.confirmation, options.allow_concurrent_open,
+            ) => prepared?,
+        };
+        let preview = prepared.as_ref().unwrap_or(preview);
+        let session = reloaded.as_ref().unwrap_or(session);
 
         let (key, stamp) = intent_identity();
         let intent = &preview.intent;
@@ -571,7 +590,7 @@ impl<'a> Trading<'a> {
         };
         let response = tokio::select! {
             biased;
-            () = interrupted => return Err(unknown_send()),
+            () = &mut interrupted => return Err(unknown_send()),
             response = self.keeper.request(SUBMIT, variables, Some(session.token()), keeper::TIMEOUT) => response,
         };
         let ack = match response {

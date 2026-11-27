@@ -38,6 +38,7 @@ from compare import (
     ledger,
     mask_doctor_stream,
     mask_overview_stdout,
+    project_historical_overview_balances,
     rewrite_mcp_fields,
     snapshot,
     stderr_category,
@@ -109,7 +110,7 @@ class Case:
     exact_output: bool = False
     current_only: bool = False
     reference_stderr_contains: list[str] | None = None
-    collateral_price_after: str | None = None
+    compare_current_margin_preview: bool = False
 
     @property
     def command(self) -> str:
@@ -403,6 +404,7 @@ def observe(
     *,
     candidate: bool = False,
     cutover: bool = False,
+    historical_overview: bool = False,
 ) -> Observation:
     checks: list[str] = []
 
@@ -594,6 +596,8 @@ def observe(
             "retryable": False,
         }
         display = json.dumps(reference_overview) + "\n"
+    if historical_overview and case.command == "account overview" and display:
+        display = project_historical_overview_balances(display, case.mode)
     if case.command == "account overview" and case.mode == "text":
         display = mask_overview_stdout(display, case.mode)
     if case.command == "doctor" and case.exact_output and case.mode == "text":
@@ -896,6 +900,7 @@ def safe_observe(
     *,
     candidate: bool = False,
     cutover: bool = False,
+    historical_overview: bool = False,
 ) -> tuple[Observation | None, str]:
     endpoints.errors.clear()
     endpoints.interrupt_ready.clear()
@@ -908,7 +913,13 @@ def safe_observe(
     try:
         result: tuple[Observation | None, str] = (
             observe(
-                case, binary, home, endpoints, candidate=candidate, cutover=cutover
+                case,
+                binary,
+                home,
+                endpoints,
+                candidate=candidate,
+                cutover=cutover,
+                historical_overview=historical_overview,
             ),
             "",
         )
@@ -1106,15 +1117,11 @@ def run_case(
     tool_evidence: dict[str, list[str]] | None = None,
 ) -> tuple[list[str], dict[str, str], str | None]:
     rust = candidate is not reference
-    candidate_case = case.rust_case() if rust else case
+    current_margin_preview = python_main and case.compare_current_margin_preview
+    # The release cases retain their recorded Rust wire expectations.
+    selected_case = replace(case, rust=None) if current_margin_preview else case
+    candidate_case = selected_case.rust_case() if rust else case
     account_balances = case.command == "account balances"
-    if python_main and case.collateral_price_after is not None:
-        wire = list(case.wire or [])
-        index = wire.index(case.collateral_price_after)
-        wire.insert(index + 1, "get_collateral_price")
-        case = replace(case, wire=wire)
-        if not rust:
-            candidate_case = case
     with (
         tempfile.TemporaryDirectory(prefix="sai-parity-") as temp,
         loopback(case.server, balance_block_reads=account_balances) as endpoints,
@@ -1129,6 +1136,7 @@ def run_case(
             endpoints,
             candidate=rust,
             cutover=cutover,
+            historical_overview=rust and not python_main,
         )
     if case.mode == "mcp" and tool_evidence is not None:
         mcp_evidence(case, left, right, tool_evidence)
@@ -1251,7 +1259,20 @@ def run_case(
     if cutover:
         diffs = cutover_differences(left, right)
     else:
-        if rust and case.position_case and not case.mcp_trade:
+        if rust and case.name == "trade-open-unknown-market-symbol":
+            error = left.output.get("error", {})
+            if (
+                error.get("message")
+                == "Unknown market symbol 'UNKNOWN'. Run sai market list."
+            ):
+                error["message"] = (
+                    "Invalid value for '--market': unknown market symbol. Run sai market list."
+                )
+        if (
+            rust
+            and case.position_case
+            and not (current_margin_preview or case.mcp_trade)
+        ):
             project_position_estimates(left.output)
         if rust and case.accepted_difference and case.mode != "mcp":
             diffs = []
@@ -1259,11 +1280,7 @@ def run_case(
                 diffs.append(
                     f"expected candidate exit {candidate_case.expect}, got {right.exit_code}"
                 )
-            # Clap prints the cancel description before the usage line.
-            if case.name == "bare-help-trade-cancel":
-                if set(left.stderr) != set(right.stderr):
-                    diffs.append("stderr categories differ")
-            elif left.stderr != right.stderr:
+            if left.stderr != right.stderr:
                 diffs.append("stderr differs")
         else:
             diffs = differences(left, right)

@@ -53,6 +53,7 @@ pub(super) fn margin(
     snapshot: &Snapshot,
     direction: MarginDirection,
     amount: &str,
+    max_collateral_usd: Option<&str>,
     effective: &ContractDecimal,
     mut inputs: Value,
 ) -> Result<TradePreview, SaiError> {
@@ -64,7 +65,7 @@ pub(super) fn margin(
             "Margin amount must have at most six decimal places",
         ));
     }
-    let delta = amount / amount_scale;
+    let mut delta = amount / amount_scale;
     let collateral = integer(field(raw, "collateral_amount")?)?;
     let stored = field(raw, "leverage")?.as_str().ok_or_else(malformed)?;
     let stored_units = positive_decimal(stored, "Current leverage")?;
@@ -77,6 +78,19 @@ pub(super) fn margin(
         return Err(invalid("Invalid margin input"));
     }
     let collateral = collateral.magnitude();
+    if let Some(cap) = max_collateral_usd {
+        let cap_units = positive_decimal(cap, "Maximum collateral in USD")?;
+        // One USDC base unit is one millionth of a dollar. Floor the ceiling
+        // to base units so the projected quote never rounds above it.
+        let maximum = BigUint::from(cap_units / amount_scale);
+        if &maximum <= collateral {
+            return Err(invalid(
+                "The USD collateral cap leaves no room to add margin",
+            ));
+        }
+        delta = delta.min(maximum - collateral);
+        inputs["maxCollateralUsd"] = json!(cap);
+    }
     let adding = direction == MarginDirection::Add;
     if !adding && &delta >= collateral {
         return Err(invalid(
@@ -319,6 +333,7 @@ mod tests {
             &snapshot,
             MarginDirection::Add,
             "1",
+            None,
             &effective,
             inputs,
         )

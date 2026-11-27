@@ -3,6 +3,22 @@
 # Titles that mention Python main compare the same fixtures with Python at a48e7775.
 # The signatures below still compare with the release.
 
+[gap."case:account-balances"]
+owner = "#231"
+signature = "3ec7ab4e5ab39c9dfd4cb19239752e9c8e8754b1d08d7dea3f6fc5d9702b6ecc"
+
+[gap."case:account-balances-derived-endpoint"]
+owner = "#231"
+signature = "3ec7ab4e5ab39c9dfd4cb19239752e9c8e8754b1d08d7dea3f6fc5d9702b6ecc"
+
+[gap."case:account-balances-no-subprotocol"]
+owner = "#231"
+signature = "3ec7ab4e5ab39c9dfd4cb19239752e9c8e8754b1d08d7dea3f6fc5d9702b6ecc"
+
+[gap."case:account-balances-redirect"]
+owner = "#231"
+signature = "3ec7ab4e5ab39c9dfd4cb19239752e9c8e8754b1d08d7dea3f6fc5d9702b6ecc"
+
 [gap."case:account-balances-interrupt"]
 owner = "#49"
 title = "Differs from Python main. Rust redacts free-form log errors."
@@ -134,11 +150,11 @@ signature = "d3d6a763000e32a8679dddcb05f4074e980c234aa1bfb40c30a993b7fe43a206"
 
 [gap."case:bare-help-trade-margin"]
 owner = "#172"
-signature = "332fccccec5e274d667ba5143155f396d53f56dc5218ec3c91cc2594345eef51"
+signature = "eeb907ca5d1af6556b50f105ad2e139977dac5212d95c05089a9772db1288bcb"
 
 [gap."case:bare-help-trade-open"]
 owner = "#172"
-signature = "f51cc0376c72daf347acfe30dacc57b3bda9733307b17a491a9b2f2c8ff3dc59"
+signature = "5ce0238065876cebd004e2209bce3c44b9af0935451f35af7dd9613bd0989c4f"
 
 [gap."case:bare-help-trade-partial-close"]
 owner = "#172"
@@ -518,11 +534,11 @@ signature = "3befa3b1161431863c4ffc26972227acd032cca0133deaf4d7cc7861cb6d602a"
 
 [gap."case:trade-bare-group-json"]
 owner = "#172"
-signature = "756245c4c1189ce9cd300c9696329612a7c0a909d12bb8238e26a978feef6ee9"
+signature = "a0c138ea865c1f407580ea1b4684691f5e7fa7f17ec2e480a29e14f95c6d1609"
 
 [gap."case:trade-bare-group-text"]
 owner = "#172"
-signature = "756245c4c1189ce9cd300c9696329612a7c0a909d12bb8238e26a978feef6ee9"
+signature = "0ab484ba9da5d1a49257d39ecbc782aa64adfb12ab72f59ee565378023403be0"
 
 [gap."case:trade-cancel"]
 owner = "#174"
@@ -542,7 +558,7 @@ signature = "866e192520eeeb1c7bc98f00573be7158e9f797c43a29d596c42d42fa157aa95"
 
 [gap."case:trade-margin"]
 owner = "#140"
-signature = "fb4d62d5792ed67060ceba1f880eb718999d9f65fb00857ddd6addfe3a86a325"
+signature = "4269bbfb0e53923bd9134fb0b5e9767e03a1effdf2689e72597fd0f705e8f07e"
 
 [gap."case:trade-margin-accepted"]
 owner = "#174"
@@ -551,12 +567,12 @@ signature = "a3060825112094e10969fa43db75eb358edbf8a4f997f16ed9aecff91e92849a"
 [gap."case:trade-margin-add-rounding"]
 owner = "#231"
 title = "Differs from Python main. The margin preview comparison reports different request traces or output."
-signature = "fe269d7a92bd28208a7cf6ed8286b6a7b19b13eb8985e813af87eb6c43fe5d3c"
+signature = "2b1f303fd087fd6ac42546a5db972c2442a93fa04a61711baac9ad54dd27fe67"
 
 [gap."case:trade-margin-after-hours"]
 owner = "#231"
 title = "Differs from Python main. The margin preview comparison reports different request traces or output."
-signature = "c2d60a315f968a68536938b87d1aca7d7f1994a62f393d965661527b571323d9"
+signature = "4e0222d17bdbfb6b56b913765ab64004b69438b3aabf6d2115e58d96fe698c9d"
 
 [gap."case:trade-margin-amount-required"]
 owner = "#49"
@@ -605,7 +621,7 @@ signature = "1d33714dd23a06abaa909bb5e5d76016d764ffe619e576a4812ffdd953cb72a0"
 [gap."case:trade-margin-remove-rounding"]
 owner = "#231"
 title = "Differs from Python main. The margin preview comparison reports different request traces or output."
-signature = "8d39feef7fd3b14b135c18f3e19cb53cbf7cf56bb1e51b1387db300022397a44"
+signature = "c9de985fdcbb2f9633a864fdbec0ad50f7ad59508b9aba80eaeb731903088094"
 
 [gap."case:trade-margin-signed-out-before-amount"]
 owner = "#174"

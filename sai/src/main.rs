@@ -664,7 +664,7 @@ fn print_parse_error(
     match error.kind() {
         ErrorKind::DisplayHelp => {
             if command == "trade" {
-                println!("{}", trade::group_help(true));
+                println!("{}", trade::group_help());
             } else if let Some(help) = help() {
                 println!("{help}");
             } else {
@@ -681,7 +681,7 @@ fn print_parse_error(
         {
             let message = match command {
                 "auth" => Some("Invalid arguments to auth.".into()),
-                "trade" => Some(trade::group_help(false)),
+                "trade" => Some(trade::group_help()),
                 _ => help().or_else(|| clap_help(command)),
             };
             if let Some(message) = message {
