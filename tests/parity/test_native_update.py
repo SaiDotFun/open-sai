@@ -1064,6 +1064,35 @@ def cached_shim_release(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+@pytest.mark.parametrize(
+    ("reported", "matches"), [("0.2.0rc1", True), ("0.2.0rc2", False)]
+)
+def test_uv_trial_checks_python_release_candidate_version(
+    standalone: NativeInstall, tmp_path: Path, reported: str, matches: bool
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    target = "0.2.0-rc.1"
+    output = f"sai, version {reported}"
+    candidate = wheel(tmp_path, target, version_output=output)
+    local_assets = {
+        **assets(install.installed, initial.name, initial.read_bytes()),
+        **assets(target, candidate.name, candidate.read_bytes()),
+    }
+    with releases(local_assets, tags=(target,)) as server:
+        result = install.update(server, "--to", target)
+    if matches:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(result.stdout)["target"] == target
+        assert install.invoke("--version").stdout.strip() == output
+    else:
+        assert result.returncode == 1, result.stdout
+        assert (
+            f"did not report {target}" in json.loads(result.stdout)["error"]["message"]
+        )
+        assert install.invoke("--version").stdout.strip() == f"sai {install.installed}"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
 @pytest.mark.parametrize("owner", ["standalone", "uv"])
 def test_doctor_repairs_cursor_through_its_managed_launcher(
     standalone: NativeInstall, tmp_path: Path, owner: str
@@ -1141,35 +1170,6 @@ def test_uv_downgrade_repairs_the_stale_cursor_alias(
     assert report["legacyName"] == RETIRED
     assert report["changes"] == ["Repaired the Sai registration in user scope"]
     assert install.state()["result"]["mcp"] == out["mcp"]
-
-
-@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
-@pytest.mark.parametrize(
-    ("reported", "matches"), [("0.2.0rc1", True), ("0.2.0rc2", False)]
-)
-def test_uv_trial_checks_python_release_candidate_version(
-    standalone: NativeInstall, tmp_path: Path, reported: str, matches: bool
-) -> None:
-    install, initial = uv_install(standalone, tmp_path)
-    target = "0.2.0-rc.1"
-    output = f"sai, version {reported}"
-    candidate = wheel(tmp_path, target, version_output=output)
-    local_assets = {
-        **assets(install.installed, initial.name, initial.read_bytes()),
-        **assets(target, candidate.name, candidate.read_bytes()),
-    }
-    with releases(local_assets, tags=(target,)) as server:
-        result = install.update(server, "--to", target)
-    if matches:
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert json.loads(result.stdout)["target"] == target
-        assert install.invoke("--version").stdout.strip() == output
-    else:
-        assert result.returncode == 1, result.stdout
-        assert (
-            f"did not report {target}" in json.loads(result.stdout)["error"]["message"]
-        )
-        assert install.invoke("--version").stdout.strip() == f"sai {install.installed}"
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
