@@ -1383,6 +1383,7 @@ client_seed = "empty"
 name = "mcp-list-redacted"
 args = ["--json", "mcp", "list"]
 client_seed = "legacy"
+rust = { output = { "clients.0.staleEnv" = ["1 other entry"], "clients.1.staleEnv" = ["1 other entry"], "clients.2.staleEnv" = ["1 other entry"] } }
 state = { "clients/.claude.json#changed" = false, "clients/.codex/config.toml#changed" = false, "clients/.cursor/mcp.json#changed" = false }
 
 [[case]]

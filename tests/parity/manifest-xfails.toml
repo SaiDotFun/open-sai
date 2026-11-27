@@ -407,7 +407,7 @@ signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
 
 [gap."case:mcp-list-redacted"]
 owner = "#215"
-signature = "9e52f8b34f70748eb6884d3710e58ba8448171fa74386c7e5161892d13a93bb8"
+signature = "d9f5e467d3ddb8590519768c8c7be8aa330fa39aae3316b7ea06a1d02febf39b"
 
 [gap."case:mcp-logs-intent-validation"]
 owner = "#175"
