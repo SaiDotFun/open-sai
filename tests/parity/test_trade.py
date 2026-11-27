@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import socket
 import sqlite3
@@ -31,6 +32,7 @@ from scenarios import (
 )
 
 CLI = tuple[str, ...]
+OBSERVED_AT = re.compile(rb'"observedAt": "\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z"')
 OPEN = (
     "trade",
     "open",
@@ -101,6 +103,7 @@ def current_trade_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
         ((*OPEN, "--type", "limit"), "quote-trigger-fee", True),
         ((*OPEN, "--type", "stop"), "quote-trigger-fee", True),
         (OPEN, "quote-close-only", False),
+        (CLOSE, "quote-close", True),
         (CLOSE, "quote-queued", True),
         (CLOSE, "quote-no-publication", False),
         ((*CLOSE, "--cancel-order"), "pending-order", True),
@@ -116,6 +119,11 @@ def current_trade_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
             True,
         ),
         (("trade", "partial-close", "7", "--percent", "50"), "partial-preview", True),
+        (
+            ("trade", "partial-close", "7", "--percent", "50"),
+            "quote-close-collateral-changed",
+            True,
+        ),
     ],
     ids=[
         "market-explicit",
@@ -124,15 +132,17 @@ def current_trade_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
         "stop",
         "rejected-open",
         "close",
+        "close-queued",
         "close-unknown-oracle",
         "pending-cancel",
         "tpsl",
         "leverage",
         "margin",
         "partial-close",
+        "partial-close-collateral-changed",
     ],
 )
-def test_cli_dry_run_digest_matches_python_main(
+def test_cli_dry_run_matches_python_main(
     cli_pair: tuple[CLI, CLI],
     tmp_path: Path,
     args: CLI,
@@ -140,7 +150,7 @@ def test_cli_dry_run_digest_matches_python_main(
     confirmable: bool,
 ) -> None:
     reference = str(Path(sys.executable).with_name("sai"))
-    confirmations = []
+    previews = []
     for index, cli in enumerate(((reference,), cli_pair[1])):
         with loopback(scenario) as endpoints:
             home = tmp_path / str(index)
@@ -154,10 +164,47 @@ def test_cli_dry_run_digest_matches_python_main(
                 assert digest == preview_digest(preview)
             else:
                 assert digest is None
-            confirmations.append((preview["positionRoute"], digest))
+            if args[:2] == ("trade", "leverage"):
+                assert preview["collateralBaseUnits"] == {
+                    "before": "10000000",
+                    "after": "10999999",
+                }
+            if index == 0 and args[1] in {"leverage", "margin"}:
+                # Issue 231 tracks the Python-only collateral display fields.
+                assert preview.pop("collateral") == {
+                    "beforeUsdc": "10.000000",
+                    "afterUsdc": "10.999999",
+                    "beforeUsd": "10",
+                    "afterUsd": "10.999999",
+                }
+            assert preview["positionRoute"]
+            canonical = json.dumps(preview, sort_keys=True).encode()
+            previews.append(OBSERVED_AT.sub(b'"observedAt": "<time>"', canonical))
             assert not endpoints.errors
             assert not rows(home)
-    assert confirmations[0] == confirmations[1]
+        if scenario == "quote-close-collateral-changed":
+            assert isinstance(digest, str)
+            with loopback("partial-preview-changed") as endpoints:
+                retry = tmp_path / f"retry-{index}"
+                seed_home(retry, endpoints, "session")
+                code, refusal, stderr = run(
+                    cli,
+                    retry,
+                    endpoints,
+                    (*args, "--preview-digest", digest),
+                    python=index == 0,
+                )
+                assert (code, stderr, refusal["error"]["code"]) == (
+                    4,
+                    "",
+                    "PREVIEW_MISMATCH",
+                ), (refusal, endpoints.errors)
+                assert not any(
+                    request.label == "recordUserIntent" for request in endpoints.wire
+                )
+                assert not endpoints.errors
+                assert not rows(retry)
+    assert previews[0] == previews[1]
 
 
 def run(

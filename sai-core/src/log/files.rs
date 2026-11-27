@@ -22,14 +22,14 @@ pub(super) struct LogDir(std::path::PathBuf);
 
 impl LogDir {
     pub fn open(root: &Path) -> io::Result<Self> {
-        Self::open_at(root, true)
+        Self::open_at(root, true, false)
     }
 
     pub fn read_only(root: &Path) -> io::Result<Self> {
-        Self::open_at(root, false)
+        Self::open_at(root, false, false)
     }
 
-    fn open_at(root: &Path, create: bool) -> io::Result<Self> {
+    fn open_at(root: &Path, create: bool, only_new: bool) -> io::Result<Self> {
         let parent = root
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
@@ -51,7 +51,10 @@ impl LogDir {
             if rustix::fs::fstat(&parent)?.st_uid != getuid().as_raw() {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
-            if create {
+            if only_new {
+                // An unapproved existing directory is never opened by Doctor.
+                rustix::fs::mkdirat(&parent, name, Mode::RWXU)?;
+            } else if create {
                 paths::create_managed_at(&parent, Path::new(name))?;
             }
             let fd = openat(parent, name, flags, Mode::empty())?;
@@ -60,13 +63,20 @@ impl LogDir {
             if info.uid() != geteuid().as_raw() {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
-            if create {
+            if only_new {
+                if info.mode() & 0o077 != 0 {
+                    return Err(io::ErrorKind::PermissionDenied.into());
+                }
+            } else if create {
                 restrict(&dir, &info)?;
             }
             Ok(Self(dir))
         }
         #[cfg(not(unix))]
         {
+            if only_new && root.exists() {
+                return Err(io::ErrorKind::AlreadyExists.into());
+            }
             if create && !root.exists() {
                 paths::managed(root)?;
             }
@@ -76,6 +86,17 @@ impl LogDir {
             }
             Ok(Self(root.into()))
         }
+    }
+
+    #[cfg(unix)]
+    pub fn open_doctor(root: &Path, approved: &mut Option<File>) -> io::Result<Self> {
+        if let Some(dir) = approved {
+            restrict(dir, &dir.metadata()?)?;
+            return Ok(Self(dir.try_clone()?));
+        }
+        let directory = Self::open_at(root, true, true)?;
+        *approved = Some(directory.0.try_clone()?);
+        Ok(directory)
     }
 
     #[cfg(unix)]
@@ -351,4 +372,32 @@ fn expired(name: &str, keep_days: u64, today: NaiveDate) -> bool {
     parse_name(name).is_some_and(|(date, _)| {
         (today - date).num_days() >= i64::try_from(keep_days).unwrap_or(i64::MAX)
     })
+}
+
+#[cfg(all(test, unix))]
+mod doctor_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn doctor_writer_never_tightens_an_unapproved_replacement() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("logs");
+        let previous = home.path().join("previous");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut approved = Some(File::open(&root).unwrap());
+        fs::rename(&root, &previous).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let opened = LogDir::open_doctor(&root, &mut approved).unwrap();
+        assert_eq!(
+            opened.0.metadata().unwrap().ino(),
+            previous.metadata().unwrap().ino()
+        );
+        assert_eq!(root.metadata().unwrap().mode() & 0o777, 0o755);
+        assert!(LogDir::open_doctor(&root, &mut None).is_err());
+        assert_eq!(root.metadata().unwrap().mode() & 0o777, 0o755);
+    }
 }

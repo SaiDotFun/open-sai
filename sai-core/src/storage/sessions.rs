@@ -245,6 +245,23 @@ fn read_envelope(path: &Path) -> Result<Option<Value>, SessionError> {
     }
 }
 
+/// Recognize supported session files without decrypting them.
+pub fn is_session_envelope(name: &str, value: &Value) -> bool {
+    let version = value["version"].as_u64();
+    let supported = match name {
+        LEGACY_SESSION => version == Some(2) && value["backend"] == "test",
+        SESSIONS => version == Some(VERSION),
+        _ => false,
+    };
+    let decoded_len = |key: &str| {
+        let decoded = STANDARD.decode(value[key].as_str()?).ok()?;
+        Some(decoded.len())
+    };
+    supported
+        && decoded_len("nonce") == Some(12)
+        && decoded_len("ciphertext").is_some_and(|len| len > 16)
+}
+
 fn cipher() -> AesGcm<Aes256, U12> {
     // This built-in compatibility key keeps tokens out of plaintext files.
     // The private file modes control access to the store.

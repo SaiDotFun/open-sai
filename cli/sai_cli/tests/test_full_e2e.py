@@ -194,7 +194,17 @@ def test_installed_cli_receives_balance_snapshot():
             check=True,
             timeout=10,
         )
-        assert json.loads(result.stdout) == golden
+        rows = json.loads(result.stdout)["data"]["userBalances"]
+        assert rows == [
+            {
+                **row,
+                "sourceBlock": None,
+                "sourceAt": None,
+                "sourceAgeSeconds": None,
+                "stale": None,
+            }
+            for row in golden["data"]["userBalances"]
+        ]
         assert [
             row["token_info"]["name"] for row in golden["data"]["userBalances"]
         ] == ["USDC on Sai", "USDC Credits on Sai"]

@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use crate::errors::SaiError;
 
 use crate::trade::{
-    TradePreview, Trading,
+    LeverageCollateral, TradePreview, Trading,
     actions::invalid,
     confirmation::{plain_decimal, positive_decimal},
     estimates::{market_rejection, oracle_publication_time},
@@ -42,11 +42,11 @@ pub(in crate::trade) async fn leverage_execution_estimates(
     height: &str,
     target: &str,
     quoted_effective: Option<u128>,
-) -> Result<Value, SnapshotError> {
+) -> Result<(Value, Option<LeverageCollateral>), SnapshotError> {
     leverage_execution(lcd, state, id, height, target, quoted_effective)
         .await
         .transpose()
-        .map(|estimates| estimates.unwrap_or_else(unknown_execution_inputs))
+        .map(|estimates| estimates.unwrap_or_else(|| (unknown_execution_inputs(), None)))
 }
 
 async fn leverage_execution(
@@ -56,8 +56,8 @@ async fn leverage_execution(
     height: &str,
     target: &str,
     quoted_effective: Option<u128>,
-) -> Option<Result<Value, SnapshotError>> {
-    let estimated = |value| Some(Ok(value));
+) -> Option<Result<(Value, Option<LeverageCollateral>), SnapshotError>> {
+    let estimated = |value| Some(Ok((value, None)));
     let raw = &state.raw;
     let read = |query| state.smart(lcd, query, height);
     let pair = read(json!({"get_market": {"index": raw.get("market_index")?}}))
@@ -196,7 +196,7 @@ async fn leverage_execution(
             .ok()?
             .parse()
             .ok()?;
-        let required = collateral - before;
+        let required = &collateral - &before;
         if available < required {
             let funding = format!(
                 "Perp requires {} USDC of additional margin. The observed available balance is {} USDC.",
@@ -210,7 +210,13 @@ async fn leverage_execution(
                 json!(format!("{funding} Perp checks funding at fill."));
         }
     }
-    estimated(estimates)
+    Some(Ok((
+        estimates,
+        Some(LeverageCollateral {
+            before: before.to_string(),
+            after: collateral.to_string(),
+        }),
+    )))
 }
 
 fn past_liquidation<T: Ord>(price: &T, threshold: &T, long: bool) -> bool {
@@ -249,6 +255,7 @@ impl Trading<'_> {
         id: &Value,
         verified: Option<(PositionRoute, Option<Value>)>,
         indexed: Value,
+        bind_collateral: bool,
     ) -> Result<(), SaiError> {
         let target = preview.intent.body["requestedLeverage"].as_str();
         let unavailable = if target.is_some() {
@@ -256,7 +263,7 @@ impl Trading<'_> {
         } else {
             unknown
         };
-        let result =
+        let (result, collateral) =
             if let (Some(endpoint), Some((route, verified_raw))) = (self.lcd_endpoint, verified) {
                 let lcd = Lcd(endpoint);
                 let quote = async {
@@ -280,21 +287,25 @@ impl Trading<'_> {
                         .await
                         .map(Some);
                     }
-                    Ok(trigger_estimates(&lcd, &snapshot, id, &height).await)
+                    Ok(trigger_estimates(&lcd, &snapshot, id, &height)
+                        .await
+                        .map(|value| (value, None)))
                 };
                 match quote.await {
-                    Ok(result) => result.unwrap_or_else(unavailable),
+                    Ok(result) => result.unwrap_or_else(|| (unavailable(), None)),
                     Err(SnapshotError::Owner(message)) => return Err(invalid(message)),
                     Err(
                         SnapshotError::CollateralMismatch
                         | SnapshotError::IndexMismatch
+                        | SnapshotError::PositionChanged
                         | SnapshotError::Unavailable,
-                    ) => unavailable(),
+                    ) => (unavailable(), None),
                 }
             } else {
-                unavailable()
+                (unavailable(), None)
             };
         preview.estimates = Some(result);
+        preview.leverage_collateral = collateral.filter(|_| bind_collateral);
         Ok(())
     }
 }

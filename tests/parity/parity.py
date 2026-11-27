@@ -105,6 +105,9 @@ class Case:
     interrupt_on_request: bool = False
     overview_expected: dict[str, Any] | None = None
     exact_output: bool = False
+    current_only: bool = False
+    reference_stderr_contains: list[str] | None = None
+    collateral_price_after: str | None = None
 
     @property
     def command(self) -> str:
@@ -525,6 +528,10 @@ def observe(
         for marker in case.absent_output_text or ()
     ):
         raise ValueError("Fixture credential appeared in CLI output")
+    if not candidate and any(
+        marker not in result.stderr for marker in case.reference_stderr_contains or ()
+    ):
+        check_failed("Reference stderr is missing required help text")
     for error in endpoints.errors:
         check_failed(error)
     actual, expected = [request.label for request in endpoints.wire], case.wire or []
@@ -1100,19 +1107,52 @@ def project_reference_doctor_keeper_log(left: Observation, right: Observation) -
             expected.pop("commandId", None)
 
 
+def hidden_arguments(count: int) -> list[str]:
+    return [f"<argument hidden {i} of {count}>" for i in range(1, count + 1)]
+
+
+def project_reference_saved_mcp_commands(case: Case, output: dict[str, Any]) -> None:
+    def project(row: dict[str, Any], key: str) -> None:
+        if argv := row.get(key):
+            if row.get("args") == "<hidden>":
+                # The shadowed Codex entries use a missing launcher and two operands.
+                if case.client_seed == "shadowed":
+                    row[key] = hidden_arguments(3)
+            else:
+                row[key] = [argv[0], *hidden_arguments(len(argv) - 1)]
+
+    if "error" in output:
+        output = output["error"].get("details", {})
+    for row in output.get("clients", []):
+        project(row, "registeredCommand")
+        for registration in row["registrations"]:
+            project(registration, "command")
+    for row in output.get("results", []):
+        project(row, "command")
+
+
 def run_case(
     case: Case,
     reference: list[str],
     candidate: list[str],
     *,
     cutover: bool = False,
+    python_main: bool = False,
     tool_evidence: dict[str, list[str]] | None = None,
 ) -> tuple[list[str], dict[str, str], str | None]:
     rust = candidate is not reference
     candidate_case = case.rust_case() if rust else case
+    account_balances = case.command == "account balances"
+    if python_main and case.collateral_price_after is not None:
+        wire = list(case.wire or [])
+        index = wire.index(case.collateral_price_after)
+        wire.insert(index + 1, "get_collateral_price")
+        case = replace(case, wire=wire)
+        if not rust:
+            candidate_case = case
     with (
         tempfile.TemporaryDirectory(prefix="sai-parity-") as temp,
-        loopback(case.server) as endpoints,
+        loopback(case.server, balance_block_reads=account_balances) as endpoints,
     ):
         left, left_error = safe_observe(
             case, reference, Path(temp) / "reference", endpoints, cutover=cutover
@@ -1163,55 +1203,37 @@ def run_case(
         project_reference_log_privacy(left, right)
         if case.name in {"mcp-install-invalid-scope", "mcp-install-empty-scope"}:
             left = project_reference_rejected_scope(left)
-        if case.accepted_divergence == "stale-env-count" and isinstance(
-            right.output, dict
+        if case.accepted_divergence == "claude-env-report":
+            for result in left.output["results"]:
+                if result["client"] == "claude":
+                    result["argv"] = [
+                        [
+                            "--env=SAI_HOME=[redacted]"
+                            if arg.startswith("--env=SAI_HOME=")
+                            else arg
+                            for arg in argv
+                        ]
+                        for argv in result["argv"]
+                    ]
+        if case.accepted_divergence == "launcher-argument-report":
+            for result in left.output["results"]:
+                launcher, *args = result["command"]
+                result["command"] = [launcher, *hidden_arguments(len(args))]
+        if (
+            case.command in {"mcp list", "mcp uninstall"}
+            or case.name == "mcp-install-legacy"
         ):
+            project_reference_saved_mcp_commands(case, left.output)
+        if case.name == "mcp-list-redacted" and isinstance(right.output, dict):
             for client in right.output.get("clients", []):
                 for row in (client, *client.get("registrations", [])):
                     if row.get("staleEnv") == ["FIXTURE_CREDENTIAL"]:
                         row["staleEnv"] = ["1 other entry"]
-        if case.accepted_divergence == "install-profile-report" and isinstance(
-            right.output, dict
-        ):
-            # Normalize the older Rust report for this exact fixture profile.
-            for row in right.output.get("results", []):
-                if row.get("client") == "claude" and "argv" in row:
-                    row["argv"] = [
-                        [
-                            "--env=SAI_HOME=<profile>"
-                            if arg == "--env=SAI_HOME=<HOME>/sai"
-                            else arg
-                            for arg in step
-                        ]
-                        for step in row["argv"]
-                    ]
     if (
         candidate != reference
         and case.accepted_divergence == "doctor-keeper-log-context"
     ):
         project_reference_doctor_keeper_log(left, right)
-    if (
-        rust
-        and not cutover
-        and case.accepted_divergence == "launcher-argument-report"
-        and isinstance(right.output, dict)
-    ):
-        # Rust may still show the exact fixture command before both CLIs use placeholders.
-        command = (
-            ["<HOME>/bin/sai", "mcp", "serve"]
-            if case.name == "mcp-install-legacy"
-            else case.args[case.args.index("--") + 1 :]
-        )
-        launcher, *args = command
-        for row in right.output.get("results", []):
-            if row.get("command") == command:
-                row["command"] = [
-                    launcher,
-                    *(
-                        f"<argument hidden {index} of {len(args)}>"
-                        for index in range(1, len(args) + 1)
-                    ),
-                ]
     if (
         candidate != reference
         and case.accepted_divergence == "codex-uninstall-rollback"
@@ -1272,7 +1294,11 @@ def run_case(
                 diffs.append(
                     f"expected candidate exit {candidate_case.expect}, got {right.exit_code}"
                 )
-            if left.stderr != right.stderr:
+            # Clap prints the cancel description before the usage line.
+            if case.name == "bare-help-trade-cancel":
+                if set(left.stderr) != set(right.stderr):
+                    diffs.append("stderr categories differ")
+            elif left.stderr != right.stderr:
                 diffs.append("stderr differs")
         else:
             diffs = differences(left, right)
@@ -1343,6 +1369,23 @@ def release_commands(reference: list[str]) -> set[str]:
     ):
         raise ValueError("Invalid release command inventory")
     return set(names)
+
+
+def supports_current_trade_ux(reference: list[str]) -> bool:
+    """Probe the executable so installed launchers and wrappers both work."""
+    with (
+        tempfile.TemporaryDirectory(prefix="sai-reference-help-") as temp,
+        loopback("normal") as endpoints,
+    ):
+        home = Path(temp)
+        result = invoke(
+            reference, ["trade", "cancel", "--help"], home, child_env(home, endpoints)
+        )
+    return (
+        result.returncode == 0
+        and result.stdout.startswith("Usage: sai trade cancel")
+        and "--preview-digest" in result.stdout
+    )
 
 
 def project_position_estimates(value: Any) -> None:
@@ -1448,14 +1491,18 @@ def main() -> int:
     cases = [Case(**item) for item in configured["case"]]
     deferred: dict[str, str] = configured.get("deferred", {})
     commands = cli_commands(python_cli)
-    if args.cutover:
-        try:
+    try:
+        if args.cutover:
             require_manifest_case_ids(
                 (case.name for case in cases), HERE / "release-case-ids.txt"
             )
             commands |= release_commands(reference)
-        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
-            parser.error(str(exc))
+        # The cancel command and the current margin preview shipped together.
+        python_main = not comparing_release and (
+            configured_reference is None or supports_current_trade_ux(reference)
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        parser.error(str(exc))
     missing = commands - ({case.command for case in cases} | deferred.keys())
     if missing:
         parser.error(
@@ -1464,7 +1511,8 @@ def main() -> int:
     selected = [
         case
         for case in cases
-        if (
+        if (python_main or not case.current_only)
+        and (
             case.name in C2_CONFIG_CASE_IDS
             if args.c2_v011
             else not args.case
@@ -1515,6 +1563,13 @@ def main() -> int:
             else None,
             row_label="C2_V011_ROW" if args.c2_v011 else "CUTOVER_ROW",
         )
+    current_gaps = None
+    if python_main and candidate is not reference:
+        current_gaps = ManifestGaps(
+            HERE / "python-main-gaps.toml",
+            case_ids={f"case:{case.name}" for case in selected} if args.case else None,
+            row_label="CURRENT_PYTHON_ROW",
+        )
     overview_reference = os.environ.get("SAI_PARITY_OVERVIEW_PYTHON")
     for case in selected:
         if args.reference is not None:
@@ -1541,18 +1596,23 @@ def main() -> int:
                 accepted_divergence=None,
                 mcp_deferred_trade_exception=False,
             )
+        case_id = f"case:{case.name}"
+        current_gap = (
+            current_gaps is not None
+            and oracle is reference
+            and case_id in current_gaps.gaps
+        )
         diffs, listed, expected = run_case(
             case,
             oracle,
             executable,
-            cutover=comparing_release,
+            cutover=comparing_release or current_gap,
+            python_main=python_main and oracle is reference,
             tool_evidence=evidence if gaps else None,
         )
         for tool, status in listed.items():
             if status != "LISTED" or tool not in tools:
                 tools[tool] = status
-        mismatches += bool(diffs)
-        expected_differences += bool(expected and not diffs)
         shown_args = [
             "<redacted>"
             if any(marker in arg for marker in case.absent_output_text or ())
@@ -1560,6 +1620,14 @@ def main() -> int:
             for arg in case.args
         ]
         command = f"`sai {shlex.join(shown_args)}` ({case.name})"
+        if current_gap and current_gaps is not None:
+            status, detail = current_gaps.result(case_id, diffs)
+            mismatches += status in {"DIFF", "XPASS"}
+            expected_differences += status == "XFAIL"
+            row(command, status, detail)
+            continue
+        mismatches += bool(diffs)
+        expected_differences += bool(expected and not diffs)
         if gaps:
             row(
                 command,
@@ -1598,7 +1666,8 @@ def main() -> int:
             print("Cutover could not verify an MCP inventory.")
             return 1
         return gaps.finish()
-    return int(bool(mismatches))
+    current_status = current_gaps.finish() if current_gaps is not None else 0
+    return int(bool(mismatches or current_status))
 
 
 if __name__ == "__main__":

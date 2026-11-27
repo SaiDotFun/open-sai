@@ -24,13 +24,7 @@ fn cursor_verification_leaves_concurrent_launcher_and_args_changes_intact() {
     let path = home.join("mcp.json");
     let old = json!({"command": "/fixture/old/sai", "args": ["mcp", "serve"]});
     let registration = Registration::new(old.clone(), &old, Scope::Project, false, vec![]).unwrap();
-    let target = Target {
-        argv: ["/fixture/new/sai", "mcp", "serve"]
-            .map(str::to_owned)
-            .to_vec(),
-        profile: None,
-        explicit: false,
-    };
+    let target = Target::generated("/fixture/new/sai".into(), None);
     let document = |entry: &Value| json!({"mcpServers": {"sai": entry}}).to_string();
     for changed in [
         old.clone(),
@@ -79,13 +73,7 @@ fn cursor_verification_timeout_restores_its_own_replacement() {
     let replacement = original.replace("old", "new");
     let deadline = Instant::now() + Duration::from_secs(3);
     let published = edit(&path, false, deadline, |_| Ok(replacement.clone())).unwrap();
-    let target = Target {
-        argv: ["/fixture/new/sai", "mcp", "serve"]
-            .map(str::to_owned)
-            .to_vec(),
-        profile: None,
-        explicit: false,
-    };
+    let target = Target::generated("/fixture/new/sai".into(), None);
     let expired = Instant::now() - Duration::from_millis(1);
     assert!(
         Client::verify_cursor_repair(&path, Scope::User, "sai", &target, published, expired)
