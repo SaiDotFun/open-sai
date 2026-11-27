@@ -2531,7 +2531,8 @@ wire = [
     "get_group", "is_after_hours_market", "get_market", "get_trade_infos", "get_after_hours_leverage",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
-output = { "1.result.content.0.text.previewDigest" = "6b4bcdb1cd79c56ff6f90e944a90c3c890f9fadd51569eb2b9875acd100824d4" }
+output = { "1.result.content.0.text.previewDigest" = "6b4bcdb1cd79c56ff6f90e944a90c3c890f9fadd51569eb2b9875acd100824d4", "1.result.content.0.text.collateral" = { beforeUsd = "10.000003", afterUsd = "11.000002" } }
+rust = { output = { "1.result.content.0.text.collateral" = "<absent>" } }
 
 [[case]]
 name = "trade-partial-close-mcp-changed-leverage"
