@@ -313,6 +313,46 @@ def test_numeric_keeper_price_rounds_to_even(
             )
 
 
+@pytest.mark.parametrize(
+    ("label", "request_number"),
+    [("borrowings", 1), ("borrowings", 2), ("oneClickTrading", 1)],
+    ids=["symbol-lookup", "price-refresh", "route-read"],
+)
+@pytest.mark.parametrize("wait", [(), ("--wait",)], ids=["submit", "wait"])
+def test_symbol_open_interrupts_preflight(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    label: str,
+    request_number: int,
+    wait: CLI,
+) -> None:
+    command = (*OPEN[:3], "BTC", *OPEN[4:-2], *wait)
+    with loopback("market-symbol", hold_read=(label, request_number)) as endpoints:
+        home = tmp_path / "rust"
+        seed_home(home, endpoints, "session")
+        with subprocess.Popen(
+            [*cli_pair[1], "--json", *command],
+            cwd=home,
+            env=child_env(home, endpoints),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) as child:
+            try:
+                assert endpoints.admission.arrived.wait(5)
+                child.send_signal(signal.SIGINT)
+                stdout, _ = child.communicate(timeout=5)
+                assert child.returncode == 1
+                assert json.loads(stdout)["error"]["message"] == "Aborted"
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                endpoints.admission.release.set()
+        assert all(request.label != "recordUserIntent" for request in endpoints.wire)
+        assert not rows(home)
+        assert not endpoints.errors
+
+
 def test_market_open_refuses_logout_during_price_refresh(
     trade_pair: tuple[CLI, CLI], tmp_path: Path
 ) -> None:

@@ -18,6 +18,7 @@ use sai_core::{
     wait,
 };
 use serde_json::{Value, json};
+use tokio::signal::unix::Signal;
 
 use crate::{load_settings, local, reads::usdc_markets};
 
@@ -230,7 +231,11 @@ impl Open {
         }
     }
 
-    async fn resolve_market(&self, keeper: &Keeper<'_>) -> Result<String, SaiError> {
+    async fn resolve_market(
+        &self,
+        keeper: &Keeper<'_>,
+        signal: &mut Signal,
+    ) -> Result<String, SaiError> {
         let market = &self.market;
         if !market.is_ascii() || !market.bytes().any(|byte| byte.is_ascii_alphabetic()) {
             return Ok(market.clone());
@@ -240,7 +245,10 @@ impl Open {
                 keeper::MARKETS,
                 Default::default(),
                 keeper::TIMEOUT,
-                crate::reads::interrupted(),
+                async {
+                    signal.recv().await;
+                    local::wait_aborted()
+                },
             )
             .await?;
         let ids: std::collections::BTreeSet<_> = usdc_markets(&response)?
@@ -475,6 +483,7 @@ pub fn run(
         .enable_all()
         .build()
         .map_err(|_| SaiError::internal())?;
+    let mut open_signal = None;
     let (preview, dry_run, wait_for_trade, allow_concurrent_open, supplied_price, confirmation) =
         match &command {
             TradeCommand::Open(open) => {
@@ -483,7 +492,14 @@ pub fn run(
                     confirmation.is_some() && matches!(open.order_type, OrderType::Market);
                 let supplied = open.price.as_deref();
                 let keeper = Keeper::new(settings.endpoint(), events);
-                let market = runtime.block_on(open.resolve_market(&keeper))?;
+                let (market, signal) = runtime.block_on(async {
+                    let mut signal = local::wait_signal()?;
+                    let market = open.resolve_market(&keeper, &mut signal).await?;
+                    Ok::<_, SaiError>((market, signal))
+                })?;
+                // Retain the receiver across lookup, refresh and dispatch so
+                // an interrupt queued between reads is still delivered.
+                open_signal = Some(signal);
                 (
                     open.preview(
                         &market,
@@ -618,11 +634,18 @@ pub fn run(
             emit_preview(output, json)?;
             return Ok(ExitCode::Ok);
         }
-        let preview = runtime.block_on(trading.prepare_preview(
-            preview,
-            session.as_ref(),
-            PreviewMode::Cli,
-        ))?;
+        let prepare = trading.prepare_preview(preview, session.as_ref(), PreviewMode::Cli);
+        let preview = runtime.block_on(async {
+            if let Some(signal) = open_signal.as_mut() {
+                tokio::select! {
+                    biased;
+                    _ = signal.recv() => Err(local::wait_aborted()),
+                    preview = prepare => preview,
+                }
+            } else {
+                prepare.await
+            }
+        })?;
         local::emit(
             &preview.cli_preview_output(session.as_ref().map(Session::addr)),
             json,
@@ -639,14 +662,21 @@ pub fn run(
         confirmation,
         on_reserved: wait_for_trade.then_some(&track),
     };
+    let wait_signal = if wait_for_trade {
+        open_signal.take()
+    } else {
+        None
+    };
     let submit = async {
+        let interrupted = async {
+            if let Some(signal) = open_signal.as_mut() {
+                signal.recv().await;
+            } else {
+                trade_interrupt(wait_for_trade).await;
+            }
+        };
         let (result, reference_price) = trading
-            .submit_with_reference_price(
-                &session,
-                &preview,
-                options,
-                trade_interrupt(wait_for_trade),
-            )
+            .submit_with_reference_price(&session, &preview, options, interrupted)
             .await?;
         let mut output = json!({
             "addr": session.addr(), "intentKey": result.intent_key, "status": result.status,
@@ -658,7 +688,7 @@ pub fn run(
         Ok(output)
     };
     if wait_for_trade {
-        return runtime.block_on(waiting.finish(submit));
+        return runtime.block_on(waiting.finish(submit, wait_signal));
     }
     local::emit(&runtime.block_on(submit)?, json)?;
     Ok(ExitCode::Ok)
@@ -740,6 +770,7 @@ impl WaitTrade<'_> {
     async fn finish(
         &self,
         submit: impl Future<Output = Result<Value, SaiError>>,
+        signal: Option<Signal>,
     ) -> Result<ExitCode, SaiError> {
         let recover = |interrupted, error: SaiError| {
             let Some((addr, key)) = self.reservation.get() else {
@@ -759,7 +790,10 @@ impl WaitTrade<'_> {
                 true,
             ))
         };
-        let mut signal = local::wait_signal()?;
+        let mut signal = match signal {
+            Some(signal) => signal,
+            None => local::wait_signal()?,
+        };
         let confirmed = OnceLock::new();
         let waited = async {
             let result = submit.await;
@@ -905,7 +939,7 @@ impl Position {
                 })
         };
         if wait_for_trade {
-            return runtime.block_on(waiting.finish(submit));
+            return runtime.block_on(waiting.finish(submit, None));
         }
         let output = runtime.block_on(submit)?;
         if self.dry_run {

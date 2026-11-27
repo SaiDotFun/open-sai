@@ -424,6 +424,7 @@ def loopback(
     | None = None,
     leverage_target: str | None = None,
     market_price: float | None = None,
+    hold_read: tuple[str, int] | None = None,
     cancel_target: str | None = None,
     close_target: str | None = None,
     lcd_query: bool = False,
@@ -1198,6 +1199,17 @@ def loopback(
                             if not admission.release.wait(5):
                                 self.reject("Market session gate timed out")
                                 return
+                        if hold_read == (
+                            name,
+                            sum(item.label == name for item in wire),
+                        ):
+                            admission.arrived.set()
+                            if not admission.release.wait(10):
+                                self.reject("Trade preflight gate timed out")
+                                return
+                            with suppress(BrokenPipeError, ConnectionResetError):
+                                self.reply(responses[name])
+                            return
                         self.reply(responses[name])
                     return
             except (ValueError, KeyError, TypeError):
