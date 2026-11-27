@@ -28,14 +28,18 @@ def pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
 
 
 @pytest.mark.parametrize(
-    ("percent", "amount_usdc", "amount_usd"),
-    # The fixture's $20 notional leaves $0.20 against Keeper's $1 minimum.
-    [("99", "9900000", "9.9")],
-    ids=["remainder-below-fee-minimum"],
+    ("collateral", "percent", "amount_usdc", "amount_usd"),
+    [
+        # The fixture's $20 notional leaves $0.20 against Keeper's $1 minimum.
+        pytest.param(10_000_000, "99", "9900000", "9.9", id="below-minimum"),
+        # The old Decimal calculation rendered the base-unit amount as 1.0…E+26.
+        pytest.param(10**28, "1", str(10**26), str(10**20), id="scientific-reduction"),
+    ],
 )
 def test_confirmed_partial_close_matches_preview_and_ledger(
     pair: tuple[CLI, CLI],
     tmp_path: Path,
+    collateral: int,
     percent: str,
     amount_usdc: str,
     amount_usd: str,
@@ -54,7 +58,9 @@ def test_confirmed_partial_close_matches_preview_and_ledger(
     for index, cli in enumerate(pair):
         home = tmp_path / str(index)
         replay = TradeReplay(kind)
-        with loopback("position-default", trade_replay=replay) as endpoints:
+        with loopback(
+            "position-default", position_collateral=collateral, trade_replay=replay
+        ) as endpoints:
             seed_home(home, endpoints, "session")
             code, preview, stderr = run(
                 cli, home, endpoints, (*args, "--dry-run"), python=index == 0
