@@ -260,14 +260,14 @@ impl Open {
             })
             .map(|row| row["marketId"].as_u64().ok_or_else(SaiError::internal))
             .collect::<Result<_, _>>()?;
-        let symbol = repr(market);
         match ids.len() {
             0 => Err(SaiError::new(
                 Code::InvalidRequest,
-                format!("Unknown market symbol {symbol}. Run sai market list."),
+                "Invalid value for '--market': unknown market symbol. Run sai market list.",
             )),
             1 => Ok(ids.first().expect("one market ID").to_string()),
             _ => {
+                let symbol = repr(market);
                 let ids = ids
                     .iter()
                     .map(u64::to_string)

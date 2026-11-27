@@ -313,6 +313,39 @@ def test_numeric_keeper_price_rounds_to_even(
             )
 
 
+@pytest.mark.parametrize("mode", [(), ("--json",)], ids=["text", "json"])
+def test_unknown_market_argument_is_not_echoed(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, mode: CLI
+) -> None:
+    rejected = "synthetic-secret-market-operand"
+    command = (*OPEN[:3], rejected, *OPEN[4:-2])
+    with loopback("market-symbol") as endpoints:
+        home = tmp_path / "rust"
+        seed_home(home, endpoints, "session")
+        result = subprocess.run(
+            [*cli_pair[1], *mode, *command],
+            cwd=home,
+            env=child_env(home, endpoints),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        assert result.returncode == 1
+        assert rejected not in result.stdout + result.stderr
+        message = (
+            "Invalid value for '--market': unknown market symbol. Run sai market list."
+        )
+        if mode:
+            assert result.stderr == ""
+            assert json.loads(result.stdout)["error"]["message"] == message
+        else:
+            assert result.stdout == ""
+            assert result.stderr == f"Error: {message}\n"
+        assert [request.label for request in endpoints.wire] == ["borrowings"]
+        assert not endpoints.errors
+
+
 @pytest.mark.parametrize(
     ("label", "request_number"),
     [("borrowings", 1), ("borrowings", 2), ("oneClickTrading", 1)],

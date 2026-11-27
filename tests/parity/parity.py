@@ -1301,6 +1301,15 @@ def run_case(
     if cutover:
         diffs = cutover_differences(left, right)
     else:
+        if rust and case.name == "trade-open-unknown-market-symbol":
+            error = left.output.get("error", {})
+            if (
+                error.get("message")
+                == "Unknown market symbol 'UNKNOWN'. Run sai market list."
+            ):
+                error["message"] = (
+                    "Invalid value for '--market': unknown market symbol. Run sai market list."
+                )
         if rust and current_margin_preview:
             project_reference_fixed_collateral(left.output)
         if rust and case.position_case and not current_margin_preview:
