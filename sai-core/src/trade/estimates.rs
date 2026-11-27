@@ -195,7 +195,7 @@ impl Trading<'_> {
         }
         let leverage = decimal(&body["leverage"])?;
         let schedule = lcd.fees(&pair, None).await?;
-        let quote = if market_row["collateralToken"]["symbol"] == "USDC" {
+        let quote = if row["collateralToken"]["symbol"] == "USDC" {
             json!("1000000000000000000")
         } else {
             lcd

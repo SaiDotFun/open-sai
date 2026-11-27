@@ -72,11 +72,32 @@ async fn leverage_execution(
     let oracle_price = if queued {
         None
     } else {
-        let prices = read(json!({"get_perp_prices": {
-            "market_index": raw["market_index"], "collateral_index": raw["collateral_index"],
-        }}))
-        .await
-        .ok()?;
+                let prices = if raw.get("collateral_index")?.as_str()? == "TokenIndex(1)" {
+            let oracle_addr = state.smart(lcd, json!({"get_oracle_address": {}}), height).await.ok()?;
+            let oracle_str = oracle_addr.as_str()?;
+            let base_str = pair.get("base")?.as_str()?;
+            let quote_str = pair.get("quote")?.as_str()?;
+            let parse_token = |s: &str| -> Option<u64> {
+                s.strip_prefix("TokenIndex(")?.strip_suffix(")")?.parse().ok()
+            };
+            let base = parse_token(base_str)?;
+            let quote = parse_token(quote_str)?;
+            let rate_resp = lcd.smart(
+                oracle_str,
+                json!({"get_exchange_rate_stamped": {"base": base, "quote": quote}}),
+                crate::trade::position::Read::At(height)
+            ).await.ok()?;
+            json!({
+                "market": rate_resp.0,
+                "collateral": {"rate": "1000000000000000000"}
+            })
+        } else {
+            read(json!({"get_perp_prices": {
+                "market_index": raw["market_index"], "collateral_index": raw["collateral_index"],
+            }}))
+            .await
+            .ok()?
+        };
         let oracle = &prices["market"];
         if let Some(published) = oracle_publication_time(oracle)? {
             let group = read(group_query.clone()).await.ok()?;

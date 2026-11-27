@@ -158,15 +158,38 @@ impl Trading<'_> {
         let row = if let Some((_, prices)) = partial.as_ref().and_then(|quote| quote.rechecked) {
             prices
         } else {
-            let read = lcd
-                .smart(
+                        let read = if raw.get("collateral_index")?.as_str()? == "TokenIndex(1)" {
+                async {
+                    let oracle_addr = position_lcd.smart(&state.route.contract_address, json!({"get_oracle_address": {}}), crate::trade::position::Read::At(height?)).await.ok()?.0;
+                    let oracle_str = oracle_addr.as_str()?;
+                    let pair = position_lcd.smart(&state.route.contract_address, json!({"get_market": {"index": raw.get("market_index")?}}), crate::trade::position::Read::At(height?)).await.ok()?.0;
+                    let base_str = pair.get("base")?.as_str()?;
+                    let quote_str = pair.get("quote")?.as_str()?;
+                    let parse_token = |s: &str| -> Option<u64> {
+                        s.strip_prefix("TokenIndex(")?.strip_suffix(")")?.parse().ok()
+                    };
+                    let base = parse_token(base_str)?;
+                    let quote = parse_token(quote_str)?;
+                    let rate_resp = position_lcd.smart(
+                        oracle_str,
+                        json!({"get_exchange_rate_stamped": {"base": base, "quote": quote}}),
+                        crate::trade::position::Read::At(height?)
+                    ).await.ok()?;
+                    Some(json!({
+                        "market": rate_resp.0,
+                        "collateral": {"rate": "1000000000000000000"}
+                    }))
+                }.await.ok_or_else(|| crate::errors::SaiError::internal())
+            } else {
+                lcd.smart(
                     json!({"get_perp_prices": {
                         "market_index": raw.get("market_index")?,
                         "collateral_index": raw.get("collateral_index")?,
                     }}),
                     height,
                 )
-                .await;
+                .await
+            };
             prices = match read {
                 Ok(prices) => prices,
                 Err(_) => return unknown_oracle_time(result),
