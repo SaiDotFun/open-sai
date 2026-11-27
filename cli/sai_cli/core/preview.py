@@ -454,12 +454,11 @@ def close_estimates(
             )
             oracle = margin.market_oracle_price(lcd, state.contract, pair, height)
             published_at = oracle_publication_time(oracle)
-            market = margin.contract_decimal(oracle["base_per_quote"])
         except margin.PositionChanged:
             raise
         except READ_ERRORS:
             published_at = None
-        if published_at is None or market <= 0:
+        if published_at is None:
             missing_time = unavailable("The oracle price publication time is unknown.")
             return {
                 **dict.fromkeys(result, missing_time),
@@ -475,7 +474,10 @@ def close_estimates(
                 "OraclePriceStale",
                 "Perp rejects the close at the observed stale oracle price.",
             )
+        market = margin.contract_decimal(oracle["base_per_quote"])
         trigger = stored_liquidation_price(lcd, state, height)
+        if market <= 0:
+            return result
         observed_at = intents.now()
         collateral = int(raw["collateral_amount"])
         if past_liquidation(market, trigger, long):
