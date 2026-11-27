@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import pty
 import select
 import signal
 import sqlite3
@@ -1373,7 +1374,11 @@ def native_wait_launcher(cli_pair: tuple[tuple[str, ...], tuple[str, ...]]) -> s
     return cli_pair[1][0]
 
 
-@pytest.mark.parametrize("launcher", ["python", "rust"])
+@pytest.mark.parametrize(
+    ("launcher", "terminal"),
+    [("python", False), ("rust", False), ("rust", True)],
+    ids=["python-pipe", "rust-pipe", "rust-terminal"],
+)
 @pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
 def test_current_cli_wait_progress_precedes_the_receipt(
     tmp_path: Path,
@@ -1381,6 +1386,7 @@ def test_current_cli_wait_progress_precedes_the_receipt(
     request: pytest.FixtureRequest,
     json_output: bool,
     launcher: str,
+    terminal: bool,
 ) -> None:
     home = tmp_path / "sai"
     binary = (
@@ -1390,7 +1396,7 @@ def test_current_cli_wait_progress_precedes_the_receipt(
     )
     first_poll = threading.Event()
     release = threading.Event()
-    with replay(get=target_lcd) as (endpoint, replies, requests):
+    with replay(get=target_lcd) as (endpoint, replies, requests), ExitStack() as stack:
         connect(home, endpoint, monkeypatch)
         preflight = filled_close(replies, requests, rust=True)
         filled = replies[-2]
@@ -1407,22 +1413,31 @@ def test_current_cli_wait_progress_precedes_the_receipt(
             for arg in trade_wait_args(endpoint, CLOSE)
             if json_output or arg != "--json"
         )
+        stderr_target = subprocess.PIPE
+        terminal_output = None
+        if terminal:
+            master, stderr_target = pty.openpty()
+            stack.callback(os.close, stderr_target)
+            terminal_output = stack.enter_context(os.fdopen(master, "rb", buffering=0))
         with subprocess.Popen(
             [binary, *args],
             env=cli_environment(home),
             cwd=tmp_path,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=stderr_target,
         ) as process:
             try:
                 assert first_poll.wait(10)
                 key = submitted_key(requests[preflight], "CLOSE_POSITION")
-                assert process.stdout is not None and process.stderr is not None
+                assert process.stdout is not None
+                stream = terminal_output if terminal else process.stderr
+                assert stream is not None
                 assert not select.select([process.stdout], [], [], 0)[0]
-                if not json_output:
-                    assert select.select([process.stderr], [], [], 1)[0]
-                    assert process.stderr.readline() == (
-                        f"Waiting for intent {key} to confirm...\n".encode()
+                if not json_output and (terminal or launcher == "python"):
+                    assert select.select([stream], [], [], 1)[0]
+                    progress = os.read(stream.fileno(), 256).replace(b"\r\n", b"\n")
+                    assert (
+                        progress == f"Waiting for intent {key} to confirm...\n".encode()
                     )
                 release.set()
                 stdout, stderr = process.communicate(timeout=10)
@@ -1431,13 +1446,17 @@ def test_current_cli_wait_progress_precedes_the_receipt(
                 if process.poll() is None:
                     process.kill()
             assert process.returncode == 0, (stdout, stderr)
-            assert stderr == b""
+            if terminal_output is not None:
+                assert stderr is None
+                assert not select.select([terminal_output], [], [], 0)[0]
+            else:
+                assert stderr == b""
             assert json.loads(stdout)["outcome"] == "filled"
             assert not replies
 
 
 @pytest.mark.skipif(not Path("/dev/full").exists(), reason="requires /dev/full")
-def test_wait_receipt_survives_failed_progress_write(
+def test_wait_receipt_survives_unwritable_stderr(
     native_wait_launcher: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "sai"
@@ -1461,4 +1480,45 @@ def test_wait_receipt_survives_failed_progress_write(
         assert receipt["intentKey"] == submitted_key(
             requests[preflight], "CLOSE_POSITION"
         )
+        assert not replies
+
+
+def test_wait_polls_with_full_stderr_pipe(
+    native_wait_launcher: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "sai"
+    with replay(get=target_lcd) as (endpoint, replies, requests):
+        connect(home, endpoint, monkeypatch)
+        preflight = filled_close(replies, requests, rust=True)
+        args = tuple(arg for arg in trade_wait_args(endpoint, CLOSE) if arg != "--json")
+        read_fd, write_fd = os.pipe()
+        try:
+            os.set_blocking(write_fd, False)
+            with pytest.raises(BlockingIOError):
+                while True:
+                    os.write(write_fd, b"x" * 4096)
+            with pytest.raises(BlockingIOError):
+                while True:
+                    os.write(write_fd, b"x")
+            os.set_blocking(write_fd, True)
+            result = subprocess.run(
+                [native_wait_launcher, *args],
+                env=cli_environment(home),
+                cwd=tmp_path,
+                stdout=subprocess.PIPE,
+                stderr=write_fd,
+                check=False,
+                timeout=10,
+            )
+            assert os.get_blocking(write_fd)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+        assert result.returncode == 0, result.stdout
+        receipt = json.loads(result.stdout)
+        assert receipt["outcome"] == "filled"
+        assert receipt["intentKey"] == submitted_key(
+            requests[preflight], "CLOSE_POSITION"
+        )
+        assert len(requests) == preflight + 3
         assert not replies
