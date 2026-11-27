@@ -66,11 +66,9 @@ def _reject_execution(
     preview: dict[str, Any],
     values: dict[str, Any],
     addr: str,
-    *,
-    require_oracle_time: bool = False,
 ) -> None:
     reason = estimates.rejection_reason(values)
-    if require_oracle_time and estimates.close_oracle_time_unknown(values):
+    if estimates.market_oracle_unverified(values):
         reason = values["execution"]["reason"]
     if reason:
         fresh = {**preview, "addr": addr}
@@ -97,9 +95,7 @@ def _checked(
             )
         raise
     if values is not None:
-        _reject_execution(
-            preview, values, addr, require_oracle_time=before_submit is not None
-        )
+        _reject_execution(preview, values, addr)
 
 
 def _attach_estimates(preview: dict[str, Any], values: dict[str, Any]) -> None:
@@ -110,7 +106,7 @@ def _attach_estimates(preview: dict[str, Any], values: dict[str, Any]) -> None:
     rejected = estimates.rejection_reason(values) is not None
     if rejected:
         preview.pop("quote", None)
-    if rejected or estimates.close_oracle_time_unknown(values):
+    if rejected or estimates.market_oracle_unverified(values):
         preview.pop("previewDigest", None)
 
 
@@ -564,7 +560,7 @@ def _estimate_position(
                 trade_id,
                 indexed=indexed,
                 verified=verified,
-                require_open_market=target is None,
+                require_open_market=updates_triggers,
             )
         except estimates.READ_ERRORS:
             pass

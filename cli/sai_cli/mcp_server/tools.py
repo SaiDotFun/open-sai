@@ -189,7 +189,7 @@ def describe(exc: Exception) -> dict[str, Any]:
             return preview_mismatch(failure.message)
         values = exc.preview.get("estimates", {})
         reason = estimates.rejection_reason(values)
-        if estimates.close_oracle_time_unknown(values):
+        if estimates.market_oracle_unverified(values):
             reason = values["execution"]["reason"]
         return preview_mismatch(
             reason

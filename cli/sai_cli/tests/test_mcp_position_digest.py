@@ -79,6 +79,7 @@ class Position:
     block_timestamp: int = 2_000_000_000
     oracle_base_age: int | None = 0
     null_market_price: bool = False
+    market_oracle_outage: bool = False
     oracle_quote_age: int | None = None
     oracle_ttl: int = 300
     fill_at_next_oracle_price: bool = False
@@ -330,6 +331,9 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 position.market_price_query_heights.append(
                     self.headers.get("x-cosmos-block-height")
                 )
+                if position.market_oracle_outage:
+                    self.reply({}, status=503)
+                    return
                 if position.collateral_price_on_market_price_read is not None:
                     position.collateral_price = (
                         position.collateral_price_on_market_price_read
@@ -785,7 +789,7 @@ def test_mcp_contract_outage_returns_unverified_preview(position_service, action
             position.null_market_price = True
             verified = await call(client, f"preview_{action}", args)
             assert verified["intent"] == preview["intent"]
-            assert len(verified["previewDigest"]) == 64
+            assert ("previewDigest" in verified) == (action == "tpsl")
             assert verified["estimates"]["fees"]["status"] == "unavailable"
             assert position.submitted == []
             assert not (storage.home() / "intents.sqlite3").exists()
@@ -1672,12 +1676,12 @@ def test_trade_rechecks_cap_after_reading_unchanged_position(
     position.collateral = 100_000_000
     position.leverage = "10"
     position.after_hours = True
-    position.reported_height = reported_height
 
     async def scenario() -> None:
         async with connected_client(base_url) as client:
             preview = await call(client, f"preview_{tool}", args)
             assert preview["quote"]["afterHoursLeverageCap"] == "5"
+            position.reported_height = reported_height
             position.cap_query_heights.clear()
             # Both rebuilt quotes see 5x. The cap changes as the final
             # contract position read starts, with the stored trade intact.
@@ -2926,6 +2930,25 @@ def test_leverage_liquidation_preview_requires_market_leverage_cap(position_serv
     asyncio.run(scenario())
 
 
+def test_plain_partial_close_refuses_market_oracle_outage(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.market_oracle_outage = True
+    save_session(f"{base_url}/query")
+    args = position_cli_args(base_url, ["partial-close", "7", "--percent", "50"])
+
+    result = CliRunner().invoke(main, args)
+
+    assert result.exit_code == ExitCode.REJECTED, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "PREVIEW_MISMATCH"
+    assert "previewDigest" not in error["details"]["preview"]
+    assert position.market_price_query_heights == ["120"]
+    assert position.price_query_heights == []
+    assert position.submitted == []
+    assert not (storage.home() / "intents.sqlite3").exists()
+
+
 def test_null_market_price_preserves_close_preview_and_refusal(position_service):
     position, base_url = position_service
     position.preview_inputs = True
@@ -3142,7 +3165,7 @@ def test_preview_uses_perp_group_and_pair_leverage_limits(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize(("price", "age"), [("95", 900), ("95", 100), ("99", 100)])
+@pytest.mark.parametrize(("price", "age"), [("95", 100), ("99", 100)])
 def test_queued_closes_defer_settlement_to_the_next_tick(position_service, price, age):
     position, base_url = position_service
     position.preview_inputs = True
@@ -3258,7 +3281,7 @@ def assert_rejected_preview(quote: dict[str, Any], code: str, reason: str) -> No
         ("99", False, 300, None),
         ("99", False, None, None),
         ("97", True, None, None),
-        ("97", True, 900, None),
+        ("97", True, 900, "OraclePriceStale"),
     ],
 )
 def test_leverage_preview_checks_prospective_liquidation_at_oracle_price(

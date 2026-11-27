@@ -8,7 +8,7 @@ import json
 from decimal import Decimal
 from typing import Any
 
-from .preview import close_oracle_time_unknown, rejection_reason
+from .preview import market_oracle_unverified, rejection_reason
 
 PARTIAL_CLOSE_PRICE_FIELDS = {"collateralPriceUsd", "closedNotionalUsd"}
 
@@ -94,7 +94,7 @@ def with_digest(preview: dict[str, Any]) -> dict[str, Any]:
     )
     if (
         rejection_reason(values) is not None
-        or close_oracle_time_unknown(values)
+        or market_oracle_unverified(values)
         or unknown_partial_leverage
         or unknown_leverage_collateral
     ):

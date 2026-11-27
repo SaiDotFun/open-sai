@@ -653,9 +653,21 @@ def snapshots(monkeypatch, *collaterals: str) -> None:
         if "get_trade_raw" in query:
             assert current is not None
             return current.raw
-        if "get_perp_prices" in query:
-            return {"collateral": "1"}
-        return "1" if "get_collateral_price" in query else False
+        if "get_market" in query:
+            return {
+                "base": "TokenIndex(7)",
+                "quote": "TokenIndex(0)",
+                "group_index": "GroupIndex(0)",
+            }
+        if "get_oracle_address" in query:
+            return "nibi1fixtureoracle"
+        if "get_exchange_rate" in query:
+            return {"base_per_quote": "100", "base_last_update_time": 1}
+        if "market_order_config" in query:
+            return {"fill_at_next_oracle_price": False}
+        if "get_group" in query:
+            return {"stale_price_expiration_secs": 0}
+        return False
 
     monkeypatch.setattr(margin, "snapshot", snapshot)
     monkeypatch.setattr(margin, "smart_value", contract_reply)

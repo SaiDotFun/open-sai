@@ -21,8 +21,29 @@ def unavailable(reason: str) -> dict[str, Any]:
     return {"status": "unavailable", "reason": reason}
 
 
-def close_oracle_time_unknown(estimates: dict[str, Any]) -> bool:
-    return estimates.get("execution", {}).get("code") == UNKNOWN_ORACLE_TIME
+def market_oracle_unverified(estimates: dict[str, Any]) -> bool:
+    return estimates.get("execution", {}).get("code") in (
+        UNKNOWN_ORACLE_TIME,
+        "OraclePriceUnavailable",
+    )
+
+
+def unverified_market_oracle(
+    fields: dict[str, Any] | tuple[str, ...], *, missing_time: bool = False
+) -> dict[str, Any]:
+    reason = (
+        "The oracle price publication time is unknown."
+        if missing_time
+        else "Cannot verify the market oracle price at the position's block."
+    )
+    missing = unavailable(reason)
+    return {
+        **dict.fromkeys(fields, missing),
+        "execution": {
+            **missing,
+            "code": UNKNOWN_ORACLE_TIME if missing_time else "OraclePriceUnavailable",
+        },
+    }
 
 
 def rejected(code: str, reason: str) -> dict[str, Any]:
@@ -438,10 +459,11 @@ def close_estimates(
             "reason": "This Keeper intent carries no slippage limit.",
         },
     }
-    if state is None or type(long := state.raw.get("long")) is not bool:
+    if state is None:
         return result
 
     raw = state.raw
+    long = raw.get("long")
     try:
         try:
             height = (
@@ -454,30 +476,36 @@ def close_estimates(
             )
             oracle = margin.market_oracle_price(lcd, state.contract, pair, height)
             published_at = oracle_publication_time(oracle)
+            if published_at is None:
+                return unverified_market_oracle(result, missing_time=True)
+            market = margin.contract_decimal(oracle["base_per_quote"])
+            if market <= 0:
+                return unverified_market_oracle(result)
+            try:
+                queued = fills_at_next_oracle_price(lcd, state.contract, height)
+            except READ_ERRORS:
+                queued = None
+            if stale_oracle(lcd, state.contract, pair, height, published_at):
+                return rejected(
+                    "OraclePriceStale",
+                    "Perp rejects the close at the observed stale oracle price.",
+                )
         except margin.PositionChanged:
             raise
         except READ_ERRORS:
-            published_at = None
-        if published_at is None:
-            missing_time = unavailable("The oracle price publication time is unknown.")
-            return {
-                **dict.fromkeys(result, missing_time),
-                "execution": {**missing_time, "code": UNKNOWN_ORACLE_TIME},
-            }
-        if fills_at_next_oracle_price(lcd, state.contract, height):
+            # A failed close quote must carry an execution refusal even
+            # when the caller has no preview digest.
+            return unverified_market_oracle(result, missing_time=True)
+        if queued is None:
+            return result
+        if queued:
             return dict.fromkeys(
                 result,
                 unavailable("Queued closes settle on a fresh oracle update."),
             )
-        if stale_oracle(lcd, state.contract, pair, height, published_at):
-            return rejected(
-                "OraclePriceStale",
-                "Perp rejects the close at the observed stale oracle price.",
-            )
-        market = margin.contract_decimal(oracle["base_per_quote"])
-        trigger = stored_liquidation_price(lcd, state, height)
-        if market <= 0:
+        if type(long) is not bool:
             return result
+        trigger = stored_liquidation_price(lcd, state, height)
         observed_at = intents.now()
         collateral = int(raw["collateral_amount"])
         if past_liquidation(market, trigger, long):
@@ -629,13 +657,18 @@ def _leverage_estimates(
     bind_collateral: bool,
 ) -> dict[str, Any]:
     raw, contract = state.raw, state.contract
-    pair = contract_market(lcd, contract, raw["market_index"], height=height)
+    try:
+        pair = contract_market(lcd, contract, raw["market_index"], height=height)
+    except READ_ERRORS:
+        return unverified_market_oracle(ESTIMATE_FIELDS)
     if refusal := market_open_rejection(pair, market_order=True):
         return refusal
 
-    queued = fills_at_next_oracle_price(lcd, contract, height)
-    price = None
-    if not queued:
+    try:
+        queued = fills_at_next_oracle_price(lcd, contract, height)
+    except READ_ERRORS:
+        queued = None
+    try:
         oracle = margin.market_oracle_price(lcd, contract, pair, height)
         published_at = oracle_publication_time(oracle)
         if published_at is not None and stale_oracle(
@@ -645,9 +678,14 @@ def _leverage_estimates(
                 "OraclePriceStale",
                 "Perp rejects the leverage change at the observed stale oracle price.",
             )
-        price = margin.contract_decimal(oracle["base_per_quote"])
-        if price <= 0:
-            raise ValueError("Invalid Perp market oracle price")
+        market = margin.contract_decimal(oracle["base_per_quote"])
+        if market <= 0:
+            return unverified_market_oracle(ESTIMATE_FIELDS)
+    except READ_ERRORS:
+        return unverified_market_oracle(ESTIMATE_FIELDS)
+    if queued is None:
+        raise ValueError("Invalid Perp market-order config")
+    price = None if queued else market
 
     effective, _ = margin.leverage_inputs(lcd, state, trade_id, height=height)
     if effective is None:
