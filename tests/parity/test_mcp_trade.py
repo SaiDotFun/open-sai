@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from scenarios import ADDRESS, OTHER_ADDRESS, loopback
+from scenarios import ADDRESS, OTHER_ADDRESS, loopback, seed_home
 from test_mcp_stdio import server
 from test_trade import rows, run
 from trade_replay import TradeReplay
@@ -198,6 +198,83 @@ def test_mcp_preview_and_confirm(
             assert not endpoints.errors
             observations.append((binding(preview), accepted, semantic))
     assert observations[0] == observations[1]
+
+
+@pytest.mark.parametrize("runtime", ["python"])
+@pytest.mark.parametrize("surface", ["cli", "mcp"])
+@pytest.mark.parametrize(
+    "collateral_changes", [True, False], ids=["collateral", "tick"]
+)
+def test_leverage_confirmation_during_fee_outage(
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    runtime: str,
+    surface: str,
+    collateral_changes: bool,
+) -> None:
+    if runtime == "rust":
+        _, (candidate,) = request.getfixturevalue("cli_pair")
+        executable = Path(candidate)
+    else:
+        executable = Path(sys.executable).with_name("sai")
+    args = {**POSITION, "leverage": "1.818181818181818182"}
+    cli = ("trade", "leverage", "7", "--leverage", args["leverage"])
+    python = runtime == "python"
+
+    home = tmp_path / "preview"
+    with loopback("quote-fee-read-error") as endpoints:
+        if surface == "cli":
+            seed_home(home, endpoints, "session")
+            status, preview, stderr = run(
+                (str(executable),), home, endpoints, (*cli, "--dry-run"), python=python
+            )
+            assert (status, stderr) == (0, "")
+        else:
+            with server(executable, home, endpoints, seed="session") as stdio:
+                preview = result(stdio.call(2, "preview_leverage", **args))
+        assert any(entry.label == "get_fees" for entry in endpoints.wire)
+        assert not endpoints.errors
+        assert not rows(home)
+
+    home = tmp_path / "confirmation"
+    replay = TradeReplay("UPDATE_TRADE", "7")
+    with loopback(
+        "quote-fee-read-error",
+        trade_replay=replay,
+        position_collateral=12_000_000 if collateral_changes else 10_000_000,
+        perp_prices=("100.01", "1.001"),
+    ) as endpoints:
+        if surface == "cli":
+            seed_home(home, endpoints, "session")
+            status, reply, stderr = run(
+                (str(executable),),
+                home,
+                endpoints,
+                (*cli, "--preview-digest", preview["previewDigest"]),
+                python=python,
+            )
+            assert (status, stderr) == (4 if collateral_changes else 0, "")
+        else:
+            with server(executable, home, endpoints, seed="session") as stdio:
+                reply = result(
+                    stdio.call(2, "trade_leverage", **trade_args(preview, args))
+                )
+        assert any(entry.label == "get_fees" for entry in endpoints.wire)
+        assert not endpoints.errors
+        if collateral_changes:
+            assert not replay.attempts()
+            assert not rows(home)
+            error = reply["error"] if surface == "cli" else reply
+            assert error["code"] == "PREVIEW_MISMATCH"
+            if surface == "mcp":
+                assert reply["preview"]["collateralBaseUnits"] == {"before": "12000000"}
+                assert reply["preview"]["previewDigest"] != preview["previewDigest"]
+        else:
+            assert reply["status"] == "accepted"
+            assert replay.attempts() == {reply["intentKey"]: 1}
+            [row] = rows(home)
+            assert row[0] == reply["intentKey"]
+    assert preview["collateralBaseUnits"] == {"before": "10000000"}
 
 
 @pytest.mark.parametrize(

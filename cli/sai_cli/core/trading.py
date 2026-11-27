@@ -513,9 +513,17 @@ def _position_intent(
         )
         if collateral := values.pop("collateralBaseUnits", None):
             quoted_preview["collateralBaseUnits"] = collateral
-        elif bind_collateral and not dry_run:
+        if (
+            bind_collateral
+            and not dry_run
+            and (collateral is None or "after" not in collateral)
+        ):
             # A definitive rejection may arrive before Perp can quote collateral.
             _reject_execution(quoted_preview, values, addr)
+            if collateral is None:
+                raise PositionChanged(
+                    "Cannot verify the current collateral. Request a new preview before submitting."
+                )
         return values
 
     if dry_run:
@@ -562,14 +570,27 @@ def _estimate_position(
             pass
     if target is None and not updates_triggers:
         return estimates.close_estimates(lcd or "", state, trade_id, None)
-    return estimates.position_estimates(
-        lcd or "",
-        state,
-        trade_id,
-        target=target,
-        show_collateral=show_collateral,
-        bind_collateral=bind_collateral,
-    )
+    try:
+        values = estimates.position_estimates(
+            lcd or "",
+            state,
+            trade_id,
+            target=target,
+            require_unchanged=bind_collateral,
+            show_collateral=show_collateral,
+            bind_collateral=bind_collateral,
+        )
+    except margin.PositionChanged:
+        return estimates.position_estimates(lcd or "", None, trade_id)
+    if bind_collateral and verified is not None and "collateralBaseUnits" not in values:
+        raw = state.raw if state is not None else verified.raw
+        try:
+            before = int(str(raw["collateral_amount"]))
+        except (KeyError, ValueError):
+            return values
+        if before >= 0:
+            values["collateralBaseUnits"] = {"before": str(before)}
+    return values
 
 
 def _position_preview(

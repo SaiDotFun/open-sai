@@ -744,11 +744,15 @@ def test_mcp_refuses_another_accounts_position(position_service, action, args):
                 f"trade_{action}",
                 {**args, "preview_digest": preview["previewDigest"]},
             )
-            for result in (refused_preview, refused_trade):
-                assert result == {
-                    "code": "INVALID_REQUEST",
-                    "error": "Keeper position belongs to a different account",
-                }
+            assert refused_preview == {
+                "code": "INVALID_REQUEST",
+                "error": "Keeper position belongs to a different account",
+            }
+            if action == "leverage":
+                assert refused_trade["code"] == "PREVIEW_MISMATCH"
+                assert "preview" not in refused_trade
+            else:
+                assert refused_trade == refused_preview
 
             assert position.position_reads == position_reads
             assert position.submitted == []
@@ -810,7 +814,10 @@ def test_mcp_rechecks_contract_position_before_admission(
                 f"trade_{action}",
                 {**args, "preview_digest": preview["previewDigest"]},
             )
-            if scenario == "unavailable":
+            if action == "leverage":
+                assert result["code"] == "PREVIEW_MISMATCH"
+                assert "confirmed preview" in result["error"]
+            elif scenario == "unavailable":
                 assert result["code"] == "PREVIEW_MISMATCH"
                 assert "Unable to verify contract state" in result["error"]
             else:

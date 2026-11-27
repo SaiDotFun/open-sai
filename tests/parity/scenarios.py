@@ -425,6 +425,8 @@ def loopback(
     | None = None,
     leverage_target: str | None = None,
     market_price: float | None = None,
+    position_collateral: int | None = None,
+    perp_prices: tuple[str, str] = ("100", "1"),
     cancel_target: str | None = None,
     close_target: str | None = None,
     lcd_query: bool = False,
@@ -460,6 +462,8 @@ def loopback(
         for row, stamp in zip(rows[: len(stamps)], stamps, strict=True):
             row["lastUpdatedBlock"]["block_ts"] = stamp
     position = PROTOCOL["account_positions_response"]["data"]["perp"]["trades"][0]
+    if position_collateral is not None:
+        position = {**position, "collateralAmount": position_collateral}
     borrowing = position["perpBorrowing"]
     recorded_markets = markets["data"]["perp"]["borrowings"]
     market = {**recorded_markets[0], "marketId": borrowing["marketId"]}
@@ -673,7 +677,10 @@ def loopback(
         "is_after_hours_market": False,
         "market_order_config": {"fill_at_next_oracle_price": False},
         "get_collateral_price": "1",
-        "get_perp_prices": {"market": {"base_per_quote": "100"}, "collateral": "1"},
+        "get_perp_prices": {
+            "market": {"base_per_quote": perp_prices[0]},
+            "collateral": perp_prices[1],
+        },
         "get_liquidation_price": {"liquidation_price": "60"},
         "quote_trade": {"data": None, "attributes": [], "events": [], "messages": []},
         "get_market": {"fee_index": "FeeIndex(0)", "group_index": "GroupIndex(0)"},
