@@ -119,11 +119,20 @@ class Release:
     def version(self) -> str:
         return tag_version(self.tag)
 
+    @property
+    def full_python_url(self) -> str:
+        base = self.wheel_url.rsplit("/", 1)[0]
+        return f"{base}/{full_python_bundle_name(self.version)}"
+
 
 def wheel_name(version: str) -> str:
     """The wheel file a release of VERSION attaches. sai-cli is pure Python,
     so every platform shares one wheel."""
     return f"sai_cli-{version}-py3-none-any.whl"
+
+
+def full_python_bundle_name(version: str) -> str:
+    return f"sai-cli-{version}-full-python.zip"
 
 
 _WHEEL_NAME = re.compile(

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import zipfile
 from itertools import product
 from pathlib import Path
 from typing import Any
@@ -44,7 +45,15 @@ def archive_names(release: str) -> set[str]:
 
 
 def package_names(version: str) -> set[str]:
-    return {f"sai_cli-{version}-py3-none-any.whl", f"sai_cli-{version}.tar.gz"}
+    return {wheel_name(version), f"sai_cli-{version}.tar.gz"}
+
+
+def wheel_name(version: str) -> str:
+    return f"sai_cli-{version}-py3-none-any.whl"
+
+
+def full_python_bundle_name(release: str) -> str:
+    return f"sai-cli-{release}-full-python.zip"
 
 
 def digests(directory: Path, names: set[str]) -> dict[str, str]:
@@ -68,11 +77,23 @@ def check_files(directory: Path, expected: set[str], label: str) -> None:
         )
 
 
-def python_package_digests(directory: Path, version: str) -> dict[str, str]:
+def python_package_names(directory: Path, version: str) -> set[str]:
     # Wheel and sdist builders normalize the PEP 440 spelling of release candidates.
     names = package_names(version.replace("-rc.", "rc"))
     check_files(directory, names, "full Python distribution")
-    return digests(directory, names)
+    return names
+
+
+def bundle_full_python(directory: Path, names: set[str], bundle: Path) -> None:
+    # The inputs are already compressed. Writing each entry by name gives
+    # it a fixed timestamp instead of copying the build's file timestamps.
+    with zipfile.ZipFile(bundle, "x") as archive:
+        for name in sorted(names):
+            with (
+                (directory / name).open("rb") as source,
+                archive.open(name, "w") as entry,
+            ):
+                shutil.copyfileobj(source, entry)
 
 
 def stage_files(output: Path, *sources: tuple[Path, dict[str, str]]) -> None:
@@ -102,11 +123,52 @@ def stage_release(
     ):
         raise ValueError("native bundle does not match its SHA256SUMS")
 
-    stage_files(
-        output,
-        (native, {name: native_hashes[name] for name in archives}),
-        (python, python_package_digests(python, python_version)),
-    )
+    python_names = python_package_names(python, python_version)
+    bundle = full_python_bundle_name(release)
+    with tempfile.TemporaryDirectory(prefix="sai-full-python-") as scratch:
+        directory = Path(scratch)
+        bundle_full_python(python, python_names, directory / bundle)
+        stage_files(
+            output, (native, native_hashes), (directory, digests(directory, {bundle}))
+        )
+
+
+def release_notes(release: str, shim: str, python_version: str) -> str:
+    bundle = full_python_bundle_name(release)
+    full_wheel = wheel_name(python_version.replace("-rc.", "rc"))
+    if "-rc." in release:
+        install_version = ""
+        install_target = "the latest stable release"
+    else:
+        install_version = f" --version {release}"
+        install_target = "this release"
+    return f"""## Choose the Sai Package
+
+The standard `sai-cli` wheel, `{wheel_name(shim)}`, is the native shim.
+It downloads and runs the matching native Sai binary on Linux and macOS.
+
+### Install the Full Python CLI
+
+Run the installer to verify and install the full Python wheel from
+{install_target}. The installer records the release for `sai update`.
+
+```console
+uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py --full-python{install_version}
+```
+
+To inspect the packages from this release, download `{bundle}` and `SHA256SUMS`.
+Compute the ZIP's SHA-256 and compare it with the ZIP's entry in `SHA256SUMS`.
+
+- Linux: `sha256sum {bundle}`
+- macOS: `shasum -a 256 {bundle}`
+- Windows PowerShell: `Get-FileHash -Algorithm SHA256 {bundle}`
+
+After the hashes match, extract the ZIP to inspect `{full_wheel}` and the sdist.
+
+```console
+uv run --no-project python -m zipfile -e {bundle} full-python
+```
+"""
 
 
 def check_attestation(
@@ -155,6 +217,7 @@ def main() -> None:
     rehearsal.add_argument("directory", type=Path)
     tag_check = commands.add_parser("check-tag")
     tag_check.add_argument("tag")
+    commands.add_parser("release-notes", help="render the native release notes")
     stage = commands.add_parser("stage-release")
     stage.add_argument("native", type=Path)
     stage.add_argument("python", type=Path)
@@ -183,9 +246,8 @@ def run(args: argparse.Namespace) -> None:
         version = pyproject_version()
         if args.tag and (error := tag_error(args.tag, version)):
             raise ValueError(error)
-        stage_files(
-            args.output, (args.python, python_package_digests(args.python, version))
-        )
+        names = python_package_names(args.python, version)
+        stage_files(args.output, (args.python, digests(args.python, names)))
         return
     release, shim = native_versions()
     if args.command == "archive":
@@ -209,6 +271,8 @@ def run(args: argparse.Namespace) -> None:
         build_rehearsal_wheel(args.directory)
     elif args.command == "check-tag":
         check_tag(args.tag, release, pyproject_version())
+    elif args.command == "release-notes":
+        print(release_notes(release, shim, pyproject_version()), end="")
     elif args.command == "stage-release":
         python_version = pyproject_version()
         if args.tag:

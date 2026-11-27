@@ -8,6 +8,9 @@ on:
     paths:
       - '.github/workflows/release.yml'
       - '.github/workflows/native-dist.yml'
+      - 'Cargo.toml'
+      - 'pyproject.toml'
+      - 'shim/**'
       - 'scripts/check_release.py'
       - 'scripts/native-dist.py'
       - 'scripts/release.py'
@@ -151,7 +154,7 @@ jobs:
         with:
           name: sai-native-ci
           path: dist/native
-      - name: Verify artifacts and stage one release checksum manifest
+      - name: Stage the release assets and write SHA256SUMS
         shell: bash
         run: |
           args=()
@@ -168,6 +171,15 @@ jobs:
       - name: Check release checksums
         working-directory: dist/release
         run: sha256sum --check --strict SHA256SUMS
+      - name: Render native release notes
+        if: matrix.mode == 'native'
+        run: uv run --no-project python scripts/native-dist.py release-notes > dist/release-notes.md
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: matrix.mode == 'native'
+        with:
+          name: sai-release-notes
+          path: dist/release-notes.md
+          if-no-files-found: error
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ github.event_name == 'pull_request' && matrix.mode == 'python-only' && 'sai-python-release-candidate' || 'sai-release-candidate' }}
@@ -186,6 +198,7 @@ jobs:
     env:
       TAG: ${{ github.ref_name }}
       TAG_OBJECT: ${{ needs.python.outputs.tag-object }}
+      RELEASE_MODE: ${{ needs.python.outputs.mode }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -199,6 +212,11 @@ jobs:
         with:
           name: sai-release-candidate
           path: dist/release
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: needs.python.outputs.mode == 'native'
+        with:
+          name: sai-release-notes
+          path: dist
       - name: Verify staged release checksums
         working-directory: dist/release
         run: sha256sum --check --strict SHA256SUMS
@@ -243,6 +261,10 @@ jobs:
           flags=()
           if [[ "$version" == *-* ]]; then
             flags+=(--prerelease)
+          fi
+          if [[ "$RELEASE_MODE" == native ]]; then
+            test -s dist/release-notes.md
+            flags+=(--notes-file dist/release-notes.md)
           fi
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "sai-cli $version" --generate-notes "${flags[@]}" dist/release/*

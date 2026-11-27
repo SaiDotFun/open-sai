@@ -19,7 +19,7 @@ It needs only uv and the standard library, so it runs straight from GitHub:
 
     uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py
 
-Usage: install.py [--native | --source] [--version VERSION] [--dry-run]
+Usage: install.py [--native | --full-python | --source] [--version VERSION] [--dry-run]
 """
 
 from __future__ import annotations
@@ -44,6 +44,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zipfile
 import zlib
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
@@ -61,6 +62,7 @@ PAGE_SIZE = 100
 MAX_PAGES = 10
 MAX_BODY = 16 << 20
 MAX_WHEEL = 64 << 20
+MAX_PYTHON_BUNDLE = 128 << 20
 MAX_SUMS = 1 << 16
 REQUEST_TIMEOUT = 10.0
 # Wall-clock limits for the release lookup and for the two downloads.
@@ -303,6 +305,10 @@ def wheel_name(version: str) -> str:
     return f"sai_cli-{version}-py3-none-any.whl"
 
 
+def full_python_bundle_name(version: str) -> str:
+    return f"sai-cli-{version}-full-python.zip"
+
+
 def download_base(tag: str, web_base: str = WEB_BASE) -> str:
     return f"{web_base.rstrip('/')}/{REPO}/releases/download/{quote(tag)}"
 
@@ -386,25 +392,190 @@ def fetch_wheel(
     directory: Path,
     web_base: str = WEB_BASE,
     timeout: float = DOWNLOAD_TIMEOUT,
+    *,
+    full_python: bool = False,
 ) -> tuple[Path, str]:
     """Download TAG's wheel and SHA256SUMS into DIRECTORY, check the hash,
     and return the wheel and its SHA-256."""
-    name = wheel_name(version_of(tag))
+    version = version_of(tag)
+    name = wheel_name(version)
     wheel, sums = directory / name, directory / "SHA256SUMS"
+    bundle = directory / full_python_bundle_name(version)
     base = download_base(tag, web_base)
+    python_only = full_python or os.name == "nt"
 
-    def work(deadline: float) -> None:
-        download(f"{base}/SHA256SUMS", sums, MAX_SUMS, deadline)
-        download(f"{base}/{name}", wheel, MAX_WHEEL, deadline)
+    def download_verified(
+        asset: Path, expected: str, limit: int, deadline: float
+    ) -> str:
+        download(f"{base}/{asset.name}", asset, limit, deadline, origin=web_base)
+        digest = file_digest(asset)
+        if digest != expected:
+            raise LookupFailed(f"{asset.name} does not match its SHA256SUMS entry")
+        return digest
 
-    within(timeout, "downloading the release", work)
-    expected = expected_hash(sums.read_text(errors="replace"), name)
+    def fetch_full_python(expected: str, deadline: float) -> str:
+        download_verified(bundle, expected, MAX_PYTHON_BUNDLE, deadline)
+        unpack_python_wheel(bundle, wheel)
+        if is_shim_wheel(wheel):
+            raise LookupFailed(f"{bundle.name} contains the native shim")
+        return file_digest(wheel)
+
+    def work(deadline: float) -> str:
+        download(f"{base}/SHA256SUMS", sums, MAX_SUMS, deadline, origin=web_base)
+        manifest = sums.read_text(errors="replace")
+        bundle_hash = native_digest(manifest, bundle.name)
+        if python_only and bundle_hash is not None:
+            return fetch_full_python(bundle_hash, deadline)
+        expected = expected_hash(manifest, name)
+        if expected is None:
+            raise LookupFailed(f"SHA256SUMS does not list {name}")
+        digest = download_verified(wheel, expected, MAX_WHEEL, deadline)
+        if not is_shim_wheel(wheel):
+            return digest
+        if python_only:
+            raise LookupFailed(f"Sai {version} has no full Python wheel for this host")
+        problem = native_wheel_problem(
+            wheel, version, manifest, directory, base, web_base, deadline
+        )
+        if problem is None:
+            return digest
+        if bundle_hash is None:
+            raise LookupFailed(
+                f"{problem}. Sai {version} has no full Python wheel for this host"
+            )
+        print(f"{problem}. Installing the full Python wheel instead.", file=sys.stderr)
+        wheel.unlink()
+        return fetch_full_python(bundle_hash, deadline)
+
+    return wheel, within(timeout, "downloading the release", work)
+
+
+def is_shim_wheel(wheel: Path) -> bool:
+    try:
+        with zipfile.ZipFile(wheel) as package:
+            return "sai_cli/_release_source.py" in package.namelist()
+    except zipfile.BadZipFile as error:
+        raise LookupFailed(f"{wheel.name} is not a valid wheel") from error
+
+
+SHIM_PROFILE_CHECK = """
+import sys
+sys.path.insert(0, sys.argv[1])
+from sai_cli.sai_cli import check_install_profile
+raise SystemExit(check_install_profile(sys.argv[2], sys.argv[3]))
+"""
+
+
+def shim_profile_problem(
+    wheel: Path, version: str, digest: str, deadline: float
+) -> str | None:
+    with tempfile.TemporaryFile() as output:
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-B",
+                    "-c",
+                    SHIM_PROFILE_CHECK,
+                    wheel,
+                    version,
+                    digest,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                timeout=min(VERIFY_TIMEOUT, left(deadline, "checking the Sai profile")),
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return "The verified shim could not check SAI_HOME"
+        if result.returncode == 0:
+            return None
+        output.seek(0)
+        reason = output.read(512).decode(errors="replace").strip()
+        return reason or "The verified shim could not check SAI_HOME"
+
+
+def native_wheel_problem(
+    wheel: Path,
+    version: str,
+    manifest: str,
+    directory: Path,
+    base: str,
+    origin: str,
+    deadline: float,
+) -> str | None:
+    """Verify and start the shim's exact binary before letting uv install it."""
+    try:
+        name = native_asset(version)
+    except LookupFailed:
+        return "This host has no supported native Sai target"
+    expected = native_digest(manifest, name)
     if expected is None:
-        raise LookupFailed(f"SHA256SUMS does not list {name}")
-    actual = hashlib.sha256(wheel.read_bytes()).hexdigest()
-    if actual != expected:
-        raise LookupFailed(f"{name} does not match its SHA256SUMS entry")
-    return wheel, actual
+        return "This release has no verified native archive for this host"
+    if not is_native_release_base(origin, WEB_BASE):
+        raise LookupFailed(
+            "the native installer requires official or loopback release URLs"
+        )
+    if problem := shim_profile_problem(wheel, version, expected, deadline):
+        return problem
+
+    with (
+        tempfile.TemporaryDirectory(dir=directory, prefix="native-probe-") as scratch,
+        tempfile.TemporaryFile() as output,
+    ):
+        home = Path(scratch)
+        archive, binary = home / name, home / "sai"
+        download(f"{base}/{name}", archive, MAX_WHEEL, deadline, origin=origin)
+        if file_digest(archive) != expected:
+            raise LookupFailed(f"{name} does not match its SHA256SUMS entry")
+        unpack_native(archive, binary)
+        try:
+            result = subprocess.run(
+                [binary, "--version"],
+                env={
+                    **os.environ,
+                    "SAI_LOG": "false",
+                    "CI": "1",
+                },
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                timeout=min(
+                    VERIFY_TIMEOUT, left(deadline, "checking native compatibility")
+                ),
+                check=False,
+            )
+            output.seek(0)
+            if (
+                result.returncode == 0
+                and output.read(512).strip() == f"sai {version}".encode()
+            ):
+                return None
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return "The verified native Sai binary could not run on this host"
+
+
+def unpack_python_wheel(bundle: Path, wheel: Path) -> None:
+    # Keep in step with the packaged updater. Copy only the fixed wheel entry.
+    try:
+        with zipfile.ZipFile(bundle) as archive:
+            members = [
+                entry for entry in archive.infolist() if entry.filename == wheel.name
+            ]
+            if len(members) != 1 or members[0].file_size > MAX_WHEEL:
+                raise LookupFailed(
+                    f"{bundle.name} must contain one bounded {wheel.name}"
+                )
+            with archive.open(members[0]) as source, wheel.open("xb") as output:
+                shutil.copyfileobj(source, output)
+    except (zipfile.BadZipFile, EOFError, RuntimeError, zlib.error) as error:
+        raise LookupFailed(
+            f"could not read the full Python wheel from {bundle.name}"
+        ) from error
 
 
 def wheel_cache() -> Path:
@@ -457,13 +628,21 @@ def private_cache() -> Path:
     return cache
 
 
-def keep_wheel(tag: str, web_base: str, timeout: float) -> tuple[Path, str]:
+def keep_wheel(
+    tag: str,
+    web_base: str,
+    timeout: float,
+    *,
+    full_python: bool = False,
+) -> tuple[Path, str]:
     """Download and verify TAG's wheel in a private directory, then move it
     into the wheel cache. Return the kept wheel and its SHA-256."""
     try:
         cache = private_cache()
         with tempfile.TemporaryDirectory(dir=cache, prefix=".download-") as temp:
-            wheel, digest = fetch_wheel(tag, Path(temp), web_base, timeout)
+            wheel, digest = fetch_wheel(
+                tag, Path(temp), web_base, timeout, full_python=full_python
+            )
             kept = cache / wheel.name
             os.replace(wheel, kept)
     except OSError as error:
@@ -541,8 +720,7 @@ def native_asset(version: str) -> str:
     if system is None or cpu is None:
         raise LookupFailed(
             "native Sai supports Linux and macOS on x86-64 and ARM64."
-            " Run this installer with --version VERSION using a full Python version"
-            " from the release notes."
+            " Run this installer without --native to install full Python."
         )
     return f"sai-{version}-{cpu}-{system}.tar.gz"
 
@@ -1092,14 +1270,18 @@ def repair_mcp(binary: Path, profile: str) -> None:
     )
 
 
+def is_native_release_base(given: str, official: str) -> bool:
+    return (
+        given == official
+        or re.fullmatch(r"http://127\.0\.0\.1:[0-9]+", given) is not None
+    )
+
+
 def install_native(args: argparse.Namespace) -> int:
     # Validate the platform before looking up a release or creating directories.
     native_asset("")
     for given, official in ((args.api_base, API_BASE), (args.web_base, WEB_BASE)):
-        if (
-            given != official
-            and re.fullmatch(r"http://127\.0\.0\.1:[0-9]+", given) is None
-        ):
+        if not is_native_release_base(given, official):
             raise LookupFailed(
                 "the native installer requires official or loopback release URLs"
             )
@@ -1205,6 +1387,11 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="install the standalone Linux or macOS binary",
     )
+    mode.add_argument(
+        "--full-python",
+        action="store_true",
+        help="install the managed full Python wheel",
+    )
     parser.add_argument("--version", help="install an exact release version")
     parser.add_argument(
         "--dry-run", action="store_true", help="print the command without running it"
@@ -1242,6 +1429,8 @@ def main(argv: list[str]) -> int:
         )
     except LookupFailed as error:
         return give_up(error)
+    if tag is None and args.full_python:
+        return give_up(LookupFailed("no stable Sai release is published"))
     uv = find_uv()
     if tag is None or args.source:
         if tag is None:
@@ -1255,14 +1444,19 @@ def main(argv: list[str]) -> int:
     else:
         print(f"Installing sai-cli {version_of(tag)} from its release wheel.")
         if args.dry_run:
+            asset = wheel_url(tag, args.web_base)
+            if args.full_python or os.name == "nt":
+                asset = f"the full Python wheel for {tag} (from its ZIP when available)"
             print(
-                f"Would download {wheel_url(tag, args.web_base)}, check it against"
+                f"Would download {asset}, check it against"
                 " the release's SHA256SUMS, and run `uv tool install` on the file."
             )
             print("Dry run: nothing was installed.")
             return 0
         try:
-            wheel, digest = keep_wheel(tag, args.web_base, args.timeout * 4)
+            wheel, digest = keep_wheel(
+                tag, args.web_base, args.timeout * 4, full_python=args.full_python
+            )
         except LookupFailed as error:
             return give_up(error)
         print(f"Verified {wheel.name} against the release's SHA256SUMS.")
