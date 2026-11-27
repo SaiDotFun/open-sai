@@ -276,7 +276,7 @@ impl ReplyState {
         }
         json!({"data": {
             "user_trade_index": "UserTradeIndex(7)", "user": self.contract_owner,
-            "trade_type": self.trade_type, "is_open": true,
+            "trade_type": self.trade_type, "is_open": true, "collateral_amount": "2000000",
         }})
     }
 }
