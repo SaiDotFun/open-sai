@@ -317,7 +317,7 @@ def open_estimates(
             )
             schedule = fee_schedule(lcd, contract, pair)
             token = f"TokenIndex({token_id})"
-            collateral_price = read_collateral_price(lcd, contract, token)
+            collateral_price = {"price": "1000000000000000000"} if row["collateralToken"]["symbol"] == "USDC" else read_collateral_price(lcd, contract, token)
             collateral = int(Decimal(body["amountUsd"]).scaleb(6))
             notional = _notional(collateral, leverage)
             with localcontext() as context:
@@ -542,13 +542,16 @@ def close_estimates(
         result["fees"] = unavailable(
             "Perp fee schedule or collateral oracle price is unavailable."
         )
-        price = margin.contract_decimal(prices["collateral"])
-        if price <= 0:
-            return result
         if pair is None:
             pair = contract_market(
                 lcd, state.contract, raw["market_index"], height=height
             )
+        if pair["collateralToken"]["symbol"] == "USDC":
+            price = Decimal("1000000000000000000")
+        else:
+            price = margin.contract_decimal(prices.get("collateral"))
+            if price <= 0:
+                return result
         schedule = fee_schedule(lcd, state.contract, pair, height=height)
         _, result["fees"] = base_fees(
             schedule,

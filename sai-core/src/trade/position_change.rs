@@ -463,7 +463,7 @@ impl PositionQuote {
             "Cannot verify effective leverage at the position's block. Request a new preview once the leverage inputs are readable.",
         ))?;
         let prices = if let Some(quoted_price) = price {
-            let (prices, _) = lcd
+            let (mut prices, _) = lcd
                 .smart(
                     &snapshot.route.contract_address,
                     json!({"get_perp_prices": {
@@ -473,6 +473,9 @@ impl PositionQuote {
                     Read::At(height),
                 )
                 .await?;
+            if snapshot.market["collateralToken"]["symbol"] == "USDC" {
+                prices["collateral"] = json!("1000000000000000000");
+            }
             if quoted_price.is_null() || prices["collateral"].is_null() {
                 return Ok(None);
             }

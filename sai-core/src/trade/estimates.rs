@@ -195,13 +195,17 @@ impl Trading<'_> {
         }
         let leverage = decimal(&body["leverage"])?;
         let schedule = lcd.fees(&pair, None).await?;
-        let quote = lcd
-            .smart(
-                json!({"get_collateral_price": {"collateral_index": format!("TokenIndex({token})")}}),
-                None,
-            )
-            .await
-            .ok()?;
+        let quote = if market_row["collateralToken"]["symbol"] == "USDC" {
+            json!("1000000000000000000")
+        } else {
+            lcd
+                .smart(
+                    json!({"get_collateral_price": {"collateral_index": format!("TokenIndex({token})")}}),
+                    None,
+                )
+                .await
+                .ok()?
+        };
         let price = Price::new(quote.as_str()?, COLLATERAL_ORACLE, Some(now()))?;
         let collateral = BigUint::from(decimal(&body["amountUsd"])? / 10u128.pow(18 - USDC_PLACES));
         let notional = &collateral * leverage / SCALE;

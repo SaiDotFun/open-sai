@@ -271,8 +271,13 @@ impl Trading<'_> {
             result["execution"] = json!({"status": "voluntary_close"});
         }
         result["fees"] = unavailable(FEE_UNAVAILABLE);
+        let collat_str = if pair["collateralToken"]["symbol"] == "USDC" {
+            Some("1000000000000000000")
+        } else {
+            row["collateral"].as_str()
+        };
         let price = Price::new(
-            row["collateral"].as_str()?,
+            collat_str?,
             COLLATERAL_ORACLE,
             Some(observed_at),
         )?;
