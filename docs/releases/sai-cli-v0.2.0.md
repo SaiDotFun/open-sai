@@ -24,14 +24,14 @@ same profile and command names as the Python CLI, including `sai mcp serve`.
   ```
 
 - If uv installed Sai from Git, uninstall the `sai-cli` tool, use the
-  [managed installer](../../README.md#trader-cli) with `--version 0.1.3`
-  or `--version 0.1.4`, then run `sai update`. Your Sai profile stays in place.
+  [managed installer](https://github.com/SaiDotFun/open-sai/blob/main/README.md#trader-cli)
+  with `--version 0.1.3` or `--version 0.1.4`, then run `sai update`. Your Sai profile stays in place.
 - The standard `sai-cli` wheel is a small launcher that downloads and runs
   the matching native binary. The full Python wheel and source package are
   inside `sai-cli-0.2.0-full-python.zip`. Windows runs full Python.
   To keep using Python on Linux or macOS, use the
-  [managed installer](../../README.md#trader-cli) with
-  `--full-python --version 0.2.0`.
+  [managed installer](https://github.com/SaiDotFun/open-sai/blob/main/README.md#trader-cli)
+  with `--full-python --version 0.2.0`.
   [#227](https://github.com/SaiDotFun/open-sai/pull/227),
   [#246](https://github.com/SaiDotFun/open-sai/pull/246)
 
