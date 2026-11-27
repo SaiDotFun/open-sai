@@ -1,5 +1,6 @@
 use std::{
     future::{Future, pending},
+    io::{self, Write as _},
     sync::OnceLock,
     time::{Duration, Instant},
 };
@@ -819,7 +820,10 @@ impl WaitTrade<'_> {
                 Err(error) => return Err(error),
             };
             if !self.json {
-                eprintln!("Waiting for intent {key} to confirm...");
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "Waiting for intent {key} to confirm..."
+                );
             }
             let remember_fill = |receipt| {
                 let _ = confirmed.set((receipt, metadata.clone(), false));

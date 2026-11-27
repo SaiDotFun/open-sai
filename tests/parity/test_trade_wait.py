@@ -1434,3 +1434,31 @@ def test_current_cli_wait_progress_precedes_the_receipt(
             assert stderr == b""
             assert json.loads(stdout)["outcome"] == "filled"
             assert not replies
+
+
+@pytest.mark.skipif(not Path("/dev/full").exists(), reason="requires /dev/full")
+def test_wait_receipt_survives_failed_progress_write(
+    native_wait_launcher: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "sai"
+    with replay(get=target_lcd) as (endpoint, replies, requests):
+        connect(home, endpoint, monkeypatch)
+        preflight = filled_close(replies, requests, rust=True)
+        args = tuple(arg for arg in trade_wait_args(endpoint, CLOSE) if arg != "--json")
+        with Path("/dev/full").open("wb") as broken_stderr:
+            result = subprocess.run(
+                [native_wait_launcher, *args],
+                env=cli_environment(home),
+                cwd=tmp_path,
+                stdout=subprocess.PIPE,
+                stderr=broken_stderr,
+                check=False,
+                timeout=15,
+            )
+        assert result.returncode == 0, result.stdout
+        receipt = json.loads(result.stdout)
+        assert receipt["outcome"] == "filled"
+        assert receipt["intentKey"] == submitted_key(
+            requests[preflight], "CLOSE_POSITION"
+        )
+        assert not replies
