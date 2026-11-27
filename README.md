@@ -368,11 +368,11 @@ sdist, and one `SHA256SUMS` file in one immutable release. After publication,
 it checks the tag and every file against GitHub's signed release attestation.
 Sai does not sign the binaries separately.
 
-Before tagging, enable immutable releases in the repository settings and set
-the Actions secret `SAI_RELEASE_SETTINGS_TOKEN` to a fine-grained token scoped
-to this repository with Administration read access. The workflow checks the
-setting with that token immediately before publication and stops if GitHub
-cannot confirm it is enabled. The usual Actions token publishes the release.
+Before tagging, enable immutable releases in the repository settings. The
+Release workflow uses the organization Actions secret `NIBIRU_PM` to read
+that setting. The token needs Administration read access to this repository.
+The same check runs during rehearsals and immediately before publication. It
+fails if the secret is unavailable or GitHub cannot confirm the setting.
 
 Native Linux builds and smoke tests use glibc 2.35 on x86_64 and arm64.
 Native macOS builds target macOS 11 on Intel and Apple silicon. The hosted
@@ -420,6 +420,12 @@ preview the tag commands.
 The Release workflow also stages both release modes on pull requests that
 change the release inputs. The native candidate is `sai-release-candidate`.
 The Python-only candidate is `sai-python-release-candidate`.
+
+Fork pull requests run only the checks that do not require the organization
+secret. For a fork contribution, run the manual rehearsal only after the
+change passes normal review and merges into a branch in `SaiDotFun/open-sai`.
+Dispatching an unreviewed workflow from an upstream branch exposes the
+`NIBIRU_PM` secret to that workflow.
 
 ### Rehearse an Upgrade and Downgrade
 
