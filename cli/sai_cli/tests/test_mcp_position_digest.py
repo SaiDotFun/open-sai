@@ -113,9 +113,8 @@ class Position:
     price_query_heights: list[str | None] = field(default_factory=list)
     perp_price_query_heights: list[str | None] = field(default_factory=list)
     collateral_price_on_perp_read: str | None = None
-    oracle_position_updates: deque[tuple[int, str] | None] = field(
-        default_factory=deque
-    )
+    lose_admission_ack: bool = False
+    reject_admission: bool = False
     submitted: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -160,6 +159,14 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 assert self.headers["Authorization"] == f"Bearer {TOKEN}"
                 envelope = request["variables"]["input"]
                 position.submitted.append(envelope["intent"])
+                if position.reject_admission:
+                    self.reply(
+                        {"errors": [{"extensions": {"code": "INTENT_NOT_ACCEPTED"}}]}
+                    )
+                    return
+                if position.lose_admission_ack:
+                    self.reply({"data": {"recordUserIntent": None}})
+                    return
                 data = {
                     "recordUserIntent": {
                         "intentKey": envelope["intentKey"],
@@ -467,10 +474,6 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     self.headers.get("x-cosmos-block-height")
                 )
                 data = position.collateral_price
-                if position.oracle_position_updates:
-                    update = position.oracle_position_updates.popleft()
-                    if update is not None:
-                        position.collateral, position.leverage = update
             if data is None:
                 self.send_error(400, "contract query unavailable")
                 return
@@ -553,6 +556,120 @@ async def call(
     return json.loads(block.text)
 
 
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        (
+            "open",
+            {
+                "market_id": 0,
+                "side": "long",
+                "order_type": "limit",
+                "amount": "5",
+                "leverage": "2",
+                "price": "100",
+                "slippage": "1",
+            },
+        ),
+        *MCP_POSITION_ACTIONS,
+        pytest.param("close", {"trade_id": 7, "cancel_order": True}, id="cancel"),
+        ("margin", {"trade_id": 7, "direction": "add", "amount": "1"}),
+        ("partial_close", {"trade_id": 7, "percent": 50}),
+    ],
+)
+@pytest.mark.parametrize("lose_ack", [False, True], ids=["blocked", "lost-ack"])
+def test_unresolved_trade_returns_ledger_key_and_account(
+    position_service: tuple[Position, str],
+    tool: str,
+    args: dict[str, Any],
+    lose_ack: bool,
+) -> None:
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.lose_admission_ack = lose_ack
+    if args.get("cancel_order"):
+        position.trade_type = "limit"
+    endpoint = f"{base_url}/query"
+    blocked_key = "20261126T200000000Z_0123456789ABCDEF"
+    recent_open = "20261126T200001000Z_0123456789ABCDEF"
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{tool}", args)
+            if not lose_ack:
+                storage.pending(blocked_key, endpoint, ADDR, "CLOSE_POSITION", "7")
+            refused = await call(
+                client,
+                f"trade_{tool}",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            local = await call(client, "intent_local", {"addr": ADDR})
+            [row] = local["intents"]
+            assert row["status"] == "unknown"
+            if not lose_ack:
+                assert row["intentKey"] == blocked_key
+            assert refused["code"] == (
+                "OUTCOME_UNKNOWN" if lose_ack else "INVALID_REQUEST"
+            )
+            assert (refused.get("intentKey"), refused.get("addr")) == (
+                row["intentKey"],
+                ADDR,
+            )
+            assert len(position.submitted) == int(lose_ack)
+            if tool == "open" and not lose_ack:
+                storage.set_status(blocked_key, endpoint, ADDR, "terminal")
+                storage.pending(recent_open, endpoint, ADDR, "OPEN_TRADE", "")
+                refused = await call(
+                    client,
+                    "trade_open",
+                    {**args, "preview_digest": preview["previewDigest"]},
+                )
+                assert refused["code"] == "RECENT_OPEN_PENDING"
+                assert (
+                    refused["intentKey"],
+                    refused["intentKeys"],
+                    refused["addr"],
+                ) == (
+                    recent_open,
+                    [recent_open],
+                    ADDR,
+                )
+                assert not position.submitted
+
+    asyncio.run(scenario())
+
+
+def test_mcp_rejection_preserves_recovery_when_status_write_fails(
+    position_service: tuple[Position, str],
+) -> None:
+    position, base_url = position_service
+    position.reject_admission = True
+    params = {"trade_id": 7}
+    with storage.db() as ledger:
+        ledger.execute(
+            "CREATE TRIGGER reject_status_write BEFORE UPDATE OF status ON intents "
+            "BEGIN SELECT RAISE(ABORT, 'ledger write failed'); END"
+        )
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, "preview_close", params)
+            outcome = await call(
+                client,
+                "trade_close",
+                {**params, "preview_digest": preview["previewDigest"]},
+            )
+            assert outcome["code"] == "ADMISSION_REJECTED"
+            [row] = (await call(client, "intent_local", {"addr": ADDR}))["intents"]
+            assert row["status"] == "unknown"
+            key = row["intentKey"]
+            assert (outcome.get("intentKey"), outcome.get("addr")) == (key, ADDR)
+            assert all(item in outcome["next"] for item in ("intent_status", key, ADDR))
+            assert len(position.submitted) == 1
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("command", CLI_POSITION_ACTIONS)
 def test_cli_refuses_another_accounts_position(position_service, command):
     position, base_url = position_service
@@ -620,11 +737,15 @@ def test_mcp_refuses_another_accounts_position(position_service, action, args):
                 f"trade_{action}",
                 {**args, "preview_digest": preview["previewDigest"]},
             )
-            for result in (refused_preview, refused_trade):
-                assert result == {
-                    "code": "INVALID_REQUEST",
-                    "error": "Keeper position belongs to a different account",
-                }
+            assert refused_preview == {
+                "code": "INVALID_REQUEST",
+                "error": "Keeper position belongs to a different account",
+            }
+            if action == "leverage":
+                assert refused_trade["code"] == "PREVIEW_MISMATCH"
+                assert "preview" not in refused_trade
+            else:
+                assert refused_trade == refused_preview
 
             assert position.position_reads == position_reads
             assert position.submitted == []
@@ -686,7 +807,10 @@ def test_mcp_rechecks_contract_position_before_admission(
                 f"trade_{action}",
                 {**args, "preview_digest": preview["previewDigest"]},
             )
-            if scenario == "unavailable":
+            if action == "leverage":
+                assert result["code"] == "PREVIEW_MISMATCH"
+                assert "confirmed preview" in result["error"]
+            elif scenario == "unavailable":
                 assert result["code"] == "PREVIEW_MISMATCH"
                 assert "Unable to verify contract state" in result["error"]
             else:
@@ -895,14 +1019,15 @@ def test_trade_confirmation_binds_verified_route(
             cli_digest = cli_document["previewDigest"]
             assert cli_document["positionRoute"] == preview["positionRoute"]
             if tool == "leverage":
-                assert "collateralBaseUnits" not in preview
+                assert (
+                    preview["collateralBaseUnits"]
+                    == cli_document["collateralBaseUnits"]
+                )
                 assert cli_document["collateralBaseUnits"] == {
                     "before": "4000000",
                     "after": "2666666",
                 }
-                assert cli_digest != digest
-            else:
-                assert cli_digest == digest
+            assert cli_digest == digest
             assert preview["positionRoute"] == {
                 "chainId": CHAIN_ID,
                 "contractAddress": "nibi1contract",
@@ -1353,11 +1478,7 @@ def test_partial_close_accepts_confirmed_reduction_after_collateral_price_moves(
             preview = await call(client, "preview_partial_close", args)
             position.collateral_price = "1.00119"
             fresh = await call(client, "preview_partial_close", args)
-            assert fresh["quote"] == {
-                **preview["quote"],
-                "collateralPriceUsd": "1.00119",
-                "closedNotionalUsd": "4.00476",
-            }
+            assert fresh["quote"] == preview["quote"]
             assert fresh["intent"] == preview["intent"]
             assert fresh["previewDigest"] == preview["previewDigest"]
 
@@ -1487,7 +1608,7 @@ def test_trade_refuses_a_change_between_live_reads(
     asyncio.run(scenario())
 
 
-def test_partial_close_rechecks_position_after_the_last_oracle_read(
+def test_partial_close_rechecks_collateral_after_both_snapshots(
     position_service: tuple[Position, str],
 ) -> None:
     position, base_url = position_service
@@ -1497,7 +1618,7 @@ def test_partial_close_rechecks_position_after_the_last_oracle_read(
         async with connected_client(base_url) as client:
             preview = await call(client, "preview_partial_close", args)
             assert preview["intent"]["body"]["collateral"]["amountUsdc"] == "2000000"
-            position.oracle_position_updates.extend([None, (3_200_000, "2.5")])
+            position.collateral_on_position_read.extend([None, None, 3_200_000])
             result = await call(
                 client,
                 "trade_partial_close",
@@ -1697,11 +1818,11 @@ def test_partial_close_rechecks_oracle_at_the_final_position_height(
             assert result["status"] == "accepted", result
             (submitted,) = position.submitted
             assert submitted["body"] == preview["intent"]["body"]
-            assert position.price_query_heights == [None, None, None]
+            assert position.price_query_heights == []
             assert position.perp_price_query_heights == ["121"]
             fresh = await call(client, "preview_partial_close", args)
-            assert fresh["quote"]["collateralPriceUsd"] == "0.98"
-            assert fresh["quote"]["closedNotionalUsd"] == "245"
+            assert fresh["quote"]["collateralPriceUsd"] == "1"
+            assert fresh["quote"]["closedNotionalUsd"] == "250"
             assert fresh["previewDigest"] == preview["previewDigest"]
 
     asyncio.run(scenario())
@@ -1733,9 +1854,9 @@ def test_partial_close_accepts_collateral_price_update_at_publication_time_read(
             (submitted,) = position.submitted
             assert submitted["body"] == preview["intent"]["body"]
             assert position.perp_price_query_heights == ["120", "121"]
-            assert all(height is None for height in position.price_query_heights)
+            assert position.price_query_heights == []
             fresh = await call(client, "preview_partial_close", args)
-            assert fresh["quote"]["closedNotionalUsd"] == "245"
+            assert fresh["quote"]["closedNotionalUsd"] == "250"
             assert fresh["previewDigest"] == preview["previewDigest"]
 
     asyncio.run(scenario())
@@ -1826,10 +1947,8 @@ def test_partial_close_binds_cap_and_quotes_with_contract_rounding(
             assert preview["intent"]["body"]["collateral"]["amountUsdc"] == "50000001"
             quote = preview["quote"]
             assert quote["effectiveLeverage"] == "5.00000009"
-            assert quote["collateralPriceUsd"] == "1.000000003"
+            assert quote["collateralPriceUsd"] == "1"
             # floor(50_000_001 * 5.00000009) is 250_000_009.
-            # Flooring that times the price leaves 250_000_009. One floor
-            # after both multiplications would give 250_000_010.
             assert (
                 quote["closedNotionalUsdc"]
                 == quote["closedNotionalUsd"]
@@ -1856,9 +1975,9 @@ def test_partial_close_binds_cap_and_quotes_with_contract_rounding(
 
 @pytest.mark.parametrize(
     ("missing", "expected_leverage", "expected_usd"),
-    [("cap", None, "20"), ("collateral_price", "5", None)],
+    [("cap", None, "20"), ("collateral_price", "5", "10")],
 )
-def test_partial_close_marks_incomplete_quotes_as_estimates(
+def test_partial_close_estimate_depends_on_effective_leverage(
     position_service: tuple[Position, str],
     missing: str,
     expected_leverage: str | None,
@@ -1878,12 +1997,12 @@ def test_partial_close_marks_incomplete_quotes_as_estimates(
             assert quote["effectiveLeverage"] == expected_leverage
             assert quote["closedNotionalUsd"] == expected_usd
             assert quote["closedNotionalUsdc"] == ("20" if missing == "cap" else "10")
-            assert quote["closedNotionalIsEstimate"] is True
+            assert quote["closedNotionalIsEstimate"] is (missing == "cap")
 
     asyncio.run(scenario())
 
 
-def test_partial_close_requires_fresh_confirmation_after_collateral_price_recovers(
+def test_partial_close_keeps_confirmation_when_collateral_price_recovers(
     position_service: tuple[Position, str],
 ) -> None:
     position, base_url = position_service
@@ -1895,29 +2014,17 @@ def test_partial_close_requires_fresh_confirmation_after_collateral_price_recove
         async with connected_client(base_url) as client:
             outage = await call(client, "preview_partial_close", args)
             assert outage["quote"]["effectiveLeverage"] == "2"
-            assert outage["quote"]["closedNotionalUsd"] is None
-            assert outage["quote"]["closedNotionalIsEstimate"] is True
+            assert outage["quote"]["closedNotionalUsd"] == "4"
+            assert outage["quote"]["closedNotionalIsEstimate"] is False
             position.collateral_price = "1.00119"
-            refused = await call(
+            accepted = await call(
                 client,
                 "trade_partial_close",
                 {**args, "preview_digest": outage["previewDigest"]},
             )
-            assert refused.get("code") == "PREVIEW_MISMATCH", refused
-            assert position.submitted == []
-            fresh = refused["preview"]
-            assert fresh["quote"]["closedNotionalUsd"] == "4.00476"
-            assert fresh["quote"]["closedNotionalIsEstimate"] is False
-            assert fresh["intent"] == outage["intent"]
-            assert fresh["previewDigest"] != outage["previewDigest"]
-            accepted = await call(
-                client,
-                "trade_partial_close",
-                {**args, "preview_digest": fresh["previewDigest"]},
-            )
             assert accepted["status"] == "accepted", accepted
             (submitted,) = position.submitted
-            assert submitted["body"] == fresh["intent"]["body"]
+            assert submitted["body"] == outage["intent"]["body"]
 
     asyncio.run(scenario())
 

@@ -626,6 +626,23 @@ def overview_clocks(
         overview_clocks(item, normalize, fetched)
 
 
+def trade_estimate_clocks(value: Any) -> None:
+    if not isinstance(value, dict) or not isinstance(
+        estimates := value.get("estimates"), dict
+    ):
+        return
+    for field, price in (
+        ("fees", "collateralPriceUsd"),
+        ("liquidationPrice", "entry"),
+        ("worstCaseFill", "reference"),
+    ):
+        estimate = estimates.get(field)
+        if isinstance(estimate, dict) and isinstance(
+            source := estimate.get(price), dict
+        ):
+            replace_if(source, "observedAt", timestamp)
+
+
 def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
     if raw == "":
         return ""
@@ -666,21 +683,8 @@ def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
                 error["message"] = DURATION.sub("<durationMs>", error["message"])
         else:
             doctor_report(value)
-    if (
-        command.startswith("trade ")
-        and isinstance(value, dict)
-        and isinstance(estimates := value.get("estimates"), dict)
-    ):
-        for field, price in (
-            ("fees", "collateralPriceUsd"),
-            ("liquidationPrice", "entry"),
-            ("worstCaseFill", "reference"),
-        ):
-            estimate = estimates.get(field)
-            if isinstance(estimate, dict) and isinstance(
-                source := estimate.get(price), dict
-            ):
-                replace_if(source, "observedAt", timestamp)
+    if command.startswith("trade "):
+        trade_estimate_clocks(value)
     if command == "skill source" and isinstance(value, dict):
         replace_if(value, "cliVersion", is_version)
         if isinstance(path := value.get("path"), str) and (

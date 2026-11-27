@@ -50,6 +50,7 @@ POSITION_SCENARIOS = {
     "position-after-hours",
     "position-malformed-after-hours-cap",
     "position-index-lag",
+    "position-index-lag-recovers",
     "position-wrong-chain",
     "position-foreign-trader",
     "position-foreign-contract-owner",
@@ -64,6 +65,7 @@ POSITION_SCENARIOS = {
     "partial-preview-changed",
     "partial-price-changed",
     "partial-price-recovers",
+    "partial-usdc-oracle-outage",
     "margin-accepted",
     "margin-interrupted",
     "margin-rejected",
@@ -425,6 +427,8 @@ def loopback(
     leverage_target: str | None = None,
     market_price: float | None = None,
     hold_read: tuple[str, int] | None = None,
+    position_collateral: int | None = None,
+    perp_prices: tuple[str, str] = ("100", "1"),
     cancel_target: str | None = None,
     close_target: str | None = None,
     lcd_query: bool = False,
@@ -460,6 +464,8 @@ def loopback(
         for row, stamp in zip(rows[: len(stamps)], stamps, strict=True):
             row["lastUpdatedBlock"]["block_ts"] = stamp
     position = PROTOCOL["account_positions_response"]["data"]["perp"]["trades"][0]
+    if position_collateral is not None:
+        position = {**position, "collateralAmount": position_collateral}
     borrowing = position["perpBorrowing"]
     recorded_markets = markets["data"]["perp"]["borrowings"]
     market = {**recorded_markets[0], "marketId": borrowing["marketId"]}
@@ -673,7 +679,10 @@ def loopback(
         "is_after_hours_market": False,
         "market_order_config": {"fill_at_next_oracle_price": False},
         "get_collateral_price": "1",
-        "get_perp_prices": {"market": {"base_per_quote": "100"}, "collateral": "1"},
+        "get_perp_prices": {
+            "market": {"base_per_quote": perp_prices[0]},
+            "collateral": perp_prices[1],
+        },
         "get_liquidation_price": {"liquidation_price": "60"},
         "quote_trade": {"data": None, "attributes": [], "events": [], "messages": []},
         "get_market": {"fee_index": "FeeIndex(0)", "group_index": "GroupIndex(0)"},
@@ -690,6 +699,7 @@ def loopback(
         "partial-preview",
         "partial-price-changed",
         "partial-price-recovers",
+        "partial-usdc-oracle-outage",
     }:
         contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
         contracts["market_order_config"]["fill_at_next_oracle_price"] = True
@@ -699,7 +709,7 @@ def loopback(
             collateral_amount="10000003", leverage="2.123456789012345678"
         )
         contracts["get_collateral_price"] = "0.987654321098765432"
-    if scenario == "position-index-lag":
+    if scenario in {"position-index-lag", "position-index-lag-recovers"}:
         contracts["get_trade_raw"]["collateral_amount"] = "10000001"
     if scenario in POSITION_SCENARIOS:
         contracts["get_trade_raw"].pop("long", None)
@@ -731,8 +741,10 @@ def loopback(
                 else "1.234567890123456789"
             ),
         )
-    if scenario == "quote-close-only":
+    if scenario in {"quote-close-only", "quote-close-only-no-borrowings"}:
         contracts["get_market"]["market_trading_state"] = "close_only"
+    if scenario == "quote-close-only-no-borrowings":
+        markets["data"]["perp"]["borrowings"] = []
     if scenario == "quote-pair-cap":
         contracts["get_pair_custom_max_leverage"] = "1.5"
     if scenario == "quote-minimum":
@@ -747,6 +759,9 @@ def loopback(
         "quote-fee-read-error",
         "quote-liquidation",
         "quote-after-hours",
+        "confirmation-account-change",
+        "shared-confirmable-position",
+        "shared-confirmable-leverage",
     }:
         contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
         contracts["get_group"]["stale_price_expiration_secs"] = 0
@@ -1117,6 +1132,20 @@ def loopback(
                                 },
                             }
                         )
+                    elif (
+                        scenario == "position-index-lag-recovers"
+                        and name == "trade"
+                        and sum(entry.label == name for entry in wire) > 1
+                    ):
+                        self.reply(
+                            {
+                                "data": {
+                                    "perp": {
+                                        "trade": {**trade, "collateralAmount": 10000001}
+                                    }
+                                }
+                            }
+                        )
                     elif name == "trade" and scenario == "partial-preview-changed":
                         self.reply(
                             {
@@ -1210,6 +1239,15 @@ def loopback(
                             with suppress(BrokenPipeError, ConnectionResetError):
                                 self.reply(responses[name])
                             return
+                        if (
+                            scenario == "quote-concurrent-previews"
+                            and name == "borrowings"
+                        ):
+                            if sum(entry.label == name for entry in wire) >= 2:
+                                admission.arrived.set()
+                            if not admission.release.wait(8):
+                                self.reject("Preview gate timed out")
+                                return
                         self.reply(responses[name])
                     return
             except (ValueError, KeyError, TypeError):
@@ -1451,12 +1489,24 @@ def loopback(
                             self.reject(f"Wrong LCD variables for {name}")
                             return
                         if scenario.startswith("quote-"):
+                            # Each MCP call can start another unpinned position
+                            # read before it pins its estimates to a block.
+                            last_position = next(
+                                (
+                                    index
+                                    for index in range(len(wire) - 1, -1, -1)
+                                    if wire[index].label == "trade"
+                                ),
+                                -1,
+                            )
+                            quote_reads = wire[last_position + 1 :]
                             pinned = name == "get_perp_prices" or any(
-                                request.label == "get_perp_prices" for request in wire
+                                request.label == "get_perp_prices"
+                                for request in quote_reads
                             )
                             anchor = name == "get_trade_raw" and any(
                                 request.label == "get_exchange_balance"
-                                for request in wire
+                                for request in quote_reads
                             )
                             if (
                                 pinned
@@ -1597,7 +1647,15 @@ def loopback(
             ):
                 self.reply({}, 503)
                 return
+            if (
+                scenario == "partial-usdc-oracle-outage"
+                and name == "get_collateral_price"
+            ):
+                self.reply({}, 503)
+                return
             data = contract_data(name, pinned=pinned)
+            if scenario == "partial-usdc-oracle-outage" and name == "get_perp_prices":
+                data = {**data, "collateral": None}
             if name == "get_exchange_balance" and (
                 scenario == "position-execution-unfunded"
                 or (scenario == "position-execution-pinned-unfunded" and pinned)

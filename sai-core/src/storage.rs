@@ -19,6 +19,26 @@ mod sessions;
 pub use ledger::{IntentRow, IntentStatus, StatusUpdateOptions};
 pub use sessions::{Accounts, RemovedSession, Session, SessionSummary, is_session_envelope};
 
+const TRADE_LEDGER_LOCKED: &str =
+    "Could not reserve the trade intent. database is locked. Nothing was sent.";
+const TRADE_LEDGER_NOT_DATABASE: &str =
+    "Could not reserve the trade intent. file is not a database. Nothing was sent.";
+const TRADE_LEDGER_CORRUPT: &str =
+    "Could not reserve the trade intent. database disk image is malformed. Nothing was sent.";
+const TRADE_LEDGER_UNAVAILABLE: &str =
+    "Could not reserve the trade intent. The intent ledger is unavailable. Nothing was sent.";
+
+/// Check for reservation diagnostics that are safe to disclose over MCP.
+pub fn is_trade_reservation_diagnostic(message: &str) -> bool {
+    matches!(
+        message,
+        TRADE_LEDGER_LOCKED
+            | TRADE_LEDGER_NOT_DATABASE
+            | TRADE_LEDGER_CORRUPT
+            | TRADE_LEDGER_UNAVAILABLE
+    )
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error(transparent)]
@@ -32,7 +52,11 @@ pub enum StorageError {
     #[error(
         "Earlier open intent {key} may still execute. Check its status with `{hint}` before retrying."
     )]
-    RecentOpenPending { key: String, hint: String },
+    RecentOpenPending {
+        key: String,
+        hint: String,
+        keys: Vec<String>,
+    },
     #[error("{0}")]
     Session(#[from] SessionError),
     #[error("{0}")]
@@ -44,6 +68,45 @@ pub enum StorageError {
 #[derive(Debug, Error)]
 #[error("{0}")]
 pub struct SessionError(pub SaiError);
+
+impl StorageError {
+    pub(crate) fn mcp_trade_error(self) -> SaiError {
+        let diagnostic = match &self {
+            Self::Sqlite(rusqlite::Error::SqliteFailure(error, _)) => {
+                use rusqlite::ErrorCode;
+                Some(match error.code {
+                    ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => TRADE_LEDGER_LOCKED,
+                    ErrorCode::NotADatabase => TRADE_LEDGER_NOT_DATABASE,
+                    ErrorCode::DatabaseCorrupt => TRADE_LEDGER_CORRUPT,
+                    _ => TRADE_LEDGER_UNAVAILABLE,
+                })
+            }
+            Self::Sqlite(_) | Self::Io(_) => Some(TRADE_LEDGER_UNAVAILABLE),
+            Self::NewerLedger => {
+                return SaiError::new(
+                    Code::InvalidRequest,
+                    format!("Could not reserve the trade intent. {self}. Nothing was sent."),
+                );
+            }
+            _ => None,
+        };
+        if let Some(message) = diagnostic {
+            return SaiError::new(Code::InternalError, message);
+        }
+        let keys = match &self {
+            Self::RecentOpenPending { keys, .. } => Some(serde_json::json!(keys)),
+            _ => None,
+        };
+        let mut error = SaiError::from(self);
+        if let Some(keys) = keys {
+            error.details = Some(Box::new(serde_json::Map::from_iter([(
+                "intentKeys".into(),
+                keys,
+            )])));
+        }
+        error
+    }
+}
 
 impl SessionError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
@@ -64,7 +127,9 @@ impl From<StorageError> for SaiError {
             StorageError::InvalidSessionExpiry => {
                 Self::new(Code::SessionUnavailable, crate::session::INVALID_EXPIRY)
             }
-            StorageError::RecentOpenPending { ref key, ref hint } => SaiError {
+            StorageError::RecentOpenPending {
+                ref key, ref hint, ..
+            } => SaiError {
                 intent_key: Some(key.clone()),
                 hint: Some(hint.clone()),
                 ..Self::new(Code::RecentOpenPending, error.to_string())

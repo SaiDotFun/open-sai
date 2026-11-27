@@ -3,6 +3,7 @@ mod logs;
 mod overview;
 mod session;
 mod stdio;
+mod trade;
 mod validation;
 
 use std::{
@@ -94,6 +95,7 @@ impl ServeArgs {
             writer,
             install: install::Installation::detect(),
             local_ledger_slots: Arc::new(Semaphore::new(2)),
+            trade_slots: Arc::new(Semaphore::new(2)),
             reconcile_slots: Arc::new(Semaphore::new(8)),
             wait_slots: Arc::new(Semaphore::new(stdio::MAX_IN_FLIGHT)),
             log_slots: Arc::new(Semaphore::new(2)),
@@ -131,6 +133,7 @@ struct SaiMcp {
     writer: Option<Arc<LogWriter>>,
     install: install::Installation,
     local_ledger_slots: Arc<Semaphore>,
+    trade_slots: Arc<Semaphore>,
     reconcile_slots: Arc<Semaphore>,
     wait_slots: Arc<Semaphore>,
     log_slots: Arc<Semaphore>,
@@ -173,6 +176,9 @@ impl SaiMcp {
         let storage = Storage::new(&self.env.home);
         let endpoint = self.settings.endpoint();
         let events = self.events().with_tool(name, call_id);
+        if let Some(action) = trade::Action::named(name) {
+            return self.trade(action, args, call_id).await;
+        }
         let keeper = Keeper::new(endpoint, events);
         let query = match name {
             "market_list" => keeper::MARKETS,
@@ -349,7 +355,9 @@ impl SaiMcp {
             match tokio::time::timeout(remaining, self.wait_slots.clone().acquire_owned()).await {
                 Ok(slot) => slot.map_err(|_| SaiError::internal())?,
                 // Admission expired before the worker could resolve an account.
-                Err(_) => return Ok(wait_result(Map::new(), wait::unknown_result(&key))),
+                Err(_) => {
+                    return Ok(wait_result(Map::new(), wait::unknown_result(&key)));
+                }
             };
         let home = self.env.home.clone();
         let endpoint = self.settings.endpoint().to_owned();
@@ -492,7 +500,13 @@ impl SaiMcp {
         Ok(self
             .run_tool(name, &args, call_id)
             .await
-            .unwrap_or_else(|error| self.error(error)))
+            .unwrap_or_else(|error| {
+                if trade::Action::named(name).is_some() {
+                    trade::failure(&self.env.home, error)
+                } else {
+                    self.error(error)
+                }
+            }))
     }
 }
 
@@ -733,6 +747,7 @@ mod tests {
             writer: None,
             install: install::Installation::detect(),
             local_ledger_slots: Arc::new(Semaphore::new(2)),
+            trade_slots: Arc::new(Semaphore::new(2)),
             reconcile_slots: Arc::new(Semaphore::new(8)),
             wait_slots: Arc::new(Semaphore::new(0)),
             log_slots: Arc::new(Semaphore::new(2)),

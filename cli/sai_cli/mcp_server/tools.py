@@ -154,23 +154,27 @@ def preview_mismatch(
 def describe(exc: Exception) -> dict[str, Any]:
     """Format the shared classification using the MCP response fields."""
     failure = describe_error(exc)
-    if failure.code == Code.OUTCOME_UNKNOWN:
+    if isinstance(exc, keeper.OutcomeUnknown):
         key = failure.intent_key
         return error(
             failure.message,
             failure.code,
             intentKey=key,
+            addr=exc.account,
             next=(
-                f"Call intent_status with key {key} to reconcile. Do not"
+                f"Call intent_status with key {key} and addr {exc.account} to reconcile. Do not"
                 " resubmit until it reports a final outcome."
             ),
         )
     if isinstance(exc, storage.RecentOpenPending):
+        next_step = f"Call intent_status with addr {exc.account} and each key in intentKeys before retrying."
         return error(
-            f"Earlier open intent {failure.intent_key} may still execute. Call"
-            " intent_status with each key in intentKeys before retrying.",
+            f"Earlier open intent {failure.intent_key} may still execute. {next_step}",
             failure.code,
+            intentKey=failure.intent_key,
             intentKeys=exc.keys,
+            addr=exc.account,
+            next=next_step,
         )
     if isinstance(exc, Refused):
         reason = estimates.rejection_reason((exc.preview or {}).get("estimates", {}))
@@ -187,6 +191,11 @@ def describe(exc: Exception) -> dict[str, Any]:
         reason = estimates.rejection_reason(values)
         if estimates.close_oracle_time_unknown(values):
             reason = values["execution"]["reason"]
+        elif confirmation.collateral_price_unverified(exc.preview.get("quote") or {}):
+            reason = (
+                "Cannot verify the collateral price. Request a new preview when the"
+                " price is available."
+            )
         return preview_mismatch(
             reason
             or (
@@ -198,15 +207,33 @@ def describe(exc: Exception) -> dict[str, Any]:
         )
     if failure.code == Code.PREVIEW_MISMATCH:
         return preview_mismatch(failure.message)
-    if isinstance(exc, storage.IntentReservationError):
+    if (
+        isinstance(exc, (keeper.AdmissionRejected, keeper.NotSent))
+        and (account := exc.recovery_account)
+        and (key := failure.intent_key)
+    ):
+        return error(
+            failure.message,
+            failure.code,
+            intentKey=key,
+            addr=account,
+            next=f"Call intent_status with key {key} and addr {account} before retrying.",
+        )
+    if isinstance(exc, (storage.UnresolvedIntent, storage.IntentReservationError)):
         if key := failure.intent_key:
             return error(
                 failure.message,
                 failure.code,
                 intentKey=key,
+                addr=exc.account,
                 next=(
                     f"Call intent_status with key {key} and addr {exc.account}"
-                    " to check the local reservation."
+                    " to reconcile before resubmitting."
+                ),
+                **(
+                    {"intentKeys": [key]}
+                    if isinstance(exc, storage.UnresolvedIntent)
+                    else {}
                 ),
             )
         return error(failure.message, failure.code)
@@ -797,5 +824,6 @@ def partial_close(
         lcd_endpoint=settings.lcd_endpoint,
         dry_run=dry_run,
         before_submit=check,
+        fixed_usdc_price=True,
     )
     return finish(load, dry_run, result)

@@ -3,17 +3,24 @@
 mod quote;
 
 use num_bigint::BigUint;
-use std::future::{Future, pending};
+use std::{
+    future::{Future, pending},
+    time::Duration,
+};
 
 const KEEPER_OWNER_MISMATCH: &str = "Keeper position belongs to a different account";
 const CONTRACT_OWNER_MISMATCH: &str = "Contract position belongs to a different account";
 const NETWORK_MISMATCH: &str = "Keeper trading route and LCD network do not match";
+const INDEX_LAG: &str = "Indexed position differs from contract state. Retry after Keeper synchronizes. No intent was submitted.";
+const INDEX_RETRY_BUDGET: Duration = Duration::from_secs(2);
+const INDEX_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(250), Duration::from_millis(500)];
 
 use serde_json::{Map, Value, json};
+use tokio::time::{Instant, sleep, timeout_at};
 
 use crate::{
     errors::{Code, SaiError},
-    keeper::{MARKET, MARKETS, POSITION, ROUTE, TIMEOUT, truthy},
+    keeper::{MARKET, ROUTE, TIMEOUT, truthy},
 };
 
 use super::estimates::{PartialCloseQuote, now};
@@ -46,6 +53,7 @@ pub enum PositionAction<'a> {
 pub enum PositionMode<'a> {
     DryRun,
     Preview,
+    McpPreview,
     Submit(SubmitOptions<'a>),
 }
 
@@ -72,6 +80,7 @@ struct PositionQuote {
     snapshot: Snapshot,
     inputs: Value,
     preview: TradePreview,
+    fixed_usdc_price: bool,
 }
 
 struct RecheckedPosition {
@@ -123,13 +132,23 @@ impl Trading<'_> {
         let lcd = Lcd(lcd_endpoint);
         let confirming =
             matches!(&mode, PositionMode::Submit(options) if options.confirmation.is_some());
+        let fixed_usdc_price = match &mode {
+            PositionMode::McpPreview => true,
+            PositionMode::Submit(options) => options
+                .confirmation
+                .as_ref()
+                .is_some_and(Confirmation::is_mcp),
+            _ => false,
+        };
         let mut first = self
-            .quote_for_position(&lcd, addr, &id, action, confirming)
+            .quote_for_position(&lcd, addr, &id, action, confirming, fixed_usdc_price)
             .await?;
         let PositionMode::Submit(options) = mode else {
             first.estimate_execution(&lcd, &id, action, None).await?;
             return Ok(match mode {
-                PositionMode::Preview => first.preview.cli_preview_output(Some(addr)),
+                PositionMode::Preview | PositionMode::McpPreview => {
+                    first.preview.cli_preview_output(Some(addr))
+                }
                 _ => first.preview.output(Some(addr)),
             });
         };
@@ -139,16 +158,20 @@ impl Trading<'_> {
             .as_ref()
             .is_none_or(Confirmation::is_cli);
         let mut current = self
-            .quote_for_position(&lcd, addr, &id, action, confirming)
+            .quote_for_position(&lcd, addr, &id, action, confirming, fixed_usdc_price)
             .await?;
         let rechecked = current.recheck(&lcd, &id).await?;
         let Some(rechecked) = rechecked else {
             let latest = async {
-                let mut latest = self.quote_for_position(&lcd, addr, &id, action, confirming).await?;
-                let checked = latest.recheck(&lcd, &id).await?.ok_or_else(|| {
-                    SaiError::new(Code::PreviewMismatch, "The position quote changed again during verification. Request a new preview.")
-                })?;
-                latest.estimate_execution(&lcd, &id, action, Some(&checked)).await?;
+                let mut latest = self.quote_for_position(&lcd, addr, &id, action, confirming, fixed_usdc_price).await?;
+                let checked = if latest.preview.collateral_price_unverified() {
+                    None
+                } else {
+                    Some(latest.recheck(&lcd, &id).await?.ok_or_else(|| {
+                        SaiError::new(Code::PreviewMismatch, "The position quote changed again during verification. Request a new preview.")
+                    })?)
+                };
+                latest.estimate_execution(&lcd, &id, action, checked.as_ref()).await?;
                 Ok(latest)
             }.await;
             return Err(position_changed(action, addr, latest, cli));
@@ -182,23 +205,31 @@ impl Trading<'_> {
         trade_id: &Value,
         action: PositionAction<'_>,
         confirming: bool,
+        fixed_usdc_price: bool,
     ) -> Result<PositionQuote, SaiError> {
-        let error = match self.quote_position(lcd, addr, trade_id, action).await {
+        let error = match self
+            .quote_position(lcd, addr, trade_id, action, fixed_usdc_price)
+            .await
+        {
             Err(error) if is_network_mismatch(&error) => error,
             result => return result,
         };
         if !confirming {
             return Err(invalid(&error.message));
         }
-        let message = match self.quote_position(lcd, addr, trade_id, action).await {
+        let message = match self.quote_position(lcd, addr, trade_id, action, fixed_usdc_price).await {
             Ok(mut fresh) => {
-                let checked = fresh.recheck(lcd, trade_id).await.map_err(|error| {
-                    SaiError::new(Code::PreviewMismatch, format!("Could not verify the replacement position quote. {}", error.message))
-                })?.ok_or_else(|| SaiError::new(
-                    Code::PreviewMismatch,
-                    "The position quote changed again during verification. Request a new preview.",
-                ))?;
-                fresh.estimate_execution(lcd, trade_id, action, Some(&checked)).await?;
+                let checked = if fresh.preview.collateral_price_unverified() {
+                    None
+                } else {
+                    Some(fresh.recheck(lcd, trade_id).await.map_err(|error| {
+                        SaiError::new(Code::PreviewMismatch, format!("Could not verify the replacement position quote. {}", error.message))
+                    })?.ok_or_else(|| SaiError::new(
+                        Code::PreviewMismatch,
+                        "The position quote changed again during verification. Request a new preview.",
+                    ))?)
+                };
+                fresh.estimate_execution(lcd, trade_id, action, checked.as_ref()).await?;
                 return Err(replacement_preview(
                     "Keeper trading route and LCD network differed during confirmation. Review the replacement preview before submitting.",
                     &fresh.preview, addr,
@@ -219,6 +250,7 @@ impl Trading<'_> {
         addr: &str,
         trade_id: &Value,
         action: PositionAction<'_>,
+        fixed_usdc_price: bool,
     ) -> Result<PositionQuote, SaiError> {
         let snapshot = self
             .read_position_change_snapshot(
@@ -229,25 +261,14 @@ impl Trading<'_> {
             )
             .await?;
         let delta = if let PositionAction::PartialClose { percent } = action {
-            let markets = self.position_request(MARKETS, Map::new()).await?;
-            let markets = field(field(&markets, "perp")?, "borrowings")?
-                .as_array()
-                .ok_or_else(malformed)?;
-            let mut matches = markets.iter().filter(|market| {
-                market["marketId"] == snapshot.market["marketId"]
-                    && market["collateralToken"]["symbol"] == "USDC"
-            });
-            let market = matches
-                .next()
-                .filter(|market| matches.next().is_none() && truthy(&market["isOpen"]))
-                .ok_or_else(|| invalid("Open market data not available"))?;
-            let minimum = field(market, "minPositionSizeUSD")?;
-            Some(quote::reduction(&snapshot.raw, percent, minimum)?)
+            Some(quote::reduction(&snapshot.raw, percent)?)
         } else {
             None
         };
 
         let (effective, mut inputs) = snapshot.leverage(lcd, trade_id, None).await?;
+        let fixed_usdc_price =
+            fixed_usdc_price && snapshot.market["collateralToken"]["symbol"] == "USDC";
         let mut preview = match action {
             PositionAction::Margin {
                 direction,
@@ -268,7 +289,11 @@ impl Trading<'_> {
                 )?
             }
             PositionAction::PartialClose { percent } => {
-                let price = snapshot.price(lcd, None).await.ok();
+                let price = if fixed_usdc_price {
+                    Some(ContractDecimal::parse(&json!("1"))?)
+                } else {
+                    snapshot.price(lcd, None).await.ok()
+                };
                 inputs["collateralPriceUsd"] = json!(price.as_ref().map(ContractDecimal::display));
                 quote::partial(
                     trade_id,
@@ -286,6 +311,7 @@ impl Trading<'_> {
             snapshot,
             inputs,
             preview,
+            fixed_usdc_price,
         })
     }
 
@@ -301,26 +327,9 @@ impl Trading<'_> {
         if route["enabled"] != true {
             return Err(invalid(NETWORK_MISMATCH));
         }
-        let position = self
-            .position_request(
-                POSITION,
-                variables([("trader", json!(addr)), ("id", trade_id.clone())]),
-            )
-            .await?;
-        let position = field(field(&position, "perp")?, "trade")?;
-        if !truthy(position) {
-            return Err(invalid("Position not found for this account"));
-        }
-        if !same_account(addr, position.get("trader")) {
-            return Err(invalid(KEEPER_OWNER_MISMATCH));
-        }
-        if position.get("id") != Some(trade_id) {
-            return Err(invalid("Keeper returned a different position index"));
-        }
-        if !truthy(field(position, "isOpen")?) || field(position, "tradeType")? != "trade" {
-            return Err(invalid("Open position not found"));
-        }
-        let trader = text_field(position, "trader")?;
+        let position = self.indexed_position(addr, trade_id, TIMEOUT).await?;
+        require_open_position(&position)?;
+        let trader = text_field(&position, "trader")?;
         let chain_id = route["chainId"]
             .as_str()
             .filter(|chain| !chain.is_empty())
@@ -333,7 +342,7 @@ impl Trading<'_> {
         if network != chain_id {
             return Err(SaiError::new(Code::PreviewMismatch, NETWORK_MISMATCH));
         }
-        let borrowing = field(position, "perpBorrowing")?;
+        let borrowing = field(&position, "perpBorrowing")?;
         let collateral = field(borrowing, "collateralToken")?;
         if field(collateral, "symbol")? != "USDC" {
             return Err(invalid("Only USDC positions are supported"));
@@ -358,21 +367,55 @@ impl Trading<'_> {
             return Err(invalid("Open market data is unavailable"));
         }
         let token = format!("TokenIndex({token_id})");
-        let (raw, _) = lcd
-            .position(contract, trader, trade_id, Read::Snapshot)
-            .await?;
-        require_object(&raw)?;
-        if !same_account(addr, raw.get("user")) {
-            return Err(invalid(CONTRACT_OWNER_MISMATCH));
-        }
-        if raw["user_trade_index"] != format!("UserTradeIndex({trade_id})")
-            || raw["market_index"] != format!("MarketIndex({market_id})")
-            || raw["collateral_index"] != token
-            || raw["is_open"] != true
-            || raw["trade_type"] != "trade"
-        {
-            return Err(position_mismatch());
-        }
+        let read_contract = || async {
+            let (raw, _) = lcd
+                .position(contract, trader, trade_id, Read::Snapshot)
+                .await?;
+            require_object(&raw)?;
+            if !same_account(addr, raw.get("user")) {
+                return Err(invalid(CONTRACT_OWNER_MISMATCH));
+            }
+            if raw["user_trade_index"] != format!("UserTradeIndex({trade_id})")
+                || raw["market_index"] != format!("MarketIndex({market_id})")
+                || raw["collateral_index"] != token
+                || raw["is_open"] != true
+                || raw["trade_type"] != "trade"
+            {
+                return Err(position_mismatch());
+            }
+            Ok(raw)
+        };
+        let raw = read_contract().await?;
+        let raw = if same_margin(&raw, &position)? {
+            raw
+        } else {
+            // Retry only amount or leverage drift, with both reads checked again.
+            let index_lag = || SaiError {
+                retryable_override: true,
+                ..invalid(INDEX_LAG)
+            };
+            let deadline = Instant::now() + INDEX_RETRY_BUDGET;
+            timeout_at(deadline, async {
+                for delay in INDEX_RETRY_DELAYS {
+                    if deadline.saturating_duration_since(Instant::now()) <= delay {
+                        break;
+                    }
+                    sleep(delay).await;
+                    let position = self.indexed_position(addr, trade_id, TIMEOUT).await?;
+                    require_open_position(&position)?;
+                    if field(&position, "perpBorrowing")? != borrowing {
+                        return Err(position_mismatch());
+                    }
+                    let raw = read_contract().await?;
+                    if same_margin(&raw, &position)? && Instant::now() < deadline {
+                        return Ok(raw);
+                    }
+                }
+                Err(index_lag())
+            })
+            .await
+            .unwrap_or_else(|_| Err(index_lag()))?
+        };
         let (funds, _) = lcd
             .smart(
                 contract,
@@ -386,17 +429,6 @@ impl Trading<'_> {
 
         if funds["collateral_index"] != token {
             return Err(position_mismatch());
-        }
-        if number_text(&raw["collateral_amount"])?
-            != number_text(field(position, "collateralAmount")?)?
-            || float(&raw["leverage"])? != float(field(position, "leverage")?)?
-        {
-            return Err(SaiError {
-                retryable_override: true,
-                ..invalid(
-                    "Indexed position differs from contract state; wait for synchronization and retry",
-                )
-            });
         }
         Ok(Snapshot {
             raw,
@@ -418,6 +450,19 @@ impl Trading<'_> {
             .await
             .map(Value::Object)
     }
+}
+
+fn require_open_position(position: &Value) -> Result<(), SaiError> {
+    if !truthy(field(position, "isOpen")?) || field(position, "tradeType")? != "trade" {
+        return Err(invalid("Open position not found"));
+    }
+    Ok(())
+}
+
+fn same_margin(raw: &Value, position: &Value) -> Result<bool, SaiError> {
+    Ok(number_text(&raw["collateral_amount"])?
+        == number_text(field(position, "collateralAmount")?)?
+        && float(&raw["leverage"])? == float(field(position, "leverage")?)?)
 }
 
 impl PositionQuote {
@@ -490,10 +535,12 @@ impl PositionQuote {
                     Read::At(height),
                 )
                 .await?;
-            if quoted_price.is_null() || prices["collateral"].is_null() {
-                return Ok(None);
+            if !self.fixed_usdc_price {
+                if quoted_price.is_null() || prices["collateral"].is_null() {
+                    return Ok(None);
+                }
+                ContractDecimal::parse(&prices["collateral"])?;
             }
-            ContractDecimal::parse(&prices["collateral"])?;
             Some(prices)
         } else {
             None
@@ -710,6 +757,11 @@ fn position_changed(
 }
 
 fn replacement_preview(message: &str, preview: &TradePreview, addr: &str) -> SaiError {
+    let message = if preview.collateral_price_unverified() {
+        "Cannot verify the collateral price. Request a new preview when the price is available."
+    } else {
+        message
+    };
     SaiError {
         details: Some(Box::new(variables([(
             "preview",

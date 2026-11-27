@@ -368,6 +368,10 @@ class PositionSnapshot:
     def contract(self) -> str:
         return self.route["contractAddress"]
 
+    @property
+    def usdc_collateral(self) -> bool:
+        return self.market.get("collateralToken", {}).get("symbol") == "USDC"
+
 
 def quote_leverage_liquidates(
     lcd: str, state: PositionSnapshot, target: Decimal, *, height: str
@@ -487,6 +491,8 @@ def recheck_position(
     state: PositionSnapshot,
     trade_id: int,
     quoted_inputs: dict[str, Any],
+    *,
+    fixed_usdc_price: bool = False,
 ) -> RecheckedPosition | None:
     """Recheck the on-chain quote inputs at the final position's block."""
     latest, height = _latest_position(lcd, state, trade_id)
@@ -519,10 +525,11 @@ def recheck_position(
     prices = None
     if check_collateral:
         prices = perp_prices(lcd, state, height)
-        value = prices.get("collateral") if isinstance(prices, dict) else None
-        if value is None or quoted_inputs["collateralPriceUsd"] is None:
-            return None
-        contract_decimal(value)
+        if not (fixed_usdc_price and state.usdc_collateral):
+            value = prices.get("collateral") if isinstance(prices, dict) else None
+            if value is None or quoted_inputs["collateralPriceUsd"] is None:
+                return None
+            contract_decimal(value)
     return RecheckedPosition(height, effective_leverage, prices)
 
 
