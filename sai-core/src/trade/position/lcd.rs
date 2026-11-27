@@ -57,6 +57,53 @@ impl Lcd<'_> {
             .map(|(mut response, height)| (response["data"].take(), height))
     }
 
+    pub(in crate::trade) async fn market_oracle_price(
+        &self,
+        contract: &str,
+        pair: &Value,
+        height: &str,
+    ) -> Result<Value, SaiError> {
+        let token_index = |side| {
+            let digits = pair
+                .get(side)
+                .and_then(Value::as_str)?
+                .strip_prefix("TokenIndex(")?
+                .strip_suffix(')')?;
+            if digits.len() > 5 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            digits.parse::<u16>().ok()
+        };
+        let base = token_index("base").ok_or_else(malformed)?;
+        let quote = token_index("quote").ok_or_else(malformed)?;
+        let (oracle, _) = self
+            .smart(
+                contract,
+                json!({"get_oracle_address": {}}),
+                Read::At(height),
+            )
+            .await?;
+        let oracle = oracle
+            .as_str()
+            .filter(|address| {
+                address.strip_prefix("nibi1").is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                })
+            })
+            .ok_or_else(malformed)?;
+        let (rate, _) = self
+            .smart(
+                oracle,
+                json!({"get_exchange_rate": {"base": base, "quote": quote}}),
+                Read::At(height),
+            )
+            .await?;
+        if !rate.is_object() {
+            return Err(malformed());
+        }
+        Ok(rate)
+    }
+
     pub(in crate::trade) async fn leverage_quote_liquidates(
         &self,
         contract: &str,
