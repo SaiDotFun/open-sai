@@ -324,7 +324,9 @@ def test_confirmed_trade_handles_balance_for_another_collateral(
         assert (code, stderr) == (0, "")
         assert not endpoints.errors
         if command == LEVERAGE:
-            assert ("collateralBaseUnits" in preview) is not preview_unavailable
+            collateral = preview["collateralBaseUnits"]
+            assert collateral["before"] == "10000000"
+            assert ("after" in collateral) is not preview_unavailable
 
     for index, cli in enumerate(pair):
         replay = TradeReplay("UPDATE_TRADE")
@@ -352,7 +354,7 @@ def test_confirmed_trade_handles_balance_for_another_collateral(
                     assert not replay.attempts()
                     assert not rows(home)
                     continue
-                # A preview with no collateral estimate can still be confirmed.
+                # A preview with only the starting collateral can still be confirmed.
                 assert (code, stderr) == (0, "")
                 (key,) = replay.admitted_keys()
                 assert replay.attempts() == {key: 1}

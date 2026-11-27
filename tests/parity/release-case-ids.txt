@@ -147,6 +147,11 @@ mcp-session-refusals
 mcp-session-reloads
 mcp-stream-error
 mcp-tool-inventory
+mcp-trade-close-confirmation
+mcp-trade-leverage-confirmation
+mcp-trade-margin-confirmation
+mcp-trade-open-confirmation
+mcp-trade-tpsl-confirmation
 mcp-uninstall-absent
 mcp-uninstall-all
 mcp-uninstall-codex-crlf

@@ -23,14 +23,18 @@ def notional_quote(
     state: margin.PositionSnapshot,
     collateral_delta: int,
     effective_leverage: Decimal | None,
+    *,
+    fixed_usdc_price: bool = False,
 ) -> dict[str, Any]:
-    """Quote the requested slice with the Perp after-hours rule and oracle."""
+    """Quote the requested slice with the Perp after-hours rule."""
     raw = state.raw
     stored_leverage = Decimal(str(raw["leverage"]))
-    try:
-        price = margin.collateral_price(lcd, state)
-    except (ValueError, TypeError):
-        price = None
+    price: Decimal | None = Decimal(1)
+    if not (fixed_usdc_price and state.usdc_collateral):
+        try:
+            price = margin.collateral_price(lcd, state)
+        except (ValueError, TypeError):
+            price = None
 
     # Perp floors in collateral units first, then again in USD units.
     leverage = stored_leverage if effective_leverage is None else effective_leverage

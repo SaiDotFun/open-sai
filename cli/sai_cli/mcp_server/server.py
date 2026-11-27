@@ -997,6 +997,9 @@ def result_summary(text: str | None) -> dict[str, Any]:
                 summary["code"] = Code(summary.get("code"))
             except ValueError:
                 summary["code"] = Code.INTERNAL_ERROR
+    if summary.get("code") == Code.RECENT_OPEN_PENDING:
+        # The blocked-open events link this call to each intent separately.
+        summary.pop("intentKey", None)
     account = value.get("account", value.get("addr"))
     if isinstance(account, str):
         summary["account"] = sai_log.Arg(account)

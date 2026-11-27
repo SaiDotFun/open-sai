@@ -637,13 +637,13 @@ def test_missing_pair_cap_still_checks_liquidation(
             )
 
 
-@pytest.mark.parametrize("bound", [True, False], ids=["bound", "advisory"])
+@pytest.mark.parametrize("projected", [True, False], ids=["projected", "before-only"])
 def test_confirmed_leverage_with_unavailable_preliminary_balance(
-    cli_pair: tuple[CLI, CLI], tmp_path: Path, bound: bool
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, projected: bool
 ) -> None:
     _, rust = cli_pair
     python = (str(Path(sys.executable).with_name("sai")),)
-    mode = "default" if bound else "balance-missing-index"
+    mode = "default" if projected else "balance-missing-index"
     with update_loopback(mode) as endpoints:
         home = tmp_path / "preview"
         seed_home(home, endpoints, "session")
@@ -651,7 +651,8 @@ def test_confirmed_leverage_with_unavailable_preliminary_balance(
             python, home, endpoints, (*LEVERAGE, "--dry-run"), python=True
         )
         assert (code, stderr) == (0, "")
-        assert ("collateralBaseUnits" in preview) is bound
+        assert preview["collateralBaseUnits"]["before"] == "20000000"
+        assert ("after" in preview["collateralBaseUnits"]) is projected
         assert not endpoints.errors
         assert not rows(home)
 
@@ -662,7 +663,7 @@ def test_confirmed_leverage_with_unavailable_preliminary_balance(
             seed_home(home, endpoints, "session")
             code, result, stderr = run(cli, home, endpoints, args, python=index == 0)
             assert not endpoints.errors
-            if bound:
+            if projected:
                 assert (code, result["error"]["code"], stderr) == (
                     4,
                     "PREVIEW_MISMATCH",

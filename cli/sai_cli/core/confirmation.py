@@ -78,16 +78,30 @@ def is_confirmable(preview: dict[str, Any]) -> bool:
     )
 
 
+def collateral_price_unverified(quote: dict[str, Any]) -> bool:
+    return "collateralPriceUsd" in quote and quote["collateralPriceUsd"] is None
+
+
 def with_digest(preview: dict[str, Any]) -> dict[str, Any]:
     values = preview.get("estimates", {})
+    quote = preview.get("quote") or {}
+    intent = preview["intent"]
     unknown_partial_leverage = (
-        preview["intent"]["kind"] == "DECREASE_POSITION_SIZE"
-        and (preview.get("quote") or {}).get("effectiveLeverage") is None
+        intent["kind"] == "DECREASE_POSITION_SIZE"
+        and quote.get("effectiveLeverage") is None
+    )
+    unknown_leverage_collateral = (
+        intent["kind"] == "UPDATE_TRADE"
+        and "requestedLeverage" in intent["body"]
+        and "quote" not in preview
+        and "collateralBaseUnits" not in preview
     )
     if (
         rejection_reason(values) is not None
         or close_oracle_time_unknown(values)
         or unknown_partial_leverage
+        or unknown_leverage_collateral
+        or collateral_price_unverified(quote)
     ):
         return {key: value for key, value in preview.items() if key != "previewDigest"}
     return {**preview, "previewDigest": preview_digest(preview)}

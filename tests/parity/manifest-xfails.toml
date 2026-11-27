@@ -1,36 +1,46 @@
 # Reviewed differences against sai-cli/v0.1.2. Stable IDs are case:, cli:, and mcp:.
 # Remove an entry in the same change that fixes its gap.
+# Titles that mention Python main compare the same fixtures with Python at a48e7775.
+# The signatures below still compare with the release.
 
 [gap."case:account-balances-interrupt"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "85399bc02829a112c8b522e284a258fbed50f14f4393a835910602e17fd986f3"
 
 [gap."case:account-balances-interrupt-close"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "85399bc02829a112c8b522e284a258fbed50f14f4393a835910602e17fd986f3"
 
 [gap."case:account-balances-partial-error"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "b87f76444b3298da9cabda4ca5f416191fc4cb72612bacd961331ab33f7c9d51"
 
 [gap."case:account-balances-redirect-limit"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "d4918d252d14348f48e8b1c65075af2eaa1180bf768b3e98844dd018b6502241"
 
 [gap."case:account-balances-unacknowledged"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "bb2ec0ba53a5026d8238e84204a9b01e9f97bcab40de4484524d27c29f644633"
 
 [gap."case:account-balances-wrong-subprotocol"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "d4918d252d14348f48e8b1c65075af2eaa1180bf768b3e98844dd018b6502241"
 
 [gap."case:account-bare"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "3015bd9644405895117cd0327cfc123b38b5e0e37c50552bd40893a97a0e1b92"
 
 [gap."case:account-history-error-codes"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "fc7b588d1bf24ecc42b258d68e40ffeb6b0fa4eb512342011fd57f25c99dba55"
 
 [gap."case:account-overview-conflicting-height"]
@@ -38,39 +48,48 @@ owner = "#175"
 signature = "b93612e5f1b90c92fc651cb9f6d79cf9dac19bc9276449af9ddc40fb305e66c7"
 
 [gap."case:account-overview-confirmation-fails"]
-owner = "#211"
+owner = "#231"
+title = "Differs from Python main. Overview section and balance freshness fields differ. Rust also redacts the error log."
 signature = "740ca26b317d7ea13fbb52915b7b81a87574d4c15b3b92c72f8bb07f10366678"
 
 [gap."case:account-overview-deadline"]
-owner = "#211"
+owner = "#231"
+title = "Differs from Python main. Both cancel the trickling LCD read at the deadline. Overview freshness fields differ."
 signature = "908760da9d8bf652db5561c0823e6b14bfefece80c4d718c77129c7f6099d42d"
 
 [gap."case:account-overview-expiry"]
-owner = "#211"
+owner = "#231"
+title = "Differs from Python main. Both give the same renewal command. Overview freshness fields differ."
 signature = "d3b64de79765bc06273344289ca3b07d1625e54138306faea4be9bc0afd0edb5"
 
 [gap."case:account-overview-expiry-text"]
-owner = "#211"
+owner = "#231"
+title = "Differs from Python main. The text report matches v0.1.3. Main changes the overview table and summary."
 signature = "20528a3719fa10a5115d98fe4ed4dc6687fc0bf42b147aa77fd50007f453544f"
 
 [gap."case:account-overview-interrupt-http"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "47d73e6204e88e6d298c2e14101f1d56d35c4c1ae7258191d108b7839ad41b04"
 
 [gap."case:account-overview-partial"]
-owner = "#211"
+owner = "#231"
+title = "Differs from Python main. Overview section and balance freshness fields differ. Rust also redacts the error log."
 signature = "7996e6f04f7d86166975330ef32f5c7c777ffa832ac2bab1cf891a573b645d05"
 
 [gap."case:account-overview-pnl-total"]
-owner = "#211"
+owner = "#231"
+title = "Differs from Python main. Both use compensated summation for total PnL. Overview freshness fields differ."
 signature = "64add034ca66d8dece6d52b9ced6717d2433acc5cbcf8ec1902e978dd4ebc678"
 
 [gap."case:account-overview-signed-out"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "1f5512d71e5092ae928423c842c3202dd2647e74f2be994482bd90d9b66d4811"
 
 [gap."case:account-overview-signed-out-leaf-json"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. The signed-out leaf differs in stdout, stderr, and log redaction."
 signature = "1f5512d71e5092ae928423c842c3202dd2647e74f2be994482bd90d9b66d4811"
 
 [gap."case:account-overview-wrong-height"]
@@ -78,15 +97,18 @@ owner = "#175"
 signature = "b93612e5f1b90c92fc651cb9f6d79cf9dac19bc9276449af9ddc40fb305e66c7"
 
 [gap."case:auth-import-rejected-operand-json"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both reject the auth import operand with the same privacy-safe diagnostic."
 signature = "b9cd24acfe95b5081aa533032dcf6d737785a5b3a3137f1f7646a9464a5d7765"
 
 [gap."case:auth-import-rejected-operand-text"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both reject the auth import operand with the same privacy-safe diagnostic."
 signature = "daa6bb6c28c5e4088d2b9ede7a99c4b8086fd9b4c28dc6defba571e677319b8f"
 
 [gap."case:auth-status-signed-out"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. The signed-out hint and free-form error log differ."
 signature = "f723398d06b9a2175fd86982b2249fe4ee6baf193fe28ad0c951a5d195e2f1ec"
 
 [gap."case:auth-use-invalid-expiry-json"]
@@ -127,99 +149,123 @@ owner = "#172"
 signature = "8e36591b91b5ec719b3270f9c899bd6a2e9765e466a769dcb2c6a57900c13d09"
 
 [gap."case:config-invalid-value"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "8befeae2a987aa65a2566829ebf28e05ced3259ecdf79325204688e38b155385"
 
 [gap."case:config-list"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both report the same default LCD endpoint."
 signature = "d888c25dd2c85bcfe292ca9a22d0b3fe6bf27d6560f3f7821f49d95ec16f52ab"
 
 [gap."case:config-unknown-key"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "6c647c05764484e94c4c9db5d91867dbcb39f562775d0f0fd254814e75c702e5"
 
 [gap."case:doctor-keeper-error-codes"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. The Keeper probe log differs in command context and free-form error redaction."
 signature = "078abdf11a54e0c206de0e3b0bde8f5b154dee3320655fefeda9170917697233"
 
 [gap."case:doctor-lcd-chain-mismatch"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both show the LCD origin and report the same chain IDs when available."
 signature = "2082573983cff770794cb60ce57e2dababd318a74693e293178dc4cc352b2926"
 
 [gap."case:doctor-lcd-chain-mismatch-text"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. The Keeper probe log differs in its command and commandId fields."
 signature = "f09702091699be1f947c44c19522c39dc45bf167a71635c00ce0014f2f5bf47c"
 
 [gap."case:doctor-lcd-invalid-chain"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both fail the LCD check for a malformed chain ID."
 signature = "ef74f114f6b10c758c1f40a90e3896ce0f52851fe0de807a6ce871cde59792ad"
 
 [gap."case:doctor-lcd-invalid-chain-text"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both fail the LCD check for a malformed chain ID."
 signature = "73798d5a2488dbde76b7330ef883b477219b1a0ea7cb4a578815e57f5d62e1e7"
 
 [gap."case:doctor-lcd-unknown-keeper-chain"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both show the LCD origin and report the same chain IDs when available."
 signature = "5516cd5c6a3f5ef6737d30587ee031d41e8b9a75f85abc812b4b09854024fd93"
 
 [gap."case:doctor-lcd-unreachable"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both show only the LCD origin when the LCD is unreachable."
 signature = "e89776421542f4ddf2a48f6a82e20cab76fb1e93c29a3892bd4a0debe510699c"
 
 [gap."case:doctor-lcd-unreachable-text"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both show only the LCD origin when the LCD is unreachable."
 signature = "3e476fa3f4019263ec8af793a32071bcba49c304cd80814f359fd10cbf5a0262"
 
 [gap."case:doctor-mcp-codex-shadow"]
-owner = "#211"
+owner = "#215"
+title = "Differs from Python main. The MCP repair advice differs. Rust also redacts the error log and writes the prune marker."
 signature = "8e0f40076fd303915e61bcf357158146b6cf3177682757de55d480118e8aaa53"
 
 [gap."case:doctor-mcp-missing"]
-owner = "#211"
+owner = "#215"
+title = "Differs from Python main. The MCP repair advice differs. Rust also redacts the error log and writes the prune marker."
 signature = "a6036ebdb9a47a089bef599fa2f18936eaab36054ac4a860908e877975613d5f"
 
 [gap."case:doctor-mcp-retired"]
-owner = "#211"
+owner = "#215"
+title = "Differs from Python main. The MCP repair advice differs. Rust also redacts the error log and writes the prune marker."
 signature = "fa9477c81aaa5dc419766117d8697abe3bb057af6e79c0b67859882b352250f9"
 
 [gap."case:doctor-mcp-uv-cache"]
-owner = "#211"
+owner = "#215"
+title = "Differs from Python main. The MCP repair advice differs. Rust also redacts the error log and writes the prune marker."
 signature = "98f5eca82bbfd7d499f39b817ee401474228a7a76594c6187874b27f2c348a1a"
 
 [gap."case:doctor-mcp-verification-failure"]
-owner = "#211"
+owner = "#215"
+title = "Differs from Python main. The MCP repair advice differs. Rust also redacts the error log and writes the prune marker."
 signature = "d60510c0a0f02dfaebd822b772b66ea275e0ca90a46fcdc56416d100615870bb"
 
 [gap."case:doctor-near-expiry"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both include the same near-expiry session guidance."
 signature = "c7f7cd648cd9c16a4553258622452ee81e30b34945a0f4a354827aad7f1c7286"
 
 [gap."case:doctor-network"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both show the LCD origin and report the same chain IDs when available."
 signature = "49dce87a5337cafea1d023ac1e771bfba56cf969dde7017e9150c2263ee34e4c"
 
 [gap."case:doctor-network-with-logging"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. The Keeper probe log differs in its command and commandId fields."
 signature = "4ea3cbfaad69b7b9dae31a0c825539628fed3d656eb2034dc5b7d94e20d752fa"
 
 [gap."case:doctor-reconcile-absent-intent"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both show the LCD origin and report the same chain IDs when available."
 signature = "4ea3cbfaad69b7b9dae31a0c825539628fed3d656eb2034dc5b7d94e20d752fa"
 
 [gap."case:doctor-report-loose-modes"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both print the same permission guidance for the loose Sai profile."
 signature = "2a4c3a0ee24ee4e28df03a3594ce7d9278ab86e309394245d0abb2de8ac27119"
 
 [gap."case:doctor-unknown-option"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. The unknown-option diagnostic and log differ. Rust also writes the prune marker."
 signature = "f5e9c854936c6bec43a24cc5b88ee5404754b6995971e1d760e5eaa6c7a47dd2"
 
 [gap."case:doctor-ws-no-subprotocol"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both show the LCD origin and report the same chain IDs when available."
 signature = "4ea3cbfaad69b7b9dae31a0c825539628fed3d656eb2034dc5b7d94e20d752fa"
 
 [gap."case:doctor-ws-timeout"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both show the LCD origin and report the same chain IDs when available."
 signature = "69ef87aee2da5b8600241b502f63a8a50c0cbf6e09525e66fb6ab65da7feb7ab"
 
 [gap."case:help"]
@@ -227,35 +273,43 @@ owner = "#172"
 signature = "26bb482fd9db4137e02af7d3689ea2cf7a1509f67a01d3af3a82e3bd159c9496"
 
 [gap."case:market-bare"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "ccdedb96b86e2ccdcb90c39e17859c64da7dab27c49872a0ccc05514945ef9d1"
 
 [gap."case:market-keeper-echo-error"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "fc7b588d1bf24ecc42b258d68e40ffeb6b0fa4eb512342011fd57f25c99dba55"
 
 [gap."case:market-keeper-error"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "fc7b588d1bf24ecc42b258d68e40ffeb6b0fa4eb512342011fd57f25c99dba55"
 
 [gap."case:market-prices"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both report unknown block timestamps as null, including epoch sentinel spellings."
 signature = "60acb316c3b0fbbe342e7a98471255fefe279dfb616d7ec1df43f4927db34539"
 
 [gap."case:market-prices-epoch-spellings"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both report unknown block timestamps as null, including epoch sentinel spellings."
 signature = "258dd637a6103ffd988c3283565fdac7c7bd81e6997d45f129b1eb7d05cc85c1"
 
 [gap."case:market-prices-interrupt"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "47d73e6204e88e6d298c2e14101f1d56d35c4c1ae7258191d108b7839ad41b04"
 
 [gap."case:market-prices-partial-error"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "fc7b588d1bf24ecc42b258d68e40ffeb6b0fa4eb512342011fd57f25c99dba55"
 
 [gap."case:market-prices-text"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both render unknown block timestamps the same way in the prices table."
 signature = "98f5dd7492def77fb178c16399871c092f2d154949da608c1a8aa1bd9b9e86f3"
 
 [gap."case:mcp-account-intent-reads"]
@@ -317,11 +371,13 @@ owner = "#215"
 signature = "522a961e0dee06f8cfb6fb3a6c5f21d35872911a11727895697d781e3eaa4b83"
 
 [gap."case:mcp-install-empty-scope"]
-owner = "#211"
+owner = "#205"
+title = "Differs from Python main. The rejected scope diagnostic and free-form error log differ."
 signature = "891eeb4559dd23e926a278cdd41a7b5e3b97a28a0798417a5d0770c1a9037369"
 
 [gap."case:mcp-install-invalid-scope"]
-owner = "#211"
+owner = "#205"
+title = "Differs from Python main. The rejected scope diagnostic and free-form error log differ."
 signature = "24bcabada920294bd40525e9dab1a25174929f71ceecf4ae73b448f696ca0017"
 
 [gap."case:mcp-install-legacy"]
@@ -329,7 +385,8 @@ owner = "#215"
 signature = "6c1fe479dc447eafadaf36c1c82268c0bdd5102674edfa349be40e68dcf6f8f3"
 
 [gap."case:mcp-install-missing-scope"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "72813cb0759d60f8662b6c203b97583483a017891fc981c01a12243aec443d4c"
 
 [gap."case:mcp-intent-wait-final"]
@@ -350,7 +407,7 @@ signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
 
 [gap."case:mcp-list-redacted"]
 owner = "#215"
-signature = "9e52f8b34f70748eb6884d3710e58ba8448171fa74386c7e5161892d13a93bb8"
+signature = "d9f5e467d3ddb8590519768c8c7be8aa330fa39aae3316b7ea06a1d02febf39b"
 
 [gap."case:mcp-logs-intent-validation"]
 owner = "#175"
@@ -370,7 +427,7 @@ signature = "d1b18d5a59bc4cd183ee0da04238c0d565185b31f7dce0fea50b9c5e8b454505"
 
 [gap."case:mcp-session-reloads"]
 owner = "#175"
-signature = "83a17b11d3bc954a858c7e9a3143d2728957e3215190dd64d9d2900aa567f563"
+signature = "941d3d05a55ca36b031a9ec651e3e01a0b3b6d9748d26491cb69389d27ddc3f7"
 
 [gap."case:mcp-stream-error"]
 owner = "#175"
@@ -389,23 +446,28 @@ owner = "#215"
 signature = "7e897111c16a90327b129fefe5c0c730044904e8a7abe9390c14393ea2ef3ea5"
 
 [gap."case:mcp-uninstall-codex-project"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts stored launcher arguments. The report and free-form error log differ."
 signature = "035be426d513cdf35fc768ccd31f387cd1a89856a35b3d4d217c684645eef78d"
 
 [gap."case:mcp-uninstall-codex-query-failure"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust restores the Codex config after verification fails. Python leaves the Sai entry removed."
 signature = "a340353825916830bad4e1195051a7b0b92558d99292009c73d03ecad9899ddd"
 
 [gap."case:mcp-uninstall-codex-read-only"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust refuses to replace a read-only client config. Python can replace it."
 signature = "5badeea48fc7033b4697de6db7bbbdb40cc7213ef61ca06da952a405313b1d8b"
 
 [gap."case:mcp-uninstall-codex-user-shadowed"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts stored launcher arguments. The report and free-form error log differ."
 signature = "e085b25316198ae96570d320529335cac9d88e3a85f53f71d2c822e4459f9bf8"
 
 [gap."case:mcp-uninstall-cursor-read-only"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust refuses to replace a read-only client config. Python can replace it."
 signature = "635a12dabc79f13efbb45bae9c195e441667d2e4fc0473b1c6e94736848e7c3a"
 
 [gap."case:mcp-uninstall-dry-run"]
@@ -421,7 +483,8 @@ owner = "#215"
 signature = "7e897111c16a90327b129fefe5c0c730044904e8a7abe9390c14393ea2ef3ea5"
 
 [gap."case:mcp-uninstall-no-client"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "9573b5ca000cde07a5e9b428ebaabd3f36972e72b7cb1f51223629a2b83ac637"
 
 [gap."case:mcp-uninstall-project"]
@@ -429,23 +492,28 @@ owner = "#215"
 signature = "7e897111c16a90327b129fefe5c0c730044904e8a7abe9390c14393ea2ef3ea5"
 
 [gap."case:skill-flag"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both emit the same bundled skill text."
 signature = "5ae8c49462c0c2a01cfe44d95295174f5bdfb9bfc2899af7198e98a42bd0de7d"
 
 [gap."case:skill-install"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both install the same bundled skill files and report the same source metadata."
 signature = "4cd6006cfdd5d5873e75e4be8435d6a87e534421f8152270b4eba8a256b6fe94"
 
 [gap."case:skill-page"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both emit the same bundled skill text."
 signature = "bbba576bda87b5f0db4d7b22ea601921f457ad8f1a279f2274bf67a9afa389fa"
 
 [gap."case:skill-show"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both emit the same bundled skill text."
 signature = "5ae8c49462c0c2a01cfe44d95295174f5bdfb9bfc2899af7198e98a42bd0de7d"
 
 [gap."case:skill-source"]
-owner = "#211"
+owner = "#171"
+title = "Matches Python main. Both report the same bundled skill source metadata."
 signature = "3befa3b1161431863c4ffc26972227acd032cca0133deaf4d7cc7861cb6d602a"
 
 [gap."case:trade-bare-group-json"]
@@ -481,47 +549,53 @@ owner = "#174"
 signature = "a3060825112094e10969fa43db75eb358edbf8a4f997f16ed9aecff91e92849a"
 
 [gap."case:trade-margin-add-rounding"]
-owner = "#211"
+owner = "#231"
+title = "Differs from Python main. The margin preview comparison reports different request traces or output."
 signature = "fe269d7a92bd28208a7cf6ed8286b6a7b19b13eb8985e813af87eb6c43fe5d3c"
 
 [gap."case:trade-margin-after-hours"]
-owner = "#211"
-signature = "265de923e5b28619b0245af75dec82d1126d057443f5e7665ccdd25f6dec0795"
+owner = "#231"
+title = "Differs from Python main. The margin preview comparison reports different request traces or output."
+signature = "c2d60a315f968a68536938b87d1aca7d7f1994a62f393d965661527b571323d9"
 
 [gap."case:trade-margin-amount-required"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "372a657ad21493ee86a02fe6faf1f71bc3455128eb8aea959620747a4f841adf"
 
 [gap."case:trade-margin-chain-before-amount"]
-owner = "#211"
+owner = "#174"
+title = "Differs from Python main. Rust checks the LCD chain before parsing the invalid amount."
 signature = "3e39c6cc4d1f37a135e532a47b5a1e0dde6d6d73fd2e67e53b0933f340a0634b"
 
 [gap."case:trade-margin-equivalent-owner"]
-owner = "#211"
+owner = "#174"
+title = "Differs from Python main. Rust makes extra validation reads before submitting for an equivalent owner."
 signature = "6b842ebc30bada8cd41aa9045ba28aebf0ff35b8677dc6f9befd9f8962264ac6"
 
 [gap."case:trade-margin-foreign-contract-owner"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "4d8e1d500c76fff5256e366d792697cd04d14ffd1f1c628ab519e8f5708595b2"
 
 [gap."case:trade-margin-foreign-trader"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "8d2e946180adc3468a098ddf360dc5e7087283e4f9f1691072d42d612ccf80a2"
 
 [gap."case:trade-margin-foreign-trader-submit"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "7b81720a53ac636c9a0291354d41fc1155316f1249c721d5933d8d629c84a46d"
 
 [gap."case:trade-margin-invalid-direction"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "63c1b71ea7a5b78339abd9aa0f91c01290e3a702c02277745bc11fd75d23126e"
 
-[gap."case:trade-margin-mcp-preview"]
-owner = "#176"
-signature = "420506bfd9eed5868d9f1013daa8835b1bffe5ddbbaa42ac3ccf1a48d76124b4"
-
 [gap."case:trade-margin-recheck-height"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "c31c076f2a5480bc0a961f1f557b80545ac070b45ca9e508b916596bdb894d46"
 
 [gap."case:trade-margin-rejected"]
@@ -529,11 +603,13 @@ owner = "#174"
 signature = "1d33714dd23a06abaa909bb5e5d76016d764ffe619e576a4812ffdd953cb72a0"
 
 [gap."case:trade-margin-remove-rounding"]
-owner = "#211"
+owner = "#231"
+title = "Differs from Python main. The margin preview comparison reports different request traces or output."
 signature = "8d39feef7fd3b14b135c18f3e19cb53cbf7cf56bb1e51b1387db300022397a44"
 
 [gap."case:trade-margin-signed-out-before-amount"]
-owner = "#211"
+owner = "#174"
+title = "Differs from Python main. Rust checks the session before parsing the invalid amount."
 signature = "3290d000c84dce5128ae890bde3c57928de183ecd2c6dfdc33b37bbab775b414"
 
 [gap."case:trade-margin-unknown-blocks-retry"]
@@ -541,11 +617,13 @@ owner = "#174"
 signature = "51827945d31a077108bd9083d38ccfae47712825be2ae9009cd8191168826080"
 
 [gap."case:trade-margin-wrong-contract-index"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "c806214752d145fb6c9b43b04de398c43e43446990e0f4fb334d84d0e736be0d"
 
 [gap."case:trade-margin-wrong-index"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "6f14fe32d261f14c6bb0ff659fcdefe89f62840b9caf2a83fd2e383c8bb4ff7b"
 
 [gap."case:trade-open-market"]
@@ -570,71 +648,77 @@ signature = "61313b81f4af139bb27ef9b7f77355143aa3fd54393c87e47eec75ed0258536c"
 
 [gap."case:trade-partial-close"]
 owner = "#140"
-signature = "716a220eccf345288b43aa4a1008aa455f32662b5f0d11b772bb90ebfac86d9d"
+signature = "6a2812254a046e26521d96b97c60fbb5238777ea600cf446683c467ea3590c36"
 
 [gap."case:trade-partial-close-accepted"]
 owner = "#174"
-signature = "fbdac4583b85e25c5ac1d4e92838acfc076b0da3906038a5e8a606e4870dd038"
+signature = "d38977cc7792bdac5ee5aa123aa4245965cf4b041ff5aaae906598720c36bc08"
 
 [gap."case:trade-partial-close-after-hours"]
-owner = "#211"
-signature = "458428592069ed23461d9c0f18b074a9d87a44596f55a425f5444b3a4fbcf1b1"
+owner = "#174"
+title = "Matches Python main for the after-hours partial-close preview."
+signature = "4c6b9c00eddd5113c61fda62f83311ce1e97913dec9146f9ab9048c228f9a13f"
 
 [gap."case:trade-partial-close-confirm-current-route"]
 owner = "#174"
-signature = "f56030577aefb046dcae35899fac71e1e9b4b6c574846fd290114ef290eb453e"
+signature = "2266b65d07efc78298b68211c400100eb15bf335dcdb955d32d9e04e699c0f75"
 
 [gap."case:trade-partial-close-index-lag-before-minimum"]
-owner = "#211"
-signature = "22c52a8a52e267104a590314b5af3e01ac062a94c26c5723dfaaea975be923a2"
+owner = "#174"
+title = "Differs from Python main in the error log. Both retry the stale position snapshot before refusing."
+signature = "93fa1c5ddb34bea62d671394988bb7da3fda7501ca0c5105d66ecdcdf707743d"
 
 [gap."case:trade-partial-close-invalid-id"]
-owner = "#211"
+owner = "#205"
+title = "Differs from Python main. The invalid trade ID diagnostic and free-form error log differ."
 signature = "e36017045cf6fd9e8c725b94918a7c32a91bf9fb77629191b0777ff2a4e65f70"
 
 [gap."case:trade-partial-close-invalid-percent"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "56a6650730701052d1895a5c7b06591a0faed6885b30a4a64b3f4e8d146e8c43"
 
 [gap."case:trade-partial-close-live-leverage-change"]
-owner = "#211"
-signature = "2dfce535971a46428d16a7917dc67eb38b82481903132023119a6faee87aaa67"
+owner = "#174"
+title = "Differs from Python main in the error log. Both reject the stale preview after rechecking the position."
+signature = "eb68d65d0845603f9b0576fbe973dcd50ade8ae3e6aab7ea64f8d11d722b01af"
 
 [gap."case:trade-partial-close-malformed-percent"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "4f264b3264ad84549e26b00b867dde006e21ebbbf3db9a775a0569f29b186228"
 
 [gap."case:trade-partial-close-market-minimum"]
-owner = "#211"
-signature = "401f4a84ef91b32b7973457e0e7de9373cadedc726a7be1f38646920a93cab90"
-
-[gap."case:trade-partial-close-mcp-changed-leverage"]
-owner = "#176"
-signature = "2955e89e66e2dd56302bc826c0771aed6626d6f0d108208acf20a77f33c8d0ff"
+owner = "#174"
+title = "Matches Python main for the 99% partial-close preview."
+signature = "7e1ec85b7dea610dbf3e800d1f5cda38d559a5999043874b860e22092eba362a"
 
 [gap."case:trade-partial-close-no-oracle"]
-owner = "#211"
-signature = "09671abccf1e9fdfb2e0d4c1034d3e33d2449a9f3b803cb2afd35adaf3c39acb"
+owner = "#174"
+title = "Differs from Python main. Rust withholds the partial-close digest when the collateral price is unavailable."
+signature = "6d1f1fdd8a01211587ee71a9c696742adbcefb127187b8e255677c3b9235e5a4"
 
 [gap."case:trade-partial-close-refuse-stale-chain"]
 owner = "#174"
-signature = "0213fc5df53fc85e0b6c1b7c8fb7b9eb2f927f3428751a2e9dd5e306c7e30e6c"
+signature = "bea5866d3806e635e313f31d71513f94c0a2ea8a660cba286ba673e041851cd7"
 
 [gap."case:trade-partial-close-refuse-stale-contract"]
 owner = "#174"
-signature = "0213fc5df53fc85e0b6c1b7c8fb7b9eb2f927f3428751a2e9dd5e306c7e30e6c"
+signature = "bea5866d3806e635e313f31d71513f94c0a2ea8a660cba286ba673e041851cd7"
 
 [gap."case:trade-partial-close-refuse-wrong-lcd-on-confirm"]
 owner = "#174"
 signature = "15b880ff6d30e09b3dd13222889d760bc53304aeb57e00436331a1a06acc73a3"
 
 [gap."case:trade-partial-close-rounding"]
-owner = "#211"
-signature = "9d9ebed968ac38cde5b621013ea2dc5c740b4234180268afbe5d7bf23de9284a"
+owner = "#174"
+title = "Matches Python main for the partial-close rounding preview."
+signature = "935cd5283de28535cf0bbe6e62dfebb5dff87e027904144e4b3485a1297434eb"
 
 [gap."case:trade-partial-close-scientific-reduction"]
-owner = "#211"
-signature = "239f76a3be30caf98fa3d5ed7716a23e0f36dcc0934cb4b833f4f5f4f0b6841d"
+owner = "#174"
+title = "Matches Python main for the partial-close preview with a reduction in scientific notation."
+signature = "42a8fcab94344028ba1b214addab6cf937da48ead8445f9af1083e0db5b80b58"
 
 [gap."case:trade-partial-close-unicode-percent"]
 owner = "#139"
@@ -642,22 +726,25 @@ signature = "5b545493cbedb49797318e5516595b2029764cc350bda78b5c3493f002389a5e"
 
 [gap."case:trade-partial-close-unknown-blocks-retry"]
 owner = "#174"
-signature = "76fea6c435428d0b2a503ed0d48d51dfeb42a66331202a4ec6dd34f278df275d"
+signature = "1f8e56f0faec6780a8460e01f522c6aac03467f89b72297ac69cb9779b369abc"
 
 [gap."case:trade-tpsl"]
 owner = "#174"
 signature = "866e192520eeeb1c7bc98f00573be7158e9f797c43a29d596c42d42fa157aa95"
 
 [gap."case:update-check-bad-json"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "5eb1707c45d8ef5d1bc8e74b2ad4ed08e6c980685cf85145e123c0f45583b29f"
 
 [gap."case:update-check-conflict"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "c5518fd726653ffa4de5825a746831742557dbfbcf7f74dc1076a69e6e920962"
 
 [gap."case:update-check-rate-limit-tag"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "c679060efa7aa7397617b86a739843d544153b80d6eb63798ac9bdaa21ef9ca9"
 
 [gap."case:version"]
@@ -666,47 +753,58 @@ owner = "#213"
 signature = "d1a087013957a4980439a4e5a774af1a6843531593dbb0cf17ba98d2869d2007"
 
 [gap."case:watch-balances"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "91ff02e2c24963e3808b26c07ab8657a453ee341cd25dc31a614b3066d89ed99"
 
 [gap."case:watch-balances-interrupt-handshake"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "85399bc02829a112c8b522e284a258fbed50f14f4393a835910602e17fd986f3"
 
 [gap."case:watch-balances-no-subprotocol"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "91ff02e2c24963e3808b26c07ab8657a453ee341cd25dc31a614b3066d89ed99"
 
 [gap."case:watch-balances-raw-numbers"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "91ff02e2c24963e3808b26c07ab8657a453ee341cd25dc31a614b3066d89ed99"
 
 [gap."case:watch-balances-reconnect-interrupt"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust writes an endpoint key and logs endpoint context on reconnect. The error log differs."
 signature = "94e5bc73fa2f5109668fbba4c3603ae5d012923c2e21d06e13a5085c73e1cee0"
 
 [gap."case:watch-balances-redirect"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "91ff02e2c24963e3808b26c07ab8657a453ee341cd25dc31a614b3066d89ed99"
 
 [gap."case:watch-bare"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "a0e0ef02e651dd4c42a573002e0fffb279bdc6081cb46f808dbdb7d381544742"
 
 [gap."case:watch-positions"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "91ff02e2c24963e3808b26c07ab8657a453ee341cd25dc31a614b3066d89ed99"
 
 [gap."case:watch-price"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "91ff02e2c24963e3808b26c07ab8657a453ee341cd25dc31a614b3066d89ed99"
 
 [gap."case:watch-price-interrupt"]
-owner = "#211"
+owner = "#49"
+title = "Differs from Python main. Rust redacts free-form log errors."
 signature = "85399bc02829a112c8b522e284a258fbed50f14f4393a835910602e17fd986f3"
 
 [gap."case:watch-price-invalid-token"]
-owner = "#211"
+owner = "#205"
+title = "Differs from Python main. The invalid price token diagnostic and free-form error log differ."
 signature = "8a3e50355aca05888c06517e5ebc8c5403087679966c5f33dcd9f12d983824ec"
 
 [gap."cli:auth import"]
@@ -778,53 +876,16 @@ owner = "#175"
 signature = "e9d90a01fe5de7ff68ee44469cdd73ddee16d7f0aae1da13c03d208619b158ab"
 
 [gap."mcp:mcp_info"]
-owner = "#211"
-signature = "0027c146f87cb0b3c12d82924e22a2ec0fb9165a034d8f3b16701932354efaa8"
-
-[gap."mcp:preview_close"]
 owner = "#176"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+title = "Differs from Python main in tool metadata and response fields."
+signature = "3b2844b011b77ddc9648577a2755b9ce4f8530631367c8ac630453f50d73dec4"
 
-[gap."mcp:preview_leverage"]
-owner = "#176"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
-
-[gap."mcp:preview_margin"]
-owner = "#176"
-signature = "102700cec2d54d76c686586b5789561a3ba16085026c38bd9227897573aa4cf9"
-
+# The v0.1.2 inventory has a different open-tool description.
 [gap."mcp:preview_open"]
-owner = "#176"
+owner = "#49"
 signature = "82489300a9b00d596a66c573969c7a44bbe6560d7f3cfaad661a0bcb3d8b3745"
 
-[gap."mcp:preview_partial_close"]
-owner = "#176"
-signature = "ee5eb7493ec4a64ec60f98b4754a490c0e7419ed08bda154b9f7602d95c35f1b"
-
-[gap."mcp:preview_tpsl"]
-owner = "#176"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
-
-[gap."mcp:trade_close"]
-owner = "#176"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
-
-[gap."mcp:trade_leverage"]
-owner = "#176"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
-
-[gap."mcp:trade_margin"]
-owner = "#176"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
-
+# The v0.1.2 inventory has a different open-tool description.
 [gap."mcp:trade_open"]
-owner = "#176"
+owner = "#49"
 signature = "0adb73da98a9099253ec61090e17065d597f2f2558c3a663c1c7036e2eaebd5f"
-
-[gap."mcp:trade_partial_close"]
-owner = "#176"
-signature = "99ec1ed744ec3efb8af06e07d84f87d4c0a3d3ccf8f610e4a4f708924863ce56"
-
-[gap."mcp:trade_tpsl"]
-owner = "#176"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"

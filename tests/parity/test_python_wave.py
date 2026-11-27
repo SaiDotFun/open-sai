@@ -793,19 +793,28 @@ def test_noninteractive_mcp_install_listing_hides_launcher_arguments(
 
 
 @pytest.mark.parametrize("flags", [(), ("--json",)], ids=["text", "json"])
-def test_mcp_reports_only_stale_environment_names(
+def test_mcp_reports_sai_environment_names_and_counts_other_entries(
     wave_clis: tuple[str, str], tmp_path: Path, flags: tuple[str, ...]
 ) -> None:
     _, rust = wave_clis
     overrides = {"PATH": os.defpath}
     seed_clients(tmp_path, overrides, "current")
     marker = "synthetic-private-env"
+    bare_token = "fixtureBareToken_71"
+    prefixed_token = "SAI_FIXTURE_WRAPPER_71"
     codex = tmp_path / ".codex/config.toml"
     forwarded = [
         f"OPENAI_API_KEY={marker}=suffix",
         "OPENAI_API_KEY",
         f"invalid name {marker}",
         f"={marker}",
+        bare_token,
+        bare_token,
+        prefixed_token,
+        f"{prefixed_token}={marker}",
+        f"SAI_LCD_ENDPOINT={marker}",
+        "SAI_LCD_ENDPOINT",
+        f"SAI_NATIVE_UV_PREFIX={marker}",
     ]
     codex.write_text(
         codex.read_text().replace(
@@ -817,7 +826,13 @@ def test_mcp_reports_only_stale_environment_names(
     for path in paths[1:]:
         config = json.loads(path.read_bytes())
         config["mcpServers"]["sai"]["env"].update(
-            {f"APP_TOKEN={marker}": marker, "APP_MODE": marker}
+            {
+                f"APP_TOKEN={marker}": marker,
+                "APP_MODE": marker,
+                bare_token: marker,
+                prefixed_token: marker,
+                f"SAI_ENDPOINT={marker}": marker,
+            }
         )
         path.write_text(json.dumps(config))
     original = {path: path.read_bytes() for path in paths}
@@ -833,13 +848,15 @@ def test_mcp_reports_only_stale_environment_names(
         )
         assert result.returncode == 0
         assert marker not in result.stdout + result.stderr
+        assert bare_token not in result.stdout + result.stderr
+        assert prefixed_token not in result.stdout + result.stderr
         clients = json.loads(result.stdout)["clients"]
         assert {row["client"] for row in clients} == {"claude", "codex", "cursor"}
         for row in clients:
             expected = (
-                ["<hidden>", "OPENAI_API_KEY"]
+                ["SAI_LCD_ENDPOINT", "SAI_NATIVE_UV_PREFIX", "8 other entries"]
                 if row["client"] == "codex"
-                else ["APP_MODE", "APP_TOKEN"]
+                else ["SAI_ENDPOINT", "4 other entries"]
             )
             assert not row["current"]
             assert row["staleEnv"] == expected

@@ -68,7 +68,10 @@ async fn leverage_execution(
     }
     let queued = read(json!({"market_order_config": {}})).await.ok()?["fill_at_next_oracle_price"]
         .as_bool()?;
-    let group_query = json!({"get_group": {"index": pair.get("group_index")?}});
+    let group_query = || {
+        pair.get("group_index")
+            .map(|index| json!({"get_group": {"index": index}}))
+    };
     let oracle_price = if queued {
         None
     } else {
@@ -79,7 +82,7 @@ async fn leverage_execution(
         .ok()?;
         let oracle = &prices["market"];
         if let Some(published) = oracle_publication_time(oracle)? {
-            let group = read(group_query.clone()).await.ok()?;
+            let group = read(group_query()?).await.ok()?;
             let ttl = group["stale_price_expiration_secs"].as_u64()?;
             if ttl > 0
                 && i128::from(lcd.block_timestamp(height).await.ok()?) - i128::from(published)
@@ -122,7 +125,7 @@ async fn leverage_execution(
         ));
     }
 
-    let group = read(group_query).await.ok()?;
+    let group = read(group_query()?).await.ok()?;
     let min = contract_decimal(group.get("min_leverage")?).ok()?;
     let max = contract_decimal(group.get("max_leverage")?).ok()?;
     let cap = read(json!({"get_pair_custom_max_leverage": {
@@ -140,10 +143,7 @@ async fn leverage_execution(
         .await
         .ok()?;
     let open_rate = contract_decimal(schedule.get("open_fee_p")?).ok()?;
-    let before: BigUint = number_text(raw.get("collateral_amount")?)
-        .ok()?
-        .parse()
-        .ok()?;
+    let before = position_collateral(raw)?;
     let notional = &before * effective / SCALE;
     let collateral = &before * effective / leverage;
     if collateral <= notional * open_rate / SCALE {
@@ -214,9 +214,16 @@ async fn leverage_execution(
         estimates,
         Some(LeverageCollateral {
             before: before.to_string(),
-            after: collateral.to_string(),
+            after: Some(collateral.to_string()),
         }),
     )))
+}
+
+fn position_collateral(raw: &Value) -> Option<BigUint> {
+    number_text(raw.get("collateral_amount")?)
+        .ok()?
+        .parse()
+        .ok()
 }
 
 fn past_liquidation<T: Ord>(price: &T, threshold: &T, long: bool) -> bool {
@@ -258,6 +265,15 @@ impl Trading<'_> {
         bind_collateral: bool,
     ) -> Result<(), SaiError> {
         let target = preview.intent.body["requestedLeverage"].as_str();
+        let bind_collateral = bind_collateral && target.is_some();
+        let mut before = if bind_collateral {
+            verified
+                .as_ref()
+                .and_then(|(_, raw)| raw.as_ref())
+                .and_then(position_collateral)
+        } else {
+            None
+        };
         let unavailable = if target.is_some() {
             unknown_execution_inputs
         } else {
@@ -277,6 +293,9 @@ impl Trading<'_> {
                             target.is_none(),
                         )
                         .await?;
+                    if bind_collateral {
+                        before = position_collateral(&snapshot.raw);
+                    }
                     let Some(height) = snapshot.verified_height(&lcd, id).await? else {
                         return Ok(None);
                     };
@@ -294,18 +313,28 @@ impl Trading<'_> {
                 match quote.await {
                     Ok(result) => result.unwrap_or_else(|| (unavailable(), None)),
                     Err(SnapshotError::Owner(message)) => return Err(invalid(message)),
-                    Err(
-                        SnapshotError::CollateralMismatch
-                        | SnapshotError::IndexMismatch
-                        | SnapshotError::PositionChanged
-                        | SnapshotError::Unavailable,
-                    ) => (unavailable(), None),
+                    Err(SnapshotError::IndexMismatch | SnapshotError::PositionChanged) => {
+                        before = None;
+                        (unavailable(), None)
+                    }
+                    Err(SnapshotError::CollateralMismatch | SnapshotError::Unavailable) => {
+                        (unavailable(), None)
+                    }
                 }
             } else {
                 (unavailable(), None)
             };
         preview.estimates = Some(result);
-        preview.leverage_collateral = collateral.filter(|_| bind_collateral);
+        preview.leverage_collateral = if bind_collateral {
+            collateral.or_else(|| {
+                before.map(|amount| LeverageCollateral {
+                    before: amount.to_string(),
+                    after: None,
+                })
+            })
+        } else {
+            None
+        };
         Ok(())
     }
 }
