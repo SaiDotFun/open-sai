@@ -75,13 +75,11 @@ async fn leverage_execution(
     let oracle_price = if queued {
         None
     } else {
-        let prices = read(json!({"get_perp_prices": {
-            "market_index": raw["market_index"], "collateral_index": raw["collateral_index"],
-        }}))
-        .await
-        .ok()?;
-        let oracle = &prices["market"];
-        if let Some(published) = oracle_publication_time(oracle)? {
+        let oracle = lcd
+            .market_oracle_price(&state.route.contract_address, &pair, height)
+            .await
+            .ok()?;
+        if let Some(published) = oracle_publication_time(&oracle)? {
             let group = read(group_query()?).await.ok()?;
             let ttl = group["stale_price_expiration_secs"].as_u64()?;
             if ttl > 0
