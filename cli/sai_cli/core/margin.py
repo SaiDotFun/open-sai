@@ -15,7 +15,7 @@ from contextlib import closing, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal, localcontext
+from decimal import Decimal
 from secrets import token_hex
 from threading import BoundedSemaphore, Thread
 from typing import Any, Literal, TypedDict
@@ -368,10 +368,6 @@ class PositionSnapshot:
     def contract(self) -> str:
         return self.route["contractAddress"]
 
-    @property
-    def usdc_collateral(self) -> bool:
-        return self.market.get("collateralToken", {}).get("symbol") == "USDC"
-
 
 def quote_leverage_liquidates(
     lcd: str, state: PositionSnapshot, target: Decimal, *, height: str
@@ -695,47 +691,14 @@ def contract_decimal(value: Any) -> Decimal:
     )
 
 
-def collateral_price(
-    lcd: str, state: PositionSnapshot, *, height: str | None = None
-) -> Decimal:
-    query = {
-        "get_collateral_price": {"collateral_index": state.raw["collateral_index"]}
-    }
-    # A replacement preview must see the new price even after a cached quote.
-    return contract_decimal(
-        smart_value(lcd, state.contract, query, height=height, fresh=True)
-    )
-
-
-def optional_collateral_price(
-    lcd: str, state: PositionSnapshot, *, height: str | None = None
-) -> Decimal | None:
-    try:
-        price = collateral_price(lcd, state, height=height)
-        return price if price > 0 else None
-    except (ValueError, TypeError, KeyError):
-        return None
-
-
-def collateral_amounts(
-    before: int, after: int, price: Decimal | None
-) -> dict[str, str | None]:
-    def units(amount: int) -> Decimal:
-        return Decimal(f"{amount}e-6")
-
-    def usd(amount: int) -> str | None:
-        if price is None:
-            return None
-        # Preserve the precision of both the base-unit amount and oracle price.
-        with localcontext() as context:
-            context.prec = len(str(amount)) + len(price.as_tuple().digits)
-            return format((units(amount) * price).normalize(), "f")
-
+def collateral_amounts(before: int, after: int) -> dict[str, str]:
+    before_usdc = format(Decimal(f"{before}e-6"), "f")
+    after_usdc = format(Decimal(f"{after}e-6"), "f")
     return {
-        "beforeUsdc": format(units(before), "f"),
-        "afterUsdc": format(units(after), "f"),
-        "beforeUsd": usd(before),
-        "afterUsd": usd(after),
+        "beforeUsdc": before_usdc,
+        "afterUsdc": after_usdc,
+        "beforeUsd": before_usdc.rstrip("0").rstrip("."),
+        "afterUsd": after_usdc.rstrip("0").rstrip("."),
     }
 
 

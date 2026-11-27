@@ -730,18 +730,10 @@ def change_margin(
         leverage, inputs = margin.leverage_inputs(lcd_endpoint, state, trade_id)
         if leverage is None:
             raise ValueError("Cannot verify effective leverage for this margin change")
-        price = None
         quote_delta = delta
-        if (show_collateral and dry_run) or cap is not None:
-            price = margin.optional_collateral_price(lcd_endpoint, state)
         if cap is not None:
-            if price is None:
-                raise ValueError(
-                    "Cannot apply the USD collateral cap without an oracle price"
-                )
             cap_num, cap_den = cap.as_integer_ratio()
-            price_num, price_den = price.as_integer_ratio()
-            max_units = cap_num * price_den * 1_000_000 // (cap_den * price_num)
+            max_units = cap_num * 1_000_000 // cap_den
             quote_delta = min(delta, max_units - int(state.raw["collateral_amount"]))
             if quote_delta <= 0:
                 raise ValueError("The USD collateral cap leaves no room to add margin")
@@ -758,7 +750,7 @@ def change_margin(
         display = (
             {
                 "collateral": margin.collateral_amounts(
-                    int(quote["collateralBefore"]), int(quote["collateralAfter"]), price
+                    int(quote["collateralBefore"]), int(quote["collateralAfter"])
                 )
             }
             if show_collateral and dry_run
