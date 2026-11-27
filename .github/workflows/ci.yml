@@ -498,3 +498,6 @@ jobs:
           uv run --locked python tests/parity/parity.py \
             --python-reference "$GITHUB_WORKSPACE/.parity-python-c7/.venv/bin/sai" \
             --case 'update-check*'
+          uv run --locked pytest \
+            tests/parity/test_native_update.py::test_standalone_update_selects_the_latest_platform_archive \
+            tests/parity/test_native_update.py::test_uv_trial_checks_python_release_candidate_version
