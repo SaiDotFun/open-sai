@@ -27,7 +27,7 @@ from stat import S_IMODE
 from typing import Any
 
 import pytest
-from compare import LOG_FILE, Normalize, is_version, validate_log_endpoint_key
+from compare import Normalize, is_version, read_log, validate_log_endpoint_key
 from release_mismatch import assert_release_equal
 from sai_cli.core import keeper, log, storage
 from sai_cli.tests.loopback import graphql_ws
@@ -464,12 +464,17 @@ def cli_version(cli: CLI) -> str:
     return version
 
 
+def read_log_files(home: Path) -> Iterator[tuple[Path, str, list[dict[str, Any]]]]:
+    directory = home / "logs"
+    shards = sorted(log.log_files(directory), key=lambda shard: shard[2])
+    if set(directory.glob("*.jsonl")) != {path for _, _, path in shards}:
+        raise ValueError("Unexpected log filename or file type")
+    for day, surface, path in shards:
+        yield path, surface, read_log(path, day.isoformat())
+
+
 def read_events(home: Path, cli: CLI | None = None) -> list[dict[str, Any]]:
-    events = [
-        json.loads(line)
-        for path in sorted((home / "logs").glob("*.jsonl"))
-        for line in path.read_bytes().splitlines()
-    ]
+    events = [event for _, _, records in read_log_files(home) for event in records]
     groups: dict[str, list[int]] = {}
     version = cli_version(cli) if cli is not None else None
     for event in events:
@@ -542,32 +547,65 @@ def test_intent_status_logs_across_utc_midnight(tmp_path: Path) -> None:
         read_state(reference)
 
 
+@pytest.mark.parametrize(
+    ("filename", "error"),
+    [
+        ("cli.jsonl", "Unexpected log filename"),
+        ("cli-2026-02-30.jsonl", "Unexpected log filename"),
+        ("unknown-2026-11-21.jsonl", "Unexpected log filename"),
+        ("cli-2026-11-22.jsonl", "Log timestamp does not match its filename"),
+    ],
+)
+def test_intent_status_rejects_invalid_log_shard(
+    tmp_path: Path, filename: str, error: str
+) -> None:
+    reference = tmp_path / "reference"
+    candidate = tmp_path / "candidate"
+    event = {
+        "ts": "2026-11-21T00:00:00.001Z",
+        "runId": "a" * 32,
+        "seq": 1,
+        "event": "intent.keeper",
+        "intentKey": KEY,
+    }
+    for home, name in ((reference, "cli-2026-11-21.jsonl"), (candidate, filename)):
+        logs = home / "logs"
+        logs.mkdir(parents=True)
+        (logs / name).write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+    assert read_events(reference) == [event]
+    read_state(reference)
+    with pytest.raises(ValueError, match=error):
+        read_events(candidate)
+    with pytest.raises(ValueError, match=error):
+        read_state(candidate)
+
+
 def read_state(home: Path) -> tuple[Any, ...]:
-    files: dict[str, int] = {}
-    for path in home.rglob("*"):
-        name = path.relative_to(home).as_posix()
-        mode = path.stat().st_mode
-        if match := LOG_FILE.fullmatch(name):
-            # Compare the mode for the stream. read_events checks all its records.
-            name = f"logs/{match['surface']}.jsonl"
-            assert files.setdefault(name, mode) == mode, (
-                "Log file modes differ within a surface"
-            )
-        else:
-            files[name] = mode
+    files = {
+        path.relative_to(home).as_posix(): path.stat().st_mode
+        for path in home.rglob("*")
+    }
+    log_modes: dict[str, int] = {}
+    for path, surface, _ in read_log_files(home):
+        mode = files.pop(path.relative_to(home).as_posix())
+        assert log_modes.setdefault(surface, mode) == mode, (
+            "Log file modes differ within a surface"
+        )
     if "logs/.endpoint-key" in files:
         validate_log_endpoint_key(home / "logs/.endpoint-key")
     if "logs/.endpoint-key.lock" in files:
         assert files["logs/.endpoint-key.lock"] & 0o777 == 0o600
+    modes = {"paths": files, "log_streams": log_modes}
     db = home / "trader/intents.sqlite3"
     if not db.exists():
-        return (files,)
+        return (modes,)
     with closing(sqlite3.connect(db)) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         schema = connection.execute("SELECT sql FROM sqlite_master ORDER BY name")
         version = connection.execute("PRAGMA user_version").fetchone()
         rows = connection.execute("SELECT * FROM intents ORDER BY id")
-        return files, schema.fetchall(), version, rows.fetchall()
+        return modes, schema.fetchall(), version, rows.fetchall()
 
 
 def test_read_state_rejects_short_endpoint_key(tmp_path: Path) -> None:
