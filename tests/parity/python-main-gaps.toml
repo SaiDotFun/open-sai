@@ -21,8 +21,3 @@ signature = "0c6c09717aa97c5866132f1e0020d745530d9da7f38155739014b3c2479aa160"
 owner = "#231"
 title = "Python includes balance freshness after a WebSocket redirect."
 signature = "0c6c09717aa97c5866132f1e0020d745530d9da7f38155739014b3c2479aa160"
-
-[gap."case:trade-margin-capped-add"]
-owner = "#231"
-title = "Python sizes margin adds with --max-collateral-usd and shows the result."
-signature = "05e696687974b12350d127d3b85050843d23e824bb515f1a7ddf2a48e233a85c"

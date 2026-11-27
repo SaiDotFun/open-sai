@@ -97,6 +97,9 @@ pub enum TradeCommand {
         /// USDC amount for a leverage quote, not an execution cap.
         #[arg(long, allow_negative_numbers = true)]
         amount: String,
+        /// Cap the margin quote only. Actual collateral in USD can exceed this cap.
+        #[arg(long, allow_negative_numbers = true)]
+        max_collateral_usd: Option<String>,
     },
     /// Reduce an open USDC position by a whole percentage.
     PartialClose {
@@ -339,16 +342,18 @@ Options:
   The amount is a quote, not a cap: collateral can change before execution.
 
 Options:
-  --direction [add|remove]  [required]
-  --amount DECIMAL          USDC amount for a leverage quote, not an execution
-                            cap.  [required]
-  --lcd-endpoint TEXT       Nibiru REST endpoint for exact contract state.
-                            Defaults to the lcd.endpoint setting.
+  --direction [add|remove]      [required]
+  --amount DECIMAL              USDC amount for a leverage quote, not an
+                                execution cap.  [required]
+  --max-collateral-usd DECIMAL  Cap the margin quote only. Actual collateral
+                                in USD can exceed this cap.
+  --lcd-endpoint TEXT           Nibiru REST endpoint for exact contract state.
+                                Defaults to the lcd.endpoint setting.
   --dry-run
-  --preview-digest TEXT     Submit only if the trade matches this dry-run
-                            digest.
-  --wait                    Wait up to 60 seconds for the intent outcome.
-  --help                    Show this message and exit."#
+  --preview-digest TEXT         Submit only if the trade matches this dry-run
+                                digest.
+  --wait                        Wait up to 60 seconds for the intent outcome.
+  --help                        Show this message and exit."#
         }
         "trade open" => {
             r#"  Open a market, limit, or stop trade.
@@ -422,7 +427,14 @@ pub fn run(
             ("--take-profit", open.take_profit.as_deref()),
             ("--stop-loss", open.stop_loss.as_deref()),
         ])?,
-        TradeCommand::Margin { amount, .. } => check_ascii_decimals(&[("--amount", Some(amount))])?,
+        TradeCommand::Margin {
+            amount,
+            max_collateral_usd,
+            ..
+        } => check_ascii_decimals(&[
+            ("--amount", Some(amount)),
+            ("--max-collateral-usd", max_collateral_usd.as_deref()),
+        ])?,
         TradeCommand::Tpsl {
             take_profit,
             stop_loss,
@@ -516,6 +528,7 @@ pub fn run(
                 position,
                 direction,
                 amount,
+                max_collateral_usd,
             } => {
                 let direction = match direction.as_str() {
                     "add" => MarginDirection::Add,
@@ -531,7 +544,11 @@ pub fn run(
                     &trading,
                     &settings,
                     account,
-                    PositionAction::Margin { direction, amount },
+                    PositionAction::Margin {
+                        direction,
+                        amount,
+                        max_collateral_usd: max_collateral_usd.as_deref(),
+                    },
                     &waiting,
                 );
             }
@@ -598,7 +615,7 @@ pub fn run(
                 session.as_ref(),
                 false,
             ))?;
-            local::emit(&output, json)?;
+            emit_preview(output, json)?;
             return Ok(ExitCode::Ok);
         }
         let preview = runtime.block_on(trading.prepare_preview(
@@ -645,6 +662,54 @@ pub fn run(
     }
     local::emit(&runtime.block_on(submit)?, json)?;
     Ok(ExitCode::Ok)
+}
+
+fn emit_preview(mut output: Value, json: bool) -> Result<(), SaiError> {
+    let quote = &output["quote"];
+    let base_units = &output["collateralBaseUnits"];
+    let (before, after) = if output["intent"]["body"]["requestedLeverage"].is_null() {
+        (None, None)
+    } else if quote.is_null() {
+        (base_units["before"].as_str(), base_units["after"].as_str())
+    } else {
+        (
+            quote["collateralBefore"].as_str(),
+            quote["collateralAfter"].as_str(),
+        )
+    };
+    if let (Some(before), Some(after)) = (before, after) {
+        let before = collateral_usd(before);
+        let after = collateral_usd(after);
+        if !json {
+            if let Some(warning) = output["estimates"]["execution"]["warning"].as_str() {
+                println!("{warning}");
+            }
+            println!("Estimated collateral: ${before} → ${after}");
+            if let Some(warning) = output["warning"].as_str() {
+                println!("{warning}");
+            }
+        }
+        if let Some(fields) = output.as_object_mut() {
+            fields.shift_insert(
+                2,
+                "collateral".into(),
+                json!({"beforeUsd": before, "afterUsd": after}),
+            );
+        }
+    }
+    local::emit(&output, json)
+}
+
+fn collateral_usd(units: &str) -> String {
+    // USDC has six decimals and uses a fixed price of one dollar.
+    let digits = format!("{units:0>7}");
+    let (whole, fraction) = digits.split_at(digits.len() - 6);
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        whole.into()
+    } else {
+        format!("{whole}.{fraction}")
+    }
 }
 
 fn check_ascii_decimals(fields: &[(&str, Option<&str>)]) -> Result<(), SaiError> {
@@ -842,7 +907,12 @@ impl Position {
         if wait_for_trade {
             return runtime.block_on(waiting.finish(submit));
         }
-        local::emit(&runtime.block_on(submit)?, waiting.json)?;
+        let output = runtime.block_on(submit)?;
+        if self.dry_run {
+            emit_preview(output, waiting.json)?;
+        } else {
+            local::emit(&output, waiting.json)?;
+        }
         Ok(ExitCode::Ok)
     }
 }

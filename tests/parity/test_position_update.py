@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import pytest
 from compare import INTENT_ID, timestamp
 from keeper_wire import WireRequest, graphql_request, same_variables
+from parity import project_reference_fixed_collateral
 from sai_cli.core.confirmation import preview_digest
 from sai_cli.tests.loopback import http_server
 from scenarios import (
@@ -589,15 +590,11 @@ def test_position_update_dry_run(
                 }
                 assert document["previewDigest"] == preview_digest(document)
                 if implementation == "python":
-                    # Issue 231 still tracks USD display in Rust.
-                    assert document.pop("collateral") == {
-                        "beforeUsdc": "20.000000",
-                        "afterUsdc": "10.000000",
-                        "beforeUsd": "20.2",
-                        "afterUsd": "10.1",
-                    }
-                    expected_wire += ["get_collateral_price"]
+                    if "beforeUsdc" in document["collateral"]:
+                        expected_wire += ["get_collateral_price"]
+                        project_reference_fixed_collateral(document)
                     output = (json.dumps(document, sort_keys=True) + "\n").encode()
+                assert document["collateral"] == {"beforeUsd": "20", "afterUsd": "10"}
             outputs.append(output)
             assert [entry.label for entry in endpoints.wire] == expected_wire
             assert not endpoints.errors

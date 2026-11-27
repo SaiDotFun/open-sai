@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 import pytest
 from compare import INTENT_ID, timestamp
 from keeper_wire import same_variables
+from parity import project_reference_fixed_collateral
 from sai_cli.core.confirmation import preview_digest
 from scenarios import (
     ADDRESS,
@@ -169,11 +170,10 @@ def test_cli_dry_run_matches_python_main(
                     "before": "10000000",
                     "after": "10999999",
                 }
-            if index == 0 and args[1] in {"leverage", "margin"}:
-                # Issue 231 tracks the Python-only collateral display fields.
-                assert preview.pop("collateral") == {
-                    "beforeUsdc": "10.000000",
-                    "afterUsdc": "10.999999",
+            if args[1] in {"leverage", "margin"}:
+                if index == 0:
+                    project_reference_fixed_collateral(preview)
+                assert preview["collateral"] == {
                     "beforeUsd": "10",
                     "afterUsd": "10.999999",
                 }
@@ -205,6 +205,51 @@ def test_cli_dry_run_matches_python_main(
                 assert not endpoints.errors
                 assert not rows(retry)
     assert previews[0] == previews[1]
+
+
+def test_native_margin_cap_uses_fixed_usd(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    with loopback("position-precision") as endpoints:
+        home = tmp_path / "native"
+        seed_home(home, endpoints, "session")
+        command = (
+            "trade",
+            "margin",
+            "7",
+            "--direction",
+            "add",
+            "--amount",
+            "1",
+            "--max-collateral-usd",
+            "10.5000009",
+            "--dry-run",
+        )
+        code, preview, stderr = run(cli_pair[1], home, endpoints, command, python=False)
+        assert (code, stderr) == (0, ""), preview
+        assert preview["collateral"] == {
+            "beforeUsd": "10.000003",
+            "afterUsd": "10.499999",
+        }
+        assert preview["quote"]["maxCollateralUsd"] == "10.5000009"
+        assert preview["previewDigest"] == preview_digest(preview)
+        text = subprocess.run(
+            [*cli_pair[1], *command],
+            cwd=home,
+            env=child_env(home, endpoints),
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        assert text.returncode == 0
+        assert text.stdout.splitlines()[0].decode() == (
+            "Estimated collateral: $10.000003 → $10.499999"
+        )
+        assert not any(
+            request.label == "get_collateral_price" for request in endpoints.wire
+        )
+        assert not endpoints.errors
+        assert not rows(home)
 
 
 def run(

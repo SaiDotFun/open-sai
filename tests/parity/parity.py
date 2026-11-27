@@ -1281,7 +1281,9 @@ def run_case(
     if cutover:
         diffs = cutover_differences(left, right)
     else:
-        if rust and case.position_case:
+        if rust and python_main and case.collateral_price_after is not None:
+            project_reference_fixed_collateral(left.output)
+        if rust and case.position_case and not case.current_only:
             project_position_estimates(left.output)
         if rust and case.accepted_difference and case.mode != "mcp":
             diffs = []
@@ -1377,6 +1379,18 @@ def supports_current_trade_ux(reference: list[str]) -> bool:
         and result.stdout.startswith("Usage: sai trade cancel")
         and "--preview-digest" in result.stdout
     )
+
+
+def project_reference_fixed_collateral(preview: dict[str, Any]) -> None:
+    """Project Python's temporary oracle-priced USDC display to the fixed USD quote."""
+    collateral = preview.get("collateral", {})
+    if set(collateral) != {"beforeUsdc", "afterUsdc", "beforeUsd", "afterUsd"}:
+        return
+    # The old display uses six decimal places for the exact USDC quantity.
+    preview["collateral"] = {
+        f"{side}Usd": collateral[f"{side}Usdc"].rstrip("0").rstrip(".")
+        for side in ("before", "after")
+    }
 
 
 def project_position_estimates(value: Any) -> None:

@@ -36,6 +36,7 @@ pub enum PositionAction<'a> {
     Margin {
         direction: MarginDirection,
         amount: &'a str,
+        max_collateral_usd: Option<&'a str>,
     },
     PartialClose {
         percent: u8,
@@ -106,6 +107,17 @@ impl Trading<'_> {
     ) -> Result<Value, SaiError> {
         let id = id(trade_id, "TRADE_ID")?;
         let id = serde_json::from_str(&id.to_string()).map_err(|_| SaiError::internal())?;
+        if let PositionAction::Margin {
+            direction,
+            max_collateral_usd: Some(cap),
+            ..
+        } = action
+        {
+            if direction != MarginDirection::Add {
+                return Err(invalid("--max-collateral-usd requires --direction add"));
+            }
+            super::positive_decimal(cap, "Maximum collateral in USD")?;
+        }
         let session = self.load_session(account)?;
         let addr = session.addr();
         let lcd = Lcd(lcd_endpoint);
@@ -237,7 +249,11 @@ impl Trading<'_> {
 
         let (effective, mut inputs) = snapshot.leverage(lcd, trade_id, None).await?;
         let mut preview = match action {
-            PositionAction::Margin { direction, amount } => {
+            PositionAction::Margin {
+                direction,
+                amount,
+                max_collateral_usd,
+            } => {
                 let leverage = effective.as_ref().ok_or_else(|| {
                     invalid("Cannot verify effective leverage for this margin change")
                 })?;
@@ -246,6 +262,7 @@ impl Trading<'_> {
                     &snapshot,
                     direction,
                     amount,
+                    max_collateral_usd,
                     leverage,
                     inputs.clone(),
                 )?

@@ -2,7 +2,6 @@
 
 import json
 import os
-import re
 import subprocess
 import sys
 import tomllib
@@ -64,17 +63,6 @@ def test_bare_leaf_prints_full_help_and_json_usage(
     assert expected.stderr == b""
     assert expected.stdout.startswith(b"Usage:") and b"--help" in expected.stdout
 
-    def comparable(help_text: bytes) -> bytes:
-        if args == ("trade", "margin"):
-            # The new option widens the option column and wraps other help text.
-            without_cap = re.sub(
-                rb"(?m)^  --max-collateral-usd [^\n]*\n(?: {4,}[^\n]*\n)*",
-                b"",
-                help_text,
-            )
-            return b" ".join(without_cap.split())
-        return help_text
-
     errors = []
     comparisons = (("python", python), ("rust", rust))
     for label, binary in comparisons:
@@ -84,10 +72,7 @@ def test_bare_leaf_prints_full_help_and_json_usage(
 
         assert bare.returncode == machine.returncode == 2
         assert bare.stdout == machine.stderr == b""
-        if label == "python":
-            assert bare.stderr == expected.stdout
-        else:
-            assert comparable(bare.stderr) == comparable(expected.stdout)
+        assert bare.stderr == expected.stdout
         error = json.loads(machine.stdout)["error"]
         assert error["code"] == "INVALID_REQUEST"
         assert error["message"].startswith("Missing ")
@@ -97,7 +82,7 @@ def test_bare_leaf_prints_full_help_and_json_usage(
     help_result = invoke(rust, tmp_path / "rust", *args, "--help")
     assert help_result.returncode == 0
     assert help_result.stderr == b""
-    assert comparable(help_result.stdout) == comparable(expected.stdout)
+    assert help_result.stdout == expected.stdout
 
 
 @pytest.mark.parametrize(
