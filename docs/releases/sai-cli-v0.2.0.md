@@ -64,9 +64,10 @@ same profile and command names as the Python CLI, including `sai mcp serve`.
 
 ## Trade Results and Account Reads
 
-- Trade commands wait up to 60 seconds for Keeper to report an outcome.
-  Text mode prints a progress line while `--wait` polls. For a delayed
-  result, the recovery command points to the same intent. MCP replies
+- With `--wait`, trade commands poll Keeper for up to 60 seconds for an
+  outcome, and text mode prints a progress line. Without `--wait`, the
+  command returns while the intent is pending. For a delayed result, the
+  recovery command points to the same intent. MCP replies
   include the account and intent key when a trade may already be pending.
   [#225](https://github.com/SaiDotFun/open-sai/pull/225),
   [#228](https://github.com/SaiDotFun/open-sai/pull/228),
