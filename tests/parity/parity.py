@@ -1067,6 +1067,10 @@ def hidden_arguments(count: int) -> list[str]:
 
 def project_reference_saved_mcp_commands(case: Case, output: dict[str, Any]) -> None:
     def project(row: dict[str, Any], key: str) -> None:
+        if case.name == "mcp-list-redacted" and row.get("staleEnv") == [
+            "FIXTURE_CREDENTIAL"
+        ]:
+            row["staleEnv"] = ["1 other entry"]
         if argv := row.get(key):
             if row.get("args") == "<hidden>":
                 # The shadowed Codex entries use a missing launcher and two operands.
