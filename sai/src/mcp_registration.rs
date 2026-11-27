@@ -3,6 +3,7 @@ mod uninstall;
 pub(crate) mod update_repair;
 
 use std::{
+    collections::BTreeSet,
     env,
     ffi::OsStr,
     path::{Path, PathBuf},
@@ -174,18 +175,29 @@ fn plain_launcher(command: &str) -> bool {
         && !command.chars().any(char::is_control)
 }
 
-fn reported_env_name(entry: &str) -> &str {
-    let name = entry.split_once('=').map_or(entry, |(name, _)| name);
-    let mut bytes = name.bytes();
-    if bytes
-        .next()
-        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    {
-        name
-    } else {
-        "<hidden>"
+fn reported_env_names(entries: &[String]) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    let mut other = 0;
+    for entry in entries {
+        let name = entry
+            .split_once('=')
+            .map_or(entry.as_str(), |(name, _)| name);
+        if name.strip_prefix("SAI_").is_some_and(|suffix| {
+            suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        }) {
+            names.insert(name.to_owned());
+        } else {
+            other += 1;
+        }
     }
+    let mut shown: Vec<_> = names.into_iter().collect();
+    if other != 0 {
+        let noun = if other == 1 { "entry" } else { "entries" };
+        shown.push(format!("{other} other {noun}"));
+    }
+    shown
 }
 
 struct Registration {
@@ -215,7 +227,7 @@ impl Registration {
         }
         let profile = entry["env"]["SAI_HOME"].as_str().map(str::to_owned);
         let invalid_profile = profile.is_none() && entry["env"].get("SAI_HOME").is_some();
-        let mut stale_env = std::collections::BTreeSet::new();
+        let mut stale_env = Vec::new();
         if let Some(env) = entry["env"].as_object() {
             stale_env.extend(env.keys().filter(|key| key.as_str() != "SAI_HOME").cloned());
         }
@@ -232,7 +244,7 @@ impl Registration {
             scope,
             profile,
             invalid_profile,
-            stale_env: stale_env.into_iter().collect(),
+            stale_env,
             disabled,
             extra,
             stdio: entry.get("type").is_none_or(|kind| kind == "stdio")
@@ -276,12 +288,7 @@ impl Registration {
             json!({"command": []})
         };
         if !self.stale_env.is_empty() {
-            let names = self
-                .stale_env
-                .iter()
-                .map(|entry| reported_env_name(entry))
-                .collect::<std::collections::BTreeSet<_>>();
-            out["staleEnv"] = json!(names);
+            out["staleEnv"] = json!(reported_env_names(&self.stale_env));
         }
         if !self.extra.is_empty() {
             out["extraSettings"] = json!(self.extra);
