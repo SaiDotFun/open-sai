@@ -87,6 +87,8 @@ class OverviewReplay:
             self.state["oldBalanceTime"] = (anchor - timedelta(minutes=15)).isoformat()
             for row in self.balances["data"]["userBalances"]:
                 name = row["token_info"]["name"]
+                if name == "USDC Unsettled on Sai":
+                    row["usd_value"] = 11.75
                 row["lastUpdatedBlock"] = {
                     "USDC on Sai": RISK_BLOCK - 1,
                     "USDC Unsettled on Sai": RISK_BLOCK,

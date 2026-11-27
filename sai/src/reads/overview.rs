@@ -2,7 +2,11 @@
 
 use std::io::{self, IsTerminal, Write as _};
 
-use sai_core::{errors::SaiError, overview::BALANCE_STALE_SECONDS, session::ExpiryNotice};
+use sai_core::{
+    errors::SaiError,
+    overview::{BALANCE_STALE_SECONDS, is_usdc_balance},
+    session::ExpiryNotice,
+};
 use serde_json::{Value, json};
 
 const UNKNOWN: &str = "unknown";
@@ -198,7 +202,11 @@ pub(super) fn show_balances(snapshot: &Value) -> Result<(), SaiError> {
         .map(|row| {
             vec![
                 text(&row["token_info"]["name"]),
-                token_quantity(row),
+                if is_usdc_balance(row) {
+                    "-".into()
+                } else {
+                    token_quantity(row)
+                },
                 number(&row["usd_value"], ""),
                 balance_source(row),
             ]

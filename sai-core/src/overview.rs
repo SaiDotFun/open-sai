@@ -159,6 +159,9 @@ pub async fn read_balance_snapshot(
             let age = row["sourceAgeSeconds"].as_f64().map(|age| age.max(0.0));
             row["sourceAgeSeconds"] = json!(age);
             row["stale"] = json!(age.map(|age| age > BALANCE_STALE_SECONDS));
+            if is_usdc_balance(row) {
+                row["usd_value"] = json!(usdc_balance_usd(row));
+            }
         }
         Ok(data)
     };
@@ -505,6 +508,23 @@ fn valid_queued_order(row: &Value) -> bool {
         && instant(&row["orderReqBlockTs"]).is_some()
 }
 
+/// Identify a USDC token or a Sai fund balance denominated in USDC.
+pub fn is_usdc_balance(row: &Value) -> bool {
+    let token = &row["token_info"];
+    token["symbol"] == "USDC"
+        || (token["type"] == "sai"
+            && token["name"]
+                .as_str()
+                .is_some_and(|name| BALANCE_KEYS.iter().any(|(label, _)| name == *label)))
+}
+
+fn usdc_balance_usd(row: &Value) -> Option<f64> {
+    let units = base_units(&row["amount"])?;
+    format!("{}.{:06}", units / 1_000_000, units % 1_000_000)
+        .parse()
+        .ok()
+}
+
 fn parse_balances(payload: Value) -> Result<Value, SaiError> {
     let mut selected = Object::new();
     for row in payload["data"]["userBalances"]
@@ -518,7 +538,7 @@ fn parse_balances(payload: Value) -> Result<Value, SaiError> {
         }
         let name = token["name"].as_str().ok_or_else(invalid)?;
         if let Some((_, key)) = BALANCE_KEYS.iter().find(|(label, _)| name == *label) {
-            let usd = number(&row["usd_value"]).ok_or_else(invalid)?;
+            let usd = usdc_balance_usd(row);
             let height = &row["lastUpdatedBlock"];
             if !valid_block(height, &Value::Null) {
                 return Err(invalid());
@@ -601,12 +621,15 @@ fn number(value: &Value) -> Option<f64> {
 }
 
 fn valid_base_units(value: &Value) -> bool {
+    base_units(value).is_some()
+}
+
+fn base_units(value: &Value) -> Option<u128> {
     value
         .as_str()
         .or_else(|| value.as_number().map(serde_json::Number::as_str))
-        .is_some_and(|text| {
-            text.bytes().all(|byte| byte.is_ascii_digit()) && text.parse::<u128>().is_ok()
-        })
+        .filter(|text| text.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|text| text.parse().ok())
 }
 
 fn valid_block(height: &Value, timestamp: &Value) -> bool {

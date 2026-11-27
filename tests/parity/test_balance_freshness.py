@@ -46,6 +46,7 @@ def test_balance_snapshot_checks_source_block_age(
         assert stale["sourceBlock"] == RISK_BLOCK - 1
         assert 900 <= stale["sourceAgeSeconds"] < 960
         assert stale["stale"] is True
+        assert fresh["usd_value"] == 12.125
         assert fresh["sourceBlock"] == RISK_BLOCK
         assert 0 <= fresh["sourceAgeSeconds"] < 60
         assert fresh["stale"] is False
@@ -79,6 +80,7 @@ def test_overview_labels_stale_balance(
         if mode:
             rows = json.loads(result.stdout)["balances"]["data"]
             assert rows["balance"]["stale"] is True
+            assert rows["unsettled"]["usd"] == 12.125
             assert rows["unsettled"]["stale"] is False
             assert rows["credits"]["stale"] is None
             assert rows["credits"]["sourceAtBasis"] == "fetchedAt"
