@@ -43,6 +43,7 @@ import threading
 import time
 import tomllib
 import zipfile
+import zlib
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -60,6 +61,7 @@ EXIT_FAILED = ExitCode.ERROR
 EXIT_UNSUPPORTED = ExitCode.UNSUPPORTED
 
 MAX_WHEEL = 64 << 20
+MAX_PYTHON_BUNDLE = 128 << 20
 MAX_SUMS = 1 << 16
 DOWNLOAD_HOSTS = {
     "github.com",
@@ -110,6 +112,10 @@ Runner = Callable[[Sequence[str], float], tuple[int, str]]
 
 class UpdateFailed(Exception):
     """A step of the update failed; the message says which."""
+
+
+class WindowsShim(UpdateFailed):
+    """The release only supplied a native shim for this Windows download."""
 
 
 # State and locks
@@ -319,10 +325,15 @@ def sha256(path: Path) -> str:
 
 
 def fetch_wheel(
-    release: update.Release, directory: Path, timeout: float = DOWNLOAD_TIMEOUT
+    release: update.Release,
+    directory: Path,
+    timeout: float = DOWNLOAD_TIMEOUT,
+    *,
+    recorded_digest: str | None = None,
 ) -> tuple[Path, str]:
     """Download RELEASE's wheel and SHA256SUMS into DIRECTORY and return the
     wheel and its SHA-256, or raise UpdateFailed when the hash differs.
+    A rollback with a release record requires the original wheel digest.
 
     TIMEOUT is wall-clock time for both transfers, with their redirects and
     response headers. HTTPX timeouts apply per network operation, so the
@@ -331,15 +342,37 @@ def fetch_wheel(
     """
     name = update.wheel_name(release.version)
     wheel, sums = directory / name, directory / "SHA256SUMS"
+    bundle = directory / update.full_python_bundle_name(release.version)
+    asset = wheel
     deadline = time.monotonic() + timeout
     outcome: dict[str, Exception] = {}
 
     def work() -> None:
+        nonlocal asset
         try:
             headers = {"User-Agent": "sai-cli"}
             with httpx.Client(headers=headers) as client:
                 _download(client, release.sums_url, sums, MAX_SUMS, deadline)
-                _download(client, release.wheel_url, wheel, MAX_WHEEL, deadline)
+                manifest = sums.read_text(errors="replace")
+                if recorded_digest is None:
+                    prefer_bundle = os.name == "nt"
+                else:
+                    prefer_bundle = expected_hash(manifest, name) != recorded_digest
+                if prefer_bundle and expected_hash(manifest, bundle.name) is not None:
+                    asset = bundle
+                    _download(
+                        client,
+                        release.full_python_url,
+                        bundle,
+                        MAX_PYTHON_BUNDLE,
+                        deadline,
+                    )
+                else:
+                    if prefer_bundle and recorded_digest is not None:
+                        raise UpdateFailed(
+                            f"{name} has no matching recorded rollback wheel"
+                        )
+                    _download(client, release.wheel_url, wheel, MAX_WHEEL, deadline)
         except Exception as exc:  # noqa: BLE001 - re-raised in the caller
             outcome["error"] = exc
 
@@ -355,13 +388,46 @@ def fetch_wheel(
         raise UpdateFailed(f"download failed: {type(error).__name__}") from error
     if error is not None:
         raise error
-    expected = expected_hash(sums.read_text(errors="replace"), name)
+    expected = expected_hash(sums.read_text(errors="replace"), asset.name)
     if expected is None:
-        raise UpdateFailed(f"SHA256SUMS does not list {name}")
-    actual = sha256(wheel)
+        raise UpdateFailed(f"SHA256SUMS does not list {asset.name}")
+    actual = sha256(asset)
     if actual != expected:
-        raise UpdateFailed(f"{name} does not match its SHA256SUMS entry")
+        raise UpdateFailed(f"{asset.name} does not match its SHA256SUMS entry")
+    if asset == bundle:
+        unpack_python_wheel(bundle, wheel)
+        actual = sha256(wheel)
+    if recorded_digest is not None and actual != recorded_digest:
+        raise UpdateFailed(f"{name} does not match the recorded rollback wheel")
+    if os.name == "nt":
+        try:
+            if native_bridge.is_shim(wheel):
+                raise WindowsShim(
+                    f"Sai {release.version} has no full Python wheel for Windows"
+                )
+        except zipfile.BadZipFile:
+            # Preserve uv's trial-install diagnostic for a malformed wheel.
+            pass
     return wheel, actual
+
+
+def unpack_python_wheel(bundle: Path, wheel: Path) -> None:
+    # Keep in step with the standalone installer. Copy only the fixed wheel entry.
+    try:
+        with zipfile.ZipFile(bundle) as archive:
+            members = [
+                entry for entry in archive.infolist() if entry.filename == wheel.name
+            ]
+            if len(members) != 1 or members[0].file_size > MAX_WHEEL:
+                raise UpdateFailed(
+                    f"{bundle.name} must contain one bounded {wheel.name}"
+                )
+            with archive.open(members[0]) as source, wheel.open("xb") as output:
+                shutil.copyfileobj(source, output)
+    except (zipfile.BadZipFile, EOFError, RuntimeError, zlib.error) as error:
+        raise UpdateFailed(
+            f"could not read the full Python wheel from {bundle.name}"
+        ) from error
 
 
 # Install, verify, roll back
@@ -878,14 +944,22 @@ class Rollback:
 
 
 def _download_to_cache(
-    release: update.Release, options: Options
+    release: update.Release,
+    options: Options,
+    *,
+    recorded_digest: str | None = None,
 ) -> tuple[Path, str, bool]:
     """Download and verify RELEASE's wheel in a private directory, then keep
     it in the wheel cache. Return its absolute path, its SHA-256, and
     whether the cache had no such file before."""
     cache = private_cache()
     with tempfile.TemporaryDirectory(dir=cache, prefix=".download-") as temp:
-        wheel, digest = fetch_wheel(release, Path(temp), options.download_timeout)
+        wheel, digest = fetch_wheel(
+            release,
+            Path(temp),
+            options.download_timeout,
+            recorded_digest=recorded_digest,
+        )
         kept = cache / wheel.name
         created = not kept.exists()
         os.replace(wheel, kept)
@@ -987,7 +1061,11 @@ def rollback_wheel(current: Current, options: Options) -> tuple[str, str, Path] 
     tag = update.tag_for(current.version)
     try:
         release = update.release_for(tag, options.web_base)
-        wheel, digest, _ = _download_to_cache(release, options)
+        wheel, digest, _ = _download_to_cache(
+            release,
+            options,
+            recorded_digest=record.sha256 if record is not None else None,
+        )
     except (UpdateFailed, OSError):
         return None
     return tag, digest, wheel
@@ -1223,6 +1301,14 @@ def _install(
         message = f"sai {target} is available. Run `sai update` to install it."
         return Outcome(AVAILABLE, message, installed, target), False
 
+    def unsupported_shim() -> tuple[Outcome, bool]:
+        discard()
+        message = (
+            f"Sai {target} requires a native binary for a supported platform. "
+            f"Keep your full Python release `sai-cli=={installed}`."
+        )
+        return Outcome(UNSUPPORTED, message, installed, target), False
+
     try:
         expected_launcher = current.launcher.lstat()
     except OSError as error:
@@ -1235,6 +1321,8 @@ def _install(
     else:
         try:
             kept, digest, created = _download_to_cache(release, options)
+        except WindowsShim:
+            return unsupported_shim()
         except (UpdateFailed, OSError) as exc:
             return unchanged(
                 str(exc) if isinstance(exc, UpdateFailed) else type(exc).__name__
@@ -1250,12 +1338,7 @@ def _install(
                 f"could not inspect the release wheel: {type(error).__name__}"
             )
         if native and not native_bridge.supported():
-            discard()
-            message = (
-                f"Sai {target} requires a native binary for a supported platform. "
-                f"Keep your full Python release `sai-cli=={installed}`."
-            )
-            return Outcome(UNSUPPORTED, message, installed, target), False
+            return unsupported_shim()
         if native and current.install.kind == update.UV_TOOL_GIT:
             return unchanged(
                 "this uv Git install needs a verified full-Python bridge wheel first."

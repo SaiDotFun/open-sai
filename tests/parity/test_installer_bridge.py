@@ -1307,16 +1307,28 @@ def test_pre_bridge_updater_can_skip_to_the_native_shim(
 
 
 @pytest.mark.skipif(WINDOWS, reason="native uv updates run on POSIX")
+@pytest.mark.parametrize("from_older_release", [False, True])
 def test_published_v013_updater_installs_the_native_shim(
-    install: Install, replay: Replay
+    install: Install,
+    replay: Replay,
+    from_older_release: bool,
 ) -> None:
     published = artifact("PUBLISHED_BRIDGE")
     assert hashlib.sha256(published.read_bytes()).hexdigest() == PUBLISHED_BRIDGE_SHA256
     assert wheel_version(published) == "0.1.3"
-    prepare_uv(install, published, replay)
+    if from_older_release:
+        baseline, script = pre_bridge_files()
+        prepare_uv(install, baseline, replay, script)
+        replay.add("0.1.3", {published.name: published.read_bytes()})
+    else:
+        prepare_uv(install, published, replay)
     launcher = install.launcher.resolve(strict=True)
     profile, contents = save_profile(install, replay)
     version = add_shim(replay, wheel_artifact("SHIM"), artifact("RUST"))
+    if from_older_release:
+        result = json.loads(ok(install.update(replay, "--to", "0.1.3")))
+        assert (result["status"], result["target"]) == ("updated", "0.1.3")
+        install.pin("0.1.3")
     result = json.loads(ok(install.update(replay)))
     assert (result["status"], result["target"]) == ("updated", version)
     assert install.launcher.resolve(strict=True) == launcher
@@ -1380,3 +1392,262 @@ def test_windows_refuses_a_replaced_uv_launcher(
     assert "runs another install" in message
     assert str(install.launcher) in message and str(inside) in message
     assert install.launcher.read_bytes() == contents
+
+
+@pytest.fixture(scope="module")
+def full_python_bundle(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[Path, bytes]:
+    version = wheel_version(wheel_artifact("SHIM"))
+    output = tmp_path_factory.mktemp("full-python-wheel")
+    ok(
+        subprocess.run(
+            [
+                sys.executable,
+                ROOT / "scripts/build-bridge.py",
+                "--version",
+                version,
+                "--out-dir",
+                output,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    )
+    wheel = only_wheel(output)
+    return wheel, zip_python_wheel(wheel)
+
+
+def zip_python_wheel(wheel: Path) -> bytes:
+    bundle = io.BytesIO()
+    with zipfile.ZipFile(bundle, "w") as archive:
+        archive.write(wheel, wheel.name)
+    return bundle.getvalue()
+
+
+@pytest.mark.parametrize("cached", [True, False])
+def test_managed_full_python_install_checks_and_applies_the_next_release(
+    install: Install,
+    replay: Replay,
+    full_python_bundle: tuple[Path, bytes],
+    cached: bool,
+) -> None:
+    bridge = wheel_artifact("BRIDGE")
+    prepare_uv(install, bridge, replay)
+    version = wheel_version(bridge)
+    ok(install.run("uv", "tool", "uninstall", "sai-cli"))
+    bundle_name = f"sai-cli-{version}-full-python.zip"
+    shim = wheel_artifact("SHIM")
+    replay.add(
+        version, {bridge.name: shim.read_bytes(), bundle_name: zip_python_wheel(bridge)}
+    )
+    replay.requests.clear()
+    ok(install.install(replay, "--full-python", "--version", version))
+    folder = f"{REPO}/releases/download/sai-cli/v{version}"
+    assert f"{folder}/{bundle_name}" in replay.requests
+    assert f"{folder}/{bridge.name}" not in replay.requests
+    rollback_wheel = install.profile / "cache/wheels" / bridge.name
+    if not cached:
+        rollback_wheel.unlink()
+    replay.requests.clear()
+
+    wheel, bundle = full_python_bundle
+    target = wheel_version(wheel)
+    if WINDOWS:
+        replay.add(
+            target,
+            {shim.name: shim.read_bytes(), f"sai-cli-{target}-full-python.zip": bundle},
+        )
+    else:
+        replay.add(target, {wheel.name: wheel.read_bytes()})
+
+    check = json.loads(ok(install.update(replay, "--check")))
+    assert (check["installed"], check["latest"]) == (version, target)
+    assert check["install"]["kind"] == "uv-tool-release"
+    assert check["updateAvailable"] is True
+    result = json.loads(ok(install.update(replay)))
+    assert (result["status"], result["target"]) == ("updated", target)
+    assert f"{folder}/{bridge.name}" not in replay.requests
+    assert rollback_wheel.read_bytes() == bridge.read_bytes()
+    install.pin(target)
+    current = json.loads(ok(install.update(replay, "--check")))
+    assert (current["installed"], current["latest"]) == (target, target)
+    assert current["updateAvailable"] is False
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires a Linux native archive")
+@pytest.mark.parametrize("has_bundle", [True, False])
+def test_default_installer_checks_native_compatibility_before_replacing_uv(
+    install: Install,
+    replay: Replay,
+    full_python_bundle: tuple[Path, bytes],
+    has_bundle: bool,
+) -> None:
+    bridge = wheel_artifact("BRIDGE")
+    prepare_uv(install, bridge, replay)
+    profile, contents = save_profile(install, replay)
+    shim = wheel_artifact("SHIM")
+    version = wheel_version(shim)
+    binary = install.home / "incompatible-sai"
+    binary.write_text("#!/no/such/dynamic-loader\n")
+    binary.chmod(0o700)
+    target = asset_name(version)
+    files = {shim.name: shim.read_bytes(), target: archive(binary)}
+    wheel, bundle = full_python_bundle
+    if has_bundle:
+        files[f"sai-cli-{version}-full-python.zip"] = bundle
+    replay.add(version, files)
+
+    result = install.install(replay)
+    assert f"{REPO}/releases/download/sai-cli/v{version}/{target}" in replay.requests
+    if has_bundle:
+        ok(result)
+        assert "Installing the full Python wheel instead" in result.stderr
+        install.pin(version)
+        assert (
+            install.profile / "cache/wheels" / wheel.name
+        ).read_bytes() == wheel.read_bytes()
+    else:
+        assert result.returncode == 1, (result.stdout, result.stderr)
+        assert "no full Python wheel" in result.stderr
+        install.pin(wheel_version(bridge))
+    assert profile.read_bytes() == contents
+
+
+@pytest.mark.skipif(WINDOWS, reason="requires a native uv shim")
+def test_default_installer_keeps_a_compatible_native_shim(
+    install: Install,
+    replay: Replay,
+) -> None:
+    shim = wheel_artifact("SHIM")
+    version = add_shim(replay, shim, artifact("RUST"))
+    result = install.install(replay)
+    ok(result)
+    assert "Installing the full Python wheel instead" not in result.stderr
+    assert (
+        f"{REPO}/releases/download/sai-cli/v{version}/{asset_name(version)}"
+        in replay.requests
+    )
+    assert not (install.profile / "bin").exists()
+    install.pin(version)
+
+
+@pytest.mark.skipif(WINDOWS, reason="requires POSIX profile permissions")
+@pytest.mark.parametrize(
+    ("obstruction", "diagnostic"),
+    [
+        ("ancestor", "SAI_HOME has an untrusted ancestor directory"),
+        ("receipt", "The Sai native cache cannot replace the verified directory"),
+        ("read-only cache", "The Sai native cache directory is not writable"),
+    ],
+)
+def test_default_installer_keeps_python_when_shim_rejects_the_real_profile(
+    install: Install,
+    replay: Replay,
+    obstruction: str,
+    diagnostic: str,
+) -> None:
+    project = install.home / "project"
+    project.mkdir(mode=0o700)
+    install.profile = project / ".sai"
+    install.env["SAI_HOME"] = str(install.profile.relative_to(install.home))
+    previous = wheel_artifact("BRIDGE")
+    prepare_uv(install, previous, replay)
+    config, contents = save_profile(install, replay)
+    record = install.tools / ".sai-cli-release.json"
+    original_record = record.read_bytes()
+    launcher = install.launcher.lstat()
+    assert install.profile.stat().st_mode & 0o777 == 0o700
+    install.pin(wheel_version(previous))
+    version = add_shim(replay, wheel_artifact("SHIM"), artifact("RUST"))
+    target = asset_name(version).removeprefix(f"sai-{version}-").removesuffix(".tar.gz")
+    cache = install.profile / "bin"
+    if obstruction == "ancestor":
+        project.chmod(0o775)
+    else:
+        cache.mkdir(mode=0o700)
+        for part in (f"shim-loopback-{replay.server.server_port}", version, target):
+            cache /= part
+            cache.mkdir(mode=0o700)
+        if obstruction == "receipt":
+            (cache / "verified").mkdir(mode=0o700)
+        else:
+            cache.chmod(0o500)
+            if os.access(cache, os.W_OK):
+                pytest.skip("the test user can write to the read-only cache")
+    before = [(path, path.lstat().st_mode) for path in cache.rglob("*")]
+
+    result = install.install(replay)
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert diagnostic in result.stderr
+    assert install.launcher.lstat().st_ino == launcher.st_ino
+    assert record.read_bytes() == original_record
+    assert config.read_bytes() == contents
+    assert [(path, path.lstat().st_mode) for path in cache.rglob("*")] == before
+    if obstruction == "ancestor":
+        assert not cache.exists()
+    assert not (
+        install.profile / "cache/wheels" / f"sai_cli-{version}-py3-none-any.whl"
+    ).exists()
+    install.pin(wheel_version(previous))
+
+
+@pytest.mark.skipif(not WINDOWS, reason="requires Windows uv launcher copies")
+@pytest.mark.parametrize(
+    ("entry", "corrupt"), [("install", False), ("update", False), ("update", True)]
+)
+def test_windows_uses_the_verified_full_python_bundle(
+    install: Install,
+    replay: Replay,
+    full_python_bundle: tuple[Path, bytes],
+    entry: str,
+    corrupt: bool,
+) -> None:
+    bridge = wheel_artifact("BRIDGE")
+    prepare_uv(install, bridge, replay)
+    profile, contents = save_profile(install, replay)
+    launcher = install.launcher.read_bytes()
+    if entry == "install":
+        ok(install.run("uv", "tool", "uninstall", "sai-cli"))
+        assert not install.launcher.exists()
+    shim = wheel_artifact("SHIM")
+    version = wheel_version(shim)
+    wheel, bundle = full_python_bundle
+    bundle_name = f"sai-cli-{version}-full-python.zip"
+    folder = f"{REPO}/releases/download/sai-cli/v{version}"
+    replay.add(version, {shim.name: shim.read_bytes(), bundle_name: bundle})
+    if corrupt:
+        replay.assets[f"{folder}/{bundle_name}"] += b"unverified bytes"
+
+    result = install.install(replay) if entry == "install" else install.update(replay)
+    assert f"{folder}/{bundle_name}" in replay.requests
+    assert f"{folder}/{shim.name}" not in replay.requests
+    if corrupt:
+        assert result.returncode == 1, (result.stdout, result.stderr)
+        assert "does not match its SHA256SUMS entry" in result.stdout
+        install.pin(wheel_version(bridge))
+    else:
+        ok(result)
+        install.pin(version)
+        cached = install.profile / "cache/wheels" / wheel.name
+        assert cached.read_bytes() == wheel.read_bytes()
+        record = json.loads((install.tools / ".sai-cli-release.json").read_text())
+        assert record["sha256"] == hashlib.sha256(wheel.read_bytes()).hexdigest()
+    if entry == "update":
+        assert install.launcher.read_bytes() == launcher
+    assert profile.read_bytes() == contents
+
+
+@pytest.mark.skipif(not WINDOWS, reason="requires Windows uv launcher copies")
+def test_windows_installer_refuses_a_shim_only_release(
+    install: Install,
+    replay: Replay,
+) -> None:
+    add_shim(replay, wheel_artifact("SHIM"))
+    result = install.install(replay)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "full Python" in result.stderr
+    assert not install.launcher.exists()

@@ -196,9 +196,17 @@ def unpack(archive: BinaryIO, output: BinaryIO) -> str:
     return digest.hexdigest()
 
 
-def private_directory(path: Path, *, home: bool = False) -> Path:
-    path.mkdir(mode=0o700, parents=home, exist_ok=True)
-    info = path.lstat()
+def private_directory(path: Path, *, home: bool = False, create: bool = True) -> Path:
+    if create:
+        path.mkdir(mode=0o700, parents=home, exist_ok=True)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        if create:
+            raise
+        if path.parent.is_dir() and not os.access(path.parent, os.W_OK | os.X_OK):
+            raise ShimError("The Sai cache parent directory is not writable")
+        return path
     unwanted = 0o022 if home else 0o077
     if (
         not stat.S_ISDIR(info.st_mode)
@@ -229,7 +237,7 @@ def check_directory_acl(path: Path) -> None:
             os.close(fd)
 
 
-def trusted_home(path: Path) -> Path:
+def trusted_home(path: Path, *, create: bool = True) -> Path:
     # Canonicalize the parent once, for aliases such as /var on macOS.
     # The opened directory chain below must keep that canonical path stable.
     path = path.parent.resolve() / path.name
@@ -243,6 +251,10 @@ def trusted_home(path: Path) -> Path:
             try:
                 child = os.open(part, flags, dir_fd=fd)
             except FileNotFoundError:
+                if not create:
+                    if not os.access(".", os.W_OK | os.X_OK, dir_fd=fd):
+                        raise ShimError("The SAI_HOME parent directory is not writable")
+                    return path
                 try:
                     os.mkdir(part, mode=0o700, dir_fd=fd)
                 except FileExistsError:
@@ -275,10 +287,18 @@ def is_private_file(info: os.stat_result, mode: int, limit: int) -> bool:
 
 
 @contextmanager
-def cache_lock(path: Path) -> Generator[None]:
+def cache_lock(path: Path, *, create: bool = True) -> Generator[None]:
     import fcntl
 
-    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        descriptor = os.open(path, flags | (os.O_CREAT if create else 0), 0o600)
+    except FileNotFoundError:
+        if create:
+            raise
+        check_cache_writable(path.parent)
+        yield
+        return
     try:
         info = os.fstat(descriptor)
         if (
@@ -315,8 +335,17 @@ def digest_directory_inaccessible(info: os.stat_result) -> bool:
     return info.st_mode & required != required
 
 
-def cached_binary(cache: Path) -> tuple[Path, BinaryIO] | None:
+def executable_digest(file: BinaryIO) -> str:
+    # The installer can run this check with Python 3.10.
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: file.read(CHUNK), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def cached_binary(cache: Path, *, repair: bool = True) -> tuple[Path, BinaryIO] | None:
     receipt = cache / "verified"
+    check_file_destination(receipt)
     try:
         fd = os.open(receipt, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as contents:
@@ -335,11 +364,12 @@ def cached_binary(cache: Path) -> tuple[Path, BinaryIO] | None:
             return None
         if digest_directory_inaccessible(info):
             return None
-        if stat.S_IMODE(info.st_mode) != 0o700:
+        if repair and stat.S_IMODE(info.st_mode) != 0o700:
             repair_digest_mode(folder)
         else:
             check_directory_acl(folder)
         binary = folder / "sai"
+        check_file_destination(binary)
         fd = os.open(binary, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         file = os.fdopen(fd, "rb")
         verified = False
@@ -347,7 +377,7 @@ def cached_binary(cache: Path) -> tuple[Path, BinaryIO] | None:
             check_acl(fd)
             verified = (
                 is_private_file(os.fstat(fd), 0o700, BINARY_LIMIT)
-                and hashlib.file_digest(file, "sha256").hexdigest() == binary_digest
+                and executable_digest(file) == binary_digest
             )
             if verified:
                 return binary, file
@@ -371,7 +401,38 @@ def publish(path: Path, source: BinaryIO, mode: int) -> None:
     os.replace(str(source.name), path)
 
 
+def check_cache_writable(path: Path) -> None:
+    if path.is_dir() and not os.access(path, os.W_OK | os.X_OK):
+        raise ShimError("The Sai native cache directory is not writable")
+
+
+def check_file_destination(path: Path) -> None:
+    with suppress(FileNotFoundError):
+        if stat.S_ISDIR(path.lstat().st_mode):
+            raise ShimError(
+                f"The Sai native cache cannot replace the {path.name} directory"
+            )
+
+
+def check_cache_destination(cache: Path, digest: str) -> None:
+    check_cache_writable(cache)
+    folder = cache / digest
+    try:
+        info = folder.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise ShimError(
+            "The native archive digest path must be an owner-controlled directory"
+        )
+    if digest_directory_inaccessible(info):
+        raise ShimError("The native archive digest directory is inaccessible")
+    check_directory_acl(folder)
+    check_file_destination(folder / "sai")
+
+
 def install_binary(cache: Path, url: str, name: str, base: str) -> None:
+    check_file_destination(cache / "verified")
     with tempfile.TemporaryFile(dir=cache) as manifest:
         download(f"{url}/SHA256SUMS", base, manifest, MANIFEST_LIMIT)
         manifest.seek(0)
@@ -406,6 +467,7 @@ def install_binary(cache: Path, url: str, name: str, base: str) -> None:
                 folder.mkdir(mode=0o700, exist_ok=True)
                 repair_digest_mode(folder)
                 binary = folder / "sai"
+                check_file_destination(binary)
                 publish(binary, file, 0o700)
             with (staged / "verified").open("wb") as file:
                 file.write(f"{digest} {binary_digest}\n".encode("ascii"))
@@ -476,6 +538,37 @@ def profile_home() -> Path:
     return Path(os.path.abspath(home))
 
 
+def profile_cache(release: str, target: str, scope: str, *, create: bool) -> Path:
+    home = trusted_home(profile_home(), create=create)
+    cache = private_directory(home, home=True, create=create)
+    for part in ("bin", scope, release, target):
+        cache = private_directory(cache / part, create=create)
+    return cache
+
+
+def check_install_profile(release: str, digest: str) -> int:
+    """Check the real profile from the verified wheel before uv replaces Sai."""
+    try:
+        _, scope = release_source()
+        cache = profile_cache(release, native_target(), scope, create=False)
+        with cache_lock(cache / ".lock", create=False):
+            cached = cached_binary(cache, repair=False)
+            if cached is None:
+                check_cache_destination(cache, digest)
+            else:
+                _, executable = cached
+                executable.close()
+    except RuntimeError as error:
+        print(error)
+    except OSError as error:
+        print(
+            f"Could not check the Sai profile or native cache ({type(error).__name__})"
+        )
+    else:
+        return 0
+    return 1
+
+
 @contextmanager
 def verified_binary() -> Generator[tuple[Path, BinaryIO]]:
     release = release_version(version("sai-cli"))
@@ -484,10 +577,7 @@ def verified_binary() -> Generator[tuple[Path, BinaryIO]]:
         base, scope = release_source()
     except RuntimeError as exc:
         raise ShimError(str(exc)) from exc
-    home = profile_home()
-    cache = private_directory(trusted_home(home), home=True)
-    for part in ("bin", scope, release, target):
-        cache = private_directory(cache / part)
+    cache = profile_cache(release, target, scope, create=True)
     with cache_lock(cache / ".lock"):
         cached = cached_binary(cache)
         if cached is None:
