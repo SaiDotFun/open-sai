@@ -1154,10 +1154,13 @@ def run_case(
     rust = candidate is not reference
     candidate_case = case.rust_case() if rust else case
     account_balances = case.command == "account balances"
-    if python_main and case.collateral_price_after is not None:
+    current_margin_preview = python_main and case.collateral_price_after is not None
+    if current_margin_preview:
         wire = list(case.wire or [])
         index = wire.index(case.collateral_price_after)
         wire.insert(index + 1, "get_collateral_price")
+        if rust:
+            candidate_case = replace(case, rust=None).rust_case()
         case = replace(case, wire=wire)
         if not rust:
             candidate_case = case
@@ -1293,9 +1296,9 @@ def run_case(
     if cutover:
         diffs = cutover_differences(left, right)
     else:
-        if rust and python_main and case.collateral_price_after is not None:
+        if rust and current_margin_preview:
             project_reference_fixed_collateral(left.output)
-        if rust and case.position_case and not case.current_only:
+        if rust and case.position_case and not current_margin_preview:
             project_position_estimates(left.output)
         if rust and case.accepted_difference and case.mode != "mcp":
             diffs = []

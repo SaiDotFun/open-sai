@@ -60,6 +60,7 @@ CURRENT_TRADE_UX_CASES = (
     "trade-open-ambiguous-market-symbol",
     "trade-open-market-symbol",
     "trade-open-unknown-market-symbol",
+    "trade-margin",
     "trade-margin-capped-add",
 )
 
