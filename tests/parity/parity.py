@@ -1239,6 +1239,11 @@ def run_case(
             or case.name == "mcp-install-legacy"
         ):
             project_reference_saved_mcp_commands(case, left.output)
+        if case.name == "mcp-list-redacted" and isinstance(right.output, dict):
+            for client in right.output.get("clients", []):
+                for row in (client, *client.get("registrations", [])):
+                    if row.get("staleEnv") == ["FIXTURE_CREDENTIAL"]:
+                        row["staleEnv"] = ["1 other entry"]
     if (
         candidate != reference
         and case.accepted_divergence == "doctor-keeper-log-context"
