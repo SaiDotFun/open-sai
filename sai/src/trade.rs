@@ -696,6 +696,14 @@ pub fn run(
 }
 
 fn emit_preview(mut output: Value, json: bool) -> Result<(), SaiError> {
+    let execution = &output["estimates"]["execution"];
+    if !json
+        && execution["status"] == "would_be_rejected"
+        && execution["code"] == "InsufficientDepositBalance"
+        && let Some(reason) = execution["reason"].as_str()
+    {
+        return Err(SaiError::new(Code::PreviewMismatch, reason));
+    }
     let quote = &output["quote"];
     let base_units = &output["collateralBaseUnits"];
     let (before, after) = if output["intent"]["body"]["requestedLeverage"].is_null() {
@@ -712,7 +720,7 @@ fn emit_preview(mut output: Value, json: bool) -> Result<(), SaiError> {
         let before = collateral_usd(before);
         let after = collateral_usd(after);
         if !json {
-            if let Some(warning) = output["estimates"]["execution"]["warning"].as_str() {
+            if let Some(warning) = execution["warning"].as_str() {
                 println!("{warning}");
             }
             println!("Estimated collateral: ${before} → ${after}");

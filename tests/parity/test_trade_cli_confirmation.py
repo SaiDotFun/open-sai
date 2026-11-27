@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Literal
@@ -25,6 +26,35 @@ PARTIAL = ("trade", "partial-close", "7", "--percent", "50")
 @pytest.fixture
 def pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
     return (str(Path(sys.executable).with_name("sai")),), cli_pair[1]
+
+
+def test_unfunded_capped_margin_text_refusal_matches_python(
+    pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    args = (*MARGIN, "--max-collateral-usd", "10.5", "--dry-run")
+    diagnostics = []
+    for index, cli in enumerate(pair):
+        with loopback(
+            "position-execution-unfunded", leverage_target="1.904761904761904762"
+        ) as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            result = subprocess.run(
+                [*cli, *args],
+                cwd=home,
+                env=child_env(home, endpoints),
+                capture_output=True,
+                check=False,
+                timeout=15,
+            )
+            assert result.returncode == 4, (result.stdout, result.stderr)
+            assert result.stdout == b""
+            assert b"additional margin" in result.stderr
+            diagnostics.append(result.stderr)
+            assert all(row.label != "recordUserIntent" for row in endpoints.wire)
+            assert not rows(home)
+            assert not endpoints.errors
+    assert diagnostics[0] == diagnostics[1]
 
 
 @pytest.mark.parametrize(
