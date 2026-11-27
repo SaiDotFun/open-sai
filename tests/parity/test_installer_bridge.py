@@ -1383,7 +1383,7 @@ def test_windows_refuses_a_replaced_uv_launcher(
 
 
 @pytest.fixture(scope="module")
-def windows_python_bundle(
+def full_python_bundle(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> tuple[Path, bytes]:
     version = wheel_version(wheel_artifact("SHIM"))
@@ -1411,6 +1411,62 @@ def windows_python_bundle(
     return wheel, bundle.getvalue()
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="requires a Linux native archive")
+@pytest.mark.parametrize("has_bundle", [True, False])
+def test_default_installer_checks_native_compatibility_before_replacing_uv(
+    install: Install,
+    replay: Replay,
+    full_python_bundle: tuple[Path, bytes],
+    has_bundle: bool,
+) -> None:
+    bridge = wheel_artifact("BRIDGE")
+    prepare_uv(install, bridge, replay)
+    profile, contents = save_profile(install, replay)
+    shim = wheel_artifact("SHIM")
+    version = wheel_version(shim)
+    binary = install.home / "incompatible-sai"
+    binary.write_text("#!/no/such/dynamic-loader\n")
+    binary.chmod(0o700)
+    target = asset_name(version)
+    files = {shim.name: shim.read_bytes(), target: archive(binary)}
+    wheel, bundle = full_python_bundle
+    if has_bundle:
+        files[f"sai-cli-{version}-full-python.zip"] = bundle
+    replay.add(version, files)
+
+    result = install.install(replay)
+    assert f"{REPO}/releases/download/sai-cli/v{version}/{target}" in replay.requests
+    if has_bundle:
+        ok(result)
+        assert "Installing the full Python wheel instead" in result.stderr
+        install.pin(version)
+        assert (
+            install.profile / "cache/wheels" / wheel.name
+        ).read_bytes() == wheel.read_bytes()
+    else:
+        assert result.returncode == 1, (result.stdout, result.stderr)
+        assert "no full Python wheel" in result.stderr
+        install.pin(wheel_version(bridge))
+    assert profile.read_bytes() == contents
+
+
+@pytest.mark.skipif(WINDOWS, reason="requires a native uv shim")
+def test_default_installer_keeps_a_compatible_native_shim(
+    install: Install,
+    replay: Replay,
+) -> None:
+    shim = wheel_artifact("SHIM")
+    version = add_shim(replay, shim, artifact("RUST"))
+    result = install.install(replay)
+    ok(result)
+    assert "Installing the full Python wheel instead" not in result.stderr
+    assert (
+        f"{REPO}/releases/download/sai-cli/v{version}/{asset_name(version)}"
+        in replay.requests
+    )
+    install.pin(version)
+
+
 @pytest.mark.skipif(not WINDOWS, reason="requires Windows uv launcher copies")
 @pytest.mark.parametrize(
     ("entry", "corrupt"), [("install", False), ("update", False), ("update", True)]
@@ -1418,7 +1474,7 @@ def windows_python_bundle(
 def test_windows_uses_the_verified_full_python_bundle(
     install: Install,
     replay: Replay,
-    windows_python_bundle: tuple[Path, bytes],
+    full_python_bundle: tuple[Path, bytes],
     entry: str,
     corrupt: bool,
 ) -> None:
@@ -1431,7 +1487,7 @@ def test_windows_uses_the_verified_full_python_bundle(
         assert not install.launcher.exists()
     shim = wheel_artifact("SHIM")
     version = wheel_version(shim)
-    wheel, bundle = windows_python_bundle
+    wheel, bundle = full_python_bundle
     bundle_name = f"sai-cli-{version}-full-python.zip"
     folder = f"{REPO}/releases/download/sai-cli/v{version}"
     replay.add(version, {shim.name: shim.read_bytes(), bundle_name: bundle})
