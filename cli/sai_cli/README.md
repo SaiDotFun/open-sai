@@ -457,8 +457,9 @@ your Sai account in Sai Web before trading. Use `--dry-run` to inspect
 the intent and any available estimates. Some previews need a session and
 live position data. To preview an open without signing in, omit `--as`.
 
-The `account overview` and `account balances ADDR` commands show the
-source block and age beside each balance. Sai marks a source more than
+The `account overview` and `account balances ADDR` commands value USDC
+balances at $1 per USDC from the raw balance. They show the source block
+and age beside each balance. Sai marks a source more than
 five minutes old as stale. This age describes the last balance update.
 If Sai cannot verify the block time, it displays an unknown age.
 
