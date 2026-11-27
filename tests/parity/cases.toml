@@ -788,8 +788,10 @@ state = { "trader/intents.sqlite3" = "file", "trader/intents.sqlite3#tables.inte
 name = "intent-status"
 args = ["--json","intent","status","{addr}","--key","{intent}"]
 seed = "ledger"
+server = "intent-status-valid-hash"
 wire = ["userIntents","intentTradeHistory"]
 state = { "trader/intents.sqlite3" = "file", "trader/intents.sqlite3#tables.intents.rows.0.status" = "terminal" }
+output = { "matchedTradeHistory.0.id" = 7, "matchedTradeHistory.1" = "<absent>" }
 
 [[case]]
 name = "intent-status-unsubmitted"
@@ -1236,6 +1238,7 @@ expect = 2
 
 [[case]]
 name = "trade-bare-group-text"
+accepted_difference = "Issue #231 lists cancel in bare Python trade help."
 args = ["trade"]
 mode = "text"
 expect = 2
@@ -1243,7 +1246,18 @@ exact_output = true
 
 [[case]]
 name = "trade-bare-group-json"
+accepted_difference = "Issue #231 lists cancel in bare Python trade help."
 args = ["--json", "trade"]
+expect = 2
+exact_output = true
+
+[[case]]
+name = "bare-help-trade-cancel"
+current_only = true
+reference_stderr_contains = ["Usage: sai trade cancel", "--preview-digest"]
+accepted_difference = "Issue #231 adds Click help and --preview-digest for cancel."
+args = ["trade", "cancel"]
+mode = "text"
 expect = 2
 exact_output = true
 
@@ -1263,6 +1277,7 @@ exact_output = true
 
 [[case]]
 name = "bare-help-trade-margin"
+accepted_difference = "Issue #231 adds --max-collateral-usd to Python main."
 args = ["trade", "margin"]
 mode = "text"
 expect = 2
@@ -1270,6 +1285,7 @@ exact_output = true
 
 [[case]]
 name = "bare-help-trade-open"
+accepted_difference = "Issue #231 adds market-symbol help to Python main."
 args = ["trade", "open"]
 mode = "text"
 expect = 2
@@ -1372,6 +1388,7 @@ state = { "clients/.claude.json#changed" = false, "clients/.codex/config.toml#ch
 [[case]]
 name = "mcp-install-all"
 args = ["--json", "mcp", "install", "--all"]
+accepted_divergence = "claude-env-report"
 client_seed = "empty"
 state = { "clients/.codex/config.toml#@mode" = 384, "clients/.cursor/mcp.json#@mode" = 384 }
 
@@ -1383,7 +1400,8 @@ state = { "clients/.claude.json#changed" = false, "clients/.codex/config.toml#ch
 
 [[case]]
 name = "mcp-install-dry-run"
-args = ["--json", "mcp", "install", "cursor", "--scope", "project", "--dry-run", "--", "fixture-wrapper", "sai", "mcp", "serve"]
+args = ["--json", "mcp", "install", "cursor", "--scope", "project", "--dry-run", "--", "env", "sai", "mcp", "serve"]
+accepted_divergence = "launcher-argument-report"
 client_seed = "empty"
 state = { "clients/.cursor/mcp.json" = "<absent>", "clients/argv.jsonl" = "<absent>" }
 
@@ -1745,6 +1763,15 @@ args = ["--json","trade","open","--market","3","--side","long","--type","market"
 wire = ["borrowings", "oneClickTrading", "node_info", "get_market", "get_group", "get_pair_custom_max_leverage", "get_fees", "get_collateral_price"]
 
 [[case]]
+name = "trade-open-market-symbol"
+current_only = true
+args = ["--json", "trade", "open", "--market", "bTc", "--side", "long", "--type", "market", "--amount", "20", "--leverage", "2", "--slippage", "1", "--price", "100", "--dry-run"]
+server = "market-symbol"
+wire = ["borrowings", "borrowings", "oneClickTrading", "node_info", "get_market", "get_group", "get_pair_custom_max_leverage", "get_fees", "get_collateral_price"]
+output = { "intent.body.market.marketIndex" = "MarketIndex(3)" }
+rust = { expect = 2, wire = [], output = { "error.code" = "INVALID_REQUEST" } }
+
+[[case]]
 name = "trade-close"
 args = ["--json","trade","close","7","--dry-run"]
 expect = 6
@@ -1768,6 +1795,7 @@ expect = 6
 
 [[case]]
 name = "trade-margin"
+collateral_price_after = "is_after_hours_market"
 args = ["--json","trade","margin","7","--direction","add","--amount","1","--dry-run"]
 seed = "session"
 wire = [
@@ -1778,6 +1806,23 @@ wire = [
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market"] }
+
+[[case]]
+name = "trade-margin-capped-add"
+current_only = true
+collateral_price_after = "is_after_hours_market"
+args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "1", "--max-collateral-usd", "10.5", "--dry-run"]
+seed = "session"
+server = "position-precision"
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market",
+    "market_order_config", "get_perp_prices", "is_after_hours_market", "get_group",
+    "get_pair_custom_max_leverage", "get_fees",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "quote.maxCollateralUsd" = "10.5", "collateral.beforeUsdc" = "10.000003", "collateral.afterUsdc" = "10.631248" }
+rust = { expect = 2, wire = [], output = { "error.code" = "INVALID_REQUEST" } }
 
 [[case]]
 name = "trade-partial-close"
@@ -1901,8 +1946,6 @@ seed = "session"
 expect = 2
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "error.code" = "INVALID_REQUEST", "error.message" = "Invalid value for '--percent': '5__0' is not a valid integer." }
-accepted_difference = "Python PR #194 changed the invalid percent diagnostic."
-rust = { output = { "error.code" = "INVALID_REQUEST", "error.message" = "Invalid value for '--percent': '5__0' is not a valid integer range." } }
 
 [[case]]
 name = "trade-partial-close-unicode-percent"
@@ -1912,15 +1955,6 @@ server = "position-default"
 expect = 2
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "error.code" = "INVALID_REQUEST", "error.message" = "Invalid value for '--percent': '٥_٠' is not a valid integer." }
-accepted_difference = "Python PR #194 rejects non-ASCII percent digits. Rust accepts the pinned Python syntax."
-
-[case.rust]
-expect = 0
-wire = [
-    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
-]
-output = { "quote.percent" = 50 }
 
 [[case]]
 name = "trade-partial-close-invalid-id"
@@ -1931,6 +1965,7 @@ output = { "error.message" = "Invalid value for 'TRADE_ID': 'invalid' is not a v
 
 [[case]]
 name = "trade-margin-add-rounding"
+collateral_price_after = "is_after_hours_market"
 args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "1.000001", "--lcd-endpoint", "{http}", "--dry-run"]
 seed = "session"
 server = "position-precision"
@@ -1947,6 +1982,7 @@ output = { "quote.requestedLeverage" = "1.930415139893933113", "quote.actualDelt
 
 [[case]]
 name = "trade-margin-remove-rounding"
+collateral_price_after = "is_after_hours_market"
 args = ["--json", "trade", "margin", "7", "--direction", "remove", "--amount", "1.000001", "--dry-run"]
 seed = "session"
 server = "position-precision"
@@ -1962,6 +1998,7 @@ output = { "quote.requestedLeverage" = "2.359396615744510258", "quote.actualDelt
 
 [[case]]
 name = "trade-margin-after-hours"
+collateral_price_after = "get_after_hours_leverage"
 args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "1", "--dry-run"]
 seed = "session"
 server = "position-after-hours"
@@ -2186,7 +2223,7 @@ wire = ["oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw", "
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "error.code" = "INVALID_REQUEST", "error.message" = "Indexed position differs from contract state. Retry after Keeper synchronizes. No intent was submitted." }
 accepted_difference = "Python retries stale Keeper index reads. Rust refuses the stale snapshot immediately."
-rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance"], output = { "error.code" = "INVALID_REQUEST", "error.message" = "Indexed position differs from contract state; wait for synchronization and retry" } }
+rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance"], output = { "error.code" = "INVALID_REQUEST", "error.message" = "Indexed position differs from contract state; wait for synchronization and retry", "error.retryable" = true } }
 
 [[case]]
 name = "trade-partial-close-market-minimum"

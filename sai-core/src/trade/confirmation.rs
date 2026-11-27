@@ -13,7 +13,6 @@ use super::{
 use crate::{
     errors::{Code, SaiError},
     keeper::TIMEOUT,
-    settings::repr,
     storage::Session,
 };
 
@@ -57,10 +56,9 @@ impl<'a> Confirmation<'a> {
             invalid("Pass the confirmed market preview's referencePrice via --price")
         })?;
         if decimal_parts(price).is_none() {
-            return Err(SaiError::usage(format!(
-                "Invalid value for '--price': {} is not a valid decimal.",
-                repr(price)
-            )));
+            return Err(SaiError::usage(
+                "Invalid value for '--price': expected a decimal.",
+            ));
         }
         let units = reference_price_units(price, "Reference price")?;
         Ok(Self {
@@ -194,6 +192,63 @@ impl<'a> Confirmation<'a> {
 }
 
 impl Trading<'_> {
+    pub(super) async fn prepare_open_submission(
+        &self,
+        session: &Session,
+        preview: &mut TradePreview,
+        confirming: bool,
+    ) -> Result<(), SaiError> {
+        let mode = if confirming {
+            PreviewMode::McpSubmission
+        } else {
+            PreviewMode::CliSubmission
+        };
+        let market_row = if preview.requires_market_price_refresh() {
+            match self.refresh_market_quote(preview).await {
+                Ok(row) => {
+                    self.load_session(Some(session.addr()))?;
+                    let price = preview
+                        .reference_price
+                        .as_deref()
+                        .ok_or_else(SaiError::internal)?;
+                    if confirming {
+                        reference_price_units(price, "Current price")?;
+                    } else {
+                        positive_decimal(price, "Current price")?;
+                    }
+                    preview.intent.body["intentPrice"] = json!(price);
+                    Some(row)
+                }
+                Err(error) => {
+                    self.estimate_preview(preview, Some(session), mode, None)
+                        .await?;
+                    if confirming {
+                        self.recheck_bound_open_route(preview).await?;
+                    }
+                    preview.check_cli_execution(session.addr(), false)?;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        self.estimate_preview(preview, Some(session), mode, market_row)
+            .await?;
+        if confirming {
+            self.recheck_bound_open_route(preview).await?;
+        }
+        Ok(())
+    }
+
+    async fn recheck_bound_open_route(&self, preview: &TradePreview) -> Result<(), SaiError> {
+        let endpoint = self.lcd_endpoint.ok_or_else(SaiError::internal)?;
+        let route = preview
+            .position_route
+            .as_ref()
+            .ok_or_else(SaiError::internal)?;
+        self.recheck_open_route(&Lcd(endpoint), route).await
+    }
+
     pub(super) async fn prepare_cli_confirmation(
         &self,
         session: &Session,
@@ -269,6 +324,9 @@ impl Trading<'_> {
                         true,
                     )
                     .await?;
+                    // A definitive rejection can leave no collateral projection
+                    // to compare with the approved digest.
+                    prepared.check_cli_execution(addr, false)?;
                 }
             }
         }
@@ -333,18 +391,15 @@ impl TradePreview {
         account: &str,
         require_oracle_time: bool,
     ) -> Result<(), SaiError> {
-        if let Some(estimates) = &self.estimates {
-            let execution = &estimates["execution"];
-            if (execution["status"] == "would_be_rejected"
-                || (require_oracle_time && execution["code"] == "OraclePublicationTimeUnknown"))
-                && let Some(reason) = execution["reason"].as_str()
-            {
-                let preview = self.cli_preview_output(Some(account));
-                return Err(SaiError {
-                    details: Some(Box::new(Map::from_iter([("preview".into(), preview)]))),
-                    ..SaiError::new(Code::PreviewMismatch, reason)
-                });
-            }
+        if let Some(reason) = self
+            .execution_refusal(require_oracle_time)
+            .and_then(|execution| execution["reason"].as_str())
+        {
+            let preview = self.cli_preview_output(Some(account));
+            return Err(SaiError {
+                details: Some(Box::new(Map::from_iter([("preview".into(), preview)]))),
+                ..SaiError::new(Code::PreviewMismatch, reason)
+            });
         }
         Ok(())
     }
@@ -472,6 +527,9 @@ pub fn digest_bytes(preview: &TradePreview, account: Option<&str>) -> Vec<u8> {
             fields.insert("closedNotionalUsdAvailable".into(), json!(usd_available));
         }
         material["quote"] = quote;
+    }
+    if let Some(collateral) = &preview.leverage_collateral {
+        material["collateralBaseUnits"] = json!(collateral);
     }
     if let Some(route) = &preview.position_route {
         material["positionRoute"] = json!(route);

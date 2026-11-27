@@ -39,6 +39,7 @@ pub(super) enum SnapshotError {
     Owner(&'static str),
     IndexMismatch,
     CollateralMismatch,
+    PositionChanged,
     Unavailable,
 }
 
@@ -342,23 +343,34 @@ impl Trading<'_> {
 }
 
 impl Snapshot {
+    // A failed height read leaves the oracle age unknown. A changed position
+    // leaves the entire quote unavailable.
     pub(super) async fn verified_height(
         &self,
         lcd: &Lcd<'_>,
         id: &Value,
     ) -> Result<Option<String>, SnapshotError> {
         let trader = text_field(&self.raw, "user")?;
-        let (latest, height) = lcd
+        let Ok((latest, height)) = lcd
             .position(&self.route.contract_address, trader, id, Read::Fresh)
-            .await?;
+            .await
+        else {
+            return Ok(None);
+        };
         if !latest.is_object() {
-            return Err(SnapshotError::Unavailable);
+            return Ok(None);
         }
         if !same_account(trader, latest.get("user")) {
             return Err(SnapshotError::Owner(CONTRACT_OWNER));
         }
         if latest["user_trade_index"] != format!("UserTradeIndex({id})") {
             return Err(SnapshotError::IndexMismatch);
+        }
+        if height.as_deref().is_some_and(|height| {
+            !height.bytes().all(|byte| byte.is_ascii_digit())
+                || height.trim_start_matches('0').is_empty()
+        }) {
+            return Ok(None);
         }
         if [
             "market_index",
@@ -373,13 +385,7 @@ impl Snapshot {
         .iter()
         .any(|&key| latest.get(key) != self.raw.get(key))
         {
-            return Ok(None);
-        }
-        if height.as_deref().is_some_and(|height| {
-            !height.bytes().all(|byte| byte.is_ascii_digit())
-                || height.trim_start_matches('0').is_empty()
-        }) {
-            return Err(height_error("LCD returned an invalid contract query height.").into());
+            return Err(SnapshotError::PositionChanged);
         }
         Ok(height)
     }

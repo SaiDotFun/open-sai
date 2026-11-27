@@ -139,10 +139,9 @@ fn short(addr: &str) -> String {
         .map_or_else(|| addr.into(), |(index, _)| format!("{}…", &addr[..index]))
 }
 
-pub(crate) fn safe_log_path(env: &Environment) -> bool {
-    !env.home.is_symlink()
-        && !env.home.join("logs").is_symlink()
-        && files::verify_profile_owner(&env.home).is_ok()
+pub(crate) fn start_log_writer(env: Environment) -> Option<sai_core::log::LogWriter> {
+    let approved = files::diagnostic_log_dir(&env.home).ok()?;
+    sai_core::log::LogWriter::start_doctor_command(env, approved)
 }
 
 impl DoctorArgs {
@@ -162,13 +161,13 @@ impl DoctorArgs {
         let fix = !self.no_fix;
         let fix_profile = fix && files::verify_profile_owner(&env.home).is_ok();
         let config_env = env.clone();
-        let (config, settings, invalid_endpoint, log_settings) =
+        let (config, settings, invalid_setting, log_settings) =
             sai_core::files::read_before(Instant::now() + DEADLINE, move || {
-                let (check, settings, invalid_endpoint) = config_check(&flags, &config_env);
+                let (check, settings, invalid_setting) = config_check(&flags, &config_env);
                 Ok((
                     check,
                     settings,
-                    invalid_endpoint,
+                    invalid_setting,
                     doctor_log_settings(&config_env),
                 ))
             })
@@ -200,7 +199,7 @@ impl DoctorArgs {
         checks.push(timed(|| files::logs_check(env, fix_profile, log_settings)));
 
         let started = Instant::now();
-        match mcp::check_registrations(fix, DEADLINE, self.mcp_profile.as_deref()) {
+        match mcp::check_registrations(&env.home, fix, DEADLINE, self.mcp_profile.as_deref()) {
             Ok(results) => checks.extend(results.into_iter().map(|report| {
                 let mut check = Check::new(
                     format!("mcp.{}", report.client),
@@ -295,7 +294,7 @@ impl DoctorArgs {
                 render_text(&checks, overall)
             };
             let mut error = SaiError::new(code, message);
-            if invalid_endpoint {
+            if invalid_setting {
                 error.exit_code = ExitCode::Usage;
             }
             if json_output {
@@ -333,7 +332,7 @@ fn config_check(flags: &Flags, env: &Environment) -> (Check, Option<Settings>, b
             return (
                 Check::new("config", "fail", message).fix(edit),
                 None,
-                error.is_invalid_endpoint(),
+                error.is_invalid_setting(),
             );
         }
     };
@@ -344,7 +343,7 @@ fn config_check(flags: &Flags, env: &Environment) -> (Check, Option<Settings>, b
                 Check::new("config", "fail", error.to_string())
                     .fix("Check the settings listed by `sai config --help`"),
                 None,
-                error.is_invalid_endpoint(),
+                error.is_invalid_setting(),
             );
         }
     };
@@ -386,7 +385,9 @@ fn install_info() -> (Check, Value, bool) {
     let provenance = if let Some(root) = checkout {
         json!({"kind": "source-checkout", "path": root, "git": mcp::checkout_state(root)})
     } else {
-        json!({"kind": "installed", "path": executable})
+        let launcher = crate::mcp::launcher_path(&executable);
+        let directory = launcher.as_deref().unwrap_or(&executable).parent();
+        json!({"kind": "installed", "path": directory})
     };
     let launchers = mcp::launchers_on_path();
     let mut details = json!({"version": VERSION, "provenance": provenance, "onPath": launchers});
@@ -552,7 +553,7 @@ fn session_check(home: &Path, settings: &Settings, now: DateTime<Utc>) -> (Check
             guidance,
         )
     } else if !matches {
-        let login = keeper_hint(home, settings.endpoint(), &["auth", "login", "NAME"]);
+        let login = storage.trade_command_hint(settings.endpoint(), &["auth", "login", "NAME"]);
         match endpoint {
             Some(origin) => Check::new("session", "fail", format!("Session for {addr} belongs to a different Keeper endpoint. Stored origin {origin}, configured origin {}", log::origin(settings.endpoint())))
                 .fix(format!("{login}, or restore the Keeper URL used to sign in")),
@@ -586,7 +587,7 @@ fn session_recovery(mut check: Check, command: Option<String>, guidance: Option<
     check
 }
 
-fn shell_quote(arg: &str) -> String {
+pub(crate) fn shell_quote(arg: &str) -> String {
     if !arg.is_empty()
         && arg
             .bytes()
@@ -595,21 +596,6 @@ fn shell_quote(arg: &str) -> String {
         return arg.to_owned();
     }
     format!("'{}'", arg.replace('\'', "'\"'\"'"))
-}
-
-fn keeper_hint(home: &Path, endpoint: &str, args: &[&str]) -> String {
-    let flag = if log::origin(endpoint) == endpoint && log::redact(home, endpoint) == endpoint {
-        shell_quote(endpoint)
-    } else {
-        r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#
-            .into()
-    };
-    let args = args
-        .iter()
-        .map(|arg| shell_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("sai --endpoint {flag} {args}")
 }
 
 fn render_text(checks: &[Check], overall: &str) -> String {

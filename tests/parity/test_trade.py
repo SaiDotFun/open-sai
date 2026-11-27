@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import socket
 import sqlite3
@@ -31,6 +32,7 @@ from scenarios import (
 )
 
 CLI = tuple[str, ...]
+OBSERVED_AT = re.compile(rb'"observedAt": "\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z"')
 OPEN = (
     "trade",
     "open",
@@ -53,6 +55,21 @@ CLOSE = ("trade", "close", "7")
 CANCEL = ("trade", "cancel", "7")
 CANCEL_READS = ["oneClickTrading", "node_info", "get_trade_raw"]
 CLOSE_READS = ["trade", *CANCEL_READS]
+CLOSE_ESTIMATE_READS = [
+    "borrowing",
+    "get_exchange_balance",
+    "get_trade_raw",
+    "get_perp_prices",
+]
+OPEN_ESTIMATE_READS = [
+    "oneClickTrading",
+    "node_info",
+    "get_market",
+    "get_group",
+    "get_pair_custom_max_leverage",
+    "get_fees",
+    "get_collateral_price",
+]
 
 
 @pytest.fixture
@@ -86,6 +103,7 @@ def current_trade_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
         ((*OPEN, "--type", "limit"), "quote-trigger-fee", True),
         ((*OPEN, "--type", "stop"), "quote-trigger-fee", True),
         (OPEN, "quote-close-only", False),
+        (CLOSE, "quote-close", True),
         (CLOSE, "quote-queued", True),
         (CLOSE, "quote-no-publication", False),
         ((*CLOSE, "--cancel-order"), "pending-order", True),
@@ -101,6 +119,11 @@ def current_trade_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
             True,
         ),
         (("trade", "partial-close", "7", "--percent", "50"), "partial-preview", True),
+        (
+            ("trade", "partial-close", "7", "--percent", "50"),
+            "quote-close-collateral-changed",
+            True,
+        ),
     ],
     ids=[
         "market-explicit",
@@ -109,15 +132,17 @@ def current_trade_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
         "stop",
         "rejected-open",
         "close",
+        "close-queued",
         "close-unknown-oracle",
         "pending-cancel",
         "tpsl",
         "leverage",
         "margin",
         "partial-close",
+        "partial-close-collateral-changed",
     ],
 )
-def test_cli_dry_run_digest_matches_python_main(
+def test_cli_dry_run_matches_python_main(
     cli_pair: tuple[CLI, CLI],
     tmp_path: Path,
     args: CLI,
@@ -125,7 +150,7 @@ def test_cli_dry_run_digest_matches_python_main(
     confirmable: bool,
 ) -> None:
     reference = str(Path(sys.executable).with_name("sai"))
-    confirmations = []
+    previews = []
     for index, cli in enumerate(((reference,), cli_pair[1])):
         with loopback(scenario) as endpoints:
             home = tmp_path / str(index)
@@ -139,10 +164,47 @@ def test_cli_dry_run_digest_matches_python_main(
                 assert digest == preview_digest(preview)
             else:
                 assert digest is None
-            confirmations.append((preview["positionRoute"], digest))
+            if args[:2] == ("trade", "leverage"):
+                assert preview["collateralBaseUnits"] == {
+                    "before": "10000000",
+                    "after": "10999999",
+                }
+            if index == 0 and args[1] in {"leverage", "margin"}:
+                # Issue 231 tracks the Python-only collateral display fields.
+                assert preview.pop("collateral") == {
+                    "beforeUsdc": "10.000000",
+                    "afterUsdc": "10.999999",
+                    "beforeUsd": "10",
+                    "afterUsd": "10.999999",
+                }
+            assert preview["positionRoute"]
+            canonical = json.dumps(preview, sort_keys=True).encode()
+            previews.append(OBSERVED_AT.sub(b'"observedAt": "<time>"', canonical))
             assert not endpoints.errors
             assert not rows(home)
-    assert confirmations[0] == confirmations[1]
+        if scenario == "quote-close-collateral-changed":
+            assert isinstance(digest, str)
+            with loopback("partial-preview-changed") as endpoints:
+                retry = tmp_path / f"retry-{index}"
+                seed_home(retry, endpoints, "session")
+                code, refusal, stderr = run(
+                    cli,
+                    retry,
+                    endpoints,
+                    (*args, "--preview-digest", digest),
+                    python=index == 0,
+                )
+                assert (code, stderr, refusal["error"]["code"]) == (
+                    4,
+                    "",
+                    "PREVIEW_MISMATCH",
+                ), (refusal, endpoints.errors)
+                assert not any(
+                    request.label == "recordUserIntent" for request in endpoints.wire
+                )
+                assert not endpoints.errors
+                assert not rows(retry)
+    assert previews[0] == previews[1]
 
 
 def run(
@@ -197,6 +259,7 @@ def test_numeric_keeper_price_rounds_to_even(
             assert code == 0
             assert [request.label for request in endpoints.wire] == [
                 "borrowings",
+                *([] if index == 0 else OPEN_ESTIMATE_READS),
                 "recordUserIntent",
             ]
             body = endpoints.wire[-1].variables["input"]["intent"]["body"]
@@ -246,6 +309,7 @@ def test_python_reads_rust_trade_events_offline(
         assert report["txHash"] == TRADE_REQUEST_HASH.lower()
         assert [request.label for request in endpoints.wire] == [
             *CLOSE_READS,
+            *CLOSE_ESTIMATE_READS,
             "recordUserIntent",
         ]
         events = {event["event"]: event for event in report["events"]}
@@ -288,6 +352,7 @@ def test_python_reads_rust_reconciliation_evidence_offline(
         }
         assert [request.label for request in endpoints.wire] == [
             *CLOSE_READS,
+            *CLOSE_ESTIMATE_READS,
             "recordUserIntent",
             "userIntents",
         ]
@@ -364,7 +429,6 @@ MARKET_PREVIEW = intent_for(
             "Slippage must be between 0 and 100 with at most 16 decimal places",
         ),
         ((*OPEN, "--slippage", "0.0"), "Slippage must be a positive finite decimal"),
-        (("trade", "close", "--", "-1"), "Trade id must not be negative"),
     ],
 )
 def test_validate_before_loading_session(
@@ -478,6 +542,7 @@ def test_position_trade_preserves_lcd_query(
             assert (code, output.get("status"), stderr) == (0, "accepted", "")
             assert [request.label for request in endpoints.wire] == [
                 *(CANCEL_READS if cancel else CLOSE_READS),
+                *(CLOSE_ESTIMATE_READS if not cancel and index == 1 else []),
                 "recordUserIntent",
             ]
             assert not endpoints.errors
@@ -710,35 +775,128 @@ def test_exact_decimal_checks_intentionally_differ_from_python(
             assert not rows(home)
 
 
-def test_non_ascii_market_id_is_an_accepted_parity_divergence(
-    trade_pair: tuple[CLI, CLI], tmp_path: Path
+@pytest.mark.parametrize(
+    "args",
+    [
+        *(
+            (*OPEN, option, "3٣")
+            for option in (
+                "--market",
+                "--amount",
+                "--leverage",
+                "--price",
+                "--slippage",
+                "--take-profit",
+                "--stop-loss",
+            )
+        ),
+        (*CLOSE[:2], "3٣"),
+        (*CANCEL[:2], "3٣"),
+        ("trade", "tpsl", "3٣", "--take-profit", "110"),
+        ("trade", "tpsl", "7", "--take-profit", "3٣"),
+        ("trade", "tpsl", "7", "--stop-loss", "3٣"),
+        ("trade", "leverage", "3٣", "--leverage", "5"),
+        ("trade", "leverage", "7", "--leverage", "3٣"),
+        ("trade", "margin", "3٣", "--direction", "add", "--amount", "1"),
+        ("trade", "margin", "7", "--direction", "add", "--amount", "3٣"),
+        ("trade", "partial-close", "3٣", "--percent", "50"),
+        ("trade", "partial-close", "7", "--percent", "3٣"),
+        ("trade", "close", "--", "-1"),
+        *(
+            args
+            for bad in ("0_7", "+7", " 7 ")
+            for args in (
+                (*OPEN, "--market", bad),
+                (*CLOSE[:2], bad),
+                (*CANCEL[:2], bad),
+                ("trade", "tpsl", bad, "--take-profit", "110"),
+                ("trade", "leverage", bad, "--leverage", "5"),
+                ("trade", "margin", bad, "--direction", "add", "--amount", "1"),
+                ("trade", "partial-close", bad, "--percent", "50"),
+                ("trade", "partial-close", "7", "--percent", bad),
+            )
+        ),
+    ],
+)
+def test_malformed_trade_numbers_are_usage_errors(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, args: CLI
 ) -> None:
-    for index, cli in enumerate(trade_pair):
+    python = (str(Path(sys.executable).with_name("sai")),)
+    results = []
+    for index, cli in enumerate((python, cli_pair[1])):
         with loopback("trade-accepted") as endpoints:
             home = tmp_path / str(index)
             seed_home(home, endpoints, "empty")
-            code, result, stderr = run(
-                cli,
-                home,
-                endpoints,
-                (*OPEN, "--market", "٣", "--dry-run"),
-                python=index == 0,
-            )
-            assert stderr == ""
-            if index == 0:
-                assert code == 0
-                assert (
-                    result["intent"]["body"]["market"]["marketIndex"]
-                    == "MarketIndex(3)"
-                )
-            else:
-                assert code == 2
-                assert (
-                    result["error"]["message"]
-                    == "Invalid value for '--market': expected an integer."
-                )
+            outcome = run(cli, home, endpoints, args, python=index == 0)
+            code, result, stderr = outcome
+            assert (code, result.get("error", {}).get("code"), stderr) == (
+                2,
+                "INVALID_REQUEST",
+                "",
+            ), result
             assert not endpoints.wire
             assert not rows(home)
+            results.append(outcome)
+    python_error = results[0][1]["error"]
+    option, value = args[-2:]
+    if python_error["message"] == (
+        f"Invalid value for '{option}': {value!r} is not a valid decimal."
+    ):
+        python_error["message"] = f"Invalid value for '{option}': expected a decimal."
+    assert results[0] == results[1]
+
+
+@pytest.mark.parametrize(
+    ("option", "host", "flags"),
+    [
+        ("--amount", "bücher.invalid", ("--dry-run",)),
+        ("--price", "fixture.invalid", ("--preview-digest", "stale")),
+        ("--leverage", "bücher.invalid", ("--dry-run",)),
+        ("--take-profit", "bücher.invalid", ("--dry-run",)),
+        ("--stop-loss", "bücher.invalid", ("--dry-run",)),
+        ("--slippage", "bücher.invalid", ("--dry-run",)),
+    ],
+)
+@pytest.mark.parametrize("json_flags", [(), ("--json",)], ids=["text", "json"])
+def test_decimal_usage_errors_hide_rejected_value(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    option: str,
+    host: str,
+    flags: CLI,
+    json_flags: CLI,
+) -> None:
+    _, rust = cli_pair
+    key = "synthetic-decimal-argument-key"
+    value = f"https://{host}/query?api_key={key}"
+    with loopback("trade-accepted") as endpoints:
+        home = tmp_path / "home"
+        seed_home(home, endpoints, "session")
+        result = subprocess.run(
+            [*rust, *json_flags, *OPEN, option, value, *flags],
+            cwd=home,
+            env={**child_env(home, endpoints), "SAI_LOG": "1", "SAI_UPDATE_AUTO": "0"},
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 2
+        if json_flags:
+            assert result.stderr == ""
+            error = json.loads(result.stdout)["error"]
+            assert error["code"] == "INVALID_REQUEST"
+            message = error["message"]
+        else:
+            assert result.stdout == ""
+            message = result.stderr
+        assert option in message
+        assert key not in result.stdout + result.stderr
+        for log_file in (home / "sai/logs").rglob("*.jsonl"):
+            assert key not in log_file.read_text()
+        assert not endpoints.wire
+        assert not rows(home)
 
 
 @pytest.mark.parametrize(
@@ -788,10 +946,16 @@ def test_trade_submission(
             )
             assert exit_status == exit_code
             assert not endpoints.errors
-            assert [request.label for request in endpoints.wire] == (
-                (["borrowings"] if markets else CANCEL_READS if cancel else CLOSE_READS)
-                + ["recordUserIntent"]
-            )
+            if markets:
+                reads = ["borrowings", *([] if index == 0 else OPEN_ESTIMATE_READS)]
+            elif close and index == 1:
+                reads = CLOSE_READS + CLOSE_ESTIMATE_READS
+            else:
+                reads = CANCEL_READS if cancel else CLOSE_READS
+            assert [request.label for request in endpoints.wire] == [
+                *reads,
+                "recordUserIntent",
+            ]
             variables = endpoints.wire[-1].variables
             envelope = variables["input"]
             key = envelope["intentKey"]
@@ -842,7 +1006,10 @@ def test_trade_submission(
             else:
                 assert output["error"]["intentKey"] == key
                 assert output["error"]["code"] == code
-            keeper_reads = 2 if close else int(markets or cancel)
+            keeper_reads = sum(
+                label in {"borrowing", "borrowings", "oneClickTrading", "trade"}
+                for label in reads
+            )
             expected_events = [("keeper.request", "ok")] * keeper_reads
             expected_events.extend(
                 [
@@ -893,7 +1060,7 @@ def test_open_retry_preserves_first_reservation(
             assert error["error"]["code"] == "RECENT_OPEN_PENDING"
             assert error["error"]["intentKey"] == key
             assert len(rows(home)) == 1
-            assert len(endpoints.wire) == 1
+            assert sum(r.label == "recordUserIntent" for r in endpoints.wire) == 1
             observations.append(
                 (json.dumps(error, sort_keys=True).replace(key, "<intent>"), stderr)
             )
@@ -905,10 +1072,78 @@ def test_open_retry_preserves_first_reservation(
                 (*args, "--allow-concurrent-open"),
                 python=index == 0,
             )
-            assert len(endpoints.wire) == 2
+            assert sum(r.label == "recordUserIntent" for r in endpoints.wire) == 2
             assert len(rows(home)) == 2
             assert not endpoints.errors
     assert observations[0] == observations[1]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("trade", "margin", "7", "--direction", "remove", "--amount", "1"),
+        ("trade", "partial-close", "7", "--percent", "50"),
+    ],
+    ids=["margin-remove", "partial-close"],
+)
+def test_stale_index_is_retryable_before_submission(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    args: CLI,
+) -> None:
+    monkeypatch.delenv("SAI_PARITY_PYTHON", raising=False)
+    clis: tuple[CLI, CLI] = request.getfixturevalue("cli_pair")
+    for index, cli in enumerate(clis):
+        with loopback("position-index-lag") as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            code, result, stderr = run(cli, home, endpoints, args, python=index == 0)
+            assert (code, stderr) == (1, "")
+            assert result["error"]["code"] == "INVALID_REQUEST"
+            assert result["error"]["retryable"] is True, (cli, result["error"])
+            assert not rows(home)
+            assert "recordUserIntent" not in [entry.label for entry in endpoints.wire]
+            assert not endpoints.errors
+
+
+def test_open_retry_is_in_the_blocking_intent_trail(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The released Python reference predates scoped open-refusal events.
+    monkeypatch.delenv("SAI_PARITY_PYTHON", raising=False)
+    clis: tuple[CLI, CLI] = request.getfixturevalue("cli_pair")
+    args = (*OPEN, "--type", "limit")
+    for index, cli in enumerate(clis):
+        with loopback("trade-accepted") as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            code, first, stderr = run(cli, home, endpoints, args, python=index == 0)
+            assert (code, stderr) == (0, "")
+            key = first["intentKey"]
+            code, blocked, stderr = run(cli, home, endpoints, args, python=index == 0)
+            assert (code, stderr) == (1, "")
+            assert blocked["error"]["code"] == "RECENT_OPEN_PENDING"
+            code, trail, stderr = run(
+                cli,
+                home,
+                endpoints,
+                ("logs", "intent", key, "--offline"),
+                python=index == 0,
+            )
+            assert (code, stderr) == (0, "")
+            [refusal] = [
+                event
+                for event in trail["events"]
+                if event["event"] == "intent.open_blocked"
+            ]
+            assert refusal["intentKey"] == key and refusal["addr"] == ADDRESS
+            assert refusal["code"] == blocked["error"]["code"]
+            assert (
+                sum(entry.label == "recordUserIntent" for entry in endpoints.wire) == 1
+            )
+            assert len(rows(home)) == 1
+            assert not endpoints.errors
 
 
 def test_connect_failure_releases_reservation(
@@ -1014,6 +1249,7 @@ def test_concurrent_close_sends_once(
     current_trade_pair: tuple[CLI, CLI], tmp_path: Path
 ) -> None:
     for index, cli in enumerate(current_trade_pair):
+        reads = CLOSE_READS + (CLOSE_ESTIMATE_READS if index == 1 else [])
         with loopback("concurrent-close") as endpoints, ThreadPoolExecutor() as tasks:
             home = tmp_path / str(index)
             seed_home(home, endpoints, "session")
@@ -1037,9 +1273,9 @@ def test_concurrent_close_sends_once(
                     "",
                 )
                 assert [entry.label for entry in endpoints.wire] == [
-                    *CLOSE_READS,
+                    *reads,
                     "recordUserIntent",
-                    *CLOSE_READS,
+                    *reads,
                 ]
             finally:
                 endpoints.admission.release.set()
@@ -1051,9 +1287,9 @@ def test_concurrent_close_sends_once(
                 "",
             )
             assert [entry.label for entry in endpoints.wire] == [
-                *CLOSE_READS,
+                *reads,
                 "recordUserIntent",
-                *CLOSE_READS,
+                *reads,
             ]
             assert [row[2] for row in rows(home)] == ["accepted"]
             assert not endpoints.errors
@@ -1124,10 +1360,11 @@ def test_interrupt_after_dispatch_reports_reserved_key(
             ) == 1
             assert not endpoints.errors
             if scenario == "concurrent-close":
+                reads = CLOSE_READS + (CLOSE_ESTIMATE_READS if index == 1 else [])
                 assert [entry.label for entry in endpoints.wire] == [
-                    *CLOSE_READS,
+                    *reads,
                     "recordUserIntent",
-                    *CLOSE_READS,
+                    *reads,
                 ]
 
 
@@ -1154,7 +1391,11 @@ def test_mixed_clients_reconcile_a_post_dispatch_timeout(
         assert code == 1
         assert result["error"]["code"] == "RECENT_OPEN_PENDING"
         assert result["error"]["intentKey"] == key
-        assert [request.label for request in endpoints.wire] == ["recordUserIntent"]
+        assert [
+            request.label
+            for request in endpoints.wire
+            if request.label in {"recordUserIntent", "userIntents"}
+        ] == ["recordUserIntent"]
 
         code, _, _ = run(
             peer,
@@ -1166,7 +1407,11 @@ def test_mixed_clients_reconcile_a_post_dispatch_timeout(
         assert code == 0
         assert [row[2] for row in rows(home)] == ["terminal"]
         assert run(sender, home, endpoints, args, python=first == 0)[0] == 0
-        assert [request.label for request in endpoints.wire] == [
+        assert [
+            request.label
+            for request in endpoints.wire
+            if request.label in {"recordUserIntent", "userIntents"}
+        ] == [
             "recordUserIntent",
             "userIntents",
             "recordUserIntent",

@@ -8,7 +8,7 @@ use crate::{
     trade::{
         TradePreview, Trading,
         actions::invalid,
-        position::{ContractPositionError, Lcd, PositionRoute, Snapshot, SnapshotError},
+        position::{ContractPositionError, Lcd, PositionRoute, Read, Snapshot, SnapshotError},
     },
 };
 
@@ -99,7 +99,12 @@ impl Trading<'_> {
         match quote.await {
             Err(SnapshotError::Owner(message)) => Err(invalid(message)),
             Err(SnapshotError::IndexMismatch) => Ok((false, result)),
-            Ok(()) | Err(SnapshotError::CollateralMismatch | SnapshotError::Unavailable) => {
+            Ok(())
+            | Err(
+                SnapshotError::CollateralMismatch
+                | SnapshotError::PositionChanged
+                | SnapshotError::Unavailable,
+            ) => {
                 // Missing estimate inputs do not invalidate the verified owner and index.
                 Ok((true, result))
             }
@@ -110,14 +115,14 @@ impl Trading<'_> {
         lcd: &Lcd<'_>,
         state: &Snapshot,
         id: &Value,
-        height: Option<&str>,
+        height: Result<Option<&str>, &SnapshotError>,
         partial: PartialCloseQuote<'_>,
     ) -> Value {
         let mut result = unavailable_close(true);
         if !state.raw["long"].is_boolean() {
             return result;
         }
-        if let Some(height) = height {
+        if let Ok(Some(height)) = height {
             let quote_lcd = QuoteLcd::new(lcd.0, state.route.contract_address.clone());
             Self::quote_close(
                 &quote_lcd,
@@ -129,7 +134,7 @@ impl Trading<'_> {
                 &mut result,
             )
             .await;
-        } else {
+        } else if !matches!(height, Err(SnapshotError::PositionChanged)) {
             unknown_oracle_time(&mut result);
         }
         result
@@ -183,7 +188,7 @@ impl Trading<'_> {
             }
             return Some(());
         }
-        let pair = lcd.market(&raw["market_index"], height).await?;
+        let pair = lcd.market(&raw["market_index"], Read::At(height?)).await?;
         let group = lcd.group(&pair, height).await?;
         let ttl = group["stale_price_expiration_secs"].as_u64()?;
         if ttl > 0

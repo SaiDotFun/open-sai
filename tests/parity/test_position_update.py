@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import pytest
 from compare import INTENT_ID, timestamp
 from keeper_wire import WireRequest, graphql_request, same_variables
+from sai_cli.core.confirmation import preview_digest
 from sai_cli.tests.loopback import http_server
 from scenarios import (
     ADDRESS,
@@ -184,7 +185,11 @@ def update_loopback(mode: str) -> Generator[Endpoints]:
     }
     lcd_replies = {
         "get_trade_raw": raw,
-        "get_exchange_balance": {"collateral_index": "TokenIndex(0)"},
+        "get_exchange_balance": (
+            {}
+            if mode == "balance-missing-index"
+            else {"collateral_index": "TokenIndex(0)"}
+        ),
         "is_after_hours_market": mode == "after-hours",
         "get_market": {
             "group_index": "GroupIndex(0)",
@@ -200,12 +205,15 @@ def update_loopback(mode: str) -> Generator[Endpoints]:
         },
         "get_pair_custom_max_leverage": "8" if mode == "pair-cap" else "0",
         "get_fees": {"open_fee_p": "0.001"},
+        "get_collateral_price": "1.01",
         "get_perp_prices": {
             "market": {
                 "base_per_quote": {
                     "queued": "85",
                     "stale": "85",
                     "liquidation": "85",
+                    "cap-missing-height": "85",
+                    "cap-wrong-height": "85",
                     "short-liquidation": "110",
                 }.get(mode, "99"),
                 "base_last_update_time": 995,
@@ -227,6 +235,7 @@ def update_loopback(mode: str) -> Generator[Endpoints]:
         "get_group": {"index": "GroupIndex(0)"},
         "get_pair_custom_max_leverage": {"index": 3},
         "get_fees": {"index": "FeeIndex(0)"},
+        "get_collateral_price": {"collateral_index": "TokenIndex(0)"},
         "get_perp_prices": {
             "market_index": "MarketIndex(3)",
             "collateral_index": "TokenIndex(0)",
@@ -566,36 +575,116 @@ def test_position_update_dry_run(
             assert document["dryRun"] is True
             assert document["intent"] == intent(command)
             assert document["estimates"] == expected
-            outputs.append(output)
             wire = PYTHON_QUOTE_WIRE if implementation == "python" else QUOTE_WIRE
             if command == LEVERAGE:
                 wire = QUOTE_WIRE[:-1]
-            assert [entry.label for entry in endpoints.wire] == wire + suffix
+            expected_wire = wire + suffix
+            if (
+                command == LEVERAGE
+                and expected["liquidationPrice"]["status"] == "estimate"
+            ):
+                assert document["collateralBaseUnits"] == {
+                    "before": "20000000",
+                    "after": "10000000",
+                }
+                assert document["previewDigest"] == preview_digest(document)
+                if implementation == "python":
+                    # Issue 231 still tracks USD display in Rust.
+                    assert document.pop("collateral") == {
+                        "beforeUsdc": "20.000000",
+                        "afterUsdc": "10.000000",
+                        "beforeUsd": "20.2",
+                        "afterUsd": "10.1",
+                    }
+                    expected_wire += ["get_collateral_price"]
+                    output = (json.dumps(document, sort_keys=True) + "\n").encode()
+            outputs.append(output)
+            assert [entry.label for entry in endpoints.wire] == expected_wire
             assert not endpoints.errors
             assert not (home / "sai/trader/intents.sqlite3").exists()
     assert outputs[0] == outputs[1]
 
 
-@pytest.mark.parametrize("mode", ["cap-wrong-height", "cap-missing-height"])
-def test_pair_cap_fallback_requires_the_pinned_height(
-    cli_pair: tuple[CLI, CLI], tmp_path: Path, mode: str
+@pytest.mark.parametrize("mode", ["cap-missing-height", "cap-wrong-height"])
+@pytest.mark.parametrize("confirmed", [False, True], ids=["direct", "confirmed"])
+def test_missing_pair_cap_still_checks_liquidation(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, confirmed: bool, mode: str
 ) -> None:
-    # The pinned Python helper accepts even unverified storage misses.
+    args = LEVERAGE
+    python = (str(Path(sys.executable).with_name("sai")),)
+    if confirmed:
+        with update_loopback("default") as endpoints:
+            home = tmp_path / "preview"
+            seed_home(home, endpoints, "session")
+            code, preview, stderr = run(
+                python, home, endpoints, (*args, "--dry-run"), python=True
+            )
+            assert (code, stderr) == (0, "")
+            args = (*args, "--preview-digest", preview["previewDigest"])
+    for index, cli in enumerate((python, cli_pair[1])):
+        home = tmp_path / str(index)
+        with update_loopback(mode) as endpoints:
+            seed_home(home, endpoints, "session")
+            code, result, stderr = run(cli, home, endpoints, args, python=index == 0)
+            assert not endpoints.errors
+            assert all(entry.label != "recordUserIntent" for entry in endpoints.wire)
+            assert not rows(home)
+            assert (code, stderr) == (4, "")
+            error = result["error"]
+            assert error["code"] == "PREVIEW_MISMATCH"
+            assert error["details"]["preview"]["estimates"]["execution"]["code"] == (
+                "LiquidationReached"
+            )
+
+
+@pytest.mark.parametrize("bound", [True, False], ids=["bound", "advisory"])
+def test_confirmed_leverage_with_unavailable_preliminary_balance(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, bound: bool
+) -> None:
     _, rust = cli_pair
+    python = (str(Path(sys.executable).with_name("sai")),)
+    mode = "default" if bound else "balance-missing-index"
     with update_loopback(mode) as endpoints:
-        seed_home(tmp_path / "rust", endpoints, "session")
-        code, output, stderr = run(
-            rust, tmp_path / "rust", endpoints, (*LEVERAGE, "--dry-run"), python=False
+        home = tmp_path / "preview"
+        seed_home(home, endpoints, "session")
+        code, preview, stderr = run(
+            python, home, endpoints, (*LEVERAGE, "--dry-run"), python=True
         )
         assert (code, stderr) == (0, "")
-        assert output["estimates"] == dict.fromkeys(
-            estimates({}), unavailable(UNKNOWN_LEVERAGE)
-        )
-        assert [request.label for request in endpoints.wire] == QUOTE_WIRE[
-            :-1
-        ] + LEVERAGE_WIRE
+        assert ("collateralBaseUnits" in preview) is bound
         assert not endpoints.errors
-        assert not (tmp_path / "rust/sai/trader/intents.sqlite3").exists()
+        assert not rows(home)
+
+    args = (*LEVERAGE, "--preview-digest", preview["previewDigest"])
+    for index, cli in enumerate((python, rust)):
+        home = tmp_path / str(index)
+        with update_loopback("balance-missing-index") as endpoints:
+            seed_home(home, endpoints, "session")
+            code, result, stderr = run(cli, home, endpoints, args, python=index == 0)
+            assert not endpoints.errors
+            if bound:
+                assert (code, result["error"]["code"], stderr) == (
+                    4,
+                    "PREVIEW_MISMATCH",
+                    "",
+                )
+                assert all(
+                    entry.label != "recordUserIntent" for entry in endpoints.wire
+                )
+                assert not rows(home)
+                continue
+            assert (code, stderr) == (0, "")
+            (request,) = [
+                entry.variables["input"]
+                for entry in endpoints.wire
+                if entry.label == "recordUserIntent"
+            ]
+            assert {key: request["intent"][key] for key in intent(LEVERAGE)} == intent(
+                LEVERAGE
+            )
+            assert [row[:6] for row in rows(home)] == [
+                (request["intentKey"], "UPDATE_TRADE", "accepted", "7", ADDRESS, None)
+            ]
 
 
 @pytest.mark.parametrize("command", [TPSL, LEVERAGE], ids=["tpsl", "leverage"])
@@ -639,13 +728,18 @@ def test_position_update_submission(
     status: str,
 ) -> None:
     for implementation, cli in runners(cli_pair):
+        reads = (
+            QUOTE_WIRE[:-1] + LEVERAGE_WIRE + ["get_fees", "quote_trade"]
+            if command == LEVERAGE and implementation == "rust"
+            else UPDATE_WIRE
+        )
         home = tmp_path / implementation
         with update_loopback(mode) as endpoints:
             seed_home(home, endpoints, "session")
             actual, output, stderr = run(cli, home, endpoints, command, python=False)
             assert (actual, stderr) == (code, "")
             assert [entry.label for entry in endpoints.wire] == [
-                *UPDATE_WIRE,
+                *reads,
                 "recordUserIntent",
             ]
             request = endpoints.wire[-1].variables["input"]
@@ -676,18 +770,20 @@ def test_position_update_submission(
                 assert failure["error"]["code"] == "INVALID_REQUEST"
                 assert failure["error"]["intentKey"] == key
                 assert [entry.label for entry in endpoints.wire] == [
-                    *UPDATE_WIRE,
+                    *reads,
                     "recordUserIntent",
-                    *UPDATE_WIRE,
+                    *reads,
                 ]
                 assert len(rows(home)) == 1
                 reconcile = ("intent", "status", ADDRESS, "--key", key)
                 assert run(cli, home, endpoints, reconcile, python=False)[0] == 0
                 assert rows(home)[0][2:6] == ("terminal", "7", ADDRESS, "terminal")
                 assert run(cli, home, endpoints, command, python=False)[0] == 0
-                assert [entry.label for entry in endpoints.wire][-6:] == [
+                assert [entry.label for entry in endpoints.wire][
+                    -(len(reads) + 2) :
+                ] == [
                     "userIntents",
-                    *UPDATE_WIRE,
+                    *reads,
                     "recordUserIntent",
                 ]
                 assert [row[2] for row in rows(home)] == ["terminal", "accepted"]

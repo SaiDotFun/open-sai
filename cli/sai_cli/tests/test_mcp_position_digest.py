@@ -101,6 +101,7 @@ class Position:
     minimum_position_microusd: str = "1"
     keeper_minimum_position_microusd: int = 1
     market_reads: int = 0
+    extra_market_rows: list[dict[str, Any]] = field(default_factory=list)
     preview_inputs: bool = False
     malformed_node_info: bool = False
     deny_lcd: bool = False
@@ -124,6 +125,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
     cached_replies: dict[str, Any] = {}
     market = {
         "marketId": 0,
+        "baseToken": {"symbol": "BTC"},
         "isOpen": True,
         "minLeverage": 1,
         "maxLeverage": 100,
@@ -206,7 +208,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     keeper.MARKET: {"perp": {"borrowing": market_row}},
                     keeper.MARKETS: {
                         "perp": {
-                            "borrowings": [market_row]
+                            "borrowings": [market_row, *position.extra_market_rows]
                             if position.keeper_market_visible
                             else []
                         }
@@ -889,7 +891,18 @@ def test_trade_confirmation_binds_verified_route(
             cli_preview = cli.invoke(main, [*cli_args, "--dry-run"])
             assert cli_preview.exit_code == 0, cli_preview.output
             digest = preview["previewDigest"]
-            assert json.loads(cli_preview.stdout)["previewDigest"] == digest
+            cli_document = json.loads(cli_preview.stdout)
+            cli_digest = cli_document["previewDigest"]
+            assert cli_document["positionRoute"] == preview["positionRoute"]
+            if tool == "leverage":
+                assert "collateralBaseUnits" not in preview
+                assert cli_document["collateralBaseUnits"] == {
+                    "before": "4000000",
+                    "after": "2666666",
+                }
+                assert cli_digest != digest
+            else:
+                assert cli_digest == digest
             assert preview["positionRoute"] == {
                 "chainId": CHAIN_ID,
                 "contractAddress": "nibi1contract",
@@ -902,7 +915,7 @@ def test_trade_confirmation_binds_verified_route(
 
             setattr(position, field, value)
             cli_refusal = cli.invoke(
-                main, [*cli_submit_args, "--preview-digest", digest]
+                main, [*cli_submit_args, "--preview-digest", cli_digest]
             )
             assert cli_refusal.exit_code == ExitCode.REJECTED, cli_refusal.output
             cli_error = json.loads(cli_refusal.stdout)["error"]
@@ -913,7 +926,9 @@ def test_trade_confirmation_binds_verified_route(
 
             if field == "contract_address" and tool != "open":
                 position.contract_position_unavailable = True
-                cli_refusal = cli.invoke(main, [*cli_args, "--preview-digest", digest])
+                cli_refusal = cli.invoke(
+                    main, [*cli_args, "--preview-digest", cli_digest]
+                )
                 assert cli_refusal.exit_code == ExitCode.REJECTED, cli_refusal.output
                 assert (
                     json.loads(cli_refusal.stdout)["error"]["code"]
@@ -941,8 +956,16 @@ def test_trade_confirmation_binds_verified_route(
                     "chainId": position.chain_id,
                     "contractAddress": position.contract_address,
                 }
+                fresh_cli_digest = fresh["previewDigest"]
+                if tool == "leverage":
+                    fresh_cli = cli.invoke(main, [*cli_args, "--dry-run"])
+                    assert fresh_cli.exit_code == 0, fresh_cli.output
+                    fresh_cli_document = json.loads(fresh_cli.stdout)
+                    assert fresh_cli_document["positionRoute"] == fresh["positionRoute"]
+                    fresh_cli_digest = fresh_cli_document["previewDigest"]
+                    assert fresh_cli_digest != cli_digest
                 accepted = cli.invoke(
-                    main, [*cli_submit_args, "--preview-digest", fresh["previewDigest"]]
+                    main, [*cli_submit_args, "--preview-digest", fresh_cli_digest]
                 )
                 assert accepted.exit_code == 0, accepted.output
                 assert json.loads(accepted.stdout)["status"] == "accepted"
@@ -3450,3 +3473,280 @@ def test_margin_checks_perps_borrowing_inclusive_leverage_quote(
             assert position.submitted == []
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("command", "after"),
+    [
+        (["leverage", "7", "--leverage", "1.6"], "5.000000"),
+        (
+            [
+                "margin",
+                "7",
+                "--direction",
+                "add",
+                "--amount",
+                "2",
+                "--max-collateral-usd",
+                "5",
+            ],
+            "4.950494",
+        ),
+        (
+            ["margin", "7", "--direction", "remove", "--amount", "1"],
+            "3.000000",
+        ),
+    ],
+    ids=["leverage", "capped-add", "remove"],
+)
+def test_cli_collateral_preview(position_service, command, after):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.fill_at_next_oracle_price = True
+    position.collateral_price = "1.01"
+    save_session(f"{base_url}/query")
+    args = position_cli_args(base_url, [*command, "--dry-run"])
+    cli = CliRunner()
+
+    result = cli.invoke(main, args)
+    assert result.exit_code == 0, result.output
+    preview = json.loads(result.stdout)
+    collateral = preview["collateral"]
+    assert collateral == {
+        "beforeUsdc": "4.000000",
+        "afterUsdc": after,
+        "beforeUsd": "4.04",
+        "afterUsd": format((Decimal(after) * Decimal("1.01")).normalize(), "f"),
+    }
+    if "--max-collateral-usd" in command:
+        assert preview["quote"]["maxCollateralUsd"] == "5"
+        assert Decimal(collateral["afterUsd"]) <= 5
+
+    result = cli.invoke(main, args[1:])
+    assert result.exit_code == 0, result.output
+    assert (
+        f"Estimated collateral: 4.000000 USDC ($4.04) → "
+        f"{after} USDC (${collateral['afterUsd']})"
+    ) in result.stdout
+    assert not position.submitted
+
+
+def test_cli_capped_margin_requotes_when_oracle_moves(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.fill_at_next_oracle_price = True
+    save_session(f"{base_url}/query")
+    args = position_cli_args(
+        base_url,
+        [
+            "margin",
+            "7",
+            "--direction",
+            "add",
+            "--amount",
+            "2",
+            "--max-collateral-usd",
+            "5",
+        ],
+    )
+    cli = CliRunner()
+    result = cli.invoke(main, [*args, "--dry-run"])
+    assert result.exit_code == 0, result.output
+    preview = json.loads(result.stdout)
+
+    position.collateral_price = "1.01"
+    result = cli.invoke(main, [*args, "--preview-digest", preview["previewDigest"]])
+    assert result.exit_code == ExitCode.REJECTED, result.output
+    assert json.loads(result.stdout)["error"]["code"] == "PREVIEW_MISMATCH"
+    assert not position.submitted
+
+    result = cli.invoke(main, [*args, "--dry-run"])
+    assert result.exit_code == 0, result.output
+    preview = json.loads(result.stdout)
+    result = cli.invoke(main, [*args, "--preview-digest", preview["previewDigest"]])
+    assert result.exit_code == 0, result.output
+    (submitted,) = position.submitted
+    assert {key: submitted[key] for key in preview["intent"]} == preview["intent"]
+
+
+def test_cli_market_symbol_and_compact_market_list(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.extra_market_rows.append(
+        {
+            "marketId": 0,
+            "baseToken": {"symbol": "BTC"},
+            "collateralToken": {"id": 2, "symbol": "NIBI"},
+            "price": None,
+        }
+    )
+    args = position_cli_args(base_url, [*OPEN_COMMAND, "--type", "market", "--dry-run"])
+    market_index = args.index("--market") + 1
+    cli = CliRunner()
+
+    numeric = cli.invoke(main, args)
+    args[market_index] = "bTc"
+    by_symbol = cli.invoke(main, args)
+    assert numeric.exit_code == by_symbol.exit_code == 0, by_symbol.output
+    assert (
+        json.loads(numeric.stdout)["intent"] == json.loads(by_symbol.stdout)["intent"]
+    )
+
+    list_args = ["--endpoint", f"{base_url}/query", "market", "list"]
+    market_list = cli.invoke(main, list_args)
+    assert market_list.exit_code == 0, market_list.output
+    assert market_list.stdout.split().count("BTC") == 1
+    assert "NIBI" not in market_list.stdout
+    for column in ("Symbol", "ID", "Collateral", "Price", "USDC", "100.5"):
+        assert column in market_list.stdout
+    machine = cli.invoke(main, ["--json", *list_args])
+    assert machine.exit_code == 0, machine.output
+    assert (
+        json.loads(machine.stdout)["perp"]["borrowings"][1]
+        == position.extra_market_rows[0]
+    )
+
+    position.extra_market_rows[0]["marketId"] = 3
+    still_unique = cli.invoke(main, args)
+    assert still_unique.exit_code == 0, still_unique.output
+    assert (
+        json.loads(still_unique.stdout)["intent"]
+        == json.loads(numeric.stdout)["intent"]
+    )
+
+    position.extra_market_rows[0]["collateralToken"] = {"id": 1, "symbol": "USDC"}
+    ambiguous = cli.invoke(main, args)
+    assert ambiguous.exit_code == 1, ambiguous.output
+    assert "Ambiguous market symbol 'bTc'. Pass a market ID: 0, 3." in ambiguous.stdout
+    args[market_index] = "ETH"
+    unknown = cli.invoke(main, args)
+    assert unknown.exit_code == 1, unknown.output
+    assert "Unknown market symbol 'ETH'. Run sai market list." in unknown.stdout
+    assert not position.submitted
+
+
+def test_cli_cancel_reuses_close_confirmation_and_pending_order_check(position_service):
+    position, base_url = position_service
+    position.trade_type = "limit"
+    save_session(f"{base_url}/query")
+    cancel = position_cli_args(base_url, ["cancel", "7"])
+    legacy = position_cli_args(base_url, ["close", "7", "--cancel-order"])
+    cli = CliRunner()
+    current = cli.invoke(main, [*cancel, "--dry-run"])
+    old = cli.invoke(main, [*legacy, "--dry-run"])
+    assert current.exit_code == old.exit_code == 0, current.output
+    preview = json.loads(current.stdout)
+    assert json.loads(old.stdout) == preview
+    assert preview["intent"]["kind"] == "CANCEL_PENDING_TRADE"
+    submit = [*cancel, "--preview-digest", preview["previewDigest"]]
+
+    position.trade_type = "trade"
+    filled = cli.invoke(main, submit)
+    assert filled.exit_code == 1, filled.output
+    assert "pending order" in filled.stdout
+    assert not position.submitted
+
+    position.trade_type = "limit"
+    accepted = cli.invoke(main, submit)
+    assert accepted.exit_code == 0, accepted.output
+    (submitted,) = position.submitted
+    assert {key: submitted[key] for key in preview["intent"]} == preview["intent"]
+
+
+@pytest.mark.parametrize(
+    "changes_position", [False, True], ids=["oracle-tick", "position"]
+)
+def test_cli_leverage_confirmation_binds_only_collateral_quantities(
+    position_service, changes_position
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.fill_at_next_oracle_price = True
+    save_session(f"{base_url}/query")
+    args = position_cli_args(base_url, ["leverage", "7", "--leverage", "1.6"])
+    cli = CliRunner()
+    dry_run = cli.invoke(main, [*args, "--dry-run"])
+    assert dry_run.exit_code == 0, dry_run.output
+    original = json.loads(dry_run.stdout)
+    assert original["collateralBaseUnits"] == {"before": "4000000", "after": "5000000"}
+
+    if changes_position:
+        position.collateral = 8_000_000
+    position.collateral_price = "1.01"
+    dry_run = cli.invoke(main, [*args, "--dry-run"])
+    assert dry_run.exit_code == 0, dry_run.output
+    fresh = json.loads(dry_run.stdout)
+    assert fresh["collateral"]["afterUsd"] != original["collateral"]["afterUsd"]
+    result = cli.invoke(main, [*args, "--preview-digest", original["previewDigest"]])
+
+    if changes_position:
+        assert fresh["collateralBaseUnits"] == {
+            "before": "8000000",
+            "after": "10000000",
+        }
+        assert fresh["previewDigest"] != original["previewDigest"]
+        assert result.exit_code == ExitCode.REJECTED, result.output
+        assert json.loads(result.stdout)["error"]["code"] == "PREVIEW_MISMATCH"
+        assert not position.submitted
+    else:
+        assert fresh["previewDigest"] == original["previewDigest"]
+        assert result.exit_code == 0, result.output
+        assert len(position.submitted) == 1
+
+
+def test_cli_margin_preview_reports_insufficient_funds_before_any_projection(
+    position_service,
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.available_balance = 500_000
+    save_session(f"{base_url}/query")
+    args = position_cli_args(
+        base_url, ["margin", "7", "--direction", "add", "--amount", "1", "--dry-run"]
+    )
+    cli = CliRunner()
+    machine = cli.invoke(main, args)
+    assert machine.exit_code == 0, machine.output
+    execution = json.loads(machine.stdout)["estimates"]["execution"]
+    assert execution["code"] == "InsufficientDepositBalance"
+
+    text = cli.invoke(main, args[1:])
+    assert text.exit_code == ExitCode.REJECTED, text.output
+    assert text.stdout == ""
+    assert "Perp requires 1.000000 USDC of additional margin" in text.stderr
+    assert "The observed available balance is 0.500000 USDC" in text.stderr
+    assert not position.submitted
+
+
+@pytest.mark.parametrize("queued", [False, True], ids=["immediate", "queued"])
+def test_cli_leverage_preview_reports_insufficient_funds(position_service, queued):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.available_balance = 500_000
+    position.fill_at_next_oracle_price = queued
+    save_session(f"{base_url}/query")
+    args = position_cli_args(
+        base_url, ["leverage", "7", "--leverage", "1.6", "--dry-run"]
+    )
+    cli = CliRunner()
+    machine = cli.invoke(main, args)
+    assert machine.exit_code == 0, machine.output
+    execution = json.loads(machine.stdout)["estimates"]["execution"]
+    text = cli.invoke(main, args[1:])
+    funding = (
+        "Perp requires 1.000000 USDC of additional margin. "
+        "The observed available balance is 0.500000 USDC."
+    )
+    if queued:
+        warning = f"{funding} Perp checks funding at fill."
+        assert execution["warning"] == warning
+        assert text.exit_code == 0, text.output
+        assert warning in text.stdout.splitlines()[:2]
+        assert "Estimated collateral: 4.000000 USDC" in text.stdout
+    else:
+        assert execution["code"] == "InsufficientDepositBalance"
+        assert execution["reason"] == funding
+        assert text.exit_code == ExitCode.REJECTED, text.output
+        assert text.stdout == ""
+        assert funding in text.stderr.splitlines()[0]
+    assert not position.submitted

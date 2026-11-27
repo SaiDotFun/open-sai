@@ -1,6 +1,21 @@
+use std::cell::RefCell;
+
 use serde_json::json;
 
 use super::*;
+
+thread_local! {
+    pub(in crate::mcp_registration) static SAVE_BEFORE_PUBLISH: RefCell<Option<(PathBuf, PathBuf)>> =
+        const { RefCell::new(None) };
+}
+
+pub(super) fn publish_fixture_save(destination: &Path) {
+    SAVE_BEFORE_PUBLISH.with_borrow_mut(|save| {
+        if let Some((staged, destination)) = save.take_if(|(_, path)| path == destination) {
+            fs::rename(staged, destination).unwrap();
+        }
+    });
+}
 
 #[test]
 fn cursor_verification_leaves_concurrent_launcher_and_args_changes_intact() {
@@ -9,13 +24,7 @@ fn cursor_verification_leaves_concurrent_launcher_and_args_changes_intact() {
     let path = home.join("mcp.json");
     let old = json!({"command": "/fixture/old/sai", "args": ["mcp", "serve"]});
     let registration = Registration::new(old.clone(), &old, Scope::Project, false, vec![]).unwrap();
-    let target = Target {
-        argv: ["/fixture/new/sai", "mcp", "serve"]
-            .map(str::to_owned)
-            .to_vec(),
-        profile: None,
-        explicit: false,
-    };
+    let target = Target::generated("/fixture/new/sai".into(), None);
     let document = |entry: &Value| json!({"mcpServers": {"sai": entry}}).to_string();
     for changed in [
         old.clone(),
@@ -64,13 +73,7 @@ fn cursor_verification_timeout_restores_its_own_replacement() {
     let replacement = original.replace("old", "new");
     let deadline = Instant::now() + Duration::from_secs(3);
     let published = edit(&path, false, deadline, |_| Ok(replacement.clone())).unwrap();
-    let target = Target {
-        argv: ["/fixture/new/sai", "mcp", "serve"]
-            .map(str::to_owned)
-            .to_vec(),
-        profile: None,
-        explicit: false,
-    };
+    let target = Target::generated("/fixture/new/sai".into(), None);
     let expired = Instant::now() - Duration::from_millis(1);
     assert!(
         Client::verify_cursor_repair(&path, Scope::User, "sai", &target, published, expired)

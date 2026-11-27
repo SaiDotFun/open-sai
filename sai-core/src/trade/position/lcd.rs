@@ -132,24 +132,23 @@ impl Lcd<'_> {
                 .expect("valid missing-cap pattern")
         });
         let (status, headers, bytes) = self.request(path, read).await?;
-        let missing_cap = !status.is_success()
-            && missing_cap_is_zero
-            && ABSENT_CAP.is_match(&String::from_utf8_lossy(&bytes));
-        if !status.is_success() && !missing_cap {
-            return Err(read.failure());
-        }
         let height = headers
             .get(SERVED_HEIGHT)
             .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
+        if !status.is_success() {
+            // Python treats Perp's missing storage key as no pair override,
+            // even when the error response reports a different height.
+            if missing_cap_is_zero && ABSENT_CAP.is_match(&String::from_utf8_lossy(&bytes)) {
+                return Ok((json!({"data": "0"}), height));
+            }
+            return Err(read.failure());
+        }
         if let Read::At(requested) = read
             && height.as_deref() != Some(requested)
         {
             return Err(height_error(
                 "LCD did not serve the requested contract query height.",
             ));
-        }
-        if missing_cap {
-            return Ok((json!({"data": "0"}), height));
         }
         let data: Value = serde_json::from_slice(&bytes).map_err(|_| read.failure())?;
         if !data.is_object() {

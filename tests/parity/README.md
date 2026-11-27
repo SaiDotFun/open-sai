@@ -81,6 +81,12 @@ signature, unexpected pass, or unused entry fails the required job. Owners
 remove their entries in the same change that repairs the corresponding gaps.
 `M2-unassigned` entries include proposed issue titles for triage.
 
+[`python-main-gaps.toml`](python-main-gaps.toml) records Python CLI changes
+that landed after the release reference. The runner checks these signatures
+when it compares current Python against a candidate and reports
+`CURRENT_PYTHON_ROW` results. A changed signature or unexpected pass fails the
+comparison. Port the behavior and remove its entry in the same change.
+
 CI records the C3 storage replays against v0.1.2 and a separate C2/C3 replay
 against v0.1.1. The nine C2 config cases share their exact log-schema
 signatures across both releases. Each v0.1.1 config result appears as a
@@ -320,6 +326,11 @@ tag `sai-cli/v0.1.2`, commit `8557a7e13dceab0accc369191182c8e01423c91b`.
 The focused release CI step runs this file and the intent status replays
 against the same executable.
 
+The `intent-status` manifest case checks that a valid transaction hash
+matches exactly one history row. The focused tests also cover the original
+malformed hash from #212. Python v0.1.2 matches it by string equality. Rust
+requires a valid hash as evidence and keeps an unresolved intent pending.
+
 ## Comparison Rules
 
 The C7d estimate cases use the Python v0.1.2 commit
@@ -525,10 +536,10 @@ compares their arguments, file modes, config values, Codex comments, and
 which files changed. It also checks that stdout and stderr omit the
 fixture credential.
 
-In `doctor-mcp-verification-failure`, Rust restores the Codex config when
-verification rejects the repaired entry. The case checks that Rust keeps the
-original bytes and mode. The pinned Python reference leaves the replacement
-on disk.
+In `doctor-mcp-verification-failure`, Rust asks Codex to check the proposed
+launcher using read-only overrides. When Codex rejects it, Rust reports the
+failure and leaves the original config in place. The pinned Python v0.1.2
+reference leaves the replacement on disk.
 
 In `mcp-uninstall-codex-query-failure`, both CLIs report the failed Codex
 query. Rust restores the original configuration bytes and mode, so the

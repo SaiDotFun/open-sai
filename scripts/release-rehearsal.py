@@ -7,6 +7,7 @@ import ctypes
 import hashlib
 import json
 import os
+import platform
 import re
 import select
 import shlex
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import unittest
 from collections import deque
 from collections.abc import Callable, Generator
@@ -38,6 +40,9 @@ VERSION = r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){2}"
 CLIENTS = ("claude", "codex")
 SYNTHETIC_TOKEN = "release-rehearsal-fixture-only"
 CHAIN = "cataclysm-1"
+CUTOVER_BASELINE = "0.1.3"
+CUTOVER_CLIENTS = (*CLIENTS, "cursor")
+RETIRED_MCP_FIXTURE = "sai" + "-mcp"
 INTENT_KEY = re.compile(r"\d{8}T\d{9}Z_[0-9A-HJKMNP-TV-Z]{16}")
 TRADE = (
     "trade",
@@ -924,6 +929,7 @@ class Install:
     ) -> None:
         self.diagnostics = diagnostics
         self.home = root / "home"
+        self.cwd = self.home
         self.sai_home = self.home / ".sai"
         self.session_file = self.sai_home / "trader/sessions.json"
         bin_dir = self.home / ".local" / "bin"
@@ -978,6 +984,7 @@ class Install:
         check: bool = True,
         timeout: float = 300,
         env: dict[str, str] | None = None,
+        cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         try:
             # File-backed input stays readable across communicate() timeouts.
@@ -986,7 +993,7 @@ class Install:
                 source.seek(0)
                 with owned_process(
                     command,
-                    self.home,
+                    cwd or self.cwd,
                     self.env if env is None else env,
                     stdin=source,
                 ) as process:
@@ -1013,8 +1020,8 @@ class Install:
                 log.write(f"\n[{step}] stdout\n".encode() + stdout)
                 log.write(f"\n[{step}] stderr\n".encode() + stderr)
 
-    def json(self, step: str, *args: str) -> Any:
-        return json.loads(self.run(step, self.sai, "--json", *args).stdout)
+    def json(self, step: str, *args: str, cwd: Path | None = None) -> Any:
+        return json.loads(self.run(step, self.sai, "--json", *args, cwd=cwd).stdout)
 
     def verify_version(self, version: str) -> None:
         result = self.run("Run the launcher", self.sai, "--version")
@@ -1058,12 +1065,13 @@ class Install:
     def verify_mcp(self, version: str) -> None:
         entries = self.json("Inspect MCP registrations", "mcp", "list")["clients"]
         command = [str(self.sai), "mcp", "serve"]
+        hidden = [str(self.sai), "<argument hidden 1 of 2>", "<argument hidden 2 of 2>"]
         for name in CLIENTS:
             row = next(entry for entry in entries if entry["client"] == name)
             require(
                 row["current"]
                 and row["scope"] == "user"
-                and row["registeredCommand"] == command,
+                and row["registeredCommand"] in (command, hidden),
                 f"{name} registration no longer points to the installed launcher",
             )
         replies = {}
@@ -1092,7 +1100,7 @@ class Install:
         ) as err:
             try:
                 with owned_process(
-                    command, self.home, self.env, stderr=err or subprocess.DEVNULL
+                    command, self.cwd, self.env, stderr=err or subprocess.DEVNULL
                 ) as process:
                     assert process.stdout is not None and process.stdin is not None
                     try:
@@ -1531,6 +1539,633 @@ def rehearse_staged(
     return 0
 
 
+class NativeAssets(NamedTuple):
+    baseline: Path
+    bridge: Path
+    shim: Path
+    archive: Path
+
+    @property
+    def bridge_version(self) -> str:
+        return self.bridge.name.split("-")[1]
+
+    @property
+    def version(self) -> str:
+        return self.shim.name.split("-")[1]
+
+
+def native_assets(
+    published: Path, bridge: Path, shim: Path, archive: Path
+) -> NativeAssets:
+    baseline = published / release_install.wheel_name(CUTOVER_BASELINE)
+    expected = release_install.expected_hash(
+        (published / "SHA256SUMS").read_text(encoding="ascii"), baseline.name
+    )
+    require(
+        expected is not None and release_install.file_digest(baseline) == expected,
+        f"Published wheel {baseline.name} did not match SHA256SUMS",
+    )
+    match = re.fullmatch(rf"sai_cli-({VERSION})-py3-none-any\.whl", bridge.name)
+    require(
+        match is not None and bridge.is_file(), "Expected a full Python bridge wheel"
+    )
+    assets = NativeAssets(baseline.resolve(), bridge.resolve(), shim, archive.resolve())
+    require(
+        tuple(map(int, assets.bridge_version.split(".")))
+        > tuple(map(int, CUTOVER_BASELINE.split("."))),
+        "The bridge must be newer than the published Python baseline",
+    )
+    require(
+        assets.version not in (assets.bridge_version, CUTOVER_BASELINE),
+        "Use a distinct native version",
+    )
+    machine = platform.machine()
+    machine = {"amd64": "x86_64", "arm64": "aarch64"}.get(machine, machine)
+    require(
+        archive.name == f"sai-{assets.version}-{machine}-unknown-linux-gnu.tar.gz"
+        and archive.is_file(),
+        "Expected a Linux native archive matching this host and the loopback shim wheel",
+    )
+    return assets
+
+
+def rehearse_native(root: Path, assets: NativeAssets, diagnostics: Path | None) -> int:
+    tool = Install(root, diagnostics, clients=(*CLIENTS, "cursor-agent"))
+    prefix = namespace_prefix(tool.home, tool.env)
+    if prefix is None:
+        raise RehearsalError(
+            "Native cutover requires a loopback-only network namespace"
+        )
+    host_cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    cache = Path(os.environ.get("UV_CACHE_DIR") or host_cache / "uv").resolve()
+    require(
+        cache.is_dir(), "Prepare the offline uv cache using the README instructions"
+    )
+    tool.env.update(
+        UV_CACHE_DIR=str(cache),
+        UV_OFFLINE="1",
+        UV_PYTHON=sys.executable,
+        UV_PYTHON_DOWNLOADS="never",
+    )
+    print(
+        f"Native candidate {assets.archive.name}, SHA-256 "
+        f"{release_install.file_digest(assets.archive)}.",
+        flush=True,
+    )
+    command = (
+        *prefix,
+        sys.executable,
+        "-I",
+        "-c",
+        'import runpy, sys; sys.exit(runpy.run_path(sys.argv[1])["native_stage"](*sys.argv[2:]))',
+        Path(__file__).resolve(),
+        root,
+        str(diagnostics) if diagnostics else "",
+        *assets,
+    )
+    with owned_process(command, tool.home, tool.env, stdout=None, stderr=None) as stage:
+        return wait_with_cancellation(stage.wait, None)
+
+
+def native_stage(root: str, log: str, *paths: str) -> int:
+    assets = NativeAssets(*map(Path, paths))
+    tool = Install(Path(root), Path(log) if log else None, prepared=True)
+    tool.cwd = Path(root) / "project"
+
+    def work() -> int:
+        with cancel_on_signal(), reap_detached_children():
+            require(
+                [name for _, name in socket.if_nameindex()] == ["lo"],
+                "Expected a loopback-only network namespace",
+            )
+            tool.cwd.mkdir(mode=0o700)
+            return rehearse_native_staged(tool, assets)
+
+    return report_result(work)
+
+
+class CutoverMcp:
+    def __init__(self, tool: Install, base: str) -> None:
+        self.tool = tool
+        self.paths = {
+            "claude": tool.home / ".claude.json",
+            "codex": tool.home / ".codex/config.toml",
+            "cursor": tool.home / ".cursor/mcp.json",
+        }
+        self.command = [str(tool.sai), "mcp", "serve"]
+        self.env = {
+            "SAI_HOME": str(tool.sai_home),
+            # The CI shim requires this fixture origin. Codex starts stdio
+            # servers with a filtered environment.
+            "SAI_NATIVE_RELEASE_BASE": base,
+        }
+        self.other = {"url": f"{base}/unrelated-mcp"}
+
+    def expected(self, client: str, *, stale: bool) -> dict[str, Any]:
+        entry: dict[str, Any] = {
+            "command": RETIRED_MCP_FIXTURE if stale else self.command[0],
+            "args": [] if stale else self.command[1:],
+            "env": self.env,
+        }
+        if client == "claude":
+            entry["type"] = "stdio"
+        key = "mcp_servers" if client == "codex" else "mcpServers"
+        return {key: {"sai": entry, "other": self.other}}
+
+    def read(self, client: str) -> dict[str, Any]:
+        path = self.paths[client]
+        source = path.read_text(encoding="utf-8")
+        return tomllib.loads(source) if client == "codex" else json.loads(source)
+
+    def seed(self, client: str, *, stale: bool = False) -> None:
+        path = self.paths[client]
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        data = self.expected(client, stale=stale)
+        if client == "codex":
+            entry = data["mcp_servers"]["sai"]
+            source = (
+                "[mcp_servers.sai]\n"
+                f"command = {json.dumps(entry['command'], ensure_ascii=False)}\n"
+                f"args = {json.dumps(entry['args'])}\n"
+                "[mcp_servers.sai.env]\n"
+                + "".join(
+                    f"{key} = {json.dumps(value, ensure_ascii=False)}\n"
+                    for key, value in self.env.items()
+                )
+                + "[mcp_servers.other]\n"
+                f"url = {json.dumps(self.other['url'])}\n"
+            )
+        else:
+            source = json.dumps(data)
+        path.write_text(source, encoding="utf-8")
+        path.chmod(0o600)
+
+    def add_stale_cursor_alias(self) -> None:
+        data = self.read("cursor")
+        data["mcpServers"][RETIRED_MCP_FIXTURE] = self.expected("cursor", stale=True)[
+            "mcpServers"
+        ]["sai"]
+        self.paths["cursor"].write_text(json.dumps(data), encoding="utf-8")
+
+    def verify_cursor_alias(self) -> None:
+        entries = self.read("cursor")["mcpServers"]
+        if RETIRED_MCP_FIXTURE not in entries:
+            return
+        expected = self.expected("cursor", stale=False)["mcpServers"]["sai"]
+        actual = entries[RETIRED_MCP_FIXTURE]
+        if isinstance(actual, dict) and isinstance(actual.get("command"), str):
+            actual["command"] = os.path.normpath(actual["command"])
+        require(
+            actual == expected,
+            "The native updater left the Cursor alias pointing to a stale command",
+        )
+
+    def verify(self, client: str, *, cursor_alias: bool = False) -> None:
+        expected = self.expected(client, stale=False)
+        data = self.read(client)
+        key = next(iter(expected))
+        if cursor_alias:
+            data[key].pop(RETIRED_MCP_FIXTURE, None)
+        entry = data.get(key, {}).get("sai", {})
+        if isinstance(entry.get("command"), str):
+            # uv can spell the registered bin path with a parent component.
+            entry["command"] = os.path.normpath(entry["command"])
+        require(
+            all(data.get(key) == value for key, value in expected.items()),
+            f"{client} did not preserve the registrations and select {self.tool.sai}",
+        )
+        if client == "claude":
+            report = self.tool.run(
+                "Start Sai through Claude Code",
+                "claude",
+                "mcp",
+                "get",
+                "sai",
+                timeout=30,
+            )
+            require(
+                re.search(r"^\s*Status: .*\bConnected\s*$", report.stdout, re.MULTILINE)
+                is not None,
+                "Claude Code did not connect to the registered Sai server",
+            )
+        elif client == "codex":
+            verify_codex_mcp(self.tool)
+        else:
+            report = self.tool.run(
+                "Start Sai through Cursor",
+                "cursor-agent",
+                "mcp",
+                "list-tools",
+                "sai",
+                timeout=30,
+            )
+            require(
+                re.search(r"^- trade_open\b", report.stdout, re.MULTILINE) is not None,
+                "Cursor did not list the registered Sai tools",
+            )
+
+
+def verify_codex_mcp(tool: Install) -> None:
+    with tool.stdio("Start Sai through Codex", "codex", "app-server") as (
+        send,
+        receive,
+    ):
+
+        def send_message(message: dict[str, Any]) -> None:
+            send.write((json.dumps({"jsonrpc": "2.0", **message}) + "\n").encode())
+            send.flush()
+
+        def request(identifier: int, method: str, params: dict[str, Any]) -> Any:
+            send_message({"id": identifier, "method": method, "params": params})
+            for _ in range(40):
+                reply = json.loads(receive.line(f"Codex {method}"))
+                if reply.get("id") == identifier:
+                    require("result" in reply, f"Codex {method} failed")
+                    return reply["result"]
+            raise RehearsalError(f"Codex {method} did not reply")
+
+        request(
+            1, "initialize", {"clientInfo": {"name": "sai-rehearsal", "version": "1"}}
+        )
+        send_message({"method": "initialized"})
+        status = request(2, "mcpServerStatus/list", {"serverName": "sai"})
+        require(
+            any(
+                row["name"] == "sai" and "trade_open" in row["tools"]
+                for row in status["data"]
+            ),
+            "Codex did not list the registered Sai tools",
+        )
+
+
+def cutover_update(
+    tool: Install, base: str, version: str, *, cwd: Path | None = None
+) -> dict[str, Any]:
+    report = tool.json(
+        f"Update to {version}",
+        "update",
+        "--to",
+        version,
+        "--api-base",
+        base,
+        "--web-base",
+        base,
+        cwd=cwd,
+    )
+    require(
+        report.get("status") == "updated" and report.get("target") == version,
+        f"sai update did not install {version}",
+    )
+    return report
+
+
+def cutover_doctor(tool: Install, label: str, *, cwd: Path) -> dict[str, Any]:
+    result = tool.run(
+        label, tool.sai, "--json", "doctor", "--offline", check=False, cwd=cwd
+    )
+    report = json.loads(result.stdout)
+    report = report.get("error", {}).get("details", report)
+    require(isinstance(report.get("checks"), list), "Doctor did not return its checks")
+    return {entry["id"]: entry for entry in report["checks"]}
+
+
+def intent_log(tool: Install, key: str) -> list[dict[str, Any]]:
+    report = tool.json("Read retained intent logs", "logs", "intent", key, "--offline")
+    require(report.get("intentKey") == key, "The log report omitted the pending intent")
+    return report["events"]
+
+
+def verify_intent_logs(tool: Install, key: str, expected: list[dict[str, Any]]) -> None:
+    actual = intent_log(tool, key)
+    require(
+        bool(expected) and all(row in actual for row in expected),
+        "The report did not include the expected intent events",
+    )
+
+
+def verify_local_intent(tool: Install, replay: Replay, key: str) -> None:
+    local = tool.json("Read the pending intent ledger", "intent", "local", replay.addr)
+    require(
+        any(
+            row["intentKey"] == key and row["status"] in {"unknown", "pending"}
+            for row in local
+        ),
+        "The local ledger did not report the original pending intent",
+    )
+
+
+def rehearse_native_staged(tool: Install, assets: NativeAssets) -> int:
+    baseline, bridge, native = CUTOVER_BASELINE, assets.bridge_version, assets.version
+    replay = Replay(assets.baseline, baseline)
+    replay.add_release(assets.bridge, bridge)
+    replay.add_release(assets.shim, native, assets.archive)
+    replay.lifecycle = "pending_exec"
+    failures = 0
+
+    def check(label: str, action: Callable[[], None]) -> None:
+        nonlocal failures
+        try:
+            action()
+        except RehearsalError as exc:
+            failures += 1
+            print(f"FAIL {label} ({exc})", flush=True)
+        except (OSError, TypeError, ValueError, KeyError) as exc:
+            failures += 1
+            print(f"FAIL {label} ({type(exc).__name__})", flush=True)
+        else:
+            print(f"PASS {label}", flush=True)
+
+    with (
+        keeper_server(replay.handler()) as base,
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM) as dead_proxy,
+    ):
+        dead_proxy.bind(("127.0.0.1", 0))
+        tool.env.update(loopback_env(base, dead_proxy.getsockname()[1]))
+        # Exercise stored config resolution throughout the cutover.
+        del tool.env["SAI_ENDPOINT"]
+        tool.env["SAI_NATIVE_RELEASE_BASE"] = base
+        tool.run(
+            "Install the verified published Python wheel",
+            sys.executable,
+            SCRIPTS / "install.py",
+            "--version",
+            baseline,
+            "--api-base",
+            base,
+            "--web-base",
+            base,
+        )
+        tool.verify_version(baseline)
+        launcher = tool.sai.resolve(strict=True)
+        endpoint = f"{base}/query"
+        tool.json(
+            "Configure loopback Keeper", "config", "set", "keeper.endpoint", endpoint
+        )
+        tool.json("Disable auto-update", "config", "set", "update.auto", "false")
+        expiry = (datetime.now(UTC) + timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        session = {
+            "evmAddress": replay.addr,
+            "endpoint": endpoint,
+            "token": SYNTHETIC_TOKEN,
+            "expiresAt": expiry,
+        }
+        tool.run(
+            "Save the synthetic session with published Python",
+            tool.python,
+            "-I",
+            "-c",
+            "import json, sys; from sai_cli.core.storage import save_session; "
+            "save_session(json.load(sys.stdin))",
+            input_text=json.dumps(session),
+        )
+        session_bytes = tool.session_file.read_bytes()
+        config = tool.sai_home / "config.toml"
+        config_bytes = config.read_bytes()
+        first = tool.run(
+            "Leave an open pending on loopback Keeper",
+            tool.sai,
+            "--json",
+            *TRADE,
+            check=False,
+        )
+        require(
+            len(replay.submitted) == 1
+            and is_lost_acknowledgement(first, replay.submitted[0]),
+            "Published Python did not save the open with a lost acknowledgement",
+        )
+        key = replay.submitted[0]
+        ledger = tool.sai_home / "trader/intents.sqlite3"
+        verify_local_intent(tool, replay, key)
+        require(
+            probe_retry(tool, replay, key, legacy=True),
+            "Published Python retried the open",
+        )
+        python_events = [
+            row for row in intent_log(tool, key) if row["version"] == baseline
+        ]
+        require(
+            any(row["event"] == "intent.reserved" for row in python_events),
+            "Published Python did not log the original reservation",
+        )
+        mcp = CutoverMcp(tool, base)
+        for client in CUTOVER_CLIENTS:
+            mcp.seed(client)
+            mcp.verify(client)
+        print(
+            f"PASS Python {baseline} install and populated profile at {tool.sai} -> {launcher}",
+            flush=True,
+        )
+
+        cutover_update(tool, base, bridge)
+        tool.verify_version(bridge)
+
+        def python_doctor_from_home() -> None:
+            mcp.seed("cursor", stale=True)
+            doctors = cutover_doctor(tool, "Run Python doctor from HOME", cwd=tool.home)
+            require(
+                doctors.get("mcp.cursor", {}).get("status") == "fixed",
+                "Python doctor did not report a successful Cursor repair from HOME",
+            )
+            mcp.verify("cursor")
+
+        check("Python doctor repairs Cursor from HOME", python_doctor_from_home)
+        for client in CUTOVER_CLIENTS:
+            mcp.seed(client, stale=True)
+        update = cutover_update(tool, base, native, cwd=tool.home)
+        tool.verify_version(native)
+        digest = release_install.file_digest(assets.archive)
+        binaries = list(tool.sai_home.glob(f"bin/*/{native}/*/{digest}/sai"))
+        require(
+            len(binaries) == 1, "The shim did not cache the verified native archive"
+        )
+        require(
+            tool.sai.resolve(strict=True) == launcher,
+            "The bridge changed uv's launcher target",
+        )
+        print(
+            f"PASS Python bridge {bridge} installed native {native} at {binaries[0]} through {tool.sai}",
+            flush=True,
+        )
+
+        def repair_claude() -> None:
+            repairs = next(
+                (
+                    result.get("manualRepairs", [])
+                    for result in update.get("mcp", [])
+                    if result["client"] == "claude"
+                ),
+                [],
+            )
+            require(
+                any(
+                    repair["scope"] == "user" and repair["name"] == "sai"
+                    for repair in repairs
+                ),
+                "The bridge update did not report the Claude Code repair",
+            )
+            tool.json(
+                "Apply the Claude Code repair reported by update",
+                "mcp",
+                "install",
+                "--client",
+                "claude",
+                "--scope",
+                "user",
+                "--repair-existing",
+                "sai",
+            )
+            mcp.verify("claude")
+
+        check(
+            "Bridge update reports a Claude Code repair and the native command applies it",
+            repair_claude,
+        )
+
+        def bridge_cursor() -> None:
+            cursor = [row for row in update.get("mcp", []) if row["client"] == "cursor"]
+            require(
+                len(cursor) == 1 and cursor[0]["status"] == "fixed",
+                "The bridge update did not report a successful Cursor repair from HOME",
+            )
+            mcp.verify("cursor")
+
+        check("Bridge update MCP codex", lambda: mcp.verify("codex"))
+        check("Bridge update repairs Cursor from HOME", bridge_cursor)
+
+        def profile() -> None:
+            require(config.read_bytes() == config_bytes, "The config file changed")
+            tool.verify_saved_endpoint(endpoint)
+            require(
+                tool.session_file.read_bytes() == session_bytes,
+                "The session file changed",
+            )
+            status = tool.json("Read the existing session", "auth", "status")
+            require(
+                status.get("addr") == replay.addr
+                and status.get("endpoint") == base
+                and datetime.fromisoformat(status["expiresAt"])
+                == datetime.fromisoformat(expiry),
+                "The active session did not match the published Python session",
+            )
+            verify_local_intent(tool, replay, key)
+
+        check("Native reads existing config, session, and ledger", profile)
+        check(
+            "Native reads published Python intent logs",
+            lambda: verify_intent_logs(tool, key, python_events),
+        )
+
+        def retry() -> None:
+            require(probe_retry(tool, replay, key), "Native retried the pending open")
+            status = tool.json(
+                "Reconcile the pending open with native",
+                "intent",
+                "status",
+                replay.addr,
+                "--key",
+                key,
+            )
+            require(
+                status.get("outcome") == "pending"
+                and ledger_row(ledger, key, migrated=True) == ("unknown", "pending"),
+                "Native did not persist the pending Keeper result",
+            )
+            require(
+                probe_retry(tool, replay, key), "Native retried after reconciliation"
+            )
+
+        check("Native blocks retry and writes a pending ledger status", retry)
+        native_events = [
+            row
+            for row in intent_log(tool, key)
+            if row["version"] == native and row["event"] == "intent.keeper"
+        ]
+
+        def verify_doctor_mcp(doctor: dict[str, Any], client: str) -> None:
+            expected = "pass" if client == "claude" else "fixed"
+            status = doctor.get(f"mcp.{client}", {}).get("status", "missing")
+            require(
+                status == expected, f"Doctor reported {status}, expected {expected}"
+            )
+            mcp.verify(client)
+
+        for location, cwd in (("project", tool.cwd), ("HOME", tool.home)):
+            for client in ("codex", "cursor"):
+                mcp.seed(client, stale=True)
+            doctor = cutover_doctor(tool, f"Run native doctor from {location}", cwd=cwd)
+            for client in CUTOVER_CLIENTS:
+                check(
+                    f"Native doctor from {location} MCP {client}",
+                    lambda client=client, doctor=doctor: verify_doctor_mcp(
+                        doctor, client
+                    ),
+                )
+
+        # Restore the good entries from before the doctor probe. Add a stale
+        # Cursor alias to check repair and startup independently on rollback.
+        mcp.seed("codex")
+        mcp.seed("cursor")
+        mcp.add_stale_cursor_alias()
+        cutover_update(tool, base, baseline)
+        tool.verify_version(baseline)
+        require(
+            tool.sai.resolve(strict=True) == launcher,
+            "Rollback changed uv's launcher target",
+        )
+        print(
+            f"PASS Native update restored published Python {baseline} through {tool.sai}",
+            flush=True,
+        )
+        check("Rolled-back Python reads the same config, session, and ledger", profile)
+
+        def verify_rollback_logs() -> None:
+            require(
+                bool(native_events), "Native Sai did not log the pending Keeper result"
+            )
+            verify_intent_logs(tool, key, [*python_events, *native_events])
+
+        check(
+            "Rolled-back Python reads intent logs from both runtimes",
+            verify_rollback_logs,
+        )
+        check(
+            "Rolled-back Python blocks the pending open",
+            lambda: require(
+                probe_retry(tool, replay, key, legacy=True),
+                "Rolled-back Python retried the open",
+            ),
+        )
+        for client in CUTOVER_CLIENTS:
+            check(
+                f"Rollback update MCP {client}",
+                lambda client=client: mcp.verify(
+                    client, cursor_alias=client == "cursor"
+                ),
+            )
+        check(
+            "Rollback update repoints or removes the stale Cursor alias",
+            mcp.verify_cursor_alias,
+        )
+    return native_cutover_result(replay, key, failures)
+
+
+def native_cutover_result(replay: Replay, key: str, failures: int) -> int:
+    if replay.submitted == [key]:
+        print("PASS Keeper recorded one open across cutover and rollback", flush=True)
+    else:
+        failures += 1
+        print(
+            "FAIL Keeper should record only the original open across cutover and rollback"
+            f" (recorded {len(replay.submitted)} submissions)",
+            flush=True,
+        )
+    print(
+        f"Native cutover rehearsal finished with {failures} failed checks.",
+        flush=True,
+    )
+    return int(bool(failures))
+
+
 def report_result(work: Callable[[], int]) -> int:
     try:
         return work()
@@ -1556,6 +2191,21 @@ def main(*, api_base: str = release_install.API_BASE) -> int:
         help="Candidate release wheel newer than the baseline",
     )
     parser.add_argument(
+        "--bridge-wheel",
+        type=Path,
+        help="Full Python bridge wheel for the native cutover",
+    )
+    parser.add_argument(
+        "--native-archive",
+        type=Path,
+        help="Native cutover archive matching the positional loopback shim wheel",
+    )
+    parser.add_argument(
+        "--published-assets",
+        type=Path,
+        help="Directory containing the published 0.1.3 wheel and its SHA256SUMS",
+    )
+    parser.add_argument(
         "--from",
         dest="baseline",
         metavar="VERSION",
@@ -1575,6 +2225,15 @@ def main(*, api_base: str = release_install.API_BASE) -> int:
         help="Require a loopback-only network namespace for the rehearsal",
     )
     args = parser.parse_args()
+    cutover = any((args.bridge_wheel, args.native_archive, args.published_assets))
+    if cutover and not all(
+        (args.bridge_wheel, args.native_archive, args.published_assets)
+    ):
+        parser.error(
+            "native cutover needs --bridge-wheel, --native-archive, and --published-assets"
+        )
+    if cutover and (args.baseline is not None or args.self_test):
+        parser.error("native cutover uses the published 0.1.3 baseline")
     if args.self_test:
         if args.wheel:
             parser.error("--self-test takes no candidate wheel")
@@ -1598,6 +2257,26 @@ def main(*, api_base: str = release_install.API_BASE) -> int:
 
     def work() -> int:
         with cancel_on_signal(), cleanup_stack() as cleanup:
+            diagnostics = None
+            if args.verbose:
+                directory = Path(tempfile.mkdtemp(prefix="sai-rehearsal-diagnostics-"))
+                diagnostics = directory / "child-output.log"
+                diagnostics.touch(mode=0o600)
+                print(f"Child output log: {diagnostics}", file=sys.stderr)
+            scratch = Path(
+                cleanup.enter_context(
+                    tempfile.TemporaryDirectory(
+                        prefix="sai-release-rehearsal-",
+                        dir=diagnostics.parent if diagnostics else None,
+                    )
+                )
+            )
+            if cutover:
+                assets = native_assets(
+                    args.published_assets, args.bridge_wheel, wheel, args.native_archive
+                )
+                with reap_detached_children():
+                    return rehearse_native(scratch, assets, diagnostics)
             baseline = (
                 args.baseline
                 if args.baseline is not None
@@ -1610,21 +2289,9 @@ def main(*, api_base: str = release_install.API_BASE) -> int:
             )
             if args.baseline is not None:
                 verify_published_baseline(baseline, api_base)
-            diagnostics = None
-            if args.verbose:
-                directory = Path(tempfile.mkdtemp(prefix="sai-rehearsal-diagnostics-"))
-                diagnostics = directory / "child-output.log"
-                diagnostics.touch(mode=0o600)
-                print(f"Child output log: {diagnostics}", file=sys.stderr)
-            scratch = cleanup.enter_context(
-                tempfile.TemporaryDirectory(
-                    prefix="sai-release-rehearsal-",
-                    dir=diagnostics.parent if diagnostics else None,
-                )
-            )
             with reap_detached_children():
                 return rehearse(
-                    Path(scratch),
+                    scratch,
                     wheel,
                     version,
                     baseline,

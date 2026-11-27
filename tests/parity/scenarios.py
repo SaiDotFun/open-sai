@@ -14,7 +14,7 @@ import time
 import uuid
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
@@ -46,6 +46,7 @@ POSITION_SCENARIOS = {
     "position-default",
     "position-precision",
     "position-after-hours",
+    "position-malformed-after-hours-cap",
     "position-index-lag",
     "position-wrong-chain",
     "position-foreign-trader",
@@ -419,10 +420,12 @@ def loopback(
     *,
     trade_replay: Callable[[WireRequest, str | None], dict[str, Any] | None]
     | None = None,
+    leverage_target: str | None = None,
     market_price: float | None = None,
     cancel_target: str | None = None,
     close_target: str | None = None,
     lcd_query: bool = False,
+    balance_block_reads: bool = False,
     overview_delay: float = 0,
     wrong_balance_at: Literal["snapshot", "pinned"] | None = None,
 ) -> Generator[Endpoints]:
@@ -461,6 +464,9 @@ def loopback(
         market["price"] = market_price
     if scenario == "quote-null-price":
         market["price"] = None
+    if scenario == "market-symbol":
+        # Keep a single USDC market for BTC and retain its other collateral rows.
+        del recorded_markets[0]
     recorded_markets.append(market)
     collateral = market["collateralToken"]
     trader = {
@@ -481,7 +487,7 @@ def loopback(
     }:
         trade["id"] = 8
     status = PROTOCOL["intent_status_response"]["data"]["userIntents"][0]
-    if scenario in {"mcp-reads", "mcp-wait-final"}:
+    if scenario in {"intent-status-valid-hash", "mcp-reads", "mcp-wait-final"}:
         status = {**status, "txHash": TRADE_REQUEST_HASH}
     elif scenario == "mcp-pending-malformed-hash":
         status = {
@@ -616,6 +622,8 @@ def loopback(
     }
     if overview is not None:
         queue_payloads["userBalancesWithBlock"] = overview.balances
+    elif balance_block_reads:
+        queue_payloads["userBalancesWithBlock"] = queue_payloads["userBalances"]
     market_index = f"MarketIndex({borrowing['marketId']})"
     token_index = f"TokenIndex({collateral['id']})"
     cancel_trader = OTHER_ADDRESS if cancel_target == "other-account" else ADDRESS
@@ -709,12 +717,16 @@ def loopback(
     if scenario == "position-scientific-reduction":
         trade["collateralAmount"] = 10**29
         contracts["get_trade_raw"]["collateral_amount"] = str(10**29)
-    if scenario == "position-after-hours":
+    if scenario in {"position-after-hours", "position-malformed-after-hours-cap"}:
         contracts.update(
             is_after_hours_market=True,
             get_market={"block_last_opened": 110, "block_last_closed": 100},
             get_trade_infos=[{"created_block": 90}],
-            get_after_hours_leverage="1.234567890123456789",
+            get_after_hours_leverage=(
+                "malformed"
+                if scenario == "position-malformed-after-hours-cap"
+                else "1.234567890123456789"
+            ),
         )
     if scenario == "quote-close-only":
         contracts["get_market"]["market_trading_state"] = "close_only"
@@ -788,7 +800,7 @@ def loopback(
             "action": {
                 "update_leverage": {
                     "trade_index": "UserTradeIndex(7)",
-                    "new_leverage": "1.818181818181818182",
+                    "new_leverage": leverage_target or "1.818181818181818182",
                 }
             },
         },
@@ -1387,7 +1399,10 @@ def loopback(
                             and query == {name: {"trader": ADDRESS, "index": 7}}
                         )
                         if name == "get_trade_raw":
-                            if scenario == "concurrent-close":
+                            if (
+                                scenario == "concurrent-close"
+                                or close_target == "verified"
+                            ):
                                 allowed.append(
                                     {name: {"trader": position["trader"], "index": 7}}
                                 )
@@ -1440,6 +1455,13 @@ def loopback(
                         if owner_read and scenario == "quote-owner-read-error":
                             self.reply({}, 503)
                             return
+                        if (
+                            scenario == "quote-close-height-failed"
+                            and name == "get_trade_raw"
+                            and anchor
+                        ):
+                            self.reply({}, 503)
+                            return
                         if name == "get_trade_raw" and cancel_target is not None:
                             [nonce] = parse_qs(urlsplit(self.path).query).get(
                                 "_sai_query", [""]
@@ -1463,6 +1485,29 @@ def loopback(
                                     self.reject("Cancellation session gate timed out")
                                     return
                         data = contract_data(name, pinned=HEIGHT_HEADER in self.headers)
+                        if name == "get_market" and scenario in {
+                            "quote-cache-reopened",
+                            "quote-cache-closed",
+                        }:
+                            fresh = "_sai_query" in parse_qs(request_url.query)
+                            close_only = fresh == (scenario == "quote-cache-closed")
+                            data = {
+                                **data,
+                                "market_trading_state": "close_only"
+                                if close_only
+                                else "open",
+                            }
+                        if (
+                            scenario == "quote-close-collateral-changed"
+                            and name == "get_trade_raw"
+                            and anchor
+                        ):
+                            data = {
+                                **data,
+                                "collateral_amount": str(
+                                    int(data["collateral_amount"]) + 1
+                                ),
+                            }
                         self.reply({"data": data}, lcd=True)
                         return
                     except (ValueError, KeyError, TypeError):
@@ -1616,8 +1661,11 @@ def loopback(
             request_id = subscription["id"]
             try:
                 request = graphql_request(subscription["payload"], websocket=True)
-                wire.append(request)
                 name = request.label.removeprefix("ws:")
+                # Both registered query shapes read the same balance snapshot.
+                if balance_block_reads and name == "userBalancesWithBlock":
+                    request = replace(request, label="ws:userBalances")
+                wire.append(request)
                 expected = {"id": 3} if name == "tokenPricesUsd" else {"user": ADDRESS}
                 if not same_variables(request.variables, expected):
                     raise ValueError(f"Wrong WebSocket variables for {name}")

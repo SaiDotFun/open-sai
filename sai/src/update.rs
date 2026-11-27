@@ -24,6 +24,10 @@ use sai_core::{
 use semver::Version;
 use serde_json::{Map, Value, json};
 
+use crate::mcp_registration::update_repair::{UpdateRepair, repair_after_update};
+
+pub(crate) use install::mcp_repair_launcher;
+
 const RUNNING: &str = env!("CARGO_PKG_VERSION");
 const LOCK_WAIT: Duration = Duration::from_secs(300);
 
@@ -94,7 +98,7 @@ impl UpdateCommand {
                 || Settings::load(flags, &env)
                     .is_ok_and(|settings| settings.value(Key::UpdateAuto).as_bool() == Some(true))
         };
-        let out = runtime.block_on(self.update(&install, releases, &env.home, allowed));
+        let out = runtime.block_on(self.update(&install, releases, &env.home, allowed, events));
         let exit = out.exit();
         events.event(
             "update.result",
@@ -126,13 +130,20 @@ impl UpdateCommand {
             });
         }
         if json_output {
-            emit(&json!({
+            let mut report = json!({
                 "status": out.status,
                 "message": out.message,
                 "installed": out.installed,
                 "target": out.target,
                 "rolledBack": out.rolled_back,
-            }));
+            });
+            if let Some(repair) = &out.mcp_repair {
+                report
+                    .as_object_mut()
+                    .expect("update report is an object")
+                    .extend(repair.json_fields());
+            }
+            emit(&report);
         } else {
             println!("{}", out.message);
         }
@@ -145,6 +156,7 @@ impl UpdateCommand {
         releases: Result<Releases, release::ReleaseError>,
         home: &Path,
         allowed: impl Fn() -> bool,
+        events: EventContext<'_>,
     ) -> Outcome {
         let Some(lock_path) = install.lock_path() else {
             return Outcome::new("unsupported", guidance(install), RUNNING, None);
@@ -320,14 +332,24 @@ impl UpdateCommand {
                 .change(&releases, &installed, &target, home, allowed)
                 .await
             {
-                Change::Updated => Outcome::new(
-                    "updated",
-                    format!(
-                        "Updated sai from {installed} to {target}. Restart agent clients and any open `sai` shell so they load it."
-                    ),
-                    &selected,
-                    to,
-                ),
+                Change::Updated => {
+                    let mut out = Outcome::new(
+                        "updated",
+                        format!(
+                            "Updated sai from {installed} to {target}. Restart agent clients and any open `sai` shell so they load it."
+                        ),
+                        &selected,
+                        to,
+                    );
+                    if let Some(launcher) = install.launcher() {
+                        out.mcp_repair = Some(Box::new(repair_after_update(
+                            launcher,
+                            self.background,
+                            events,
+                        )));
+                    }
+                    out
+                }
                 Change::Available => available(),
                 Change::Unsupported(reason) => {
                     return Outcome::new("unsupported", reason, &before, to);
@@ -508,6 +530,7 @@ struct Outcome {
     installed: String,
     target: Option<String>,
     rolled_back: bool,
+    mcp_repair: Option<Box<UpdateRepair>>,
 }
 
 impl Outcome {
@@ -523,6 +546,7 @@ impl Outcome {
             installed: installed.into(),
             target: target.map(str::to_owned),
             rolled_back: false,
+            mcp_repair: None,
         }
     }
 
@@ -535,14 +559,21 @@ impl Outcome {
     }
 
     async fn save(&self, home: &Path, before: &str, seen: bool) {
-        let mut changes = json!({"result": {
+        let mut result = json!({
             "status": self.status,
             "from": before,
             "to": self.target,
             "at": state::stamp(),
             "error": (self.status == "failed").then_some(&self.message),
             "rolledBack": self.rolled_back,
-        }});
+        });
+        if let Some(repair) = &self.mcp_repair {
+            result
+                .as_object_mut()
+                .expect("update state result is an object")
+                .extend(repair.state_fields());
+        }
+        let mut changes = json!({"result": result});
         if seen && let Some(target) = &self.target {
             changes["notified"] = json!(format!("{}:{target}", self.status));
         }

@@ -5,6 +5,7 @@ use std::time::Duration;
 use crate::{
     errors::{Code, SaiError},
     keeper::{MARKETS, TIMEOUT},
+    settings::repr,
 };
 
 use super::{TradeIntent, TradePreview, Trading, confirmation::plain_decimal, positive_decimal};
@@ -205,19 +206,22 @@ impl Trading<'_> {
 
 pub(super) fn id(value: &str, parameter: &str) -> Result<BigInt, SaiError> {
     let invalid = || {
-        SaiError::usage(format!(
-            "Invalid value for '{parameter}': expected an integer."
-        ))
+        // Arbitrary rejected arguments can contain credentials.
+        let reason = if value.chars().all(|character| {
+            character.is_numeric()
+                || character.is_whitespace()
+                || matches!(character, '+' | '-' | '_')
+        }) {
+            format!("{} is not a valid integer.", repr(value))
+        } else {
+            "expected an integer.".into()
+        };
+        SaiError::usage(format!("Invalid value for '{parameter}': {reason}"))
     };
-    let text = value.trim();
-    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
-    if !digits
-        .split('_')
-        .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-    {
+    if value.is_empty() || value.len() > 4300 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(invalid());
     }
-    text.replace('_', "").parse().map_err(|_| invalid())
+    value.parse().map_err(|_| invalid())
 }
 
 pub(super) fn invalid(message: &str) -> SaiError {

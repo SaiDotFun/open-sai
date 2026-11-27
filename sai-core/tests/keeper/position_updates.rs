@@ -42,6 +42,8 @@ struct ReplyState {
     indexed_position_missing: bool,
     close_height_check_index: Option<u8>,
     target_missing: bool,
+    market_close_only: bool,
+    stale_oracle: bool,
 }
 
 struct PositionServer {
@@ -70,6 +72,8 @@ impl PositionServer {
             indexed_position_missing: false,
             close_height_check_index: None,
             target_missing: false,
+            market_close_only: false,
+            stale_oracle: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let replies = Arc::clone(&state);
@@ -97,10 +101,15 @@ impl PositionServer {
                 } else {
                     "200 OK"
                 };
+                let height = if replies.stale_oracle {
+                    "grpc-metadata-x-cosmos-block-height: 120\r\n"
+                } else {
+                    ""
+                };
                 drop(replies);
                 write!(
                     stream,
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    "HTTP/1.1 {status}\r\n{height}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
                     response.len(),
                 )
                 .unwrap();
@@ -188,18 +197,49 @@ impl ReplyState {
             self.requests.push("node_info".into());
             return json!({"default_node_info": {"network": self.lcd_chain}});
         }
+        if request.starts_with("GET /cosmos/base/tendermint/v1beta1/blocks/120 ") {
+            self.requests.push("block".into());
+            return json!({"block": {"header": {"height": "120", "time": "1970-01-01T00:16:40Z"}}});
+        }
         let path = request
             .strip_prefix(&format!(
                 "GET /cosmwasm/wasm/v1/contract/{}/smart/",
                 self.contract
             ))
             .unwrap_or_else(|| panic!("Unexpected LCD request: {request}"));
+        let (target, _) = path.split_once(' ').unwrap();
+        let path = target.split('?').next().unwrap();
+        let (encoded, _) = url::form_urlencoded::parse(path.as_bytes()).next().unwrap();
+        let message: Value =
+            serde_json::from_slice(&STANDARD.decode(encoded.as_bytes()).unwrap()).unwrap();
+        if message == json!({"get_market": {"index": "MarketIndex(3)"}}) {
+            self.requests.push("market_state".into());
+            return json!({"data": {
+                "market_trading_state": if self.market_close_only { "close_only" } else { "open" },
+                "group_index": "GroupIndex(0)",
+            }});
+        }
+        if self.stale_oracle {
+            let (name, value) = match message.as_object().unwrap().keys().next().unwrap().as_str() {
+                "get_perp_prices" => (
+                    "prices",
+                    json!({"market": {
+                        "base_per_quote": "100", "base_last_update_time": 1
+                    }}),
+                ),
+                "market_order_config" => (
+                    "market_order_config",
+                    json!({"fill_at_next_oracle_price": false}),
+                ),
+                "get_group" => ("group", json!({"stale_price_expiration_secs": 30})),
+                _ => ("", Value::Null),
+            };
+            if !name.is_empty() {
+                self.requests.push(name.into());
+                return json!({"data": value});
+            }
+        }
         if let Some(latest_index) = self.close_height_check_index {
-            let (target, _) = path.split_once(' ').unwrap();
-            let path = target.split('?').next().unwrap();
-            let (encoded, _) = url::form_urlencoded::parse(path.as_bytes()).next().unwrap();
-            let message: Value =
-                serde_json::from_slice(&STANDARD.decode(encoded.as_bytes()).unwrap()).unwrap();
             if message.get("get_exchange_balance").is_some() {
                 assert_eq!(
                     message,
@@ -320,7 +360,7 @@ async fn close_preview_requires_verified_ownership_to_issue_a_digest() {
 }
 
 #[tokio::test]
-async fn close_preview_withholds_digest_when_the_height_check_returns_a_different_index() {
+async fn close_preview_checks_the_index_even_without_a_block_height() {
     for (latest_index, verified) in [(8, false), (7, true)] {
         let server = PositionServer::start(ACCOUNT, ACCOUNT);
         // Neither response serves a block height. Only a conflicting index
@@ -350,12 +390,15 @@ async fn close_preview_withholds_digest_when_the_height_check_returns_a_differen
             ]
         );
         assert_eq!(output["estimates"]["fees"]["status"], "unavailable");
+        assert!(output.get("previewDigest").is_none());
         if verified {
-            assert!(output["previewDigest"].is_string());
+            assert_eq!(
+                output["estimates"]["execution"]["code"],
+                "OraclePublicationTimeUnknown"
+            );
             assert_eq!(output["positionRoute"]["contractAddress"], CONTRACT);
             assert!(output.get("positionOwnerVerified").is_none());
         } else {
-            assert!(output.get("previewDigest").is_none());
             assert!(output.get("positionRoute").is_none());
             assert_eq!(output["positionOwnerVerified"], false);
         }
@@ -601,9 +644,164 @@ async fn shared_market_submit_refreshes_before_reserving() {
             "markets",
             "route",
             "node_info",
-            "markets"
+            "markets",
+            "market_state",
+            "route",
+            "node_info"
         ]
     );
+    assert!(!home.path().join("trader/intents.sqlite3").exists());
+}
+
+#[tokio::test]
+async fn confirmed_core_open_checks_market_state_before_reserving() {
+    let server = PositionServer::start(ACCOUNT, ACCOUNT);
+    let endpoint = format!("{}/query", server.url);
+    let home = tempfile::tempdir().unwrap();
+    let storage = fixture_storage(&home, &endpoint);
+    let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+    let session = trading.load_session(None).unwrap();
+    let preview = market_open();
+    let issued = trading
+        .confirmed_trade_preview(&session, preview.clone())
+        .await
+        .unwrap();
+    server.state.lock().unwrap().market_close_only = true;
+
+    let error = trading
+        .submit(
+            &session,
+            &preview,
+            SubmitOptions {
+                confirmation: Some(
+                    Confirmation::new(issued["previewDigest"].as_str().unwrap(), Some("100"))
+                        .unwrap(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, Code::PreviewMismatch);
+    assert_eq!(
+        error.details.unwrap()["preview"]["estimates"]["execution"]["code"],
+        "MarketClosed"
+    );
+    server.state.lock().unwrap().price = "110";
+    let moved = trading
+        .submit(
+            &session,
+            &preview,
+            SubmitOptions {
+                confirmation: Some(
+                    Confirmation::new(issued["previewDigest"].as_str().unwrap(), Some("100"))
+                        .unwrap(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(moved.code, Code::PriceMoved);
+    let details = moved.details.unwrap();
+    let replacement = &details["preview"];
+    assert_eq!(
+        replacement["estimates"]["execution"]["code"],
+        "MarketClosed"
+    );
+    assert!(replacement.get("previewDigest").is_none());
+    assert!(!server.requests().iter().any(|label| label == "admission"));
+    assert!(!home.path().join("trader/intents.sqlite3").exists());
+}
+
+#[tokio::test]
+async fn confirmed_core_close_checks_oracle_age_before_reserving() {
+    let server = PositionServer::start(ACCOUNT, ACCOUNT);
+    let endpoint = format!("{}/query", server.url);
+    let home = tempfile::tempdir().unwrap();
+    let storage = fixture_storage(&home, &endpoint);
+    let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+    let session = trading.load_session(None).unwrap();
+    let preview = close_preview("7", false).unwrap();
+    let issued = trading
+        .confirmed_trade_preview(&session, preview.clone())
+        .await
+        .unwrap();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.close_height_check_index = Some(7);
+        state.stale_oracle = true;
+    }
+
+    let stale = trading
+        .confirmed_trade_preview(&session, preview.clone())
+        .await
+        .unwrap();
+    assert_eq!(stale["estimates"]["execution"]["code"], "OraclePriceStale");
+    assert!(stale.get("previewDigest").is_none());
+
+    let error = trading
+        .submit(
+            &session,
+            &preview,
+            SubmitOptions {
+                confirmation: Some(
+                    Confirmation::new(issued["previewDigest"].as_str().unwrap(), None).unwrap(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, Code::PreviewMismatch);
+    let details = error.details.unwrap();
+    let replacement = &details["preview"];
+    assert_eq!(
+        replacement["estimates"]["execution"]["code"],
+        "OraclePriceStale"
+    );
+    assert!(replacement.get("previewDigest").is_none());
+    assert!(!server.requests().iter().any(|label| label == "admission"));
+    assert!(!home.path().join("trader/intents.sqlite3").exists());
+}
+
+#[tokio::test]
+async fn confirmed_core_leverage_checks_execution_before_reserving() {
+    let server = PositionServer::start(ACCOUNT, ACCOUNT);
+    let endpoint = format!("{}/query", server.url);
+    let home = tempfile::tempdir().unwrap();
+    let storage = fixture_storage(&home, &endpoint);
+    let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+    let session = trading.load_session(None).unwrap();
+    let preview = leverage_preview("7", "10").unwrap();
+    let digest = confirmed_digest(&trading, &session, &preview).await;
+    {
+        let mut state = server.state.lock().unwrap();
+        state.close_height_check_index = Some(7);
+        state.stale_oracle = true;
+    }
+
+    let error = trading
+        .submit(
+            &session,
+            &preview,
+            SubmitOptions {
+                confirmation: Some(Confirmation::new(&digest, None).unwrap()),
+                ..Default::default()
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, Code::PreviewMismatch);
+    assert_eq!(
+        error.details.unwrap()["preview"]["estimates"]["execution"]["code"],
+        "OraclePriceStale"
+    );
+    assert!(!server.requests().iter().any(|label| label == "admission"));
     assert!(!home.path().join("trader/intents.sqlite3").exists());
 }
 

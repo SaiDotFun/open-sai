@@ -233,10 +233,15 @@ def read_collateral_price(lcd: str, contract: str, token: str) -> dict[str, Any]
 
 
 def contract_market(
-    lcd: str, contract: str, market: str, *, height: str | None = None
+    lcd: str,
+    contract: str,
+    market: str,
+    *,
+    height: str | None = None,
+    fresh: bool = False,
 ) -> dict[str, Any]:
     pair = margin.smart_value(
-        lcd, contract, {"get_market": {"index": market}}, height=height
+        lcd, contract, {"get_market": {"index": market}}, height=height, fresh=fresh
     )
     if not isinstance(pair, dict):
         raise TypeError("Perp market is unavailable")
@@ -278,6 +283,7 @@ def open_estimates(
     market_reference: dict[str, Any] | None,
     *,
     market_bound: bool,
+    fresh_market: bool = False,
 ) -> dict[str, Any]:
     order_type, long = body["orderType"], body["side"] == "long"
     reference = market_reference
@@ -295,7 +301,9 @@ def open_estimates(
     liq = unavailable("An entry price and opening fee estimate are required.")
     if lcd and contract:
         try:
-            pair = contract_market(lcd, contract, body["market"]["marketIndex"])
+            pair = contract_market(
+                lcd, contract, body["market"]["marketIndex"], fresh=fresh_market
+            )
             if refusal := market_open_rejection(
                 pair, market_order=order_type == "market"
             ):
@@ -566,6 +574,8 @@ def position_estimates(
     target: Decimal | None = None,
     quoted_effective: Decimal | None = None,
     require_unchanged: bool = False,
+    show_collateral: bool = False,
+    bind_collateral: bool = False,
 ) -> dict[str, Any]:
     """Quote leverage or TP/SL changes after checking the after-hours guard."""
     unknown = unavailable(
@@ -579,7 +589,14 @@ def position_estimates(
         raw = state.raw
         if target is not None:
             return _leverage_estimates(
-                lcd, state, trade_id, height, target, quoted_effective
+                lcd,
+                state,
+                trade_id,
+                height,
+                target,
+                quoted_effective,
+                show_collateral,
+                bind_collateral,
             )
         effective, _ = margin.leverage_inputs(lcd, state, trade_id, height=height)
         if effective is None:
@@ -622,6 +639,8 @@ def _leverage_estimates(
     height: str,
     target: Decimal,
     quoted_effective: Decimal | None,
+    show_collateral: bool,
+    bind_collateral: bool,
 ) -> dict[str, Any]:
     raw, contract = state.raw, state.contract
     pair = contract_market(lcd, contract, raw["market_index"], height=height)
@@ -744,4 +763,14 @@ def _leverage_estimates(
             if not queued:
                 return rejected("InsufficientDepositBalance", funding)
             result["execution"]["warning"] = f"{funding} Perp checks funding at fill."
+    if bind_collateral:
+        result["collateralBaseUnits"] = {
+            "before": str(before),
+            "after": str(collateral),
+        }
+    if show_collateral:
+        collateral_price = margin.optional_collateral_price(lcd, state, height=height)
+        result["collateral"] = margin.collateral_amounts(
+            before, collateral, collateral_price
+        )
     return result

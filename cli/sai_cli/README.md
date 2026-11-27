@@ -451,15 +451,29 @@ requires a new preview and confirmation. A position preview with
 
 Commands include `market list`, `market prices`, `account positions ADDR`,
 `account balances ADDR`, `account history ADDR`, `trade open`, `trade
-close`, `trade partial-close`, `trade tpsl`, `intent wait KEY`,
+close`, `trade cancel`, `trade partial-close`, `trade tpsl`, `intent wait KEY`,
 and live `watch` streams. Run any command with `--help` for details. Fund
 your Sai account in Sai Web before trading. Use `--dry-run` to inspect
 the intent and any available estimates. Some previews need a session and
 live position data. To preview an open without signing in, omit `--as`.
 
+The `account overview` and `account balances ADDR` commands show the
+source block and age beside each balance. Sai marks a source more than
+five minutes old as stale. This age describes the last balance update.
+If Sai cannot verify the block time, it displays an unknown age.
+
+Use `sai trade cancel ID --dry-run` to preview a pending order cancellation.
+The command accepts `--preview-digest` and `--wait` on submission. Existing
+scripts can still use `sai trade close ID --cancel-order`.
+
 On `main`, Sai refuses a position preview or submission if the position
 belongs to another account. A dry run with `positionOwnerVerified: false`
 is informational. Get a verified preview before submitting.
+
+Use `sai market list` to see the symbol, market ID, collateral token, and
+price. The `trade open --market` option accepts a case-insensitive symbol
+such as `BTC` or a numeric ID. If a symbol matches multiple market IDs,
+choose the ID from the table.
 
 For a live market order, the CLI refreshes the price before admission and
 reports that reference price after acceptance. A dry run marks the price as
@@ -484,7 +498,18 @@ the direction. When the after-hours guard is pending,
 before the leverage change. Keeper submits the target leverage. Perp uses
 effective leverage at execution to determine the direction and amount.
 `--dry-run` reads live state and prints the quote without submitting an
-intent. Use `--lcd-endpoint` to select the matching network's
+intent. The preview shows collateral before and after in USDC and USD. In
+JSON, those values appear in `collateral.beforeUsdc`, `collateral.afterUsdc`,
+`collateral.beforeUsd`, and `collateral.afterUsd`. The USD fields are null
+when the collateral oracle price is unavailable.
+
+Use `--max-collateral-usd 5` with `trade margin --direction add --amount 1`
+to quote an add of up to 1 USDC with at most $5 of estimated total
+collateral. The CLI rounds down to whole base units and reduces the amount
+if needed. Pass the same cap when submitting. The contract executes the
+target leverage, so collateral at execution can differ from the quote.
+
+Use `--lcd-endpoint` to select the matching network's
 Nibiru REST service; the CLI checks that its chain matches Keeper.
 Margin changes and partial closes briefly re-read Keeper and the contract if
 their position data disagree. If the mismatch persists, the command stops
@@ -511,7 +536,8 @@ recorded for the key, then the active account on the configured Keeper
 endpoint. Pass `--addr ADDR` to look up an intent from another machine
 without signing in. The address can be EVM or Nibiru. If Sai cannot select
 an account, the command exits 1 with code `INVALID_REQUEST`. Add `--wait` to a live
-trade command to submit once and wait up to 60 seconds for that key. With
+trade command to submit once and wait up to 60 seconds for that key. In text
+mode, the CLI prints one progress line to stderr when polling starts. With
 MCP, call `intent_wait` after the trade returns its key. The tool caps each
 call at 10 seconds.
 
@@ -543,8 +569,10 @@ that filled it. When history is available, `execution.historyId` identifies
 the matching row. `positionNow` shows Keeper's latest state for that trade,
 and `positionFeesUsd` gives cumulative fees. The fill can include an oracle
 quote and the escrowed collateral in base units from the matching market
-order. Actual fill price and size remain null when Keeper exposes only the
-current position.
+order. For a market opening, `fill.price` is the executed entry price and
+`fill.sizeCollateralBaseUnits` is the leveraged size after opening fees,
+rounded down to whole collateral base units. Each field is null when
+Keeper cannot tie its value to the fill.
 
 ### Doctor
 

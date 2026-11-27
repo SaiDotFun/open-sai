@@ -40,6 +40,8 @@ use uuid::Uuid;
 
 use crate::reads::output;
 
+pub(crate) use install::launcher_path;
+
 const MCP_WAIT_LIMIT: Duration = Duration::from_secs(10);
 const INSTRUCTIONS: &str = include_str!("mcp/instructions.txt");
 // Wire metadata captured from Python main at 1c671b231b0fc968a44ec8dd520e67ea28e25b7f.
@@ -82,12 +84,9 @@ impl ServeArgs {
             );
         }
         let settings = crate::load_settings(&flags, env).map_err(|error| {
-            let message = format!("sai mcp serve: {error}");
-            if error.is_invalid_endpoint() {
-                SaiError::usage(message)
-            } else {
-                SaiError::new(Code::InvalidRequest, message)
-            }
+            let mut error = SaiError::from(error);
+            error.message = format!("sai mcp serve: {}", error.message);
+            error
         })?;
         let server = SaiMcp {
             settings: Arc::new(settings),
@@ -393,7 +392,12 @@ impl SaiMcp {
                         };
                         let addr = account["addr"].as_str().expect("resolved account address");
                         let receipt = wait::for_intent(
-                            &endpoint, addr, &key, timeout, started, &storage, events,
+                            &endpoint,
+                            addr,
+                            &key,
+                            wait::WaitOptions { timeout, started, remember_fill: None },
+                            &storage,
+                            events,
                         )
                         .await?;
                         Ok(wait_result(account, receipt))

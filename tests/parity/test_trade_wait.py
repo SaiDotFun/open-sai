@@ -9,6 +9,8 @@ import select
 import signal
 import sqlite3
 import subprocess
+import sys
+import threading
 import time
 from collections import deque
 from collections.abc import Callable
@@ -273,6 +275,8 @@ def target_lcd(request: Request, *, trade_type: str = "trade") -> Reply:
     path = urlsplit(request.path).path
     assert path.startswith(SMART_QUERY)
     query = json.loads(base64.b64decode(unquote(path.removeprefix(SMART_QUERY))))
+    if query == {"get_market": {"index": "MarketIndex(1)"}}:
+        return response({"data": {"market_trading_state": "open"}})
     assert query == {"get_trade_raw": {"trader": ADDR, "index": 17}}
     return response(
         {
@@ -548,6 +552,8 @@ def test_trade_wait(
                 preflight = close_preflight(replies, rust=index == 1)
             elif case.args == OPEN:
                 replies.append(response(MARKETS))
+                if index == 1:
+                    replies.append(response({"data": {"oneClickTrading": ROUTE}}))
             if update:
                 queue_update_preflight(replies)
             replies.append(admit)
@@ -593,6 +599,11 @@ def test_trade_wait(
                 else {"path": urlsplit(request.path).path}
                 for request in requests[preflight:]
             ]
+            if case.args == OPEN and index == 1:
+                assert wire[1] == {"query": keeper.ROUTE, "variables": {}}
+                assert requests[2].path == NODE_INFO
+                assert requests[3].path.startswith(SMART_QUERY)
+                del wire[1:4]
             if case.kind == "CANCEL_PENDING_TRADE":
                 assert wire[0]["query"] == keeper.ROUTE
                 assert requests[1].path == NODE_INFO
@@ -606,7 +617,7 @@ def test_trade_wait(
                 if preflight:
                     assert requests[2].path == NODE_INFO
                     assert requests[3].path.startswith(SMART_QUERY)
-                assert all(request.body for request in requests[preflight:])
+                assert all("query" in item for item in wire)
             assert (
                 sum(item.get("query", "").startswith("mutation") for item in wire) == 1
             )
@@ -1354,4 +1365,58 @@ def test_trade_wait_interrupts_a_full_stdout_pipe(
             assert document["localStatus"] == document["outcome"] == "terminal"
             assert document["receipt"] is None
             assert ledger_state(home) == [(key, "terminal", "terminal")]
+            assert not replies
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_current_cli_wait_progress_precedes_the_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, json_output: bool
+) -> None:
+    home = tmp_path / "sai"
+    python = str(Path(sys.executable).with_name("sai"))
+    first_poll = threading.Event()
+    release = threading.Event()
+    with replay(get=target_lcd) as (endpoint, replies, requests):
+        connect(home, endpoint, monkeypatch)
+        preflight = filled_close(replies, requests, rust=True)
+        filled = replies[-2]
+
+        def hold_poll(request: Request) -> Reply:
+            first_poll.set()
+            assert release.wait(10)
+            assert callable(filled)
+            return filled(request)
+
+        replies[-2] = hold_poll
+        args = tuple(
+            arg
+            for arg in trade_wait_args(endpoint, CLOSE)
+            if json_output or arg != "--json"
+        )
+        with subprocess.Popen(
+            [python, *args],
+            env=cli_environment(home),
+            cwd=tmp_path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) as process:
+            try:
+                assert first_poll.wait(10)
+                key = submitted_key(requests[preflight], "CLOSE_POSITION")
+                assert process.stdout is not None and process.stderr is not None
+                assert not select.select([process.stdout], [], [], 0)[0]
+                if not json_output:
+                    assert select.select([process.stderr], [], [], 1)[0]
+                    assert process.stderr.readline() == (
+                        f"Waiting for intent {key} to confirm...\n".encode()
+                    )
+                release.set()
+                stdout, stderr = process.communicate(timeout=10)
+            finally:
+                release.set()
+                if process.poll() is None:
+                    process.kill()
+            assert process.returncode == 0, (stdout, stderr)
+            assert stderr == b""
+            assert json.loads(stdout)["outcome"] == "filled"
             assert not replies

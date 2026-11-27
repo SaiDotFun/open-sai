@@ -10,13 +10,14 @@ use thiserror::Error;
 use crate::{
     errors::{Code, SaiError},
     paths,
+    settings::MAINNET_HTTP,
 };
 
 mod ledger;
 mod sessions;
 
 pub use ledger::{IntentRow, IntentStatus, StatusUpdateOptions};
-pub use sessions::{Accounts, RemovedSession, Session, SessionSummary};
+pub use sessions::{Accounts, RemovedSession, Session, SessionSummary, is_session_envelope};
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -82,11 +83,12 @@ pub struct Storage<'a> {
     pub(crate) trader: PathBuf,
     busy_timeout: Duration,
     ledger_deadline: Option<Instant>,
+    preserve_ledger_modes: bool,
     events: Option<&'a (dyn Fn(StorageEvent<'_>) + Sync)>,
 }
 
-/// State changes to pass to the shared log writer. The event sink runs only
-/// after the operation has committed. Endpoints contain only the URL origin.
+/// Storage events for the shared log writer. State changes are emitted after
+/// commit. Endpoints contain only the URL origin.
 pub enum StorageEvent<'a> {
     SessionSaved {
         addr: &'a str,
@@ -111,6 +113,11 @@ pub enum StorageEvent<'a> {
         kind: &'a str,
         addr: &'a str,
         entity: &'a str,
+        endpoint: &'a str,
+    },
+    OpenBlocked {
+        key: &'a str,
+        addr: &'a str,
         endpoint: &'a str,
     },
     IntentStatus {
@@ -181,6 +188,7 @@ impl<'a> Storage<'a> {
             trader: sai_home.as_ref().join("trader"),
             busy_timeout: Duration::from_secs(10),
             ledger_deadline: None,
+            preserve_ledger_modes: false,
             events: None,
         }
     }
@@ -194,6 +202,12 @@ impl<'a> Storage<'a> {
     /// Bound ledger writes during one doctor reconciliation run.
     pub fn with_ledger_deadline(mut self, deadline: Instant) -> Self {
         self.ledger_deadline = Some(deadline);
+        self
+    }
+
+    /// Open only an existing ledger without changing its mode or its directory's mode.
+    pub fn with_preserved_ledger_modes(mut self) -> Self {
+        self.preserve_ledger_modes = true;
         self
     }
 
@@ -230,16 +244,19 @@ impl<'a> Storage<'a> {
     }
 
     pub(crate) fn keeper_hint_flag(&self, endpoint: &str) -> String {
-        if endpoint_origin(endpoint) == endpoint
-            && self
-                .trader
-                .parent()
-                .is_some_and(|home| crate::log::redact(home, endpoint) == endpoint)
-        {
+        if self.keeper_hint_uses_url(endpoint, Some(&endpoint_origin(endpoint))) {
             crate::session::shell_quote(endpoint)
         } else {
             crate::session::ORIGINAL_KEEPER_HINT.into()
         }
+    }
+
+    pub(crate) fn keeper_hint_uses_url(&self, endpoint: &str, origin: Option<&str>) -> bool {
+        (endpoint == MAINNET_HTTP || origin == Some(endpoint))
+            && self
+                .trader
+                .parent()
+                .is_some_and(|home| crate::log::redact(home, endpoint) == endpoint)
     }
 
     pub(crate) fn emit(&self, event: StorageEvent<'_>) {

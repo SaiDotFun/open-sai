@@ -1,7 +1,7 @@
 use std::{
     env, fs,
     io::{IsTerminal, Read, Write},
-    os::unix::fs::{PermissionsExt, symlink},
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::Path,
     process::{Command, Stdio},
     time::Duration,
@@ -14,17 +14,29 @@ use sai_core::{
 use serde_json::{Value, json};
 
 use super::{RETIRED_NAME, repair_after_update};
+use crate::mcp_registration::client::SAVE_BEFORE_PUBLISH;
 
 const CODEX: &str = r#"#!/bin/sh
 if [ "$3" != sai ]; then
     printf "Error: No MCP server named '%s' found.\n" "$3" >&2
     exit 1
 fi
-if grep -Fq "$HOME/.local/bin/sai" "$CODEX_HOME/config.toml"; then
-    [ ! -f "$HOME/reject-repair" ] || exit 9
+if [ -f "$HOME/.cursor/pending-save.json" ]; then
+    mv "$HOME/.cursor/pending-save.json" "$HOME/.cursor/mcp.json" || exit 10
+fi
+if [ "$5" = "-c" ]; then
+    case "$6" in
+        'mcp_servers.sai.command="'*"$HOME/.local/bin/sai"'"') ;;
+        *) exit 9 ;;
+    esac
+    launcher="$HOME/.local/bin/sai"
+elif grep -Fq "$HOME/.local/bin/sai" "$CODEX_HOME/config.toml"; then
     launcher="$HOME/.local/bin/sai"
 else
     launcher="$HOME/retired/sai"
+fi
+if [ "$launcher" = "$HOME/.local/bin/sai" ] && [ -f "$HOME/reject-repair" ]; then
+    exit 9
 fi
 printf '{"transport":{"type":"stdio","command":"%s","args":["mcp","serve"]}}\n' "$launcher"
 "#;
@@ -40,7 +52,7 @@ fn uv_background() {
 }
 
 #[test]
-fn uv_background_success() {
+fn uv_background_preserves_client_saves() {
     replay("uv-success");
 }
 
@@ -182,6 +194,7 @@ fn check_fixture(home: &Path, project: &Path, installed: &str, background: bool,
         old.display(),
     );
     write(&codex, &codex_bytes, 0o640);
+    let codex_inode = fs::metadata(&codex).unwrap().ino();
     if reject {
         write(&home.join("reject-repair"), "", 0o600);
     }
@@ -208,6 +221,26 @@ fn check_fixture(home: &Path, project: &Path, installed: &str, background: bool,
     let project_entry = cursor_entry(&old);
     write(&project_cursor, project_entry.to_string(), 0o640);
 
+    // The fixture Codex process publishes a Cursor save during background repair.
+    let cursor_save = if background && !reject {
+        let staged = home.join(".cursor/pending-save.json");
+        let mut document = cursor_entry(&old);
+        document["mcpServers"]["new-server"] = json!({"url": "http://127.0.0.1:8765/mcp"});
+        let bytes = document.to_string();
+        write(&staged, &bytes, 0o600);
+        Some((bytes, fs::metadata(staged).unwrap().ino()))
+    } else {
+        None
+    };
+    let codex_save = cursor_save.as_ref().map(|_| {
+        let staged = home.join(".codex/pending-save.toml");
+        let bytes =
+            format!("{codex_bytes}\n[mcp_servers.other]\nurl = 'http://127.0.0.1:8765/mcp'\n");
+        write(&staged, &bytes, 0o640);
+        SAVE_BEFORE_PUBLISH.set(Some((staged.clone(), codex.clone())));
+        bytes
+    });
+
     let sai_home = home.join("sai-home");
     fs::create_dir(&sai_home).unwrap();
     let writer = LogWriter::start(Environment::new(sai_home.clone(), |_| None)).unwrap();
@@ -227,34 +260,68 @@ fn check_fixture(home: &Path, project: &Path, installed: &str, background: bool,
         0o640
     );
 
-    if reject {
-        assert_eq!(report("codex")["status"], "fail");
-        assert_eq!(fs::read_to_string(&codex).unwrap(), codex_bytes);
-        assert_eq!(report("cursor")["status"], "fail");
-        assert_eq!(fs::read_to_string(&user_cursor).unwrap(), user_entry);
+    if let Some(bytes) = codex_save {
+        let reached_publish = SAVE_BEFORE_PUBLISH.take().is_none();
+        let expected = if reached_publish {
+            &bytes
+        } else {
+            &codex_bytes
+        };
         assert_eq!(
-            fs::metadata(&user_cursor).unwrap().permissions().mode() & 0o777,
-            0o444
+            fs::read_to_string(&codex).unwrap(),
+            *expected,
+            "The Codex save at the rename boundary must survive"
         );
+        assert!(
+            !reached_publish,
+            "Background repair reached the Codex writer"
+        );
+    }
+    if background {
+        assert_eq!(report("codex")["status"], "fail");
+        assert_eq!(report("codex")["changes"], json!([]));
+        assert!(
+            report("codex")["fix"]
+                .as_str()
+                .unwrap()
+                .contains("sai doctor")
+        );
+        assert_eq!(fs::read_to_string(&codex).unwrap(), codex_bytes);
+        assert_eq!(fs::metadata(&codex).unwrap().ino(), codex_inode);
     } else {
         assert_eq!(report("codex")["status"], "fixed");
         let updated = fs::read_to_string(&codex).unwrap();
         assert!(updated.contains(launcher.to_str().unwrap()));
         assert!(updated.contains("# keep this comment"));
         assert!(updated.contains("SAI_HOME = '/fixture/profile'"));
-        let (scope, path) = if background {
-            assert_eq!(report("cursor")["status"], "fixed");
-            ("user", &user_cursor)
-        } else {
-            assert_eq!(report("cursor")["pinned"], true);
-            assert_eq!(fs::read_to_string(&user_cursor).unwrap(), user_entry);
-            ("project", &project_cursor)
-        };
+    }
+    if reject {
+        assert_eq!(report("cursor")["status"], "fail");
+        assert_eq!(fs::read_to_string(&user_cursor).unwrap(), user_entry);
+        assert_eq!(
+            fs::metadata(&user_cursor).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+    }
+    if let Some((bytes, inode)) = cursor_save {
+        assert_eq!(fs::read_to_string(&user_cursor).unwrap(), bytes);
+        assert_eq!(fs::metadata(&user_cursor).unwrap().ino(), inode);
+        assert_eq!(report("cursor")["status"], "fail");
+        assert_eq!(report("cursor")["changes"], json!([]));
+        assert!(
+            report("cursor")["fix"]
+                .as_str()
+                .unwrap()
+                .contains("sai doctor")
+        );
+    } else if !background {
+        assert_eq!(report("cursor")["pinned"], true);
+        assert_eq!(fs::read_to_string(&user_cursor).unwrap(), user_entry);
         assert_eq!(
             report("cursor")["changes"],
-            json!([format!("Repaired the Sai registration in {scope} scope")])
+            json!(["Repaired the Sai registration in project scope"])
         );
-        let updated: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let updated: Value = serde_json::from_slice(&fs::read(&project_cursor).unwrap()).unwrap();
         assert_eq!(updated, cursor_entry(&launcher));
         let saved = &updated["mcpServers"]["sai"];
         let args = saved["args"]
@@ -276,6 +343,7 @@ fn check_fixture(home: &Path, project: &Path, installed: &str, background: bool,
             project_entry.to_string()
         );
         assert_eq!(result.state_fields()["mcpNotes"], json!(["background"]));
+        assert_eq!(result.state_fields()["mcp"], fields["mcp"]);
         assert!(
             fields["mcpNotes"][0]
                 .as_str()

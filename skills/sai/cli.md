@@ -15,6 +15,11 @@ sai --json account overview --as 0x0000000000000000000000000000000000000001
 a connected account. Account reads can use a public address without a session.
 Supply a command when invoking Sai from an agent. A bare `sai` opens a shell.
 
+Use `sai market list` to see the symbol, market ID, collateral token, and
+price. The `trade open --market` option accepts a case-insensitive symbol
+such as `BTC` or a numeric ID. If a symbol matches multiple market IDs,
+choose the ID from the table.
+
 ## Read Markets and Accounts
 
 ```bash
@@ -37,7 +42,10 @@ sai --json watch price 3
   and `queuedMarketOrders`. Check each section's fetch time, source age,
   and `error`. A section can fail when the command exits 0.
 - `account positions ADDR` returns `perp.trades`, including pending orders.
-  `account balances ADDR` returns one snapshot in `data.userBalances`.
+  `account balances ADDR` shows source block and age in text mode and returns
+  one snapshot in JSON field `data.userBalances`. Both balance reads mark a
+  source more than five minutes old as stale. An unverifiable block time has
+  an unknown age.
   `account history ADDR` returns `perp.tradeHistory`.
 - `watch price TOKEN_ID`, `watch positions ADDR`, and `watch balances
   ADDR` stream JSON lines until interrupted. A stream reconnects after a
@@ -325,7 +333,8 @@ If `sai skill` answers "No such command", the installed CLI predates it. Use
 
 `trade open`, `trade close`, `trade partial-close`, `trade tpsl`, `trade
 leverage`, and `trade margin` submit intents. Add `--wait` to a live trade
-to wait for its outcome, or run `sai intent wait KEY --timeout 30` with an
-existing key. The commands `intent local` and `intent status` show the
+to wait for its outcome. In text mode, the CLI prints one progress line to
+stderr when polling starts. For an existing key, run
+`sai intent wait KEY --timeout 30`. The commands `intent local` and `intent status` show the
 local ledger and Keeper's latest records. [Trading safety](trading-safety.md)
 has the approval, dry-run, and follow-up steps.
