@@ -1,4 +1,3 @@
-import json
 import os
 import subprocess
 import sys
@@ -49,13 +48,34 @@ def test_configured_exception_cannot_mask_a_network_violation(tmp_path: Path) ->
     assert gaps.finish() == 1
 
 
+CURRENT_TRADE_UX_CASES = (
+    "account-balances",
+    "account-balances-derived-endpoint",
+    "account-balances-no-subprotocol",
+    "account-balances-redirect",
+    "account-balances-text",
+    "bare-help-trade-cancel",
+    "market-list-text",
+    "trade-cancel-alias",
+    "trade-open-ambiguous-market-symbol",
+    "trade-open-market-symbol",
+    "trade-open-unknown-market-symbol",
+    "trade-margin-capped-add",
+)
+
+
 CURRENT_GAPS = ManifestGaps(Path(__file__).with_name("python-main-gaps.toml"))
 
 
-@pytest.mark.parametrize("case_id", CURRENT_GAPS.gaps)
-def test_current_python_gap_against_native(
+@pytest.mark.parametrize(
+    ("case_name", "status"),
+    [(case, "PASS") for case in CURRENT_TRADE_UX_CASES]
+    + [(case.removeprefix("case:"), "XFAIL") for case in CURRENT_GAPS.gaps],
+)
+def test_current_trade_ux_manifest_matches_native(
     cli_pair: tuple[tuple[str, ...], tuple[str, ...]],
-    case_id: str,
+    case_name: str,
+    status: str,
 ) -> None:
     directory = Path(__file__).parent
     result = subprocess.run(
@@ -65,7 +85,7 @@ def test_current_python_gap_against_native(
             "--reference",
             str(Path(sys.executable).with_name("sai")),
             "--case",
-            case_id.removeprefix("case:"),
+            case_name,
         ],
         cwd=directory.parents[1],
         env={**os.environ, "SAI_PARITY_BIN": cli_pair[1][0]},
@@ -75,11 +95,4 @@ def test_current_python_gap_against_native(
         timeout=60,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    prefix = "CURRENT_PYTHON_ROW "
-    (row,) = [
-        json.loads(line.removeprefix(prefix))
-        for line in result.stdout.splitlines()
-        if line.startswith(prefix)
-    ]
-    assert row["id"] == case_id
-    assert row["status"] == "XFAIL"
+    assert f"({case_name}) | {status} |" in result.stdout

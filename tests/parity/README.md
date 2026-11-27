@@ -409,7 +409,10 @@ summation on Python 3.11, the package's minimum supported interpreter.
 Set `SAI_PARITY_OVERVIEW_PYTHON` to its `sai` executable for local runs.
 The cases validate height-pinned requests and compare section errors,
 source timestamps, risk values, and persisted state. Fetch timestamps and
-ages are checked against the invocation and then normalized.
+ages are checked against the invocation and then normalized. For the pinned
+reference, project the native balance freshness fields and unknown-age labels
+to the historical format. Separate loopback cases check the current labels
+and the stale field against Python main.
 
 ## C9b Python Reference
 

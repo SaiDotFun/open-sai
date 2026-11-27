@@ -1,6 +1,22 @@
 # Reviewed differences against sai-cli/v0.1.2. Stable IDs are case:, cli:, and mcp:.
 # Remove an entry in the same change that fixes its gap.
 
+[gap."case:account-balances"]
+owner = "#231"
+signature = "3ec7ab4e5ab39c9dfd4cb19239752e9c8e8754b1d08d7dea3f6fc5d9702b6ecc"
+
+[gap."case:account-balances-derived-endpoint"]
+owner = "#231"
+signature = "3ec7ab4e5ab39c9dfd4cb19239752e9c8e8754b1d08d7dea3f6fc5d9702b6ecc"
+
+[gap."case:account-balances-no-subprotocol"]
+owner = "#231"
+signature = "3ec7ab4e5ab39c9dfd4cb19239752e9c8e8754b1d08d7dea3f6fc5d9702b6ecc"
+
+[gap."case:account-balances-redirect"]
+owner = "#231"
+signature = "3ec7ab4e5ab39c9dfd4cb19239752e9c8e8754b1d08d7dea3f6fc5d9702b6ecc"
+
 [gap."case:account-balances-interrupt"]
 owner = "#211"
 signature = "85399bc02829a112c8b522e284a258fbed50f14f4393a835910602e17fd986f3"

@@ -82,6 +82,14 @@ class OverviewReplay:
                 "token_info": {"type": "sai", "name": "USDC Unsettled on Sai"},
             }
         )
+        if scenario == "overview-balance-freshness":
+            self.state["oldBalanceTime"] = (anchor - timedelta(minutes=15)).isoformat()
+            for row in self.balances["data"]["userBalances"]:
+                name = row["token_info"]["name"]
+                row["lastUpdatedBlock"] = {
+                    "USDC on Sai": RISK_BLOCK - 1,
+                    "USDC Unsettled on Sai": RISK_BLOCK,
+                }.get(name)
         self.trades = self.state["http"][keeper.OVERVIEW_TRADES]
         self.orders = self.state["http"][keeper.PENDING_MARKET_ORDERS]
         if scenario in {"overview-fill-check-fails", "overview-fill-check-malformed"}:
@@ -189,6 +197,25 @@ class OverviewReplay:
     ) -> tuple[WireRequest, dict[str, Any], int | None] | None:
         if path.startswith(BLOCKS):
             height = path.removeprefix(BLOCKS)
+            if (
+                self.scenario == "overview-balance-freshness"
+                and height == str(RISK_BLOCK - 1)
+                and requested_height is None
+                and not query_string
+            ):
+                return (
+                    WireRequest("lcd:balance-source"),
+                    {
+                        "block": {
+                            "header": {
+                                "height": height,
+                                "chain_id": "cataclysm-1",
+                                "time": self.state["oldBalanceTime"],
+                            }
+                        }
+                    },
+                    None,
+                )
             if height != "latest" or requested_height is not None:
                 raise ValueError("Unexpected overview block lookup")
             self.check_nonce(query_string)

@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 import json
 import os
+import select
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -1274,6 +1276,31 @@ def loopback(
                     )
 
         def do_GET(self) -> None:
+            if (
+                scenario == "overview-balance-freshness"
+                and self.path == f"{scope}/query"
+                and self.headers.get("Upgrade", "").lower() == "websocket"
+            ):
+                # Serve the WebSocket and HTTP route on one origin for this fixture.
+                target = urlsplit(ws)
+                assert target.hostname is not None and target.port is not None
+                request = [
+                    self.requestline,
+                    *(f"{key}: {value}" for key, value in self.headers.items()),
+                ]
+                with socket.create_connection(
+                    (target.hostname, target.port), timeout=5
+                ) as upstream:
+                    upstream.sendall(
+                        ("\r\n".join(request) + "\r\n\r\n").encode("ascii")
+                    )
+                    peers = {self.connection: upstream, upstream: self.connection}
+                    while readable := select.select(list(peers), [], [], 5)[0]:
+                        for connection in readable:
+                            if not (chunk := connection.recv(65536)):
+                                return
+                            peers[connection].sendall(chunk)
+                return
             if not self.path.startswith("/"):
                 self.reject("Unexpected external HTTP GET")
                 return

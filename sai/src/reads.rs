@@ -153,12 +153,13 @@ impl AccountCommand {
                 // A cancelled system DNS job can outlive the overview's deadline.
                 // Let the CLI report its result without waiting for that blocking job.
                 runtime.shutdown_background();
-                let value = value.map_err(|mut error| {
+                let mut value = value.map_err(|mut error| {
                     if error.code == Code::SessionUnavailable {
                         error.message.push_str(". Pass --as ADDR explicitly.");
                     }
                     error
                 })?;
+                overview::add_balance_freshness(&mut value);
                 return if json || overview_json {
                     output::read(&value, true)
                 } else {
@@ -168,14 +169,40 @@ impl AccountCommand {
             Self::Positions { addr } => (keeper::POSITIONS, addr),
             Self::History { addr } => (keeper::HISTORY, addr),
             Self::Balances { addr, ws_endpoint } => {
-                let endpoint = stream_endpoint(ws_endpoint, flags, env)?;
-                let payload = runtime()?.block_on(stream::snapshot(
-                    &endpoint,
-                    &Subscription::Balances(addr),
+                let flags = Flags {
+                    endpoint: flags.endpoint.clone(),
+                    ws_endpoint: ws_endpoint.or_else(|| flags.ws_endpoint.clone()),
+                    lcd_endpoint: flags.lcd_endpoint.clone(),
+                };
+                if let Some(endpoint) = &flags.ws_endpoint {
+                    Key::KeeperWsEndpoint.parse_value(endpoint)?;
+                }
+                let settings = match load_settings(&flags, env) {
+                    Ok(settings) => Some(settings),
+                    Err(_) if flags.ws_endpoint.is_some() => None,
+                    Err(error) => return Err(error.into()),
+                };
+                let endpoint = settings
+                    .as_ref()
+                    .map(sai_core::settings::Settings::ws_endpoint)
+                    .or(flags.ws_endpoint.as_deref())
+                    .ok_or_else(SaiError::internal)?;
+                let runtime = runtime()?;
+                let payload = runtime.block_on(sai_core::overview::read_balance_snapshot(
+                    settings.as_ref(),
+                    endpoint,
+                    addr,
+                    events,
                     || eprintln!("{}", stream::CONNECTED),
                     interrupted(),
-                ))?;
-                return output::read(&payload, json);
+                ));
+                runtime.shutdown_background();
+                let payload = payload?;
+                return if json {
+                    output::read(&payload, true)
+                } else {
+                    overview::show_balances(&payload)
+                };
             }
         };
         read(

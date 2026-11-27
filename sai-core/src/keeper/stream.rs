@@ -124,6 +124,18 @@ pub async fn snapshot(
     notify: impl Fn(),
     interrupt: impl Future<Output = SaiError>,
 ) -> Result<Value, SaiError> {
+    snapshot_with_endpoint(endpoint, subscribe, notify, interrupt)
+        .await
+        .map(|(payload, _)| payload)
+}
+
+/// Return the endpoint that delivered the snapshot, including any redirects.
+pub(crate) async fn snapshot_with_endpoint(
+    endpoint: &str,
+    subscribe: &Subscription,
+    notify: impl Fn(),
+    interrupt: impl Future<Output = SaiError>,
+) -> Result<(Value, Url), SaiError> {
     check_endpoint(endpoint)?;
     let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
     tokio::pin!(interrupt);
@@ -145,15 +157,17 @@ pub async fn snapshot(
             result.unwrap_or(Err(Failure::Disconnected("TimeoutError"))).map_err(balance_error)
         }
     };
-    tokio::select! {
+    let payload = tokio::select! {
         biased;
         () = connection.close() => result,
         error = &mut interrupt => Err(error),
-    }
+    }?;
+    Ok((payload, connection.endpoint))
 }
 
 pub struct Connection {
     socket: WebSocketStream<transport::SocketBox>,
+    endpoint: Url,
     field: &'static str,
     heartbeat: Instant,
     ping: Option<[u8; 8]>,
@@ -250,6 +264,7 @@ impl Connection {
                             Some(config),
                         )
                         .await,
+                        endpoint: url,
                         field,
                         heartbeat: Instant::now() + PING_INTERVAL,
                         ping: None,

@@ -663,6 +663,14 @@ server = "ws-no-subprotocol"
 wire = ["ws:init","ws:userBalances"]
 
 [[case]]
+name = "account-balances-text"
+current_only = true
+seed = "session"
+args = ["account", "balances", "{addr}"]
+mode = "text"
+wire = ["ws:init","ws:userBalances"]
+
+[[case]]
 name = "account-balances-wrong-subprotocol"
 args = ["--json","account","balances","{addr}"]
 server = "ws-wrong-subprotocol"

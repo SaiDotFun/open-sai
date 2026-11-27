@@ -38,6 +38,7 @@ from compare import (
     ledger,
     mask_doctor_stream,
     mask_overview_stdout,
+    project_historical_overview_balances,
     rewrite_mcp_fields,
     snapshot,
     stderr_category,
@@ -433,6 +434,7 @@ def observe(
     *,
     candidate: bool = False,
     cutover: bool = False,
+    historical_overview: bool = False,
 ) -> Observation:
     checks: list[str] = []
 
@@ -623,6 +625,8 @@ def observe(
             "retryable": False,
         }
         display = json.dumps(reference_overview) + "\n"
+    if historical_overview and case.command == "account overview" and display:
+        display = project_historical_overview_balances(display, case.mode)
     if case.command == "account overview" and case.mode == "text":
         display = mask_overview_stdout(display, case.mode)
     if case.command == "doctor" and case.exact_output and case.mode == "text":
@@ -905,6 +909,7 @@ def safe_observe(
     *,
     candidate: bool = False,
     cutover: bool = False,
+    historical_overview: bool = False,
 ) -> tuple[Observation | None, str]:
     endpoints.errors.clear()
     endpoints.interrupt_ready.clear()
@@ -917,7 +922,13 @@ def safe_observe(
     try:
         result: tuple[Observation | None, str] = (
             observe(
-                case, binary, home, endpoints, candidate=candidate, cutover=cutover
+                case,
+                binary,
+                home,
+                endpoints,
+                candidate=candidate,
+                cutover=cutover,
+                historical_overview=historical_overview,
             ),
             "",
         )
@@ -1164,6 +1175,7 @@ def run_case(
             endpoints,
             candidate=rust,
             cutover=cutover,
+            historical_overview=rust and not python_main,
         )
     if case.mode == "mcp" and tool_evidence is not None:
         mcp_evidence(case, left, right, tool_evidence)
