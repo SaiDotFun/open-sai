@@ -15,14 +15,23 @@ same profile and command names as the Python CLI, including `sai mcp serve`.
   [#226](https://github.com/SaiDotFun/open-sai/pull/226),
   [#232](https://github.com/SaiDotFun/open-sai/pull/232),
   [#238](https://github.com/SaiDotFun/open-sai/pull/238)
+- On Windows, `sai update` stays on 0.1.3 because native Sai does not run
+  on Windows ([#260](https://github.com/SaiDotFun/open-sai/issues/260)).
+  Run the managed installer to install the full Python CLI instead:
+
+  ```console
+  uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py --full-python --version 0.2.0
+  ```
+
 - If uv installed Sai from Git, uninstall the `sai-cli` tool, use the
-  [managed installer](../../README.md#trader-cli) with `--version 0.1.3`
-  or `--version 0.1.4`, then run `sai update`. Your Sai profile stays in place.
+  [managed installer](https://github.com/SaiDotFun/open-sai/blob/main/README.md#trader-cli)
+  with `--version 0.1.3` or `--version 0.1.4`, then run `sai update`. Your Sai profile stays in place.
 - The standard `sai-cli` wheel is a small launcher that downloads and runs
   the matching native binary. The full Python wheel and source package are
   inside `sai-cli-0.2.0-full-python.zip`. Windows runs full Python.
-  Use the [managed installer](../../README.md#trader-cli) with
-  `--full-python --version 0.2.0` on Windows or to keep using Python.
+  To keep using Python on Linux or macOS, use the
+  [managed installer](https://github.com/SaiDotFun/open-sai/blob/main/README.md#trader-cli)
+  with `--full-python --version 0.2.0`.
   [#227](https://github.com/SaiDotFun/open-sai/pull/227),
   [#246](https://github.com/SaiDotFun/open-sai/pull/246)
 
@@ -55,9 +64,10 @@ same profile and command names as the Python CLI, including `sai mcp serve`.
 
 ## Trade Results and Account Reads
 
-- Trade commands wait up to 60 seconds for Keeper to report an outcome.
-  Text mode prints a progress line while `--wait` polls. For a delayed
-  result, the recovery command points to the same intent. MCP replies
+- With `--wait`, trade commands poll Keeper for up to 60 seconds for an
+  outcome, and text mode prints a progress line. Without `--wait`, the
+  command returns while the intent is pending. For a delayed result, the
+  recovery command points to the same intent. MCP replies
   include the account and intent key when a trade may already be pending.
   [#225](https://github.com/SaiDotFun/open-sai/pull/225),
   [#228](https://github.com/SaiDotFun/open-sai/pull/228),

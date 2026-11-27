@@ -171,6 +171,8 @@ jobs:
       - name: Check release checksums
         working-directory: dist/release
         run: sha256sum --check --strict SHA256SUMS
+      # A stable release must have docs/releases/sai-cli-vX.Y.Z.md, which
+      # leads the release body before the package-choice section.
       - name: Render native release notes
         if: matrix.mode == 'native'
         run: uv run --no-project python scripts/native-dist.py release-notes > dist/release-notes.md

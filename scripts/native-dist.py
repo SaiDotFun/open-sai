@@ -133,7 +133,20 @@ def stage_release(
         )
 
 
-def release_notes(release: str, shim: str, python_version: str) -> str:
+def release_guide(directory: Path, release: str) -> str:
+    """Return the versioned upgrade guide without its title heading."""
+    guide = directory / f"sai-cli-v{release}.md"
+    if not guide.exists():
+        if "-" not in release:
+            raise ValueError(f"missing release guide {guide}")
+        return ""
+    lines = guide.read_text(encoding="utf-8").splitlines()
+    if lines and lines[0].startswith("# "):
+        lines = lines[1:]
+    return "\n".join(lines).strip() + "\n\n"
+
+
+def release_notes(release: str, shim: str, python_version: str, guide: str = "") -> str:
     bundle = full_python_bundle_name(release)
     full_wheel = wheel_name(python_version.replace("-rc.", "rc"))
     if "-rc." in release:
@@ -142,7 +155,7 @@ def release_notes(release: str, shim: str, python_version: str) -> str:
     else:
         install_version = f" --version {release}"
         install_target = "this release"
-    return f"""## Choose the Sai Package
+    return f"""{guide}## Choose the Sai Package
 
 The standard `sai-cli` wheel, `{wheel_name(shim)}`, is the native shim.
 It downloads and runs the matching native Sai binary on Linux and macOS.
@@ -217,7 +230,9 @@ def main() -> None:
     rehearsal.add_argument("directory", type=Path)
     tag_check = commands.add_parser("check-tag")
     tag_check.add_argument("tag")
-    commands.add_parser("release-notes", help="render the native release notes")
+    commands.add_parser(
+        "release-notes", help="render the upgrade guide and native package notes"
+    )
     stage = commands.add_parser("stage-release")
     stage.add_argument("native", type=Path)
     stage.add_argument("python", type=Path)
@@ -272,7 +287,8 @@ def run(args: argparse.Namespace) -> None:
     elif args.command == "check-tag":
         check_tag(args.tag, release, pyproject_version())
     elif args.command == "release-notes":
-        print(release_notes(release, shim, pyproject_version()), end="")
+        guide = release_guide(ROOT / "docs/releases", release)
+        print(release_notes(release, shim, pyproject_version(), guide), end="")
     elif args.command == "stage-release":
         python_version = pyproject_version()
         if args.tag:
