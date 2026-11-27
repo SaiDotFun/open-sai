@@ -143,6 +143,14 @@ def test_release_notes_lead_with_the_versioned_guide(tmp_path: Path) -> None:
     assert notes.index("## Upgrade") < notes.index("## Choose the Sai Package")
 
 
+def test_release_guide_is_required_for_stable_releases(tmp_path: Path) -> None:
+    dist = runpy.run_path(str(ROOT / "scripts/native-dist.py"))
+
+    with pytest.raises(ValueError, match="missing release guide"):
+        dist["release_guide"](tmp_path, "2.0.0")
+    assert dist["release_guide"](tmp_path, "2.0.0-rc.1") == ""
+
+
 def test_renders_the_checked_in_guide_with_absolute_links() -> None:
     release = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"][
         "version"

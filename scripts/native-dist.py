@@ -137,6 +137,8 @@ def release_guide(directory: Path, release: str) -> str:
     """Return the versioned upgrade guide without its title heading."""
     guide = directory / f"sai-cli-v{release}.md"
     if not guide.exists():
+        if "-" not in release:
+            raise ValueError(f"missing release guide {guide}")
         return ""
     lines = guide.read_text(encoding="utf-8").splitlines()
     if lines and lines[0].startswith("# "):
