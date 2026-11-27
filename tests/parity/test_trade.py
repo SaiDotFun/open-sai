@@ -30,6 +30,7 @@ from scenarios import (
     loopback,
     seed_home,
 )
+from trade_replay import TradeReplay
 
 CLI = tuple[str, ...]
 OBSERVED_AT = re.compile(rb'"observedAt": "\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z"')
@@ -59,7 +60,9 @@ CLOSE_ESTIMATE_READS = [
     "borrowing",
     "get_exchange_balance",
     "get_trade_raw",
-    "get_perp_prices",
+    "get_market",
+    "get_oracle_address",
+    "get_exchange_rate",
 ]
 OPEN_ESTIMATE_READS = [
     "oneClickTrading",
@@ -68,7 +71,6 @@ OPEN_ESTIMATE_READS = [
     "get_group",
     "get_pair_custom_max_leverage",
     "get_fees",
-    "get_collateral_price",
 ]
 
 
@@ -1178,74 +1180,119 @@ def test_connect_failure_releases_reservation(
 
 
 @pytest.mark.parametrize(
-    "scenario", ["partial-price-changed", "partial-price-recovers"]
+    "scenario", ["partial-price-changed", "partial-usdc-oracle-outage"]
 )
-def test_confirmed_partial_close_binds_collateral_price_availability(
+def test_confirmed_partial_close_uses_fixed_usdc_price(
     cli_pair: tuple[CLI, CLI], tmp_path: Path, scenario: str
 ) -> None:
-    # Both implementations at this checkout use the reduction digest.
     _, candidate = cli_pair
     reference = (str(Path(sys.executable).with_name("sai")),)
     args = ("trade", "partial-close", "7", "--percent", "50")
-    digests = []
+    observations = []
     for index, cli in enumerate((reference, candidate)):
-        with loopback(scenario) as endpoints:
+        with loopback(
+            scenario, trade_replay=TradeReplay("DECREASE_POSITION_SIZE", "7")
+        ) as endpoints:
             home = tmp_path / str(index)
             seed_home(home, endpoints, "session")
             code, preview, _ = run(
                 cli, home, endpoints, (*args, "--dry-run"), python=index == 0
             )
             assert code == 0, preview
-            digest = preview_digest(preview)
-            assert preview.get("previewDigest") == (
-                None if scenario == "partial-price-recovers" else digest
+            assert preview["intent"] == PARTIAL_INTENT
+            assert preview["quote"]["collateralPriceUsd"] == "1"
+            assert (
+                preview["quote"]["closedNotionalUsd"]
+                == preview["quote"]["closedNotionalUsdc"]
             )
-            code, fresh, _ = run(
-                cli, home, endpoints, (*args, "--dry-run"), python=index == 0
-            )
-            assert code == 0, fresh
-            assert fresh["intent"] == preview["intent"] == PARTIAL_INTENT
-            for field in ("collateralPriceUsd", "closedNotionalUsd"):
-                assert fresh["quote"][field] != preview["quote"][field]
+            digest = preview["previewDigest"]
+            assert digest == preview_digest(preview)
             assert rows(home) == []
-
-            if scenario == "partial-price-recovers":
-                assert preview["quote"]["closedNotionalUsd"] is None
-                assert preview["quote"]["closedNotionalIsEstimate"] is True
-                assert fresh["quote"]["closedNotionalIsEstimate"] is False
-                code, refused, _ = run(
-                    cli,
-                    home,
-                    endpoints,
-                    (*args, "--preview-digest", digest),
-                    python=index == 0,
-                )
-                assert code == 4, refused
-                assert refused["error"]["code"] == "PREVIEW_MISMATCH"
-                assert rows(home) == []
-                assert not any(
-                    entry.label == "recordUserIntent" for entry in endpoints.wire
-                )
-                assert fresh["previewDigest"] != digest
-            else:
-                assert fresh["previewDigest"] == digest
 
             code, submitted, _ = run(
                 cli,
                 home,
                 endpoints,
-                (*args, "--preview-digest", fresh["previewDigest"]),
+                (*args, "--preview-digest", digest),
                 python=index == 0,
             )
             assert code == 0, submitted
             assert submitted["status"] == "accepted"
-            assert [record[2] for record in rows(home)] == ["accepted"]
-            assert [entry.label for entry in endpoints.wire].count(
-                "recordUserIntent"
-            ) == 1
+            [row] = rows(home)
+            assert (row[0], row[2]) == (submitted["intentKey"], "accepted")
+            [intent] = [
+                entry.variables["input"]["intent"]
+                for entry in endpoints.wire
+                if entry.label == "recordUserIntent"
+            ]
+            assert {key: intent[key] for key in PARTIAL_INTENT} == PARTIAL_INTENT
+            labels = {entry.label for entry in endpoints.wire}
+            assert "get_exchange_rate" in labels
+            assert not labels & {"get_perp_prices", "get_collateral_price"}
             assert not endpoints.errors
-            digests.append((digest, fresh["previewDigest"]))
-    assert digests[0] == digests[1]
+            observations.append((digest, row[1:-1], preview["quote"]))
+    assert observations[0] == observations[1]
+
+
+@pytest.mark.parametrize(
+    ("args", "kind", "scenario"),
+    [
+        (CLOSE, "CLOSE_POSITION", "quote-usdc-oracle-outage"),
+        (
+            ("trade", "leverage", "7", "--leverage", "4"),
+            "UPDATE_TRADE",
+            "quote-usdc-oracle-outage",
+        ),
+    ],
+    ids=["full-close", "immediate-leverage"],
+)
+def test_confirmed_cli_position_trade_without_usdc_oracle(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, args: CLI, kind: str, scenario: str
+) -> None:
+    reference = (str(Path(sys.executable).with_name("sai")),)
+    observations = []
+    for index, cli in enumerate((reference, cli_pair[1])):
+        replay = TradeReplay(kind, "7")
+        with loopback(scenario, trade_replay=replay, leverage_target="4") as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            code, preview, _ = run(
+                cli, home, endpoints, (*args, "--dry-run"), python=index == 0
+            )
+            assert code == 0, preview
+            digest = preview["previewDigest"]
+            assert digest == preview_digest(preview)
+            if kind == "UPDATE_TRADE":
+                assert preview["collateralBaseUnits"] == {
+                    "before": "10000000",
+                    "after": "5000000",
+                }
+            assert rows(home) == []
+
+            code, submitted, _ = run(
+                cli,
+                home,
+                endpoints,
+                (*args, "--preview-digest", digest),
+                python=index == 0,
+            )
+            assert code == 0, submitted
+            assert submitted["status"] == "accepted"
+            [row] = rows(home)
+            assert (row[0], row[2]) == (submitted["intentKey"], "accepted")
+            assert replay.attempts() == {submitted["intentKey"]: 1}
+            [intent] = [
+                entry.variables["input"]["intent"]
+                for entry in endpoints.wire
+                if entry.label == "recordUserIntent"
+            ]
+            assert {key: intent[key] for key in preview["intent"]} == preview["intent"]
+            labels = {entry.label for entry in endpoints.wire}
+            assert "get_exchange_rate" in labels
+            assert not labels & {"get_perp_prices", "get_collateral_price"}
+            assert not endpoints.errors
+            observations.append((digest, row[1:-1], preview["intent"]))
+    assert observations[0] == observations[1]
 
 
 def test_concurrent_close_sends_once(
