@@ -45,7 +45,15 @@ def archive_names(release: str) -> set[str]:
 
 
 def package_names(version: str) -> set[str]:
-    return {f"sai_cli-{version}-py3-none-any.whl", f"sai_cli-{version}.tar.gz"}
+    return {wheel_name(version), f"sai_cli-{version}.tar.gz"}
+
+
+def wheel_name(version: str) -> str:
+    return f"sai_cli-{version}-py3-none-any.whl"
+
+
+def full_python_bundle_name(release: str) -> str:
+    return f"sai-cli-{release}-full-python.zip"
 
 
 def digests(directory: Path, names: set[str]) -> dict[str, str]:
@@ -116,13 +124,40 @@ def stage_release(
         raise ValueError("native bundle does not match its SHA256SUMS")
 
     python_names = python_package_names(python, python_version)
-    bundle = f"sai-cli-{release}-full-python.zip"
+    bundle = full_python_bundle_name(release)
     with tempfile.TemporaryDirectory(prefix="sai-full-python-") as scratch:
         directory = Path(scratch)
         bundle_full_python(python, python_names, directory / bundle)
         stage_files(
             output, (native, native_hashes), (directory, digests(directory, {bundle}))
         )
+
+
+def release_notes(release: str, shim: str, python_version: str) -> str:
+    bundle = full_python_bundle_name(release)
+    full_wheel = wheel_name(python_version.replace("-rc.", "rc"))
+    return f"""## Choose the Sai Package
+
+The standard `sai-cli` wheel, `{wheel_name(shim)}`, is the native shim.
+It downloads and runs the matching native Sai binary on Linux and macOS.
+
+### Install the Full Python CLI
+
+Download `{bundle}` and `SHA256SUMS` from the release assets. From the
+download directory, compute the ZIP's SHA-256 with the command for your
+shell and compare it with the ZIP's entry in `SHA256SUMS`.
+
+- Linux: `sha256sum {bundle}`
+- macOS: `shasum -a 256 {bundle}`
+- Windows PowerShell: `Get-FileHash -Algorithm SHA256 {bundle}`
+
+After the hashes match, extract the ZIP and install its wheel with uv.
+
+```console
+uv run --no-project python -m zipfile -e {bundle} full-python
+uv tool install ./full-python/{full_wheel}
+```
+"""
 
 
 def check_attestation(
@@ -171,6 +206,7 @@ def main() -> None:
     rehearsal.add_argument("directory", type=Path)
     tag_check = commands.add_parser("check-tag")
     tag_check.add_argument("tag")
+    commands.add_parser("release-notes", help="render the native release notes")
     stage = commands.add_parser("stage-release")
     stage.add_argument("native", type=Path)
     stage.add_argument("python", type=Path)
@@ -224,6 +260,8 @@ def run(args: argparse.Namespace) -> None:
         build_rehearsal_wheel(args.directory)
     elif args.command == "check-tag":
         check_tag(args.tag, release, pyproject_version())
+    elif args.command == "release-notes":
+        print(release_notes(release, shim, pyproject_version()), end="")
     elif args.command == "stage-release":
         python_version = pyproject_version()
         if args.tag:

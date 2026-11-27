@@ -99,6 +99,25 @@ def test_stages_native_archives_shim_and_full_python_bundle(candidate) -> None:
     assert_staged_candidate(native, python, output, names)
 
 
+def test_renders_native_release_notes_for_the_staged_packages(candidate) -> None:
+    native, python, output, _ = candidate
+    result = native_dist("stage-release", native, python, output)
+    assert result.returncode == 0, result.stderr
+    result = native_dist("release-notes")
+    assert result.returncode == 0, result.stderr
+
+    (bundle,) = output.glob("*.zip")
+    (shim,) = output.glob("*.whl")
+    (full_wheel,) = python.glob("*.whl")
+    notes = result.stdout
+    assert f"The standard `sai-cli` wheel, `{shim.name}`, is the native shim." in notes
+    assert f"`{bundle.name}` and `SHA256SUMS`" in notes
+    assert f"sha256sum {bundle.name}" in notes
+    assert f"Get-FileHash -Algorithm SHA256 {bundle.name}" in notes
+    assert f"python -m zipfile -e {bundle.name} full-python" in notes
+    assert f"uv tool install ./full-python/{full_wheel.name}" in notes
+
+
 def test_stages_python_only_without_cargo_or_shim(tmp_path: Path) -> None:
     scripts = tmp_path / "scripts"
     scripts.mkdir()

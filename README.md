@@ -15,7 +15,7 @@ standalone installer. It verifies the release archive against `SHA256SUMS`,
 checks that Sai and its MCP server start, and installs the launcher at
 `~/.local/bin/sai`. Add `~/.local/bin` to your `PATH` to run the command. The
 installed binary runs on its own. Until a native release is available, use the
-pinned Python installer below.
+Python installer below.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py | python3 - --native
@@ -37,12 +37,29 @@ Replace `BRIDGE_VERSION` with the version in the release notes. The second
 command selects the native release by its tag, verifies the matching shim,
 and keeps your uv launcher.
 
-On Windows, use the latest full Python release listed in the release notes.
-Replace `PYTHON_VERSION` with that release version. The installer verifies the
-wheel against `SHA256SUMS` and caches it under `$SAI_HOME/cache/wheels`.
+On Windows, use the Python installer. It verifies the release download against
+`SHA256SUMS` and installs the full Python wheel. Add `--version X.Y.Z` to pin
+a stable release. If an older Windows `sai update` asks you to keep your
+current Python version, use this installer to update first.
 
 ```powershell
-uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py --version PYTHON_VERSION
+uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py
+```
+
+On a native release, the standard `sai-cli` wheel is the native shim. To
+install the full Python package yourself, download `sai-cli-X.Y.Z-full-python.zip`
+and `SHA256SUMS` from the release assets. Compute the ZIP's SHA-256 and
+compare it with the ZIP's entry in `SHA256SUMS`.
+
+- Linux: `sha256sum sai-cli-X.Y.Z-full-python.zip`
+- macOS: `shasum -a 256 sai-cli-X.Y.Z-full-python.zip`
+- Windows PowerShell: `Get-FileHash -Algorithm SHA256 sai-cli-X.Y.Z-full-python.zip`
+
+After the hashes match, extract the ZIP and install its wheel with uv.
+
+```console
+uv run --no-project python -m zipfile -e sai-cli-X.Y.Z-full-python.zip full-python
+uv tool install ./full-python/sai_cli-X.Y.Z-py3-none-any.whl
 ```
 
 For maintainers, ship the next regular Python release, then publish the
@@ -71,11 +88,12 @@ To build from source instead, install from Git:
 uv tool install git+https://github.com/SaiDotFun/open-sai
 ```
 
-To try the CLI without installing it:
+To try the CLI without installing it, pass the release wheel to `uvx`.
+For full Python on a native release, use the wheel you extracted above.
 
 ```bash
-PYTHON_VERSION=X.Y.Z
-uvx --from "https://github.com/SaiDotFun/open-sai/releases/download/sai-cli/v${PYTHON_VERSION}/sai_cli-${PYTHON_VERSION}-py3-none-any.whl" sai --json market prices
+VERSION=X.Y.Z
+uvx --from "https://github.com/SaiDotFun/open-sai/releases/download/sai-cli/v${VERSION}/sai_cli-${VERSION}-py3-none-any.whl" sai --json market prices
 ```
 
 The Git install builds `main`. Run `sai --version` to check your installed version.
