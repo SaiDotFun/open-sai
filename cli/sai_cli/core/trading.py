@@ -721,9 +721,6 @@ def change_margin(
             inputs,
             {
                 "dryRun": True,
-                "collateral": margin.collateral_usd(
-                    int(quote["collateralBefore"]), int(quote["collateralAfter"])
-                ),
                 "positionRoute": state.route,
                 "quote": {
                     **quote,
@@ -736,6 +733,27 @@ def change_margin(
             },
         )
 
+    def estimate(
+        state: margin.PositionSnapshot,
+        inputs: dict[str, Any],
+        fresh: dict[str, Any],
+        _: margin.RecheckedPosition | None,
+    ) -> dict[str, Any]:
+        quote = fresh["quote"]
+        values = estimates.position_estimates(
+            lcd_endpoint,
+            state,
+            trade_id,
+            target=Decimal(quote["requestedLeverage"]),
+            quoted_effective=_quoted_leverage(inputs),
+            require_unchanged=not dry_run,
+        )
+        if dry_run or estimates.rejection_reason(values) is None:
+            values["collateral"] = margin.collateral_usd(
+                int(quote["collateralBefore"]), int(quote["collateralAfter"])
+            )
+        return values
+
     preview = _position_preview(
         build_preview,
         lcd_endpoint=lcd_endpoint,
@@ -744,14 +762,7 @@ def change_margin(
         dry_run=dry_run,
         before_submit=before_submit,
         changed_message="Position changed; review the margin change again",
-        estimate=lambda state, inputs, fresh, _: estimates.position_estimates(
-            lcd_endpoint,
-            state,
-            trade_id,
-            target=Decimal(fresh["quote"]["requestedLeverage"]),
-            quoted_effective=_quoted_leverage(inputs),
-            require_unchanged=not dry_run,
-        ),
+        estimate=estimate,
     )
     if dry_run:
         return preview
