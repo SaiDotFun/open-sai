@@ -86,3 +86,41 @@ def test_overview_labels_stale_balance(
         funds = result.stdout.split("Sai Funds", 1)[1].split("Open Positions", 1)[0]
         assert re.search(rf"block {RISK_BLOCK - 1} \(15m \d+s old · stale\)", funds)
         assert re.search(rf"block {RISK_BLOCK} \(0m \d+s old\)", funds)
+
+
+def test_overview_preserves_balance_stream_error(
+    balance_launcher: str, tmp_path: Path
+) -> None:
+    with (
+        loopback("overview-full") as endpoint,
+        loopback("ws-wrong-subprotocol") as socket,
+    ):
+        home = tmp_path / "overview"
+        seed_home(home, endpoint, "session")
+        environment = {**child_env(home, endpoint), "SAI_WS_ENDPOINT": socket.ws}
+        command = ("account", "overview", "--as", ADDRESS)
+        for mode in [("--json",), ()]:
+            result = subprocess.run(
+                [balance_launcher, *mode, *command],
+                cwd=home,
+                env=environment,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+                timeout=20,
+            )
+            assert result.returncode == 0, result.stderr
+            if mode:
+                funds = json.loads(result.stdout)["balances"]
+                assert funds["error"]["code"] == "STREAM_ERROR"
+                assert "data" not in funds
+            else:
+                funds = result.stdout.split("Sai Funds", 1)[1].split(
+                    "Open Positions", 1
+                )[0]
+                assert "(STREAM_ERROR)" in funds
+                assert "Source (Age)" not in funds
+                assert "Unsettled Teller" not in funds
+        assert not endpoint.errors
+        assert not socket.errors

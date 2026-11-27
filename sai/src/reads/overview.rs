@@ -10,7 +10,7 @@ const UNKNOWN: &str = "unknown";
 pub(super) fn add_balance_freshness(overview: &mut Value) {
     let balances = &mut overview["balances"];
     let fetched = balances["fetchedAt"].clone();
-    if let Some(rows) = balances["data"].as_object_mut() {
+    if let Some(rows) = balances.get_mut("data").and_then(Value::as_object_mut) {
         for row in rows.values_mut() {
             if row["sourceAt"].is_null() && !row["usd"].is_null() {
                 row["sourceAt"] = fetched.clone();
