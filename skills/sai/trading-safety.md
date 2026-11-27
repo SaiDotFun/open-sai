@@ -84,7 +84,10 @@ error after submission leaves the outcome unknown.
 - The receipt's `requestTxHash` identifies the submission. For a
   next-oracle fill, cite `execution.block` for the fill. The receipt
   includes `positionNow` and cumulative `positionFeesUsd` when Keeper has
-  indexed them. Use `fill` for execution-time evidence.
+  indexed them. Use `fill` for execution-time evidence. Each collateral
+  amount in base units has a dollar field beside it at $1 per USDC:
+  `fill.sizeCollateralUsd`, `fill.escrowedCollateralUsd`,
+  `positionNow.collateralUsd`, and `positionNow.openCollateralUsd`.
 - To see what happened on this machine, read the logs: `sai --json logs tail
   -n 50 --event intent` shows the intent's status changes by `intentKey`,
   and `--event keeper.request` shows whether the `submit` request was sent
@@ -253,7 +256,8 @@ and get confirmation again before submitting.
   about 50 USDC" and the position doubles before submit, the live command
   closes 100 USDC. Ask the person to approve the percentage of whatever the
   position is at submit. For a quoted slice, show the person the collateral
-  reduction and quoted notional and submit with the confirmed digest. If
+  reduction, `collateral.beforeUsd` and `collateral.afterUsd`, and the
+  quoted notional, then submit with the confirmed digest. If
   `quote.closedNotionalIsEstimate` is true, say the notional is an estimate.
   Keeper sends the collateral delta to Perp. Perp applies the position
   state and market price at execution, so the executed notional can differ

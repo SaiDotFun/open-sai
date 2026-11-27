@@ -6,7 +6,7 @@ use bigdecimal::{BigDecimal, ToPrimitive};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 
-use crate::{keeper, wait::Outcome};
+use crate::{keeper, usdc, wait::Outcome};
 
 const TRADE_FILLS: &[&str] = &[
     "position_opened",
@@ -193,12 +193,17 @@ impl<'a> Evidence<'a> {
                 "extraEffects": extra_effects,
             })
         });
+        let usdc = usdc_collateral(&self.indexed["trade"]);
         let fill = (outcome == Outcome::Filled).then(|| {
+            let size = fill_values.1.map_or(Value::Null, |size| json!(size));
+            let escrow = number(&order["collateralAmount"]);
             json!({
                 "price": fill_values.0,
-                "sizeCollateralBaseUnits": fill_values.1,
+                "sizeCollateralBaseUnits": size,
+                "sizeCollateralUsd": usdc_usd(&size, usdc),
                 "oraclePrice": number(&order["execPrice"]),
-                "escrowedCollateralBaseUnits": number(&order["collateralAmount"]),
+                "escrowedCollateralBaseUnits": escrow,
+                "escrowedCollateralUsd": usdc_usd(&escrow, usdc),
             })
         });
         let fees = [
@@ -335,6 +340,7 @@ fn number(value: &Value) -> Value {
 }
 
 fn position(trade: &Value, public: &Value) -> Option<Map<String, Value>> {
+    let usdc = usdc_collateral(trade);
     let trade = trade.as_object()?;
     let mut result = public.as_object().cloned().unwrap_or_default();
     for field in ["isOpen", "isLong"] {
@@ -347,15 +353,18 @@ fn position(trade: &Value, public: &Value) -> Option<Map<String, Value>> {
     {
         result.insert("tradeType".into(), json!(kind));
     }
-    for field in [
-        "collateralAmount",
-        "openCollateralAmount",
-        "leverage",
-        "openPrice",
-        "closePrice",
-        "tp",
-        "sl",
+    for (field, usd) in [
+        ("collateralAmount", "collateralUsd"),
+        ("openCollateralAmount", "openCollateralUsd"),
     ] {
+        if let Some(value) = trade.get(field) {
+            let units = number(value);
+            let dollars = usdc_usd(&units, usdc);
+            result.insert(field.into(), units);
+            result.insert(usd.into(), dollars);
+        }
+    }
+    for field in ["leverage", "openPrice", "closePrice", "tp", "sl"] {
         if let Some(value) = trade.get(field) {
             result.insert(field.into(), number(value));
         }
@@ -385,4 +394,44 @@ fn position(trade: &Value, public: &Value) -> Option<Map<String, Value>> {
         result.insert("perpBorrowing".into(), market);
     }
     Some(result)
+}
+
+/// Report whether a position's collateral is USDC, or unknown and so the
+/// USDC every CLI order escrows.
+fn usdc_collateral(trade: &Value) -> bool {
+    match &trade["perpBorrowing"]["collateralToken"]["symbol"] {
+        Value::String(symbol) => symbol == "USDC",
+        _ => true,
+    }
+}
+
+/// Read USDC base units as dollars, or null for other collateral.
+fn usdc_usd(units: &Value, usdc: bool) -> Value {
+    usdc.then(|| usdc::base_units_usd(units))
+        .flatten()
+        .map_or(Value::Null, Value::String)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::{usdc_collateral, usdc_usd};
+
+    #[test]
+    fn receipts_read_usdc_base_units_as_dollars() {
+        assert_eq!(usdc_usd(&json!(3_000_000), true), json!("3"));
+        assert_eq!(usdc_usd(&json!("2997450"), true), json!("2.99745"));
+        assert_eq!(usdc_usd(&Value::Null, true), Value::Null);
+        assert_eq!(usdc_usd(&json!(3_000_000), false), Value::Null);
+    }
+
+    #[test]
+    fn only_known_non_usdc_collateral_drops_the_dollar_value() {
+        let trade =
+            |symbol: Value| json!({"perpBorrowing": {"collateralToken": {"symbol": symbol}}});
+        assert!(usdc_collateral(&trade(json!("USDC"))));
+        assert!(usdc_collateral(&json!({})));
+        assert!(!usdc_collateral(&trade(json!("stNIBI"))));
+    }
 }

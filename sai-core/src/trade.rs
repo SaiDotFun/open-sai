@@ -136,6 +136,7 @@ impl TradePreview {
         {
             output["previewDigest"] = json!(preview_digest(self, account));
         }
+        attach_collateral_usd(&mut output);
         output
     }
 
@@ -177,6 +178,7 @@ impl TradePreview {
                 output["previewDigest"] = json!(preview_digest(self, account));
             }
         }
+        attach_collateral_usd(&mut output);
         output
     }
 
@@ -245,6 +247,44 @@ pub struct Trading<'a> {
     lcd_endpoint: Option<&'a str>,
     storage: &'a Storage<'a>,
     events: EventContext<'a>,
+}
+
+/// Show the position's collateral before and after the change in dollars,
+/// next to the base-unit fields, so no one has to convert USDC units.
+/// Previews quote USDC positions only, valued at $1 per USDC.
+fn attach_collateral_usd(output: &mut Value) {
+    let quote = &output["quote"];
+    let base_units = &output["collateralBaseUnits"];
+    let intent = &output["intent"];
+    let units = |value: &Value| value.as_str().and_then(|text| text.parse::<u128>().ok());
+    let (before, after) = if intent["kind"] == "DECREASE_POSITION_SIZE" {
+        let before = units(&quote["collateralBefore"]);
+        let reduction = units(&intent["body"]["collateral"]["amountUsdc"]);
+        (
+            before,
+            before.zip(reduction).and_then(|(b, r)| b.checked_sub(r)),
+        )
+    } else if intent["body"]["requestedLeverage"].is_null() {
+        (None, None)
+    } else if quote.is_null() {
+        (units(&base_units["before"]), units(&base_units["after"]))
+    } else {
+        (
+            units(&quote["collateralBefore"]),
+            units(&quote["collateralAfter"]),
+        )
+    };
+    let usd = |units: Option<u128>| crate::usdc::base_units_usd(&json!(units?.to_string()));
+    let (Some(before), Some(after)) = (usd(before), usd(after)) else {
+        return;
+    };
+    if let Some(fields) = output.as_object_mut() {
+        fields.shift_insert(
+            2,
+            "collateral".into(),
+            json!({"beforeUsd": before, "afterUsd": after}),
+        );
+    }
 }
 
 impl<'a> Trading<'a> {
