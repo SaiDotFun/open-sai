@@ -334,22 +334,74 @@ Each component of this repository releases under its own tag prefix. The CLI
 uses `sai-cli/vX.Y.Z`, where `X.Y.Z` is the version in `pyproject.toml`, and
 `sai-cli/vX.Y.Z-rc.N` for a pre-release.
 
-To release, merge the version bump and complete the
-[upgrade and downgrade rehearsal](#rehearse-an-upgrade-and-downgrade), then
-run `just release X.Y.Z` on `main`.
-It is a dry run that checks the tree and prints the Git commands; add `--run`
-to create and push the tag. The tag starts the
-[Release workflow](.github/workflows/release.yml), which runs the tests,
-builds the wheel and sdist, writes `SHA256SUMS`, and publishes all three as a
-GitHub Release. The install script and `sai update` look for the highest
-`sai-cli/v*` release that is not a pre-release.
+For the default native release, merge a version bump that aligns the Python
+package, Cargo workspace, and shim on the same release version. In the shim,
+use `X.Y.ZrcN` for release candidates. Run the
+[Release workflow](.github/workflows/release.yml) manually on the candidate
+commit with the planned tag. The workflow checks the package versions, runs
+the Python tests and the four native smoke jobs, and uploads the
+`sai-release-candidate` Actions artifact. Complete the rehearsal below for
+the planned tag before publishing.
+
+Run `just release X.Y.Z` on `main` to check the tree and preview the Git
+commands. Add `--run` to create and push the tag. The tag workflow checks that
+the tagged commit is on main's first-parent history. It publishes the full
+Python wheel and sdist, four native archives, and one `SHA256SUMS` file in
+one immutable release. After publication, it checks the tag and every file
+against GitHub's signed release attestation. Sai does not sign the binaries
+separately.
+
+Before tagging, enable immutable releases in the repository settings and set
+the Actions secret `SAI_RELEASE_SETTINGS_TOKEN` to a fine-grained token scoped
+to this repository with Administration read access. The workflow checks the
+setting with that token immediately before publication and stops if GitHub
+cannot confirm it is enabled. The usual Actions token publishes the release.
+
+Native Linux builds and smoke tests use glibc 2.35 on x86_64 and arm64.
+Native macOS builds target macOS 11 on Intel and Apple silicon. The hosted
+smoke tests run on macOS 15, the tested support floor. The full Python
+package remains the published Python distribution during this stage of the
+handoff. The shim keeps the same package name and is exercised in CI until
+the handoff release can use that filename for the shim.
+
+### Release Python Only
+
+Use this mode for a full Python release before the native distribution is
+ready. Bump the Python package version and run the manual Release workflow
+with the planned tag and the `python-only` option enabled. Its candidate
+artifact contains the full Python wheel, sdist, and `SHA256SUMS`.
+
+Preview the tag on `main` with `just release X.Y.Z --python-only`. Add
+`--run` when the rehearsal is complete. The command records
+`Sai-Release-Mode: python-only` in the annotated `sai-cli/vX.Y.Z` tag.
+The workflow uses the Python version and omits the native build. The Python
+files keep their usual download URLs and publish together in one immutable
+release.
+
+### Rehearse a Release Candidate
+
+Use `sai-cli/vX.Y.Z-rc.N` as the planned tag for the manual run. After it
+passes, download its candidate
+artifact. From the artifact directory, verify the checksums and start the
+full Python wheel in an isolated uv environment. The version output should
+report `X.Y.ZrcN`.
+
+```bash
+sha256sum --check --strict SHA256SUMS
+SAI_HOME="$(mktemp -d)" uv run --isolated --no-project \
+  --with ./sai_cli-X.Y.ZrcN-py3-none-any.whl sai --version
+```
+
+On `main`, run `just release X.Y.Z-rc.N` to check the package versions and
+preview the tag commands.
 
 ### Rehearse an Upgrade and Downgrade
 
-After the version bump lands on `main`, build the candidate and run the
-rehearsal with `--strict` before tagging. Replace `X.Y.Z` with the version in
-`pyproject.toml`. The release gate requires a Linux
-host that can create a loopback-only network namespace with `unshare` and
+For a stable release, build the candidate on `main` and run the rehearsal
+with `--strict` before tagging. The rehearsal exercises stable release
+discovery and takes a wheel with the `X.Y.Z` version from `pyproject.toml`.
+The release gate requires a Linux host that can create a loopback-only
+network namespace with `unshare` and
 `ip`. The script also needs Python 3.11 or later, `uv`, `claude`, and
 `codex` on `PATH`, and network access to GitHub and the Python package
 index. Use executables that can run with a fresh home directory.
