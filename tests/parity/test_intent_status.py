@@ -19,6 +19,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager, suppress
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
 from functools import cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,7 +27,7 @@ from stat import S_IMODE
 from typing import Any
 
 import pytest
-from compare import Normalize, is_version, validate_log_endpoint_key
+from compare import LOG_FILE, Normalize, is_version, validate_log_endpoint_key
 from release_mismatch import assert_release_equal
 from sai_cli.core import keeper, log, storage
 from sai_cli.tests.loopback import graphql_ws
@@ -508,10 +509,52 @@ def test_log_events_detect_wrong_fixture_intent_key(tmp_path: Path) -> None:
     assert normalized_events(tmp_path) != reference
 
 
+def test_intent_status_logs_across_utc_midnight(tmp_path: Path) -> None:
+    reference = tmp_path / "reference"
+    candidate = tmp_path / "candidate"
+    midnight = datetime.fromisoformat("2026-11-21T00:00:00Z")
+    for home, start in (
+        (reference, midnight - timedelta(milliseconds=1)),
+        (candidate, midnight),
+    ):
+        logs = home / "logs"
+        logs.mkdir(parents=True)
+        for seq, event in enumerate(
+            ("command.start", "intent.keeper", "command.end"), 1
+        ):
+            stamp = start + timedelta(milliseconds=seq - 1)
+            path = logs / f"cli-{stamp.date()}.jsonl"
+            record = {
+                "ts": stamp.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                "runId": "a" * 32,
+                "seq": seq,
+                "event": event,
+            }
+            with path.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(record) + "\n")
+            path.chmod(0o600)
+
+    assert read_state(reference) == read_state(candidate)
+    assert normalized_events(reference) == normalized_events(candidate)
+
+    (reference / "logs/cli-2026-11-20.jsonl").chmod(0o644)
+    with pytest.raises(AssertionError, match="Log file modes differ within a surface"):
+        read_state(reference)
+
+
 def read_state(home: Path) -> tuple[Any, ...]:
-    files = {
-        str(path.relative_to(home)): path.stat().st_mode for path in home.rglob("*")
-    }
+    files: dict[str, int] = {}
+    for path in home.rglob("*"):
+        name = path.relative_to(home).as_posix()
+        mode = path.stat().st_mode
+        if match := LOG_FILE.fullmatch(name):
+            # Compare the mode for the stream. read_events checks all its records.
+            name = f"logs/{match['surface']}.jsonl"
+            assert files.setdefault(name, mode) == mode, (
+                "Log file modes differ within a surface"
+            )
+        else:
+            files[name] = mode
     if "logs/.endpoint-key" in files:
         validate_log_endpoint_key(home / "logs/.endpoint-key")
     if "logs/.endpoint-key.lock" in files:
