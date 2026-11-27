@@ -179,7 +179,6 @@ impl Trading<'_> {
             return Some(());
         }
         let row = row?;
-        let token = json_index(row.get("collateralToken")?.get("id")?)?;
         let group = lcd.group(&pair, None).await?;
         let minimum = decimal(&group["min_leverage"])?;
         let mut maximum = decimal(&group["max_leverage"])?;
@@ -189,14 +188,20 @@ impl Trading<'_> {
         }
         let leverage = decimal(&body["leverage"])?;
         let schedule = lcd.fees(&pair, None).await?;
-        let quote = lcd
-            .smart(
-                json!({"get_collateral_price": {"collateral_index": format!("TokenIndex({token})")}}),
-                None,
-            )
-            .await
-            .ok()?;
-        let price = Price::new(quote.as_str()?, COLLATERAL_ORACLE, Some(now()))?;
+        let token = row.get("collateralToken")?;
+        let price = if token["symbol"] == "USDC" {
+            Price::usdc()
+        } else {
+            let token = json_index(token.get("id")?)?;
+            let quote = lcd
+                .smart(
+                    json!({"get_collateral_price": {"collateral_index": format!("TokenIndex({token})")}}),
+                    None,
+                )
+                .await
+                .ok()?;
+            Price::new(quote.as_str()?, COLLATERAL_ORACLE, Some(now()))?
+        };
         let collateral = BigUint::from(decimal(&body["amountUsd"])? / 10u128.pow(18 - USDC_PLACES));
         let notional = &collateral * leverage / SCALE;
         // Perp floors USD notional before dividing by leverage.
