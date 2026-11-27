@@ -191,11 +191,6 @@ def describe(exc: Exception) -> dict[str, Any]:
         reason = estimates.rejection_reason(values)
         if estimates.close_oracle_time_unknown(values):
             reason = values["execution"]["reason"]
-        elif confirmation.collateral_price_unverified(exc.preview.get("quote") or {}):
-            reason = (
-                "Cannot verify the collateral price. Request a new preview when the"
-                " price is available."
-            )
         return preview_mismatch(
             reason
             or (
@@ -824,6 +819,5 @@ def partial_close(
         lcd_endpoint=settings.lcd_endpoint,
         dry_run=dry_run,
         before_submit=check,
-        fixed_usdc_price=True,
     )
     return finish(load, dry_run, result)

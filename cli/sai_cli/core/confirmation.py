@@ -78,10 +78,6 @@ def is_confirmable(preview: dict[str, Any]) -> bool:
     )
 
 
-def collateral_price_unverified(quote: dict[str, Any]) -> bool:
-    return "collateralPriceUsd" in quote and quote["collateralPriceUsd"] is None
-
-
 def with_digest(preview: dict[str, Any]) -> dict[str, Any]:
     values = preview.get("estimates", {})
     quote = preview.get("quote") or {}
@@ -101,7 +97,6 @@ def with_digest(preview: dict[str, Any]) -> dict[str, Any]:
         or close_oracle_time_unknown(values)
         or unknown_partial_leverage
         or unknown_leverage_collateral
-        or collateral_price_unverified(quote)
     ):
         return {key: value for key, value in preview.items() if key != "previewDigest"}
     return {**preview, "previewDigest": preview_digest(preview)}

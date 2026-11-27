@@ -14,7 +14,7 @@ from typing import Any
 
 from . import intents, keeper, margin, partial
 from . import preview as estimates
-from .confirmation import collateral_price_unverified, digest_material
+from .confirmation import digest_material
 from .errors import Code, SaiError
 
 SessionLoader = Callable[[], dict[str, str]]
@@ -611,21 +611,15 @@ def _position_preview(
         ],
         dict[str, Any],
     ],
-    fixed_usdc_price: bool = False,
 ) -> dict[str, Any]:
     def recheck(
         state: margin.PositionSnapshot, inputs: dict[str, Any]
     ) -> margin.RecheckedPosition | None:
-        return margin.recheck_position(
-            lcd_endpoint, state, trade_id, inputs, fixed_usdc_price=fixed_usdc_price
-        )
+        return margin.recheck_position(lcd_endpoint, state, trade_id, inputs)
 
     def verify_replacement(
         state: margin.PositionSnapshot, inputs: dict[str, Any]
     ) -> margin.RecheckedPosition | None:
-        if collateral_price_unverified(inputs):
-            # Return the estimate without a confirmation. This branch never submits.
-            return None
         try:
             checked = recheck(state, inputs)
         except estimates.READ_ERRORS as exc:
@@ -819,7 +813,6 @@ def partial_close(
     lcd_endpoint: str,
     dry_run: bool,
     before_submit: SubmitCheck | None = None,
-    fixed_usdc_price: bool = False,
 ) -> dict[str, Any]:
     """Reduce an open USDC position by a whole percentage.
 
@@ -838,9 +831,7 @@ def partial_close(
         payload = intents.partial_intent(position, percent)
         delta = int(payload["body"]["collateral"]["amountUsdc"])
         leverage, inputs = margin.leverage_inputs(lcd_endpoint, state, trade_id)
-        notional = partial.notional_quote(
-            lcd_endpoint, state, delta, leverage, fixed_usdc_price=fixed_usdc_price
-        )
+        notional = partial.notional_quote(state, delta, leverage)
         return (
             state,
             {**inputs, "collateralPriceUsd": notional["collateralPriceUsd"]},
@@ -866,7 +857,6 @@ def partial_close(
         dry_run=dry_run,
         before_submit=before_submit,
         changed_message="Position changed; review the reduction again",
-        fixed_usdc_price=fixed_usdc_price,
         estimate=lambda state, inputs, fresh, rechecked: estimates.close_estimates(
             lcd_endpoint,
             state,
