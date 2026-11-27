@@ -11,7 +11,7 @@ import pytest
 from sai_cli.core.confirmation import preview_digest
 from sai_cli.core.settings import load as load_settings
 from sai_cli.mcp_server.tools import partial_close as mcp_partial_close
-from scenarios import child_env, loopback, seed_home
+from scenarios import ADDRESS, child_env, loopback, seed_home
 from test_trade import CANCEL, CLI, CLOSE, OPEN, rows, run
 from trade_replay import TradeReplay
 
@@ -55,6 +55,73 @@ def test_unfunded_capped_margin_text_refusal_matches_python(
             assert not rows(home)
             assert not endpoints.errors
     assert diagnostics[0] == diagnostics[1]
+
+
+@pytest.mark.parametrize(
+    ("collateral", "percent", "amount_usdc", "amount_usd"),
+    [
+        # The fixture's $20 notional leaves $0.20 against Keeper's $1 minimum.
+        pytest.param(10_000_000, "99", "9900000", "9.9", id="below-minimum"),
+        # The old Decimal calculation rendered the base-unit amount as 1.0…E+26.
+        pytest.param(10**28, "1", str(10**26), str(10**20), id="scientific-reduction"),
+    ],
+)
+def test_confirmed_partial_close_matches_preview_and_ledger(
+    pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    collateral: int,
+    percent: str,
+    amount_usdc: str,
+    amount_usd: str,
+) -> None:
+    args = (*PARTIAL[:-1], percent)
+    kind = "DECREASE_POSITION_SIZE"
+    expected = {
+        "kind": kind,
+        "target": {"userTradeId": "7"},
+        "body": {
+            "collateral": {"amountUsdc": amount_usdc, "amountUsd": amount_usd},
+            "leverageDelta": "0",
+        },
+    }
+    digests = []
+    for index, cli in enumerate(pair):
+        home = tmp_path / str(index)
+        replay = TradeReplay(kind)
+        with loopback(
+            "position-default", position_collateral=collateral, trade_replay=replay
+        ) as endpoints:
+            seed_home(home, endpoints, "session")
+            code, preview, stderr = run(
+                cli, home, endpoints, (*args, "--dry-run"), python=index == 0
+            )
+            assert (code, stderr) == (0, ""), preview
+            assert preview["intent"] == expected
+            digest = preview["previewDigest"]
+            assert digest == preview_digest(preview)
+            assert not replay.attempts()
+            assert not rows(home)
+
+            code, result, stderr = run(
+                cli,
+                home,
+                endpoints,
+                (*args, "--preview-digest", digest),
+                python=index == 0,
+            )
+            assert (code, stderr) == (0, ""), (result, endpoints.errors)
+            key = result["intentKey"]
+            assert result["status"] == "accepted"
+            assert replay.attempts() == {key: 1}
+            sent = replay.intent(key)
+            assert {field: sent[field] for field in expected} == expected
+            [(row_key, *ledger, created_at)] = rows(home)
+            assert row_key == key
+            assert ledger == [kind, "accepted", "7", ADDRESS.lower(), None]
+            assert isinstance(created_at, float)
+            assert not endpoints.errors
+            digests.append(digest)
+    assert digests[0] == digests[1]
 
 
 @pytest.mark.parametrize(

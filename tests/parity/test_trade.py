@@ -19,7 +19,6 @@ from urllib.parse import urlsplit
 import pytest
 from compare import INTENT_ID, timestamp
 from keeper_wire import same_variables
-from parity import project_reference_fixed_collateral
 from sai_cli.core.confirmation import preview_digest
 from scenarios import (
     ADDRESS,
@@ -171,8 +170,6 @@ def test_cli_dry_run_matches_python_main(
                     "after": "10999999",
                 }
             if args[1] in {"leverage", "margin"}:
-                if index == 0:
-                    project_reference_fixed_collateral(preview)
                 assert preview["collateral"] == {
                     "beforeUsd": "10",
                     "afterUsd": "10.999999",

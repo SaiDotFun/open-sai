@@ -110,7 +110,7 @@ class Case:
     exact_output: bool = False
     current_only: bool = False
     reference_stderr_contains: list[str] | None = None
-    collateral_price_after: str | None = None
+    compare_current_margin_preview: bool = False
 
     @property
     def command(self) -> str:
@@ -644,6 +644,13 @@ def observe(
                 trade_estimate_clocks(payload)
                 if isinstance(payload, dict):
                     trade_estimate_clocks(payload.get("preview"))
+                    preview = payload.get("preview", payload)
+                    if case.name == "mcp-trade-leverage-confirmation" and isinstance(
+                        preview, dict
+                    ):
+                        # The fixture checks each runtime's display before
+                        # comparing the shared base-unit binding and digest.
+                        preview.pop("collateral", None)
     stderr = stderr_category(result.stderr)
     if case.accepted_divergence == "uninstall-read-only":
         check_read_only_uninstall(case, result.returncode, output, stderr, candidate)
@@ -1110,18 +1117,11 @@ def run_case(
     tool_evidence: dict[str, list[str]] | None = None,
 ) -> tuple[list[str], dict[str, str], str | None]:
     rust = candidate is not reference
-    candidate_case = case.rust_case() if rust else case
+    current_margin_preview = python_main and case.compare_current_margin_preview
+    # The release cases retain their recorded Rust wire expectations.
+    selected_case = replace(case, rust=None) if current_margin_preview else case
+    candidate_case = selected_case.rust_case() if rust else case
     account_balances = case.command == "account balances"
-    current_margin_preview = python_main and case.collateral_price_after is not None
-    if current_margin_preview:
-        wire = list(case.wire or [])
-        index = wire.index(case.collateral_price_after)
-        wire.insert(index + 1, "get_collateral_price")
-        if rust:
-            candidate_case = replace(case, rust=None).rust_case()
-        case = replace(case, wire=wire)
-        if not rust:
-            candidate_case = case
     with (
         tempfile.TemporaryDirectory(prefix="sai-parity-") as temp,
         loopback(case.server, balance_block_reads=account_balances) as endpoints,

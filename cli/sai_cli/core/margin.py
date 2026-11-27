@@ -15,7 +15,7 @@ from contextlib import closing, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal, localcontext
+from decimal import Decimal
 from secrets import token_hex
 from threading import BoundedSemaphore, Thread
 from typing import Any, Literal, TypedDict
@@ -722,36 +722,11 @@ def collateral_price(
     )
 
 
-def optional_collateral_price(
-    lcd: str, state: PositionSnapshot, *, height: str | None = None
-) -> Decimal | None:
-    try:
-        price = collateral_price(lcd, state, height=height)
-        return price if price > 0 else None
-    except (ValueError, TypeError, KeyError):
-        return None
+def collateral_usd(before: int, after: int) -> dict[str, str]:
+    def usd(amount: int) -> str:
+        return format(Decimal(f"{amount}e-6"), "f").rstrip("0").rstrip(".")
 
-
-def collateral_amounts(
-    before: int, after: int, price: Decimal | None
-) -> dict[str, str | None]:
-    def units(amount: int) -> Decimal:
-        return Decimal(f"{amount}e-6")
-
-    def usd(amount: int) -> str | None:
-        if price is None:
-            return None
-        # Preserve the precision of both the base-unit amount and oracle price.
-        with localcontext() as context:
-            context.prec = len(str(amount)) + len(price.as_tuple().digits)
-            return format((units(amount) * price).normalize(), "f")
-
-    return {
-        "beforeUsdc": format(units(before), "f"),
-        "afterUsdc": format(units(after), "f"),
-        "beforeUsd": usd(before),
-        "afterUsd": usd(after),
-    }
+    return {"beforeUsd": usd(before), "afterUsd": usd(after)}
 
 
 def perp_prices(lcd: str, state: PositionSnapshot, height: str) -> Any:

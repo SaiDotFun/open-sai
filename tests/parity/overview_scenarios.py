@@ -77,6 +77,7 @@ class OverviewReplay:
         self.balances = recorded["balances"]
         self.balances["data"]["userBalances"].append(
             {
+                "amount": "12125000",
                 "usd_value": 12.125,
                 "lastUpdatedBlock": RISK_BLOCK,
                 "token_info": {"type": "sai", "name": "USDC Unsettled on Sai"},
