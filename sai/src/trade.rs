@@ -7,6 +7,7 @@ use std::{
 use clap::{Args, Subcommand, ValueEnum};
 use sai_core::{
     errors::{Code, ExitCode, SaiError},
+    keeper::{self, Keeper},
     log::EventContext,
     settings::{Environment, Flags, Key, Settings, repr},
     storage::{Session, Storage, StorageEvent},
@@ -18,7 +19,7 @@ use sai_core::{
 };
 use serde_json::{Value, json};
 
-use crate::{load_settings, local};
+use crate::{load_settings, local, reads::usdc_markets};
 
 #[derive(Subcommand)]
 pub enum TradeCommand {
@@ -160,6 +161,7 @@ fn missing_enum_option<T: ValueEnum>(option: &str) -> SaiError {
 
 #[derive(Args)]
 pub struct Open {
+    /// Market ID or symbol, such as BTC.
     #[arg(long, allow_negative_numbers = true)]
     market: String,
     #[arg(long)]
@@ -194,9 +196,14 @@ pub struct Open {
 }
 
 impl Open {
-    fn preview(&self, price: Option<&str>, confirmed: bool) -> Result<TradePreview, SaiError> {
+    fn preview(
+        &self,
+        market: &str,
+        price: Option<&str>,
+        confirmed: bool,
+    ) -> Result<TradePreview, SaiError> {
         let trade = OpenTrade {
-            market: &self.market,
+            market,
             side: match self.side {
                 Side::Long => trade::Side::Long,
                 Side::Short => trade::Side::Short,
@@ -217,6 +224,48 @@ impl Open {
             trade.confirmed_cli_preview()
         } else {
             trade.preview()
+        }
+    }
+
+    async fn resolve_market(&self, keeper: &Keeper<'_>) -> Result<String, SaiError> {
+        let market = &self.market;
+        if !market.is_ascii() || !market.bytes().any(|byte| byte.is_ascii_alphabetic()) {
+            return Ok(market.clone());
+        }
+        let response = keeper
+            .read_until(
+                keeper::MARKETS,
+                Default::default(),
+                keeper::TIMEOUT,
+                crate::reads::interrupted(),
+            )
+            .await?;
+        let ids: std::collections::BTreeSet<_> = usdc_markets(&response)?
+            .filter(|row| {
+                row["baseToken"]["symbol"]
+                    .as_str()
+                    .is_some_and(|symbol| symbol.eq_ignore_ascii_case(market))
+            })
+            .map(|row| row["marketId"].as_u64().ok_or_else(SaiError::internal))
+            .collect::<Result<_, _>>()?;
+        let symbol = repr(market);
+        match ids.len() {
+            0 => Err(SaiError::new(
+                Code::InvalidRequest,
+                format!("Unknown market symbol {symbol}. Run sai market list."),
+            )),
+            1 => Ok(ids.first().expect("one market ID").to_string()),
+            _ => {
+                let ids = ids
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(SaiError::new(
+                    Code::InvalidRequest,
+                    format!("Ambiguous market symbol {symbol}. Pass a market ID: {ids}."),
+                ))
+            }
         }
     }
 
@@ -305,7 +354,7 @@ Options:
             r#"  Open a market, limit, or stop trade.
 
 Options:
-  --market INTEGER            [x<=None; required]
+  --market MARKET             Market ID or symbol, such as BTC.  [required]
   --side [long|short]         [required]
   --type [market|limit|stop]  [required]
   --amount DECIMAL            USDC amount in USD.  [required]
@@ -410,6 +459,10 @@ pub fn run(
                 ..
             }
     );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| SaiError::internal())?;
     let (preview, dry_run, wait_for_trade, allow_concurrent_open, supplied_price, confirmation) =
         match &command {
             TradeCommand::Open(open) => {
@@ -417,8 +470,11 @@ pub fn run(
                 let confirmed_market =
                     confirmation.is_some() && matches!(open.order_type, OrderType::Market);
                 let supplied = open.price.as_deref();
+                let keeper = Keeper::new(settings.endpoint(), events);
+                let market = runtime.block_on(open.resolve_market(&keeper))?;
                 (
                     open.preview(
+                        &market,
                         if confirmed_market { None } else { supplied },
                         open.dry_run || confirmation.is_some(),
                     )?,
@@ -535,10 +591,6 @@ pub fn run(
         }
         Err(error) => return Err(error),
     };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|_| SaiError::internal())?;
     if dry_run {
         if preview.is_standalone_position_update() {
             let output = runtime.block_on(trading.position_update_preview(

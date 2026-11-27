@@ -206,9 +206,47 @@ fn read(
     }
     if query == keeper::HISTORY {
         output::read(&keeper::public_account_history(&env.home, &data), json)
+    } else if query == keeper::MARKETS && !json {
+        market_table(&data)
     } else {
         output::read(&data, json)
     }
+}
+
+pub(super) fn usdc_markets(
+    data: &Map<String, Value>,
+) -> Result<impl Iterator<Item = &Value>, SaiError> {
+    let rows = data
+        .get("perp")
+        .and_then(|perp| perp["borrowings"].as_array())
+        .ok_or_else(SaiError::internal)?;
+    Ok(rows
+        .iter()
+        .filter(|row| row["collateralToken"]["symbol"] == "USDC"))
+}
+
+fn market_table(data: &Map<String, Value>) -> Result<(), SaiError> {
+    let rows = usdc_markets(data)?
+        .map(|row| {
+            let price = &row["price"];
+            Ok(vec![
+                row["baseToken"]["symbol"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .into(),
+                row["marketId"].to_string(),
+                "USDC".into(),
+                if price.is_null() {
+                    "-".into()
+                } else if let Some(price) = price.as_str() {
+                    price.into()
+                } else {
+                    output::line(price)?
+                },
+            ])
+        })
+        .collect::<Result<Vec<_>, SaiError>>()?;
+    overview::show_table(&["Symbol", "ID", "Collateral", "Price"], rows, 40)
 }
 
 #[derive(Subcommand)]
@@ -296,7 +334,7 @@ fn runtime() -> Result<tokio::runtime::Runtime, SaiError> {
         .map_err(|_| SaiError::internal())
 }
 
-async fn interrupted() -> SaiError {
+pub(super) async fn interrupted() -> SaiError {
     match tokio::signal::ctrl_c().await {
         Ok(()) => SaiError::new(Code::InvalidRequest, "Aborted"),
         Err(_) => SaiError::internal(),

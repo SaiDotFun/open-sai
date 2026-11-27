@@ -22,11 +22,6 @@ owner = "#231"
 title = "Python includes balance freshness after a WebSocket redirect."
 signature = "0c6c09717aa97c5866132f1e0020d745530d9da7f38155739014b3c2479aa160"
 
-[gap."case:trade-open-market-symbol"]
-owner = "#231"
-title = "Python resolves case-insensitive symbols using Keeper's USDC borrowing rows."
-signature = "b64337407377e1113dc12c29f0ef467a3b4f5c288cb62de3bd33a4f4313afc1c"
-
 [gap."case:trade-margin-capped-add"]
 owner = "#231"
 title = "Python sizes margin adds with --max-collateral-usd and shows the result."

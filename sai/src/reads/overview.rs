@@ -8,12 +8,7 @@ use serde_json::Value;
 const UNKNOWN: &str = "unknown";
 
 pub(super) fn show(result: &Value) -> Result<(), SaiError> {
-    let color = io::stdout().is_terminal()
-        && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
-    let mut display = Display {
-        out: String::new(),
-        color,
-    };
+    let mut display = Display::new();
     let session = &result["session"]["data"];
     let renewal = session["expiryWarning"].as_str().map(|warning| {
         ExpiryNotice {
@@ -173,10 +168,17 @@ pub(super) fn show(result: &Value) -> Result<(), SaiError> {
             display.line("  No local session for this account");
         }
     }
-    io::stdout()
-        .lock()
-        .write_all(display.out.as_bytes())
-        .map_err(|_| SaiError::internal())
+    display.flush()
+}
+
+pub(super) fn show_table(
+    headers: &[&str],
+    rows: Vec<Vec<String>>,
+    max_col_width: usize,
+) -> Result<(), SaiError> {
+    let mut display = Display::new();
+    display.render_table(headers, rows, max_col_width);
+    display.flush()
 }
 
 struct Display {
@@ -185,6 +187,21 @@ struct Display {
 }
 
 impl Display {
+    fn new() -> Self {
+        Self {
+            out: String::new(),
+            color: io::stdout().is_terminal()
+                && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()),
+        }
+    }
+
+    fn flush(self) -> Result<(), SaiError> {
+        io::stdout()
+            .lock()
+            .write_all(self.out.as_bytes())
+            .map_err(|_| SaiError::internal())
+    }
+
     fn line(&mut self, text: impl AsRef<str>) {
         self.out.push_str(text.as_ref());
         self.out.push('\n');
@@ -247,6 +264,10 @@ impl Display {
             self.line("  None");
             return;
         }
+        self.render_table(headers, rows, 72);
+    }
+
+    fn render_table(&mut self, headers: &[&str], rows: Vec<Vec<String>>, max_col_width: usize) {
         let widths: Vec<_> = headers
             .iter()
             .enumerate()
@@ -256,7 +277,7 @@ impl Display {
                     .max()
                     .unwrap_or(0)
                     .max(header.len())
-                    .min(72)
+                    .min(max_col_width)
             })
             .collect();
         let separator = self.paint("38;5;240", " │ ");

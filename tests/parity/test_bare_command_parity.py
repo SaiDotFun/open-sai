@@ -65,9 +65,6 @@ def test_bare_leaf_prints_full_help_and_json_usage(
     assert expected.stdout.startswith(b"Usage:") and b"--help" in expected.stdout
 
     def comparable(help_text: bytes) -> bytes:
-        if args == ("trade", "open"):
-            # Issue 231 tracks the --market help and symbol support.
-            return re.sub(rb"(?m)^  --market [^\n]*\n", b"", help_text)
         if args == ("trade", "margin"):
             # The new option widens the option column and wraps other help text.
             without_cap = re.sub(

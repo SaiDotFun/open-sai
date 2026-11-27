@@ -90,6 +90,15 @@ args = ["--json","market","list"]
 wire = ["borrowings"]
 
 [[case]]
+name = "market-list-text"
+current_only = true
+seed = "session"
+args = ["market", "list"]
+mode = "text"
+exact_output = true
+wire = ["borrowings"]
+
+[[case]]
 name = "market-prices"
 args = ["--json","market","prices"]
 wire = ["tokenPricesUsd"]
@@ -1282,7 +1291,6 @@ exact_output = true
 
 [[case]]
 name = "bare-help-trade-open"
-accepted_difference = "Issue #231 adds market-symbol help to Python main."
 args = ["trade", "open"]
 mode = "text"
 expect = 2
@@ -1766,7 +1774,20 @@ args = ["--json", "trade", "open", "--market", "bTc", "--side", "long", "--type"
 server = "market-symbol"
 wire = ["borrowings", "borrowings", "oneClickTrading", "node_info", "get_market", "get_group", "get_pair_custom_max_leverage", "get_fees", "get_collateral_price"]
 output = { "intent.body.market.marketIndex" = "MarketIndex(3)" }
-rust = { expect = 2, wire = [], output = { "error.code" = "INVALID_REQUEST" } }
+
+[[case]]
+name = "trade-open-ambiguous-market-symbol"
+current_only = true
+args = ["--json", "trade", "open", "--market", "bTc", "--side", "long", "--type", "market", "--amount", "20", "--leverage", "2", "--slippage", "1", "--dry-run"]
+wire = ["borrowings"]
+expect = 1
+
+[[case]]
+name = "trade-open-unknown-market-symbol"
+current_only = true
+args = ["--json", "trade", "open", "--market", "UNKNOWN", "--side", "long", "--type", "market", "--amount", "20", "--leverage", "2", "--slippage", "1", "--dry-run"]
+wire = ["borrowings"]
+expect = 1
 
 [[case]]
 name = "trade-close"

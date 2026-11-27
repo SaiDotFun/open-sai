@@ -116,7 +116,7 @@ signature = "332fccccec5e274d667ba5143155f396d53f56dc5218ec3c91cc2594345eef51"
 
 [gap."case:bare-help-trade-open"]
 owner = "#172"
-signature = "f51cc0376c72daf347acfe30dacc57b3bda9733307b17a491a9b2f2c8ff3dc59"
+signature = "5ce0238065876cebd004e2209bce3c44b9af0935451f35af7dd9613bd0989c4f"
 
 [gap."case:bare-help-trade-partial-close"]
 owner = "#172"
