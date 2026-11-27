@@ -27,6 +27,7 @@ const ACCOUNT: &str = "0x1111111111111111111111111111111111111111";
 const OTHER_ACCOUNT: &str = "0x2222222222222222222222222222222222222222";
 const NETWORK: &str = "fixture-chain-1";
 const CONTRACT: &str = "nibi1fixturecontract";
+const ORACLE: &str = "nibi1fixtureoracle";
 
 struct ReplyState {
     keeper_owner: &'static str,
@@ -206,6 +207,9 @@ impl ReplyState {
                 "GET /cosmwasm/wasm/v1/contract/{}/smart/",
                 self.contract
             ))
+            .or_else(|| {
+                request.strip_prefix(&format!("GET /cosmwasm/wasm/v1/contract/{ORACLE}/smart/"))
+            })
             .unwrap_or_else(|| panic!("Unexpected LCD request: {request}"));
         let (target, _) = path.split_once(' ').unwrap();
         let path = target.split('?').next().unwrap();
@@ -216,17 +220,22 @@ impl ReplyState {
             self.requests.push("market_state".into());
             return json!({"data": {
                 "market_trading_state": if self.market_close_only { "close_only" } else { "open" },
-                "group_index": "GroupIndex(0)",
+                "group_index": "GroupIndex(0)", "base": "TokenIndex(7)", "quote": "TokenIndex(0)",
             }});
         }
         if self.stale_oracle {
             let (name, value) = match message.as_object().unwrap().keys().next().unwrap().as_str() {
-                "get_perp_prices" => (
-                    "prices",
-                    json!({"market": {
-                        "base_per_quote": "100", "base_last_update_time": 1
-                    }}),
-                ),
+                "get_oracle_address" => ("oracle_address", json!(ORACLE)),
+                "get_exchange_rate" => {
+                    assert_eq!(
+                        message,
+                        json!({"get_exchange_rate": {"base": 7, "quote": 0}})
+                    );
+                    (
+                        "market_price",
+                        json!({"base_per_quote": "100", "base_last_update_time": 1}),
+                    )
+                }
                 "market_order_config" => (
                     "market_order_config",
                     json!({"fill_at_next_oracle_price": false}),
