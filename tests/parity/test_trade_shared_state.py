@@ -32,7 +32,7 @@ from trade_replay import REQUEST_HASH, SESSION, TradeReplay
 
 pytestmark = pytest.mark.parity_namespace
 
-REFERENCE = "973f3f59f38dd89d0c2e03e674157934a00316ae"
+REFERENCE = "7c7b00dee586a6e148da7d482c89fc91c610b968"
 KEY = "20261124T120000000Z_0123456789ABCDEF"
 RETRY = "20261124T120001000Z_0123456789ABCDEF"
 LEDGER = Path("sai/trader/intents.sqlite3")
@@ -861,6 +861,87 @@ def mcp_action(action_name: str) -> str:
     return "close" if action_name == "cancel" else action_name.replace("-", "_")
 
 
+@pytest.mark.parametrize("action_name", ["close", "open"])
+@pytest.mark.parametrize("writer_name", ["python", "rust"])
+def test_mcp_recovers_blocked_trade_for_a_nonactive_account(
+    cli_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    tmp_path: Path,
+    action_name: str,
+    writer_name: str,
+) -> None:
+    runtimes = {
+        "python": Runtime("python", (str(Path(sys.executable).with_name("sai")),)),
+        "rust": Runtime("rust", cli_pair[1]),
+    }
+    writer = runtimes[writer_name]
+    reader = runtimes["rust" if writer_name == "python" else "python"]
+    action = ACTIONS[action_name]
+    replay = action.replay(lose_reply=True)
+    scenario = "quote-market" if action_name == "open" else "quote-close"
+
+    with loopback(scenario, trade_replay=replay) as endpoints:
+        home = Home(tmp_path / "home", endpoints)
+        seed_home(home.path, endpoints, "accounts")
+        home.json(runtimes["python"], "auth", "use", OTHER_ADDRESS)
+        args = {**MCP_ARGS[action_name], "addr": ADDRESS}
+
+        async def recover() -> None:
+            async with mcp_session(home, writer) as session:
+                preview = await tool(session, f"preview_{action_name}", **args)
+                confirmed = {**args, "preview_digest": preview["previewDigest"]}
+                if action_name == "open":
+                    confirmed["reference_price"] = preview["referencePrice"]
+                lost = await tool(session, f"trade_{action_name}", **confirmed)
+
+            [key] = replay.admitted_keys()
+            assert lost["code"] == "OUTCOME_UNKNOWN"
+            home.row(key, action.kind, action.entity, "unknown")
+            async with mcp_session(home, reader) as session:
+                blocked = await tool(session, f"trade_{action_name}", **confirmed)
+                assert blocked["code"] == (
+                    "RECENT_OPEN_PENDING"
+                    if action_name == "open"
+                    else "INVALID_REQUEST"
+                )
+                assert (blocked.get("intentKeys"), blocked.get("addr")) == (
+                    [key],
+                    ADDRESS,
+                )
+                assert lost["intentKey"] == blocked["intentKey"] == key
+                assert lost["addr"] == ADDRESS
+                for response in (lost, blocked):
+                    assert all(
+                        field in response["next"] for field in ("intent_status", "addr")
+                    )
+                home.row(key, action.kind, action.entity, "unknown")
+                assert replay.attempts() == {key: 1}
+                replay.phase = "pending"
+                reconciled = await tool(
+                    session,
+                    "intent_status",
+                    key=blocked["intentKey"],
+                    addr=blocked["addr"],
+                )
+                assert reconciled["addr"] == ADDRESS
+                assert reconciled["outcome"] == "pending"
+                home.row(key, action.kind, action.entity, "pending")
+                assert replay.attempts() == {key: 1}
+
+        asyncio.run(recover())
+        assert not endpoints.errors
+
+
+def mcp_trade_runtime(
+    name: str, request: pytest.FixtureRequest, python_reference: Path | None
+) -> Runtime:
+    if name == "python":
+        executable = os.environ.get(
+            "SAI_PARITY_MCP_TRADE_PYTHON", str(Path(sys.executable).with_name("sai"))
+        )
+        return Runtime(name, (executable,))
+    return runtime(name, request, python_reference)
+
+
 async def mcp_preview(
     session: ClientSession,
     home: Home,
@@ -904,15 +985,20 @@ def test_cli_and_mcp_overlap(
     python_reference: Path | None,
 ) -> None:
     cli = runtime(cli_name, request, python_reference)
-    mcp = runtime(mcp_name, request, python_reference)
+    mcp = mcp_trade_runtime(mcp_name, request, python_reference)
     reconciler = runtime(
         "rust" if python_reference is not None else "python", request, python_reference
     )
     action = ACTIONS[action_name]
     replay = action.replay(hold_admission=True)
     tool_name = f"trade_{mcp_action(action_name)}"
+    scenario = {
+        "close": "shared-confirmable-position",
+        "partial-close": "shared-confirmable-position",
+        "leverage": "shared-confirmable-leverage",
+    }.get(action_name, action.server)
     with loopback(
-        action.server, trade_replay=replay, leverage_target=action.leverage_target
+        scenario, trade_replay=replay, leverage_target=action.leverage_target
     ) as endpoints:
         home = Home(tmp_path / "home", endpoints)
         seed_home(home.path, endpoints, "session")
@@ -1031,7 +1117,7 @@ def test_mcp_confirmation_rechecks_active_account(
     tmp_path: Path,
     python_reference: Path | None,
 ) -> None:
-    mcp = runtime(mcp_name, request, python_reference)
+    mcp = mcp_trade_runtime(mcp_name, request, python_reference)
     cli = runtime(switcher, request, python_reference)
     replay = TradeReplay()
     with loopback("confirmation-account-change", trade_replay=replay) as endpoints:
@@ -1058,8 +1144,9 @@ def test_mcp_confirmation_rechecks_active_account(
                 if rust_mcp_stub(mcp, "trade_close", refused):
                     return False
                 assert refused["code"] == "PREVIEW_MISMATCH"
-                assert refused["preview"]["addr"] == OTHER_ADDRESS
-                assert refused["preview"]["previewDigest"] != preview["previewDigest"]
+                assert refused["quoteStatus"] == "unavailable"
+                assert refused["recovery"]["action"] == "request_preview"
+                assert "preview" not in refused
                 return True
 
         confirmed = asyncio.run(confirm())

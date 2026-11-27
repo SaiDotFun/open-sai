@@ -15,48 +15,64 @@ standalone installer. It verifies the release archive against `SHA256SUMS`,
 checks that Sai and its MCP server start, and installs the launcher at
 `~/.local/bin/sai`. Add `~/.local/bin` to your `PATH` to run the command. The
 installed binary runs on its own. Until a native release is available, use the
-pinned Python installer below.
+Python installer below.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py | python3 - --native
 sai --help
 ```
 
-If you installed Sai from a release wheel with [uv](https://docs.astral.sh/uv/),
-find the full Python bridge version in the release notes. Install it explicitly
-before running the native update. The bridge is published after the first
-native release, whose version is higher, so an unpinned update can skip the
-bridge.
+On a host that can run native Sai, a [uv](https://docs.astral.sh/uv/) install
+from the Sai 0.1.3 release wheel can update directly.
 
 ```bash
-sai update --to BRIDGE_VERSION
 sai update
 ```
 
-Replace `BRIDGE_VERSION` with the version in the release notes. The second
-command selects the native release by its tag, verifies the matching shim,
-and keeps your uv launcher.
+If you installed an earlier release wheel, first update to the published
+full Python release `0.1.3`, then run the native update. The update verifies
+the shim and keeps your uv launcher.
 
-On Windows, use the latest full Python release listed in the release notes.
-Replace `PYTHON_VERSION` with that release version. The installer verifies the
-wheel against `SHA256SUMS` and caches it under `$SAI_HOME/cache/wheels`.
-
-```powershell
-uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py --version PYTHON_VERSION
+```bash
+sai update --to 0.1.3
+sai update
 ```
 
-For maintainers, ship the next regular Python release, then publish the
-native archives and matching shim. Cut the bridge afterward as the last full
-Python release in the existing series. Choose its version at cut time and set
-it in `pyproject.toml` for the ordinary Python release build. It must be newer
-than the earlier full Python releases and lower than the first native
-release. To rehearse a proposed version before bumping the package metadata,
-run `uv run python scripts/build-bridge.py --version BRIDGE_VERSION --out-dir dist`.
+Use the managed Python installer on Windows or when you want the full Python
+package on another platform. It verifies the release download against
+`SHA256SUMS` and records the release for `sai update`. Add `--version X.Y.Z`
+to pin a stable release. If an older Windows `sai update` asks you to keep
+your current Python version, use this installer to update first.
 
-If uv installed Sai from Git, run `uv tool uninstall sai-cli` and use the
-pinned installer above with the published full-Python bridge version. Then
-run `sai update`. The bridge keeps a verified Python wheel for offline
-recovery. Your Sai profile stays in place when you replace the uv tool.
+```powershell
+uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py --full-python
+```
+
+On a native release, the standard `sai-cli` wheel is the native shim. To
+inspect the full Python packages, download `sai-cli-X.Y.Z-full-python.zip`
+and `SHA256SUMS` from the release assets. Compute the ZIP's SHA-256 and
+compare it with the ZIP's entry in `SHA256SUMS`.
+
+- Linux: `sha256sum sai-cli-X.Y.Z-full-python.zip`
+- macOS: `shasum -a 256 sai-cli-X.Y.Z-full-python.zip`
+- Windows PowerShell: `Get-FileHash -Algorithm SHA256 sai-cli-X.Y.Z-full-python.zip`
+
+After the hashes match, extract the ZIP to inspect the wheel and sdist.
+
+```console
+uv run --no-project python -m zipfile -e sai-cli-X.Y.Z-full-python.zip full-python
+```
+
+If uv installed Sai from Git and you want to move to the native release, first
+switch to the published 0.1.3 wheel. The installer keeps a verified Python wheel
+for offline recovery. Your Sai profile stays in place when you replace the uv
+tool.
+
+```bash
+uv tool uninstall sai-cli
+uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py --version 0.1.3
+sai update
+```
 
 If the uv switch is interrupted, run the saved recovery binary with the same
 uv settings:
@@ -71,11 +87,12 @@ To build from source instead, install from Git:
 uv tool install git+https://github.com/SaiDotFun/open-sai
 ```
 
-To try the CLI without installing it:
+To try the CLI without installing it, pass the release wheel to `uvx`.
+For full Python on a native release, use the wheel you extracted above.
 
 ```bash
-PYTHON_VERSION=X.Y.Z
-uvx --from "https://github.com/SaiDotFun/open-sai/releases/download/sai-cli/v${PYTHON_VERSION}/sai_cli-${PYTHON_VERSION}-py3-none-any.whl" sai --json market prices
+VERSION=X.Y.Z
+uvx --from "https://github.com/SaiDotFun/open-sai/releases/download/sai-cli/v${VERSION}/sai_cli-${VERSION}-py3-none-any.whl" sai --json market prices
 ```
 
 The Git install builds `main`. Run `sai --version` to check your installed version.
@@ -334,22 +351,83 @@ Each component of this repository releases under its own tag prefix. The CLI
 uses `sai-cli/vX.Y.Z`, where `X.Y.Z` is the version in `pyproject.toml`, and
 `sai-cli/vX.Y.Z-rc.N` for a pre-release.
 
-To release, merge the version bump and complete the
-[upgrade and downgrade rehearsal](#rehearse-an-upgrade-and-downgrade), then
-run `just release X.Y.Z` on `main`.
-It is a dry run that checks the tree and prints the Git commands; add `--run`
-to create and push the tag. The tag starts the
-[Release workflow](.github/workflows/release.yml), which runs the tests,
-builds the wheel and sdist, writes `SHA256SUMS`, and publishes all three as a
-GitHub Release. The install script and `sai update` look for the highest
-`sai-cli/v*` release that is not a pre-release.
+For the default native release, merge a version bump that aligns the Python
+package, Cargo workspace, and shim on the same release version. In the shim,
+use `X.Y.ZrcN` for release candidates. Run the
+[Release workflow](.github/workflows/release.yml) manually on the candidate
+commit with the planned tag. The workflow checks the package versions, runs
+the Python tests and the four native smoke jobs, and uploads the
+`sai-release-candidate` Actions artifact. Complete the rehearsal below for
+the planned tag before publishing.
+
+Run `just release X.Y.Z` on `main` to check the tree and preview the Git
+commands. Add `--run` to create and push the tag. The tag workflow checks that
+the tagged commit is on main's first-parent history. It publishes four native
+archives, the shim wheel and sdist, a ZIP containing the full Python wheel and
+sdist, and one `SHA256SUMS` file in one immutable release. After publication,
+it checks the tag and every file against GitHub's signed release attestation.
+Sai does not sign the binaries separately.
+
+Before tagging, enable immutable releases in the repository settings and set
+the Actions secret `SAI_RELEASE_SETTINGS_TOKEN` to a fine-grained token scoped
+to this repository with Administration read access. The workflow checks the
+setting with that token immediately before publication and stops if GitHub
+cannot confirm it is enabled. The usual Actions token publishes the release.
+
+Native Linux builds and smoke tests use glibc 2.35 on x86_64 and arm64.
+Native macOS builds target macOS 11 on Intel and Apple silicon. The hosted
+smoke tests run on macOS 15, the tested support floor.
+
+The shim keeps the `sai-cli` package name and takes the standard wheel and
+sdist filenames on native releases. The Python bridge downloads the wheel
+by that filename and keeps the uv-managed `sai` launcher. The full Python
+build keeps both original filenames inside `sai-cli-X.Y.Z-full-python.zip`.
+Use the [managed Python installer](#trader-cli) with `--full-python --version X.Y.Z`
+to install that release and keep it eligible for updates.
+
+### Release Python Only
+
+Use this mode for a full Python release before the native distribution is
+ready. Bump the Python package version and run the manual Release workflow
+with the planned tag and the `python-only` option enabled. Its candidate
+artifact contains the full Python wheel, sdist, and `SHA256SUMS`.
+
+Preview the tag on `main` with `just release X.Y.Z --python-only`. Add
+`--run` when the rehearsal is complete. The command records
+`Sai-Release-Mode: python-only` in the annotated `sai-cli/vX.Y.Z` tag.
+The workflow uses the Python version and omits the native build. The Python
+files keep their usual download URLs and publish together in one immutable
+release.
+
+### Rehearse a Release Candidate
+
+Use `sai-cli/vX.Y.Z-rc.N` as the planned tag for the manual run. After it
+passes, download its candidate artifact and verify the checksums. On a
+native candidate, extract the full Python packages into a separate directory
+with `unzip sai-cli-X.Y.Z-rc.N-full-python.zip -d full-python`. Use
+`./full-python/` in the wheel path below. The full Python wheel should
+report `X.Y.ZrcN`.
+
+```bash
+sha256sum --check --strict SHA256SUMS
+SAI_HOME="$(mktemp -d)" uv run --isolated --no-project \
+  --with ./sai_cli-X.Y.ZrcN-py3-none-any.whl sai --version
+```
+
+On `main`, run `just release X.Y.Z-rc.N` to check the package versions and
+preview the tag commands.
+
+The Release workflow also stages both release modes on pull requests that
+change the release inputs. The native candidate is `sai-release-candidate`.
+The Python-only candidate is `sai-python-release-candidate`.
 
 ### Rehearse an Upgrade and Downgrade
 
-After the version bump lands on `main`, build the candidate and run the
-rehearsal with `--strict` before tagging. Replace `X.Y.Z` with the version in
-`pyproject.toml`. The release gate requires a Linux
-host that can create a loopback-only network namespace with `unshare` and
+For a stable release, build the candidate on `main` and run the rehearsal
+with `--strict` before tagging. The rehearsal exercises stable release
+discovery and takes a wheel with the `X.Y.Z` version from `pyproject.toml`.
+The release gate requires a Linux host that can create a loopback-only
+network namespace with `unshare` and
 `ip`. The script also needs Python 3.11 or later, `uv`, `claude`, and
 `codex` on `PATH`, and network access to GitHub and the Python package
 index. Use executables that can run with a fresh home directory.

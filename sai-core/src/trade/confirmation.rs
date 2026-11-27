@@ -6,24 +6,32 @@ use serde_json::{Map, json};
 use sha2::{Digest, Sha256};
 
 use super::{
-    PreviewMode, TradePreview, Trading,
+    OrderType, PreviewMode, TradePreview, Trading,
     actions::invalid,
     position::{Lcd, PositionRoute},
 };
 use crate::{
     errors::{Code, SaiError},
     keeper::TIMEOUT,
-    storage::Session,
+    storage::{Session, StorageError},
 };
 
 const NEEDS_DIGEST: &str = "preview_digest is required: call the matching preview_* tool, show the user the preview, get confirmation, then pass its previewDigest";
+const NEEDS_REFERENCE: &str = "reference_price is required for a market order: pass the referencePrice from the preview_open result the user confirmed";
+const MARKET_ONLY_REFERENCE: &str = "reference_price applies only to market orders";
 const MISMATCH: &str = "The trade no longer matches the preview the user confirmed, so nothing was submitted. Show the user this new preview, get their confirmation again, then retry with its previewDigest.";
 
 /// Preview confirmation supplied by a caller that requires an explicit digest.
 pub struct Confirmation<'a> {
     digest: &'a str,
     reference_price: Option<(&'a str, BigUint)>,
-    cli: bool,
+    mode: ConfirmationMode,
+}
+
+enum ConfirmationMode {
+    Core,
+    Cli,
+    Mcp,
 }
 
 impl<'a> Confirmation<'a> {
@@ -39,7 +47,7 @@ impl<'a> Confirmation<'a> {
         Ok(Self {
             digest,
             reference_price,
-            cli: false,
+            mode: ConfirmationMode::Core,
         })
     }
 
@@ -47,7 +55,7 @@ impl<'a> Confirmation<'a> {
         Self {
             digest,
             reference_price: None,
-            cli: true,
+            mode: ConfirmationMode::Cli,
         }
     }
 
@@ -68,12 +76,44 @@ impl<'a> Confirmation<'a> {
     }
 
     pub(super) fn is_cli(&self) -> bool {
-        self.cli
+        matches!(self.mode, ConfirmationMode::Cli)
+    }
+
+    pub(super) fn is_mcp(&self) -> bool {
+        matches!(self.mode, ConfirmationMode::Mcp)
+    }
+
+    fn submission_preview_mode(&self) -> PreviewMode {
+        if self.is_mcp() {
+            PreviewMode::McpSubmission
+        } else {
+            PreviewMode::CliSubmission
+        }
+    }
+
+    pub fn for_mcp(digest: &'a str, reference_price: Option<&'a str>) -> Result<Self, SaiError> {
+        Ok(Self {
+            mode: ConfirmationMode::Mcp,
+            ..Self::new(digest, reference_price)?
+        })
+    }
+
+    pub fn for_mcp_open(
+        order_type: OrderType,
+        digest: &'a str,
+        reference_price: Option<&'a str>,
+    ) -> Result<Self, SaiError> {
+        match (order_type == OrderType::Market, reference_price) {
+            (true, None) => return Err(invalid(NEEDS_REFERENCE)),
+            (false, Some(_)) => return Err(invalid(MARKET_ONLY_REFERENCE)),
+            _ => {}
+        }
+        Self::for_mcp(digest, reference_price)
     }
 
     fn verify_digest(&self, preview: &TradePreview, account: &str) -> Result<(), SaiError> {
         if !self.digest_matches(preview, account)? {
-            if self.cli {
+            if self.is_cli() {
                 return Err(SaiError::new(
                     Code::PreviewMismatch,
                     "The trade no longer matches the confirmed preview. Run with --dry-run to review a new preview before submitting.",
@@ -84,6 +124,7 @@ impl<'a> Confirmation<'a> {
                 account,
                 Code::PreviewMismatch,
                 MISMATCH.into(),
+                self.is_mcp(),
             ));
         }
         Ok(())
@@ -100,7 +141,7 @@ impl<'a> Confirmation<'a> {
         if self.digest_matches(&current, account)? {
             return Ok(());
         }
-        let message = if self.cli {
+        let message = if self.is_cli() {
             "The trade no longer matches the confirmed preview. Request a new preview before submitting."
         } else {
             "The trade no longer matches the preview the user confirmed. Request a fresh preview before submitting."
@@ -114,16 +155,10 @@ impl<'a> Confirmation<'a> {
             self.reference_price.as_ref(),
         ) {
             (true, None) => {
-                return Err(SaiError::new(
-                    Code::InvalidRequest,
-                    "reference_price is required for a market order: pass the referencePrice from the preview_open result the user confirmed",
-                ));
+                return Err(SaiError::new(Code::InvalidRequest, NEEDS_REFERENCE));
             }
             (false, Some(_)) => {
-                return Err(SaiError::new(
-                    Code::InvalidRequest,
-                    "reference_price applies only to market orders",
-                ));
+                return Err(SaiError::new(Code::InvalidRequest, MARKET_ONLY_REFERENCE));
             }
             _ => {}
         }
@@ -156,7 +191,7 @@ impl<'a> Confirmation<'a> {
             let moved = distance * 100u32;
             if &moved * SCALE > reference * allowed {
                 let moved = display_movement(moved, reference.clone());
-                if self.cli {
+                if self.is_cli() {
                     return Err(SaiError::new(
                         Code::PriceMoved,
                         format!(
@@ -171,6 +206,7 @@ impl<'a> Confirmation<'a> {
                     format!(
                         "The market price moved {moved}% from the confirmed referencePrice, more than the {slippage}% slippage, so nothing was submitted. Show the user this new preview, get their confirmation again, then retry with its previewDigest and referencePrice."
                     ),
+                    self.is_mcp(),
                 ));
             }
         }
@@ -249,11 +285,12 @@ impl Trading<'_> {
         self.recheck_open_route(&Lcd(endpoint), route).await
     }
 
-    pub(super) async fn prepare_cli_confirmation(
+    pub(super) async fn prepare_confirmation(
         &self,
         session: &Session,
         preview: &TradePreview,
         confirmation: &Confirmation<'_>,
+        allow_concurrent_open: bool,
     ) -> Result<TradePreview, SaiError> {
         let lcd = self.lcd_endpoint.map(Lcd).ok_or_else(|| {
             let message = match preview.intent.kind {
@@ -269,9 +306,17 @@ impl Trading<'_> {
         let addr = session.addr();
         match preview.intent.kind {
             "OPEN_TRADE" => {
+                if confirmation.is_mcp()
+                    && preview.requires_market_price_refresh()
+                    && confirmation.digest_matches(&prepared, addr)?
+                {
+                    self.storage
+                        .check_open_pending(self.keeper.endpoint(), addr, allow_concurrent_open)
+                        .map_err(StorageError::mcp_trade_error)?;
+                }
                 let market_row = if preview.requires_market_price_refresh() {
                     Some(
-                        self.refresh_confirmed_cli_price(
+                        self.refresh_confirmed_price(
                             session,
                             &mut prepared,
                             confirmation,
@@ -286,7 +331,7 @@ impl Trading<'_> {
                 self.estimate_preview(
                     &mut prepared,
                     Some(session),
-                    PreviewMode::CliSubmission,
+                    confirmation.submission_preview_mode(),
                     market_row,
                 )
                 .await?;
@@ -310,11 +355,16 @@ impl Trading<'_> {
                 let (indexed, verified) =
                     confirmation.check_unavailable_target(preview, addr, &route, target)?;
                 if preview.is_market_close() {
-                    let (_, estimates) = self
+                    let (owner_verified, estimates) = self
                         .estimate_verified_close(&lcd, addr, &id, indexed, verified)
                         .await?;
+                    if confirmation.is_mcp() {
+                        prepared.position_owner_verified = Some(owner_verified);
+                    }
                     prepared.estimates = Some(estimates);
-                } else if !preview.intent.body["requestedLeverage"].is_null() {
+                } else if !preview.intent.body["requestedLeverage"].is_null()
+                    || (confirmation.is_mcp() && !confirmation.digest_matches(&prepared, addr)?)
+                {
                     self.estimate_position_update(
                         &mut prepared,
                         addr,
@@ -327,13 +377,23 @@ impl Trading<'_> {
                     // A definitive rejection can leave no collateral projection
                     // to compare with the approved digest.
                     prepared.check_cli_execution(addr, false)?;
+                    if prepared.leverage_collateral_unverified() {
+                        return Err(refusal(
+                            &prepared,
+                            addr,
+                            Code::PreviewMismatch,
+                            "Cannot verify the current collateral. Request a new preview before submitting."
+                                .into(),
+                            confirmation.is_mcp(),
+                        ));
+                    }
                 }
             }
         }
         Ok(prepared)
     }
 
-    async fn refresh_confirmed_cli_price(
+    async fn refresh_confirmed_price(
         &self,
         session: &Session,
         preview: &mut TradePreview,
@@ -361,8 +421,13 @@ impl Trading<'_> {
             )),
             Err(error) => {
                 self.recheck_open_route(lcd, route).await?;
-                self.estimate_preview(preview, Some(session), PreviewMode::CliSubmission, None)
-                    .await?;
+                self.estimate_preview(
+                    preview,
+                    Some(session),
+                    confirmation.submission_preview_mode(),
+                    None,
+                )
+                .await?;
                 self.recheck_open_route(lcd, route).await?;
                 preview.check_cli_execution(session.addr(), false)?;
                 Err(error)
@@ -405,12 +470,20 @@ impl TradePreview {
     }
 }
 
-fn refusal(preview: &TradePreview, account: &str, code: Code, message: String) -> SaiError {
+fn refusal(
+    preview: &TradePreview,
+    account: &str,
+    code: Code,
+    message: String,
+    mcp: bool,
+) -> SaiError {
+    let replacement = if mcp {
+        preview.mcp_preview_output(Some(account))
+    } else {
+        preview.confirmed_output(Some(account))
+    };
     SaiError {
-        details: Some(Box::new(Map::from_iter([(
-            "preview".into(),
-            preview.confirmed_output(Some(account)),
-        )]))),
+        details: Some(Box::new(Map::from_iter([("preview".into(), replacement)]))),
         ..SaiError::new(code, message)
     }
 }

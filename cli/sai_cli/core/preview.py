@@ -584,6 +584,7 @@ def position_estimates(
     result = dict.fromkeys(ESTIMATE_FIELDS, unknown)
     if state is None:
         return result
+    height = None
     try:
         height = margin.verified_position_height(lcd, state, trade_id)
         raw = state.raw
@@ -613,7 +614,9 @@ def position_estimates(
             },
         )
     except margin.PositionChanged:
-        if require_unchanged:
+        # A pinned balance read can invalidate the projection while the
+        # starting collateral stays verified.
+        if require_unchanged and (height is None or not bind_collateral):
             raise
     except READ_ERRORS:
         pass

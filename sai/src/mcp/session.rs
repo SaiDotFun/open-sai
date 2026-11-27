@@ -78,17 +78,30 @@ impl StoredSession {
                 let reason = match (matches, expired) {
                     (false, _) => "other-endpoint",
                     (true, true) => "expired",
-                    (true, false) => "not-implemented",
+                    (true, false) => "signed-in",
                 };
-                json!({"available": false, "reason": reason, "addr": session.addr()})
+                json!({"available": *matches && !expired, "reason": reason, "addr": session.addr()})
             }
         }
+    }
+
+    pub(super) fn into_trade_session(self, optional: bool) -> Result<Option<Session>, SaiError> {
+        if let Some(error) = self.refusal() {
+            return if optional { Ok(None) } else { Err(error) };
+        }
+        let Self::Present { session, .. } = self else {
+            return Err(SaiError::internal());
+        };
+        log::remember([session.token().to_owned()]);
+        Ok(Some(session))
     }
 
     pub(super) fn summary(&self, storage: &Storage<'_>, home: &Path) -> Result<Value, SaiError> {
         let report = match self {
             Self::Missing => json!({"signedIn": false}),
-            Self::Unreadable(error) => json!({"signedIn": false, "error": error.message}),
+            Self::Unreadable(error) => {
+                json!({"signedIn": false, "error": error.message})
+            }
             Self::Present {
                 session,
                 expired,

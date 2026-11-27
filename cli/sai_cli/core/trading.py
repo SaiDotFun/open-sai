@@ -14,7 +14,7 @@ from typing import Any
 
 from . import intents, keeper, margin, partial
 from . import preview as estimates
-from .confirmation import digest_material
+from .confirmation import collateral_price_unverified, digest_material
 from .errors import Code, SaiError
 
 SessionLoader = Callable[[], dict[str, str]]
@@ -440,7 +440,6 @@ def set_leverage(
     dry_run: bool,
     lcd_endpoint: str | None = None,
     before_submit: SubmitCheck | None = None,
-    bind_collateral: bool = False,
 ) -> dict[str, Any]:
     """Set target leverage without changing TP or SL."""
     payload = intents.leverage_intent(trade_id, leverage)
@@ -454,7 +453,6 @@ def set_leverage(
         lcd_endpoint,
         trade_id,
         target=Decimal(leverage),
-        bind_collateral=bind_collateral,
     )
 
 
@@ -469,7 +467,6 @@ def _position_intent(
     *,
     target: Decimal | None = None,
     updates_triggers: bool = False,
-    bind_collateral: bool = False,
 ) -> dict[str, Any]:
     addr = get_session()["evmAddress"]
     preview = {"dryRun": True, "intent": payload}
@@ -496,6 +493,8 @@ def _position_intent(
     if verified is not None:
         preview["positionRoute"] = verified.route
 
+    bind_collateral = target is not None and (dry_run or before_submit is not None)
+
     def estimate(quoted_preview: dict[str, Any]) -> dict[str, Any]:
         values = _estimate_position(
             endpoint,
@@ -506,15 +505,22 @@ def _position_intent(
             verified,
             target,
             updates_triggers,
-            show_collateral=target is not None
-            and (dry_run or before_submit is not None),
-            bind_collateral=bind_collateral and (dry_run or before_submit is not None),
+            show_collateral=bind_collateral,
+            bind_collateral=bind_collateral,
         )
         if collateral := values.pop("collateralBaseUnits", None):
             quoted_preview["collateralBaseUnits"] = collateral
-        elif bind_collateral and not dry_run and before_submit is not None:
+        if (
+            bind_collateral
+            and not dry_run
+            and (collateral is None or "after" not in collateral)
+        ):
             # A definitive rejection may arrive before Perp can quote collateral.
             _reject_execution(quoted_preview, values, addr)
+            if collateral is None:
+                raise PositionChanged(
+                    "Cannot verify the current collateral. Request a new preview before submitting."
+                )
         return values
 
     if dry_run:
@@ -561,14 +567,27 @@ def _estimate_position(
             pass
     if target is None and not updates_triggers:
         return estimates.close_estimates(lcd or "", state, trade_id, None)
-    return estimates.position_estimates(
-        lcd or "",
-        state,
-        trade_id,
-        target=target,
-        show_collateral=show_collateral,
-        bind_collateral=bind_collateral,
-    )
+    try:
+        values = estimates.position_estimates(
+            lcd or "",
+            state,
+            trade_id,
+            target=target,
+            require_unchanged=bind_collateral,
+            show_collateral=show_collateral,
+            bind_collateral=bind_collateral,
+        )
+    except margin.PositionChanged:
+        return estimates.position_estimates(lcd or "", None, trade_id)
+    if bind_collateral and verified is not None and "collateralBaseUnits" not in values:
+        raw = state.raw if state is not None else verified.raw
+        try:
+            before = int(str(raw["collateral_amount"]))
+        except (KeyError, ValueError):
+            return values
+        if before >= 0:
+            values["collateralBaseUnits"] = {"before": str(before)}
+    return values
 
 
 def _position_preview(
@@ -589,12 +608,23 @@ def _position_preview(
         ],
         dict[str, Any],
     ],
+    fixed_usdc_price: bool = False,
 ) -> dict[str, Any]:
+    def recheck(
+        state: margin.PositionSnapshot, inputs: dict[str, Any]
+    ) -> margin.RecheckedPosition | None:
+        return margin.recheck_position(
+            lcd_endpoint, state, trade_id, inputs, fixed_usdc_price=fixed_usdc_price
+        )
+
     def verify_replacement(
         state: margin.PositionSnapshot, inputs: dict[str, Any]
-    ) -> margin.RecheckedPosition:
+    ) -> margin.RecheckedPosition | None:
+        if collateral_price_unverified(inputs):
+            # Return the estimate without a confirmation. This branch never submits.
+            return None
         try:
-            checked = margin.recheck_position(lcd_endpoint, state, trade_id, inputs)
+            checked = recheck(state, inputs)
         except estimates.READ_ERRORS as exc:
             raise PositionChanged(
                 f"Could not verify the replacement position quote. {exc}"
@@ -643,7 +673,7 @@ def _position_preview(
         margin.MarketUnavailable,
     ) as exc:
         raise PositionChanged(f"{changed_message}. {exc}") from exc
-    rechecked = margin.recheck_position(lcd_endpoint, state, trade_id, inputs)
+    rechecked = recheck(state, inputs)
     changed = rechecked is None
     if changed:
         try:
@@ -781,6 +811,7 @@ def partial_close(
     lcd_endpoint: str,
     dry_run: bool,
     before_submit: SubmitCheck | None = None,
+    fixed_usdc_price: bool = False,
 ) -> dict[str, Any]:
     """Reduce an open USDC position by a whole percentage.
 
@@ -799,7 +830,9 @@ def partial_close(
         payload = intents.partial_intent(position, percent)
         delta = int(payload["body"]["collateral"]["amountUsdc"])
         leverage, inputs = margin.leverage_inputs(lcd_endpoint, state, trade_id)
-        notional = partial.notional_quote(lcd_endpoint, state, delta, leverage)
+        notional = partial.notional_quote(
+            lcd_endpoint, state, delta, leverage, fixed_usdc_price=fixed_usdc_price
+        )
         return (
             state,
             {**inputs, "collateralPriceUsd": notional["collateralPriceUsd"]},
@@ -825,6 +858,7 @@ def partial_close(
         dry_run=dry_run,
         before_submit=before_submit,
         changed_message="Position changed; review the reduction again",
+        fixed_usdc_price=fixed_usdc_price,
         estimate=lambda state, inputs, fresh, rechecked: estimates.close_estimates(
             lcd_endpoint,
             state,

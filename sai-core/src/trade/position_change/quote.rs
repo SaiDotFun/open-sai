@@ -154,48 +154,23 @@ fn fixed(amount: &BigUint, scale: usize) -> String {
     }
 }
 
-pub(super) fn reduction(
-    raw: &Value,
-    percent: u8,
-    market_minimum: &Value,
-) -> Result<BigUint, SaiError> {
+pub(super) fn reduction(raw: &Value, percent: u8) -> Result<BigUint, SaiError> {
     if !(1..=99).contains(&percent) {
         return Err(invalid("Partial close percentage must be from 1 to 99"));
     }
     let collateral = integer(field(raw, "collateral_amount")?)?;
-    let leverage = ratio(field(raw, "leverage")?)?;
-    let minimum = ratio(market_minimum)?;
-    let fail = || invalid("Reduction is too small or leaves less than the market minimum");
-    if collateral.sign() != Sign::Plus {
+    let (numerator, denominator) = ratio(field(raw, "leverage")?)?;
+    let fail = || invalid("Reduction rounds to zero or leaves no open position");
+    if collateral.sign() != Sign::Plus || numerator.sign() != Sign::Plus {
         return Err(fail());
     }
     let collateral = collateral.magnitude();
-    let scaled = round_decimal(collateral * percent);
-    let delta = &scaled / 100u32;
-    if delta == BigUint::ZERO {
+    let delta = collateral * percent / 100u32;
+    // Perp floors the full notional and the closed slice separately.
+    let size = collateral * numerator.magnitude() / &denominator;
+    let closed = &delta * numerator.magnitude() / denominator;
+    if delta == BigUint::ZERO || size <= closed {
         return Err(fail());
-    }
-    let remaining = round_decimal(collateral - &delta);
-    let notional = round_decimal(remaining * leverage.0.magnitude());
-    let notional = BigInt::from_biguint(leverage.0.sign(), notional);
-    if notional * BigInt::from(minimum.1) < minimum.0 * BigInt::from(leverage.1) * MICROS {
-        return Err(fail());
-    }
-    // Decimal division preserves the rounded product's exponent when its
-    // trailing zeroes permit it. Python's later int() rejects that notation.
-    let scaled = scaled.to_str_radix(10);
-    let trailing_zeroes = scaled.len() - scaled.trim_end_matches('0').len();
-    let exponent = scaled
-        .len()
-        .saturating_sub(DECIMAL_PRECISION)
-        .min(trailing_zeroes.saturating_sub(2));
-    if exponent > 0 {
-        let digits = delta.to_str_radix(10);
-        let (whole, fraction) = digits[..digits.len() - exponent].split_at(1);
-        return Err(invalid(&format!(
-            "invalid literal for int() with base 10: '{whole}.{fraction}E+{}'",
-            digits.len() - 1
-        )));
     }
     Ok(delta)
 }
@@ -227,7 +202,10 @@ pub(super) fn partial(
         "DECREASE_POSITION_SIZE",
         Some(trade_id.to_string()),
         json!({
-            "collateral": {"amountUsdc": delta.to_string(), "amountUsd": fixed(delta, 6)},
+            "collateral": {
+                "amountUsdc": delta.to_string(),
+                "amountUsd": fixed(&round_decimal(delta.clone()), 6),
+            },
             "leverageDelta": "0",
         }),
     ));
@@ -242,8 +220,7 @@ fn integer(value: &Value) -> Result<BigInt, SaiError> {
         .map_err(|_| invalid("Invalid contract integer"))
 }
 
-// Python Decimal multiplies and subtracts with 28 significant digits before
-// applying the explicit floor in the reduction and converting margin to micros.
+// Match the precision Python Decimal uses to convert amounts.
 fn round_decimal(value: BigUint) -> BigUint {
     let digits = value.to_str_radix(10).len();
     if digits <= DECIMAL_PRECISION {
@@ -301,15 +278,18 @@ mod tests {
     const ACCOUNT: &str = "0x1111111111111111111111111111111111111111";
 
     #[test]
-    fn reduction_refuses_only_when_decimal_would_render_an_exponent() {
-        let raw = |collateral| json!({"collateral_amount": collateral, "leverage": "2.0"});
-        let failure = reduction(&raw("1000000000000000000000000000"), 50, &json!(1)).unwrap_err();
+    fn reduction_uses_integer_collateral_and_floored_notionals() {
+        let raw = json!({"collateral_amount": "10000000000000000000000000002", "leverage": "2.0"});
+        let delta = reduction(&raw, 50).unwrap();
+        assert_eq!(delta.to_string(), "5000000000000000000000000001");
+
+        let raw = json!({"collateral_amount": "4", "leverage": "0.75"});
+        assert_eq!(reduction(&raw, 99).unwrap(), BigUint::from(3u32));
+        let raw = json!({"collateral_amount": "3", "leverage": "0.5"});
         assert_eq!(
-            failure.message,
-            "invalid literal for int() with base 10: '5.0000000000000000000000000E+26'"
+            reduction(&raw, 99).unwrap_err().message,
+            "Reduction rounds to zero or leaves no open position"
         );
-        let delta = reduction(&raw("10000000000000000000000000020"), 1, &json!(1)).unwrap();
-        assert_eq!(delta.to_string(), "100000000000000000000000000");
     }
 
     #[test]
@@ -355,7 +335,7 @@ mod tests {
         let confirmation = |leverage| {
             let raw = json!({"collateral_amount": "10000000", "leverage": leverage});
             let effective = ContractDecimal::parse(&raw["leverage"]).unwrap();
-            let delta = reduction(&raw, 50, &json!(1)).unwrap();
+            let delta = reduction(&raw, 50).unwrap();
             let inputs = json!({
                 "marketIndex": "MarketIndex(3)",
                 "collateralIndex": "TokenIndex(1)",

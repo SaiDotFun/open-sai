@@ -42,9 +42,10 @@ from compare import (
     snapshot,
     stderr_category,
     stdout,
+    trade_estimate_clocks,
 )
 from manifest_gaps import ManifestGaps
-from mcp_cases import CALLS, DEFERRED_TRADE_PROBE, RELEASE_MCP_TOOL_NAMES, handshake
+from mcp_cases import CALLS, RELEASE_MCP_TOOL_NAMES, handshake
 from mcp_clients import SECRET, client_state, seed_clients
 from network import enter_loopback, restricted, unroutable_packets
 from reference_uv import resolve_uv
@@ -84,7 +85,8 @@ class Case:
     mcp_profile: str = ""
     mcp_protocol: str = "2025-11-25"
     mcp_logs: bool = False
-    mcp_deferred_trade_exception: bool = False
+    mcp_trade: bool = False
+    checkout_reference: bool = False
     seed: str = "empty"
     server: str = "normal"
     setup: list[str] | None = None
@@ -120,7 +122,10 @@ class Case:
             for index in range(len(wire) - 2):
                 if wire[index : index + 3] == ["oneClickTrading", "node_info", "trade"]:
                     wire[index + 1 : index + 3] = ["trade", "node_info"]
-        return replace(self, **{"wire": wire, **(self.rust or {})})
+        return replace(
+            self,
+            **{"wire": wire if self.wire is not None else None, **(self.rust or {})},
+        )
 
     @property
     def position_case(self) -> bool:
@@ -224,8 +229,6 @@ def mcp_exchange(
     env: dict[str, str],
     endpoints: Endpoints,
     case: Case,
-    *,
-    probe_deferred_trade: bool,
 ) -> subprocess.CompletedProcess[str]:
     # Keep stdin open until the server replies. Closing it while a request is
     # still running can cancel the MCP server's pending work.
@@ -257,26 +260,15 @@ def mcp_exchange(
             deadline = time.monotonic() + 20
             try:
                 requests = [
-                    (request, None, None, False)
-                    for request in handshake(case.mcp_protocol)
+                    (request, None, None) for request in handshake(case.mcp_protocol)
                 ]
                 if case.mcp_calls is None:
                     calls = CALLS[case.mcp_profile]
-                    if probe_deferred_trade:
-                        requests.append(
-                            (
-                                DEFERRED_TRADE_PROBE.request(3 + len(calls), endpoints),
-                                None,
-                                None,
-                                True,
-                            )
-                        )
                     requests.extend(
                         (
                             call.request(id_, endpoints),
                             call.session,
                             call.switch_active,
-                            False,
                         )
                         for id_, call in enumerate(calls, 3)
                     )
@@ -288,11 +280,10 @@ def mcp_exchange(
                             {"id": id_, "method": "tools/call", "params": call},
                             None,
                             None,
-                            False,
                         )
                         for id_, call in enumerate(case.mcp_calls, 2)
                     )
-                for request, session, switch_active, probe in requests:
+                for request, session, switch_active in requests:
                     if session is not None:
                         write_seed(
                             home, endpoints, [session_fixture(endpoints, session)]
@@ -329,10 +320,7 @@ def mcp_exchange(
                     ):
                         label = request.get("params", {}).get("name", request["method"])
                         raise ValueError(f"Unexpected MCP frame for {label}")
-                    if probe:
-                        check_deferred_trade_probe(message["result"])
-                    else:
-                        received.append(line)
+                    received.append(line)
                 proc.stdin.close()
                 if lines.get(timeout=max(0, deadline - time.monotonic())) is not None:
                     raise ValueError("Unexpected MCP stdout after the last response")
@@ -364,24 +352,6 @@ def field_matches(actual: Any, keys: str, expected: Any) -> bool:
     if expected == "<absent>":
         return actual is ABSENT
     return first_difference(actual, expected, keys) is None
-
-
-def check_deferred_trade_probe(result: dict[str, Any]) -> None:
-    blocks = result.get("content")
-    if (
-        result.get("isError") is False
-        and isinstance(blocks, list)
-        and len(blocks) == 1
-        and blocks[0].get("type") == "text"
-        and isinstance(text := blocks[0].get("text"), str)
-        and result.get("structuredContent") == {"result": text}
-        and isinstance(value := json.loads(text), dict)
-        and value.get("code") == DEFERRED_TRADE_PROBE.expected
-    ):
-        return
-    raise ValueError(
-        "Temporary trading availability exception expired. Remove it once trade_open is implemented"
-    )
 
 
 def state_differences(state: dict[str, Any], files: dict[str, Entry]) -> list[str]:
@@ -512,7 +482,6 @@ def observe(
             env,
             endpoints,
             case,
-            probe_deferred_trade=candidate and case.mcp_deferred_trade_exception,
         )
     else:
         result = invoke(binary, args, home, env)
@@ -535,6 +504,8 @@ def observe(
     for error in endpoints.errors:
         check_failed(error)
     actual, expected = [request.label for request in endpoints.wire], case.wire or []
+    if case.mcp_trade and case.wire is None:
+        actual = [label for label in actual if label == "recordUserIntent"]
     if case.command == "doctor":
         actual, expected = sorted(actual), sorted(expected)
     if actual != expected:
@@ -656,6 +627,19 @@ def observe(
             check_mcp_calls(output, case.mcp_profile)
         except ValueError as exc:
             check_failed(str(exc))
+    if case.mcp_trade:
+        for frame in output[1:]:
+            result_fields = frame["result"]
+            # stdout() already checked that both MCP representations carry
+            # the same text. Compare the JSON members independent of order.
+            result_fields.pop("_toolText", None)
+            for payload in (
+                result_fields["content"][0]["text"],
+                result_fields.get("structuredContent", {}).get("result"),
+            ):
+                trade_estimate_clocks(payload)
+                if isinstance(payload, dict):
+                    trade_estimate_clocks(payload.get("preview"))
     stderr = stderr_category(result.stderr)
     if case.accepted_divergence == "uninstall-read-only":
         check_read_only_uninstall(case, result.returncode, output, stderr, candidate)
@@ -934,36 +918,6 @@ def safe_observe(
     return result
 
 
-def expect_native_mcp_info(
-    output: list[dict[str, Any]], *, allow_deferred_trade: bool
-) -> str | None:
-    reasons: dict[str, None] = {}
-    for frame in output:
-        result = frame["result"]
-        value = result.get("structuredContent", {}).get("result")
-        if not isinstance(value, dict) or value.get("name") != "sai":
-            continue
-        updates = {}
-        trading = value["trading"]
-        if (
-            allow_deferred_trade
-            and trading["available"] is True
-            and trading["reason"] == "signed-in"
-        ):
-            updates["trading"] = {
-                **trading,
-                "available": False,
-                "reason": "not-implemented",
-            }
-            reasons[
-                "Temporary native trading deferral until trade_open is implemented"
-            ] = None
-        value.update(updates)
-        result["content"][0]["text"].update(updates)
-        result["_toolText"] = rewrite_mcp_fields(result["_toolText"], updates)
-    return ", ".join(reasons) or None
-
-
 def project_reference_auth_status_errors(
     output: list[dict[str, Any]], endpoints: Endpoints
 ) -> str | None:
@@ -1113,6 +1067,10 @@ def hidden_arguments(count: int) -> list[str]:
 
 def project_reference_saved_mcp_commands(case: Case, output: dict[str, Any]) -> None:
     def project(row: dict[str, Any], key: str) -> None:
+        if case.name == "mcp-list-redacted" and row.get("staleEnv") == [
+            "FIXTURE_CREDENTIAL"
+        ]:
+            row["staleEnv"] = ["1 other entry"]
         if argv := row.get(key):
             if row.get("args") == "<hidden>":
                 # The shadowed Codex entries use a missing launcher and two operands.
@@ -1224,6 +1182,11 @@ def run_case(
             or case.name == "mcp-install-legacy"
         ):
             project_reference_saved_mcp_commands(case, left.output)
+        if case.name == "mcp-list-redacted" and isinstance(right.output, dict):
+            for client in right.output.get("clients", []):
+                for row in (client, *client.get("registrations", [])):
+                    if row.get("staleEnv") == ["FIXTURE_CREDENTIAL"]:
+                        row["staleEnv"] = ["1 other entry"]
     if (
         candidate != reference
         and case.accepted_divergence == "doctor-keeper-log-context"
@@ -1281,7 +1244,7 @@ def run_case(
     if cutover:
         diffs = cutover_differences(left, right)
     else:
-        if rust and case.position_case:
+        if rust and case.position_case and not case.mcp_trade:
             project_position_estimates(left.output)
         if rust and case.accepted_difference and case.mode != "mcp":
             diffs = []
@@ -1310,10 +1273,6 @@ def run_case(
             expected = "Rust checks Keeper ownership before reading the LCD network."
 
         if inventory_case and rust:
-            expected = expect_native_mcp_info(
-                left.output,
-                allow_deferred_trade=case.mcp_deferred_trade_exception,
-            )
             validation = expect_native_mcp_validation(left.output, case.mcp_profile)
             auth_status = None
             if case.mcp_profile == "auth-status":
@@ -1321,9 +1280,7 @@ def run_case(
                     left.output, endpoints
                 )
             expected = (
-                ", ".join(
-                    reason for reason in (expected, validation, auth_status) if reason
-                )
+                ", ".join(reason for reason in (validation, auth_status) if reason)
                 or None
             )
             diffs = differences(left, right)
@@ -1335,6 +1292,8 @@ def run_case(
         for call in CALLS[case.mcp_profile]:
             if call.expected == "ok" and not diffs:
                 tools[call.tool] = "PASS"
+    elif case.mcp_trade and not diffs:
+        tools.update({call["name"]: "PASS" for call in case.mcp_calls or ()})
     return diffs, tools, expected
 
 
@@ -1530,6 +1489,14 @@ def main() -> int:
             parser.error("SAI_PARITY_BIN must name an executable file or command")
         candidate = [str(Path(executable).absolute())]
     mcp_reference = reference
+    mcp_trade_reference = None
+    if override := os.getenv("SAI_PARITY_MCP_TRADE_PYTHON"):
+        executable = shutil.which(override)
+        if not executable:
+            parser.error(
+                "SAI_PARITY_MCP_TRADE_PYTHON must name an executable Python sai"
+            )
+        mcp_trade_reference = [str(Path(executable).absolute())]
     if args.reference is None and any(case.mode == "mcp" for case in selected):
         if override := os.getenv("SAI_MCP_PARITY_PYTHON"):
             executable = shutil.which(override)
@@ -1567,7 +1534,11 @@ def main() -> int:
         )
     overview_reference = os.environ.get("SAI_PARITY_OVERVIEW_PYTHON")
     for case in selected:
-        if args.reference is not None:
+        if case.checkout_reference:
+            oracle = [checkout_python]
+        elif case.mcp_trade and mcp_trade_reference:
+            oracle = mcp_trade_reference
+        elif args.reference is not None:
             oracle = reference
         elif overview_reference and (
             case.name == "account-bare" or case.command == "account overview"
@@ -1589,7 +1560,6 @@ def main() -> int:
             case = replace(
                 case,
                 accepted_divergence=None,
-                mcp_deferred_trade_exception=False,
             )
         case_id = f"case:{case.name}"
         current_gap = (

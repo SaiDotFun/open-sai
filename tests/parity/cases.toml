@@ -1383,6 +1383,7 @@ client_seed = "empty"
 name = "mcp-list-redacted"
 args = ["--json", "mcp", "list"]
 client_seed = "legacy"
+rust = { output = { "clients.0.staleEnv" = ["1 other entry"], "clients.1.staleEnv" = ["1 other entry"], "clients.2.staleEnv" = ["1 other entry"] } }
 state = { "clients/.claude.json#changed" = false, "clients/.codex/config.toml#changed" = false, "clients/.cursor/mcp.json#changed" = false }
 
 [[case]]
@@ -1652,10 +1653,80 @@ name = "mcp-session-reloads"
 args = ["--endpoint","{http}","mcp","serve","--endpoint","{keeper}"]
 mode = "mcp"
 mcp_profile = "session"
-# Temporary. The native-only trade_open probe expires this when the tool lands.
-mcp_deferred_trade_exception = true
 seed = "session"
 wire = ["trades", "trades", "trades"]
+
+[[case]]
+name = "mcp-trade-open-confirmation"
+args = ["mcp", "serve"]
+mode = "mcp"
+mcp_trade = true
+mcp_calls = [
+    { name = "preview_open", arguments = { market_id = 3, side = "long", order_type = "market", amount = "20", leverage = "2", slippage = "1" } },
+    { name = "trade_open", arguments = { market_id = 3, side = "long", order_type = "market", amount = "20", leverage = "2", slippage = "1", preview_digest = "fixture-mismatch", reference_price = "100" } },
+]
+seed = "session"
+server = "quote-market"
+state = { "trader/intents.sqlite3#tables.intents.rows.0" = "<absent>" }
+output = { "1.result.content.0.text.previewDigest" = "ec927cf7dff167a5110a0b966f5aaeb054f699f25ca50b833b9cc1c564731102", "2.result.content.0.text.code" = "PREVIEW_MISMATCH", "2.result.content.0.text.preview.previewDigest" = "ec927cf7dff167a5110a0b966f5aaeb054f699f25ca50b833b9cc1c564731102" }
+
+[[case]]
+name = "mcp-trade-close-confirmation"
+args = ["mcp", "serve"]
+mode = "mcp"
+mcp_trade = true
+mcp_calls = [
+    { name = "preview_close", arguments = { trade_id = 7 } },
+    { name = "trade_close", arguments = { trade_id = 7, preview_digest = "fixture-mismatch" } },
+]
+seed = "session"
+server = "quote-close"
+state = { "trader/intents.sqlite3#tables.intents.rows.0" = "<absent>" }
+output = { "1.result.content.0.text.previewDigest" = "5fe6c4f9957732af1b02c8c745d11111300039a58a65a6d4e3d606b538879835", "2.result.content.0.text.code" = "PREVIEW_MISMATCH", "2.result.content.0.text.preview.previewDigest" = "5fe6c4f9957732af1b02c8c745d11111300039a58a65a6d4e3d606b538879835" }
+
+[[case]]
+name = "mcp-trade-tpsl-confirmation"
+args = ["mcp", "serve"]
+mode = "mcp"
+mcp_trade = true
+mcp_calls = [
+    { name = "preview_tpsl", arguments = { trade_id = 7, take_profit = "110", clear_stop_loss = true } },
+    { name = "trade_tpsl", arguments = { trade_id = 7, take_profit = "110", clear_stop_loss = true, preview_digest = "fixture-mismatch" } },
+]
+seed = "session"
+server = "quote-close"
+state = { "trader/intents.sqlite3#tables.intents.rows.0" = "<absent>" }
+output = { "1.result.content.0.text.previewDigest" = "3e702707cae9997f1fe01b44c53af7b06025aea351918ba679b110f5fa56a92b", "2.result.content.0.text.code" = "PREVIEW_MISMATCH", "2.result.content.0.text.preview.previewDigest" = "3e702707cae9997f1fe01b44c53af7b06025aea351918ba679b110f5fa56a92b" }
+
+[[case]]
+name = "mcp-trade-leverage-confirmation"
+args = ["mcp", "serve"]
+mode = "mcp"
+mcp_trade = true
+# The collateral binding was added after the MCP trade reference release.
+checkout_reference = true
+mcp_calls = [
+    { name = "preview_leverage", arguments = { trade_id = 7, leverage = "1.818181818181818182" } },
+    { name = "trade_leverage", arguments = { trade_id = 7, leverage = "1.818181818181818182", preview_digest = "fixture-mismatch" } },
+]
+seed = "session"
+server = "quote-close"
+state = { "trader/intents.sqlite3#tables.intents.rows.0" = "<absent>" }
+output = { "1.result.content.0.text.previewDigest" = "d8f9ebbe79ae2a06786bdc51609d5d09de48ab07daa062b98971b2ad224dc0b5", "1.result.content.0.text.collateralBaseUnits" = { before = "10000000", after = "10999999" }, "2.result.content.0.text.code" = "PREVIEW_MISMATCH", "2.result.content.0.text.preview.previewDigest" = "d8f9ebbe79ae2a06786bdc51609d5d09de48ab07daa062b98971b2ad224dc0b5", "2.result.content.0.text.preview.collateralBaseUnits" = { before = "10000000", after = "10999999" } }
+
+[[case]]
+name = "mcp-trade-margin-confirmation"
+args = ["mcp", "serve"]
+mode = "mcp"
+mcp_trade = true
+mcp_calls = [
+    { name = "preview_margin", arguments = { trade_id = 7, direction = "add", amount = "1" } },
+    { name = "trade_margin", arguments = { trade_id = 7, direction = "add", amount = "1", preview_digest = "fixture-mismatch" } },
+]
+seed = "session"
+server = "position-default"
+state = { "trader/intents.sqlite3#tables.intents.rows.0" = "<absent>" }
+output = { "1.result.content.0.text.previewDigest" = "6f48301bf903ecc5f7cbee27011d49a9feeb23be9bda8af8ee2db8058c182475", "2.result.content.0.text.code" = "PREVIEW_MISMATCH", "2.result.content.0.text.preview.previewDigest" = "6f48301bf903ecc5f7cbee27011d49a9feeb23be9bda8af8ee2db8058c182475" }
 
 [[case]]
 name = "mcp-keeper-errors"
@@ -1834,7 +1905,7 @@ wire = [
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 
-rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price"] }
+rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "get_perp_prices", "market_order_config"] }
 output = { "positionRoute.chainId" = "cataclysm-1", "positionRoute.contractAddress" = "nibi1syntheticfixture", "previewDigest" = "639610d6417d78b973fc2d64c56f2c15d6b17c0673cb02ea623ec85dfa7567e8" }
 
 # C7b position cases use the Python ownership and confirmation contracts from PRs 148 and 150.
@@ -2003,7 +2074,6 @@ wire = [
     "get_trade_raw", "get_market", "market_order_config", "get_perp_prices", "is_after_hours_market",
     "get_market", "get_trade_infos", "get_after_hours_leverage",
 ]
-rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_market", "get_trade_infos", "get_after_hours_leverage"] }
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "quote.effectiveLeverage" = "1.234567890123456789", "quote.actualDeltaUsdc" = "999999", "quote.marginChangeIsEstimate" = true, "positionRoute.contractAddress" = "nibi1syntheticfixture", "previewDigest" = "6b4bcdb1cd79c56ff6f90e944a90c3c890f9fadd51569eb2b9875acd100824d4" }
 
@@ -2142,15 +2212,11 @@ wire = [
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "intent.body.collateral.amountUsdc" = "50000000000000000000000000000" }
 
-accepted_difference = "Python uses Perp's integer sizing rules from PR #167. Rust still follows the pinned Python reference."
-
 [case.rust]
-expect = 1
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "get_trade_raw",
 ]
-output = { "error.code" = "INVALID_REQUEST", "error.message" = "invalid literal for int() with base 10: '5.0000000000000000000000000E+28'" }
 
 [[case]]
 name = "trade-partial-close-rounding"
@@ -2167,7 +2233,7 @@ output = { "intent.body.collateral.amountUsdc" = "3300000", "quote.closedNotiona
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "get_trade_raw",
 ]
 
 [[case]]
@@ -2186,8 +2252,8 @@ output = { "quote.effectiveLeverage" = "1.234567890123456789", "quote.closedNoti
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_market", "get_trade_infos",
-    "get_after_hours_leverage", "get_collateral_price",
+    "get_exchange_balance", "is_after_hours_market", "get_market", "get_trade_infos",
+    "get_after_hours_leverage", "get_collateral_price", "get_trade_raw",
 ]
 
 [[case]]
@@ -2200,12 +2266,12 @@ wire = [
     "get_exchange_balance", "is_after_hours_market", "get_collateral_price",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
-output = { "quote.closedNotionalIsEstimate" = true }
+output = { "quote.closedNotionalIsEstimate" = true, "previewDigest" = "<absent>" }
 
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "get_trade_raw",
 ]
 
 [[case]]
@@ -2216,9 +2282,7 @@ server = "position-index-lag"
 expect = 1
 wire = ["oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw", "trade", "get_trade_raw", "trade", "get_trade_raw"]
 state = { "trader/intents.sqlite3" = "<absent>" }
-output = { "error.code" = "INVALID_REQUEST", "error.message" = "Indexed position differs from contract state. Retry after Keeper synchronizes. No intent was submitted." }
-accepted_difference = "Python retries stale Keeper index reads. Rust refuses the stale snapshot immediately."
-rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance"], output = { "error.code" = "INVALID_REQUEST", "error.message" = "Indexed position differs from contract state; wait for synchronization and retry", "error.retryable" = true } }
+output = { "error.code" = "INVALID_REQUEST", "error.message" = "Indexed position differs from contract state. Retry after Keeper synchronizes. No intent was submitted.", "error.retryable" = true }
 
 [[case]]
 name = "trade-partial-close-market-minimum"
@@ -2233,15 +2297,11 @@ wire = [
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "intent.body.collateral.amountUsdc" = "9900000" }
 
-accepted_difference = "Python uses Perp's integer sizing rules from PR #167. Rust still follows the pinned Python reference."
-
 [case.rust]
-expect = 1
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "get_trade_raw",
 ]
-output = { "error.message" = "Reduction is too small or leaves less than the market minimum" }
 
 [[case]]
 name = "trade-partial-close-live-leverage-change"
@@ -2262,10 +2322,10 @@ output = { "error.message" = "Position changed; review the reduction again" }
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
-    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
-    "get_trade_raw", "is_after_hours_market", "get_collateral_price",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
+    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_perp_prices",
 ]
 
 [[case]]
@@ -2286,10 +2346,10 @@ output = { "status" = "accepted" }
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
     "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "borrowings", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
-    "get_collateral_price", "recordUserIntent",
+    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_perp_prices", "recordUserIntent",
 ]
 
 [[case]]
@@ -2311,10 +2371,10 @@ output = { "error.code" = "PREVIEW_MISMATCH", "error.details" = "<absent>", "err
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
     "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "borrowings", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
-    "get_collateral_price",
+    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_perp_prices",
 ]
 
 [[case]]
@@ -2336,10 +2396,10 @@ output = { "error.code" = "PREVIEW_MISMATCH", "error.details" = "<absent>", "err
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
     "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "borrowings", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
-    "get_collateral_price",
+    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_perp_prices",
 ]
 
 [[case]]
@@ -2374,10 +2434,10 @@ output = { "status" = "accepted", "intentKey" = "<intentKey 1>", "quote" = "<abs
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
     "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "borrowings", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
-    "get_collateral_price", "recordUserIntent",
+    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_perp_prices", "recordUserIntent",
 ]
 
 [[case]]
@@ -2404,20 +2464,21 @@ output = { "first.error.code" = "OUTCOME_UNKNOWN", "first.error.intentKey" = "<i
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
     "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "borrowings", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
-    "get_collateral_price", "recordUserIntent", "oneClickTrading", "trade", "node_info",
-    "borrowing", "get_trade_raw", "get_exchange_balance", "borrowings", "is_after_hours_market",
-    "get_collateral_price", "oneClickTrading", "trade", "node_info", "borrowing",
-    "get_trade_raw", "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
-    "get_trade_raw", "is_after_hours_market", "get_collateral_price",
+    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_perp_prices", "recordUserIntent", "oneClickTrading", "trade", "node_info", "borrowing",
+    "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_collateral_price",
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "get_trade_raw",
+    "is_after_hours_market", "get_perp_prices",
 ]
 
 [[case]]
 name = "trade-margin-mcp-preview"
 args = ["mcp", "serve"]
 mode = "mcp"
+mcp_trade = true
 mcp_calls = [
     { name = "preview_margin", arguments = { trade_id = 7, direction = "add", amount = "1" } },
 ]
@@ -2436,6 +2497,9 @@ output = { "1.result.content.0.text.previewDigest" = "6b4bcdb1cd79c56ff6f90e944a
 name = "trade-partial-close-mcp-changed-leverage"
 args = ["mcp", "serve"]
 mode = "mcp"
+mcp_trade = true
+# The fixed USDC price in MCP was added after the trade reference release.
+checkout_reference = true
 mcp_calls = [
     { name = "preview_partial_close", arguments = { trade_id = 7, percent = 50 } },
     { name = "trade_partial_close", arguments = { trade_id = 7, percent = 50, preview_digest = "639610d6417d78b973fc2d64c56f2c15d6b17c0673cb02ea623ec85dfa7567e8" } },
@@ -2444,14 +2508,23 @@ seed = "session"
 server = "partial-preview-changed"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading",
     "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "is_after_hours_market", "get_collateral_price", "oneClickTrading", "node_info",
+    "is_after_hours_market", "oneClickTrading", "node_info",
     "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market", "get_perp_prices",
+    "is_after_hours_market", "get_trade_raw", "is_after_hours_market", "get_perp_prices",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "1.result.content.0.text.previewDigest" = "639610d6417d78b973fc2d64c56f2c15d6b17c0673cb02ea623ec85dfa7567e8", "2.result.content.0.text.code" = "PREVIEW_MISMATCH", "2.result.content.0.text.preview.previewDigest" = "31871b2aa39eb00c7d14021f2af5fb65ed5795a7125cc2f1d7ac924ae8a20176" }
+rust = { wire = [
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market",
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market",
+    "get_trade_raw", "is_after_hours_market", "get_perp_prices",
+] }
 
 [[case]]
 name = "trade-concurrent-close"
