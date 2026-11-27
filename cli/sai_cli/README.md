@@ -430,9 +430,8 @@ have the user run `sai auth login NAME` or `sai auth import`. A signed-in trade
 still needs the `previewDigest` of the preview the user confirmed.
 
 The partial-close digest covers the close percentage, starting collateral,
-reduction amount, and leverage inputs. A tick in the collateral/USD price
-updates the USD estimate without changing the digest. The
-margin digest covers the full quote, including starting collateral, stored
+reduction amount, and leverage inputs. The margin digest covers the full
+quote, including starting collateral, stored
 leverage, and the inputs that determine effective leverage. Before submitting,
 both tools re-read the position and the effective-leverage inputs, including
 the applicable after-hours cap, at the same block. Submission requires an LCD
@@ -479,15 +478,12 @@ For a live market order, the CLI refreshes the price before admission and
 reports that reference price after acceptance. A dry run marks the price as
 requiring refresh and may include an optional supplied reference. A partial
 close sizes the collateral reduction from the Perp contract's position.
-It quotes the requested slice in fields `quote.closedNotionalUsdc` and
-`quote.closedNotionalUsd` using the effective leverage, collateral/USD
-oracle price, and Perp's rounding. A missing sizing input sets
-`quote.closedNotionalIsEstimate` to true. If the collateral price is
-unavailable, the USD field is null. To submit a partial close, the CLI
-must verify the collateral price. Preview again after the price is available.
-The CLI rechecks the position before submission. Partial close accepts
-`--lcd-endpoint` like `trade margin`. Market schedule and other Keeper
-admission checks remain authoritative.
+The fields `quote.closedNotionalUsdc` and `quote.closedNotionalUsd` use the
+same notional at $1 per USDC. If effective leverage is unavailable, the
+preview uses stored leverage for the estimate and omits the digest. The
+CLI rechecks the position and market oracle before confirmed submission.
+Partial close accepts `--lcd-endpoint` like `trade margin`. Market schedule
+and other Keeper admission checks remain authoritative.
 
 `trade leverage TRADE_ID --leverage VALUE` sets a target leverage.
 `trade margin TRADE_ID --direction add|remove --amount USDC` reads the
@@ -500,8 +496,8 @@ effective leverage at execution to determine the direction and amount.
 `--dry-run` reads live state and prints the quote without submitting an
 intent. The preview shows collateral before and after in USDC and USD. In
 JSON, those values appear in `collateral.beforeUsdc`, `collateral.afterUsdc`,
-`collateral.beforeUsd`, and `collateral.afterUsd`. The USD fields are null
-when the collateral oracle price is unavailable.
+`collateral.beforeUsd`, and `collateral.afterUsd`. Sai values the collateral
+at $1 per USDC.
 
 Use `--max-collateral-usd 5` with `trade margin --direction add --amount 1`
 to quote an add of up to 1 USDC with at most $5 of estimated total
