@@ -28,6 +28,7 @@ const NAMES: [&str; 2] = ["sai", RETIRED_NAME];
 const CLIENTS: [Client; 3] = [Client::Claude, Client::Codex, Client::Cursor];
 const INSTALL: &str = "uv tool install git+https://github.com/SaiDotFun/open-sai";
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
+const SAI_ENV_NAMES: &str = include_str!("../../cli/sai_cli/mcp_env_names.txt");
 const CODEX_PROJECT_ENTRY: &str = "Codex uses a project-level sai entry in this directory that overrides the user entry; edit or remove it in the project's .codex/config.toml, then run this again";
 const CODEX_STILL_ACTIVE: &str = "a project .codex/config.toml entry is still active";
 
@@ -182,11 +183,7 @@ fn reported_env_names(entries: &[String]) -> Vec<String> {
         let name = entry
             .split_once('=')
             .map_or(entry.as_str(), |(name, _)| name);
-        if name.strip_prefix("SAI_").is_some_and(|suffix| {
-            suffix
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        }) {
+        if SAI_ENV_NAMES.lines().any(|allowed| name == allowed) {
             names.insert(name.to_owned());
         } else {
             other += 1;

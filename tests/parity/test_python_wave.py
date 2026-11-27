@@ -810,6 +810,7 @@ def test_mcp_reports_sai_environment_names_and_counts_other_entries(
     seed_clients(tmp_path, overrides, "current")
     marker = "synthetic-private-env"
     bare_token = "fixtureBareToken_71"
+    prefixed_token = "SAI_FIXTURE_WRAPPER_71"
     codex = tmp_path / ".codex/config.toml"
     forwarded = [
         f"OPENAI_API_KEY={marker}=suffix",
@@ -818,8 +819,11 @@ def test_mcp_reports_sai_environment_names_and_counts_other_entries(
         f"={marker}",
         bare_token,
         bare_token,
+        prefixed_token,
+        f"{prefixed_token}={marker}",
         f"SAI_LCD_ENDPOINT={marker}",
         "SAI_LCD_ENDPOINT",
+        f"SAI_NATIVE_UV_PREFIX={marker}",
     ]
     codex.write_text(
         codex.read_text().replace(
@@ -835,6 +839,7 @@ def test_mcp_reports_sai_environment_names_and_counts_other_entries(
                 f"APP_TOKEN={marker}": marker,
                 "APP_MODE": marker,
                 bare_token: marker,
+                prefixed_token: marker,
                 f"SAI_ENDPOINT={marker}": marker,
             }
         )
@@ -853,13 +858,14 @@ def test_mcp_reports_sai_environment_names_and_counts_other_entries(
         assert result.returncode == 0
         assert marker not in result.stdout + result.stderr
         assert bare_token not in result.stdout + result.stderr
+        assert prefixed_token not in result.stdout + result.stderr
         clients = json.loads(result.stdout)["clients"]
         assert {row["client"] for row in clients} == {"claude", "codex", "cursor"}
         for row in clients:
             expected = (
-                ["SAI_LCD_ENDPOINT", "6 other entries"]
+                ["SAI_LCD_ENDPOINT", "SAI_NATIVE_UV_PREFIX", "8 other entries"]
                 if row["client"] == "codex"
-                else ["SAI_ENDPOINT", "3 other entries"]
+                else ["SAI_ENDPOINT", "4 other entries"]
             )
             assert not row["current"]
             assert row["staleEnv"] == expected

@@ -87,10 +87,16 @@ def prepare_rust(source: Path, version: str) -> None:
     for directory in ("sai", "sai-core", "skills/sai", ".cargo"):
         if (ROOT / directory).is_dir():
             shutil.copytree(ROOT / directory, source / directory)
-    for file in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml"):
-        shutil.copyfile(ROOT / file, source / file)
-    (source / "docs").mkdir()
-    shutil.copyfile(ROOT / "docs/log-events.json", source / "docs/log-events.json")
+    for file in (
+        "Cargo.toml",
+        "Cargo.lock",
+        "rust-toolchain.toml",
+        "cli/sai_cli/mcp_env_names.txt",
+        "docs/log-events.json",
+    ):
+        target = source / file
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / file, target)
 
     main = source / "sai/src/main.rs"
     cargo = source / "sai/Cargo.toml"
