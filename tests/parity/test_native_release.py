@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -67,18 +68,35 @@ def candidate(tmp_path: Path) -> tuple[Path, Path, Path, set[str]]:
     for name in python_names:
         (python / name).write_text(f"full Python asset {name}")
 
-    return native, python, tmp_path / "release", archives | python_names
+    bundle = f"sai-cli-{cargo['version']}-full-python.zip"
+    return (
+        native,
+        python,
+        tmp_path / "release",
+        archives | packages(shim["version"]) | {bundle},
+    )
 
 
-def test_stages_only_native_archives_and_the_full_python_packages(candidate) -> None:
+def assert_staged_candidate(
+    native: Path, python: Path, output: Path, names: set[str]
+) -> None:
+    assert {path.name for path in output.iterdir()} == names | {"SHA256SUMS"}
+    (bundle,) = output.glob("sai-cli-*-full-python.zip")
+    with zipfile.ZipFile(bundle) as archive:
+        assert archive.namelist() == sorted(path.name for path in python.iterdir())
+        for path in python.iterdir():
+            assert archive.read(path.name) == path.read_bytes()
+    for name in names - {bundle.name}:
+        assert (output / name).read_bytes() == (native / name).read_bytes()
+    assert (output / "SHA256SUMS").read_text() == manifest(output, names)
+
+
+def test_stages_native_archives_shim_and_full_python_bundle(candidate) -> None:
     native, python, output, names = candidate
     result = native_dist("stage-release", native, python, output)
 
     assert result.returncode == 0, result.stderr
-    assert {path.name for path in output.iterdir()} == names | {"SHA256SUMS"}
-    for path in python.iterdir():
-        assert (output / path.name).read_bytes() == path.read_bytes()
-    assert (output / "SHA256SUMS").read_text() == manifest(output, names)
+    assert_staged_candidate(native, python, output, names)
 
 
 def test_stages_python_only_without_cargo_or_shim(tmp_path: Path) -> None:
@@ -113,8 +131,8 @@ def test_stages_python_only_without_cargo_or_shim(tmp_path: Path) -> None:
     assert (output / "SHA256SUMS").read_text() == manifest(output, names)
 
 
-def test_retains_full_python_bytes_when_package_names_collide(candidate) -> None:
-    native, python, output, _ = candidate
+def test_keeps_both_distributions_when_package_names_collide(candidate) -> None:
+    native, python, output, names = candidate
     dist = runpy.run_path(str(ROOT / "scripts/native-dist.py"))
     release, shim = dist["native_versions"]()
     for path in python.iterdir():
@@ -127,8 +145,7 @@ def test_retains_full_python_bytes_when_package_names_collide(candidate) -> None
         dist["check_tag"]("sai-cli/v0.0.0", release, "0.0.0")
     dist["stage_release"](native, python, output, release, shim, release)
 
-    for name in packages(shim):
-        assert (output / name).read_bytes() == b"full Python"
+    assert_staged_candidate(native, python, output, names)
 
 
 @pytest.mark.parametrize("fault", ["missing", "changed", "extra", "missing-checksum"])

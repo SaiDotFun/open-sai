@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import zipfile
 from itertools import product
 from pathlib import Path
 from typing import Any
@@ -68,11 +69,23 @@ def check_files(directory: Path, expected: set[str], label: str) -> None:
         )
 
 
-def python_package_digests(directory: Path, version: str) -> dict[str, str]:
+def python_package_names(directory: Path, version: str) -> set[str]:
     # Wheel and sdist builders normalize the PEP 440 spelling of release candidates.
     names = package_names(version.replace("-rc.", "rc"))
     check_files(directory, names, "full Python distribution")
-    return digests(directory, names)
+    return names
+
+
+def bundle_full_python(directory: Path, names: set[str], bundle: Path) -> None:
+    # The inputs are already compressed. Writing each entry by name gives
+    # it a fixed timestamp instead of copying the build's file timestamps.
+    with zipfile.ZipFile(bundle, "x") as archive:
+        for name in sorted(names):
+            with (
+                (directory / name).open("rb") as source,
+                archive.open(name, "w") as entry,
+            ):
+                shutil.copyfileobj(source, entry)
 
 
 def stage_files(output: Path, *sources: tuple[Path, dict[str, str]]) -> None:
@@ -102,11 +115,14 @@ def stage_release(
     ):
         raise ValueError("native bundle does not match its SHA256SUMS")
 
-    stage_files(
-        output,
-        (native, {name: native_hashes[name] for name in archives}),
-        (python, python_package_digests(python, python_version)),
-    )
+    python_names = python_package_names(python, python_version)
+    bundle = f"sai-cli-{release}-full-python.zip"
+    with tempfile.TemporaryDirectory(prefix="sai-full-python-") as scratch:
+        directory = Path(scratch)
+        bundle_full_python(python, python_names, directory / bundle)
+        stage_files(
+            output, (native, native_hashes), (directory, digests(directory, {bundle}))
+        )
 
 
 def check_attestation(
@@ -183,9 +199,8 @@ def run(args: argparse.Namespace) -> None:
         version = pyproject_version()
         if args.tag and (error := tag_error(args.tag, version)):
             raise ValueError(error)
-        stage_files(
-            args.output, (args.python, python_package_digests(args.python, version))
-        )
+        names = python_package_names(args.python, version)
+        stage_files(args.output, (args.python, digests(args.python, names)))
         return
     release, shim = native_versions()
     if args.command == "archive":

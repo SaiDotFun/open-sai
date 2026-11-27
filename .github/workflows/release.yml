@@ -8,6 +8,9 @@ on:
     paths:
       - '.github/workflows/release.yml'
       - '.github/workflows/native-dist.yml'
+      - 'Cargo.toml'
+      - 'pyproject.toml'
+      - 'shim/**'
       - 'scripts/check_release.py'
       - 'scripts/native-dist.py'
       - 'scripts/release.py'
@@ -151,7 +154,7 @@ jobs:
         with:
           name: sai-native-ci
           path: dist/native
-      - name: Verify artifacts and stage one release checksum manifest
+      - name: Stage the release assets and write SHA256SUMS
         shell: bash
         run: |
           args=()
