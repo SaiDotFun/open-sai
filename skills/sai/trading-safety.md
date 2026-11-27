@@ -8,10 +8,6 @@ the CLI or the MCP tools. A mistake here spends the person's money.
 1. **Preview first.** With MCP tools, call the matching `preview_*` tool. In
    the CLI, run the trade command with `--dry-run`. Show the person the
    result and the account it names, and wait for an explicit yes.
-   During a collateral oracle outage, a partial-close preview can show a
-   USDC estimate, and Sai requires a verifiable collateral price to submit
-   the trade. Once Sai can verify the price, run a fresh preview and get
-   the person's confirmation before submitting.
 2. **Pin the account and the network on both calls.** Each call resolves
    the active account and the Keeper endpoint by itself. Another terminal or
    MCP client can switch the account, and a changed setting can point the
@@ -143,20 +139,17 @@ The server refuses submission. Show the replacement preview and ask for
 confirmation if it has a `previewDigest`. If the quote is unavailable,
 follow the result's recovery instructions.
 
-For a partial close, ask for confirmation when the preview has a digest
-and both `quote.effectiveLeverage` and `quote.collateralPriceUsd` have
-values. When effective leverage is unreadable, the preview gives a fallback
-estimate and omits the digest. An estimate may still carry a digest while
-the collateral price is `null`. If either value is missing, wait until it
-is readable and request a fresh preview.
+For a partial close, ask for confirmation when the preview has a digest.
+It values USDC at $1. When effective leverage is unreadable, the preview
+uses stored leverage for the estimate and omits the digest. Request a
+fresh preview after effective leverage is readable.
 
 `PRICE_MOVED` is the quote check from rule 3. Passing it does not cap the
 fill at the confirmed price plus the slippage.
 
 The partial-close digest covers the close percentage, starting collateral,
 reduction amount, and leverage inputs, including the applicable after-hours
-cap. A tick in the collateral/USD price updates the USD estimate without
-requiring a new confirmation.
+cap.
 [mcp.md](mcp.md#preview-confirm-then-trade) lists what each digest covers.
 
 ## Reading the Estimates
@@ -166,13 +159,14 @@ both the indented output and `--json` include these fields.
 
 | Field | Inputs and precision |
 | --- | --- |
-| `fees.amountUsdc` | Perp's decimal fee rates and collateral oracle. Perp floors each component to six-decimal USDC base units. Opens and closes show undiscounted execution fees. The `excludes` list names omitted costs and discounts. |
+| `fees.amountUsdc` | Perp's decimal fee rates and $1 per USDC. Perp floors each component to six-decimal USDC base units. Opens and closes show undiscounted execution fees. The `excludes` list names omitted costs and discounts. |
 | `liquidationPrice.price` | Perp's 90% PnL threshold and two 5% liquidation fee components, floored separately. Opens use the reference or trigger as the entry and deduct the estimated opening fees from collateral. Position changes use the stored entry price and the projected collateral and leverage. The estimate excludes accrued borrowing fees. |
 | `worstCaseFill.price` | Keeper's market price, the supplied CLI market reference, or the order trigger. Perp rounds each slippage distance down to 18 decimal places. The `side` field identifies an upper bound for a long or a lower bound for a short. |
 
 The `observedAt` field gives the UTC time the CLI or MCP server read a
 price. Oracle publication can predate that read. User-supplied references
-and triggers have no observation timestamp.
+and triggers have no observation timestamp. The fixed USDC price also
+has no observation timestamp.
 
 Show `unavailable` when a required input is missing or quoted collateral or
 leverage falls outside market limits. An `unbounded` fill has
@@ -261,14 +255,10 @@ and get confirmation again before submitting.
   position is at submit. For a quoted slice, show the person the collateral
   reduction and quoted notional and submit with the confirmed digest. If
   `quote.closedNotionalIsEstimate` is true, say the notional is an estimate.
-  If the collateral oracle price is unavailable, show the USDC estimate
-  from `quote.closedNotionalUsdc`. Sai requires a verifiable price to
-  submit the partial close. When the price is available, preview again
-  and ask for confirmation. Keeper sends the collateral delta to Perp.
-  Perp applies the position state and oracle price at execution, so the
-  executed notional can differ from the confirmed quote. The after-hours
-  risk guard can also reduce the position before Perp closes the requested
-  slice.
+  Keeper sends the collateral delta to Perp. Perp applies the position
+  state and market price at execution, so the executed notional can differ
+  from the confirmed quote. The after-hours risk guard can also reduce the
+  position before Perp closes the requested slice.
 - **Margin** takes an amount, `--direction add|remove --amount USDC`, and
   computes the target from the effective leverage Perp will use, including
   any applicable after-hours cap. Adding 25 USDC to 100 USDC of collateral
