@@ -200,7 +200,7 @@ def test_mcp_preview_and_confirm(
     assert observations[0] == observations[1]
 
 
-@pytest.mark.parametrize("runtime", ["python"])
+@pytest.mark.parametrize("runtime", ["python", "rust"])
 @pytest.mark.parametrize("surface", ["cli", "mcp"])
 @pytest.mark.parametrize(
     "collateral_changes", [True, False], ids=["collateral", "tick"]

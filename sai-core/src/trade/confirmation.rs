@@ -377,6 +377,16 @@ impl Trading<'_> {
                     // A definitive rejection can leave no collateral projection
                     // to compare with the approved digest.
                     prepared.check_cli_execution(addr, false)?;
+                    if prepared.leverage_collateral_unverified() {
+                        return Err(refusal(
+                            &prepared,
+                            addr,
+                            Code::PreviewMismatch,
+                            "Cannot verify the current collateral. Request a new preview before submitting."
+                                .into(),
+                            confirmation.is_mcp(),
+                        ));
+                    }
                 }
             }
         }

@@ -74,7 +74,8 @@ pub struct TradePreview {
 #[derive(Clone, Debug, Serialize)]
 struct LeverageCollateral {
     before: String,
-    after: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after: Option<String>,
 }
 
 impl TradePreview {
@@ -132,6 +133,7 @@ impl TradePreview {
         if self.execution_refusal(true).is_none()
             && !self.has_unknown_partial_leverage()
             && !self.collateral_price_unverified()
+            && !self.leverage_collateral_unverified()
         {
             output["previewDigest"] = json!(preview_digest(self, account));
         }
@@ -172,6 +174,7 @@ impl TradePreview {
                 && self.execution_refusal(true).is_none()
                 && !self.has_unknown_partial_leverage()
                 && !self.collateral_price_unverified()
+                && !self.leverage_collateral_unverified()
             {
                 output["previewDigest"] = json!(preview_digest(self, account));
             }
@@ -192,6 +195,12 @@ impl TradePreview {
                 .quote
                 .as_ref()
                 .is_none_or(|quote| quote["effectiveLeverage"].is_null())
+    }
+
+    fn leverage_collateral_unverified(&self) -> bool {
+        self.is_standalone_position_update()
+            && self.intent.body["requestedLeverage"].is_string()
+            && self.leverage_collateral.is_none()
     }
 
     fn collateral_price_unverified(&self) -> bool {
