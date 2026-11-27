@@ -84,7 +84,6 @@ struct PositionQuote {
 struct RecheckedPosition {
     height: String,
     effective: u128,
-    prices: Option<Value>,
 }
 
 impl Trading<'_> {
@@ -469,25 +468,9 @@ impl PositionQuote {
             Code::PreviewMismatch,
             "Cannot verify effective leverage at the position's block. Request a new preview once the leverage inputs are readable.",
         ))?;
-        let prices = if self.preview.intent.kind == "DECREASE_POSITION_SIZE" {
-            let (prices, _) = lcd
-                .smart(
-                    &snapshot.route.contract_address,
-                    json!({"get_perp_prices": {
-                        "market_index": snapshot.raw["market_index"],
-                        "collateral_index": snapshot.raw["collateral_index"],
-                    }}),
-                    Read::At(height),
-                )
-                .await?;
-            Some(prices)
-        } else {
-            None
-        };
         Ok(Some(RecheckedPosition {
             height: height.to_owned(),
             effective: effective.units,
-            prices,
         }))
     }
 
@@ -538,12 +521,6 @@ impl PositionQuote {
                 else {
                     return Ok(());
                 };
-                let rechecked = rechecked.and_then(|checked| {
-                    checked
-                        .prices
-                        .as_ref()
-                        .map(|prices| (checked.effective, prices))
-                });
                 self.preview.estimates = Some(
                     Trading::partial_close_estimates(
                         lcd,
@@ -552,7 +529,7 @@ impl PositionQuote {
                         height,
                         PartialCloseQuote {
                             amount: &amount,
-                            rechecked,
+                            effective: rechecked.map(|checked| checked.effective),
                         },
                     )
                     .await,

@@ -233,6 +233,13 @@ struct Price {
 }
 
 impl Price {
+    fn usdc() -> Self {
+        Self {
+            units: SCALE,
+            output: json!({"price": "1", "source": "Fixed USDC price", "observedAt": null}),
+        }
+    }
+
     fn new(text: &str, source: &str, observed_at: Option<String>) -> Option<Self> {
         Some(Self {
             units: positive_decimal(text, "Quote price").ok()?,
