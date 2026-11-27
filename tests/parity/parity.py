@@ -109,7 +109,6 @@ class Case:
     exact_output: bool = False
     current_only: bool = False
     reference_stderr_contains: list[str] | None = None
-    collateral_price_after: str | None = None
 
     @property
     def command(self) -> str:
@@ -1095,19 +1094,11 @@ def run_case(
     candidate: list[str],
     *,
     cutover: bool = False,
-    python_main: bool = False,
     tool_evidence: dict[str, list[str]] | None = None,
 ) -> tuple[list[str], dict[str, str], str | None]:
     rust = candidate is not reference
     candidate_case = case.rust_case() if rust else case
     account_balances = case.command == "account balances"
-    if python_main and case.collateral_price_after is not None:
-        wire = list(case.wire or [])
-        index = wire.index(case.collateral_price_after)
-        wire.insert(index + 1, "get_collateral_price")
-        case = replace(case, wire=wire)
-        if not rust:
-            candidate_case = case
     with (
         tempfile.TemporaryDirectory(prefix="sai-parity-") as temp,
         loopback(case.server, balance_block_reads=account_balances) as endpoints,
@@ -1572,7 +1563,6 @@ def main() -> int:
             oracle,
             executable,
             cutover=comparing_release or current_gap,
-            python_main=python_main and oracle is reference,
             tool_evidence=evidence if gaps else None,
         )
         for tool, status in listed.items():
