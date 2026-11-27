@@ -236,7 +236,7 @@ fn invalid_settings_diagnostics_omit_supplied_values() {
     let home = tempdir().unwrap();
     let marker = "synthetic-secret-setting-value";
     for (variable, key, code) in [
-        ("SAI_UPDATE_AUTO", "update.auto", 1),
+        ("SAI_UPDATE_AUTO", "update.auto", 2),
         ("SAI_ENDPOINT", "keeper.endpoint", 2),
         ("SAI_WS_ENDPOINT", "keeper.ws_endpoint", 2),
         ("SAI_LCD_ENDPOINT", "lcd.endpoint", 2),
@@ -261,7 +261,7 @@ fn invalid_settings_diagnostics_omit_supplied_values() {
         assert!(!diagnostic.contains(marker), "{variable} echoed its value");
         assert!(diagnostic.contains(variable) && diagnostic.contains(key));
         if variable == "SAI_UPDATE_AUTO" {
-            assert!(diagnostic.contains("expected true, false, yes, no, on, off, 1, or 0"));
+            assert!(diagnostic.contains("expected true or false"));
         }
     }
 

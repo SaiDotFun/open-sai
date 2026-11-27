@@ -30,7 +30,7 @@ use session_tokens::{FileStamp, Tokens, stamp};
 
 const QUEUE_SIZE: usize = 2048;
 const QUEUE_CHARS: usize = 4 * 1024 * 1024;
-const MAX_LINE: usize = 16 * 1024;
+pub const MAX_LINE: usize = 16 * 1024;
 pub const EXIT_FLUSH: Duration = Duration::from_millis(300);
 
 const COMMON: [&str; 10] = [
@@ -45,6 +45,19 @@ const COMMON: [&str; 10] = [
     "schema",
     "commandId",
 ];
+/// Recognize the first row of a Sai log, including legacy rows without a schema.
+pub fn recognizes_line(line: &[u8], surface: &str) -> bool {
+    line.ends_with(b"\n")
+        && serde_json::from_slice::<Value>(line).is_ok_and(|row| {
+            row["surface"] == surface
+                && row.get("schema").is_none_or(|schema| schema == 2)
+                && COMMON
+                    .iter()
+                    .filter(|key| !matches!(**key, "schema" | "commandId"))
+                    .all(|key| row.get(key).is_some())
+        })
+}
+
 static RUN_ID: LazyLock<String> = LazyLock::new(|| Uuid::new_v4().simple().to_string());
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static KNOWN: LazyLock<Mutex<Arc<[String]>>> = LazyLock::new(|| Mutex::new(Arc::new([])));
@@ -247,7 +260,7 @@ impl<'a> EventContext<'a> {
 impl LogWriter {
     /// Start a writer for one Sai home. Filesystem work stays on its thread.
     pub fn start(env: Environment) -> Option<Self> {
-        Self::start_bound(env, None, settings::log_keep_days)
+        Self::start_bound(env, None, settings::log_keep_days, LogDir::open)
     }
 
     /// Start a writer with the v2 CLI command envelope.
@@ -256,20 +269,43 @@ impl LogWriter {
             env,
             Some(Uuid::new_v4().simple().to_string()),
             settings::log_keep_days,
+            LogDir::open,
         )
     }
 
     pub fn start_diagnostic_command(env: Environment) -> Option<Self> {
-        Self::start_bound(env, Some(Uuid::new_v4().simple().to_string()), |env| {
-            let (enabled, days) = settings::doctor_log_settings(env);
-            enabled.then(|| days.as_u64().unwrap_or(u64::MAX))
-        })
+        Self::start_bound(
+            env,
+            Some(Uuid::new_v4().simple().to_string()),
+            Self::diagnostic_log_days,
+            LogDir::open,
+        )
+    }
+
+    /// Write Doctor diagnostics to an approved handle or create a new log directory.
+    #[cfg(unix)]
+    pub fn start_doctor_command(
+        env: Environment,
+        mut approved: Option<std::fs::File>,
+    ) -> Option<Self> {
+        Self::start_bound(
+            env,
+            Some(Uuid::new_v4().simple().to_string()),
+            Self::diagnostic_log_days,
+            move |path| LogDir::open_doctor(path, &mut approved),
+        )
+    }
+
+    fn diagnostic_log_days(env: &Environment) -> Option<u64> {
+        let (enabled, days) = settings::doctor_log_settings(env);
+        enabled.then(|| days.as_u64().unwrap_or(u64::MAX))
     }
 
     fn start_bound(
         env: Environment,
         command_id: Option<String>,
         log_days: fn(&Environment) -> Option<u64>,
+        open_directory: impl FnMut(&std::path::Path) -> std::io::Result<LogDir> + Send + 'static,
     ) -> Option<Self> {
         if settings::log_disabled_in_env(&env) {
             return None;
@@ -282,7 +318,14 @@ impl LogWriter {
         thread::Builder::new()
             .name("sai-log".into())
             .spawn(move || {
-                drain(env, pending, &worker_queue, command_id.as_deref(), log_days);
+                drain(
+                    env,
+                    pending,
+                    &worker_queue,
+                    command_id.as_deref(),
+                    log_days,
+                    open_directory,
+                );
                 let _ = done_signal.send(());
             })
             .ok()?;
@@ -405,6 +448,7 @@ fn drain(
     queue: &Queue,
     command_id: Option<&str>,
     log_days: fn(&Environment) -> Option<u64>,
+    mut open_directory: impl FnMut(&std::path::Path) -> std::io::Result<LogDir>,
 ) {
     let config_path = env.path();
     let log_path = env.home.join("logs");
@@ -430,7 +474,7 @@ fn drain(
             }
         };
         let Some(keep) = keep else { continue };
-        let Ok(directory) = LogDir::open(&log_path) else {
+        let Ok(directory) = open_directory(&log_path) else {
             continue;
         };
         tokens.refresh(&env.home);

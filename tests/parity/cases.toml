@@ -1388,6 +1388,7 @@ state = { "clients/.claude.json#changed" = false, "clients/.codex/config.toml#ch
 [[case]]
 name = "mcp-install-all"
 args = ["--json", "mcp", "install", "--all"]
+accepted_divergence = "claude-env-report"
 client_seed = "empty"
 state = { "clients/.codex/config.toml#@mode" = 384, "clients/.cursor/mcp.json#@mode" = 384 }
 
@@ -1399,7 +1400,8 @@ state = { "clients/.claude.json#changed" = false, "clients/.codex/config.toml#ch
 
 [[case]]
 name = "mcp-install-dry-run"
-args = ["--json", "mcp", "install", "cursor", "--scope", "project", "--dry-run", "--", "fixture-wrapper", "sai", "mcp", "serve"]
+args = ["--json", "mcp", "install", "cursor", "--scope", "project", "--dry-run", "--", "env", "sai", "mcp", "serve"]
+accepted_divergence = "launcher-argument-report"
 client_seed = "empty"
 state = { "clients/.cursor/mcp.json" = "<absent>", "clients/argv.jsonl" = "<absent>" }
 

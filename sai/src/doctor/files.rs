@@ -1,6 +1,6 @@
 use std::{
     fs::{DirBuilder, File, Metadata},
-    io,
+    io::{self, BufRead, BufReader, Read},
     os::unix::fs::{DirBuilderExt, MetadataExt},
     path::{Path, PathBuf},
 };
@@ -13,7 +13,7 @@ use rustix::{
 use sai_core::settings::Environment;
 use serde_json::{Value, json};
 
-use super::{Check, plural};
+use super::{Check, intents, plural, shell_quote};
 
 pub(super) const SYMLINK_FIX: &str = "Replace the symlink with a real file or directory by hand";
 const SHARED_HOME_FIX: &str = "This Sai home may be shared. Stop all Sai CLI and MCP processes before moving the profile to a dedicated directory. Keep the trader data, including the intent ledger. Set SAI_HOME to the new directory for the CLI and in every MCP client configuration before restarting clients or resuming trading.";
@@ -69,7 +69,7 @@ impl Loose {
     }
 
     fn fix(&self) -> String {
-        format!("chmod go-rwx {}", self.path.display())
+        format!("chmod go-rwx {}", shell_quote(&self.path.to_string_lossy()))
     }
 }
 
@@ -124,10 +124,24 @@ fn chmod(path: &Path, file: &File, info: &Metadata) -> io::Result<Option<String>
     )))
 }
 
-fn tighten(root: &Path, names: &[&str]) -> (Vec<String>, Vec<String>) {
+fn tighten(
+    root: &Path,
+    names: &[&str],
+    apply: bool,
+    eligible: impl FnOnce(&Metadata) -> bool,
+) -> (Vec<String>, Vec<String>, bool) {
     let mut changes = Vec::new();
     let mut failed = Vec::new();
-    let fix = |path: &Path| format!("chmod go-rwx {}", path.display());
+    let fix = |path: &Path| format!("chmod go-rwx {}", shell_quote(&path.to_string_lossy()));
+    let repair = |path: &Path, file: &File, info: &Metadata, eligible: bool| {
+        if !eligible || info.mode() & GROUP_OR_OTHER == 0 {
+            Ok(None)
+        } else if apply {
+            chmod(path, file, info)
+        } else {
+            Ok(Some(fix(path)))
+        }
+    };
     let open = || -> io::Result<File> {
         let home = root.parent().ok_or(io::ErrorKind::InvalidInput)?;
         let name = root.file_name().ok_or(io::ErrorKind::InvalidInput)?;
@@ -141,10 +155,10 @@ fn tighten(root: &Path, names: &[&str]) -> (Vec<String>, Vec<String>) {
         )?))
     };
     let Ok(dir) = open() else {
-        return (changes, vec![fix(root)]);
+        return (changes, vec![fix(root)], false);
     };
     let Ok(info) = dir.metadata() else {
-        return (changes, vec![fix(root)]);
+        return (changes, vec![fix(root)], false);
     };
     if info.uid() != getuid().as_raw() {
         return (
@@ -153,9 +167,24 @@ fn tighten(root: &Path, names: &[&str]) -> (Vec<String>, Vec<String>) {
                 "{} belongs to another user; fix by hand",
                 root.display()
             )],
+            false,
         );
     }
-    match chmod(root, &dir, &info) {
+    let eligible = eligible(&info);
+    if !root
+        .symlink_metadata()
+        .is_ok_and(|current| same_file(&current, &info))
+    {
+        return (
+            changes,
+            vec![format!(
+                "{} changed during the check; run sai doctor again",
+                root.display()
+            )],
+            false,
+        );
+    }
+    match repair(root, &dir, &info, eligible) {
         Ok(change) => changes.extend(change),
         Err(_) => failed.push(fix(root)),
     }
@@ -171,18 +200,26 @@ fn tighten(root: &Path, names: &[&str]) -> (Vec<String>, Vec<String>) {
             }
         };
         match file.metadata() {
+            Ok(info) if info.uid() != getuid().as_raw() => failed.push(format!(
+                "{} belongs to another user; fix by hand",
+                path.display()
+            )),
             Ok(info) if info.nlink() > 1 => failed.push(format!(
                 "{} has other hard links; fix by hand",
                 path.display()
             )),
-            Ok(info) if info.is_file() => match chmod(&path, &file, &info) {
+            Ok(info) if info.is_file() => match repair(&path, &file, &info, eligible) {
                 Ok(change) => changes.extend(change),
                 Err(_) => failed.push(fix(&path)),
             },
             _ => failed.push(fix(&path)),
         }
     }
-    (changes, failed)
+    (changes, failed, eligible)
+}
+
+fn same_file(left: &Metadata, right: &Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 #[derive(Clone, Copy)]
@@ -229,8 +266,16 @@ impl ProfileDir {
         }
     }
 
-    fn has_data(self, dir: &File, uid: u32) -> Option<bool> {
+    fn has_data(
+        self,
+        dir: &File,
+        path: &Path,
+        uid: u32,
+        allow_loose_trader: bool,
+        expected_child: Option<(&str, &Metadata)>,
+    ) -> Option<bool> {
         let mut has_data = false;
+        let mut matched_child = expected_child.is_none();
         for item in Dir::read_from(dir).ok()? {
             let item = item.ok()?;
             let name = item.file_name();
@@ -242,7 +287,10 @@ impl ProfileDir {
             if info.st_uid != uid {
                 return None;
             }
-            let mode: u32 = info.st_mode as _;
+            let mut mode: u32 = info.st_mode as _;
+            if allow_loose_trader && matches!(self, Self::Root) && text == "trader" {
+                mode &= !GROUP_OR_OTHER;
+            }
             match FileType::from_raw_mode(info.st_mode) {
                 FileType::Directory if mode & SHARED == 0 => {
                     let child = self.child(text)?;
@@ -252,29 +300,147 @@ impl ProfileDir {
                     if device != opened.dev() || info.st_ino != opened.ino() {
                         return None;
                     }
-                    has_data |= child.has_data(&fd, uid)?;
+                    if let Some((name, expected)) = expected_child
+                        && text == name
+                    {
+                        if !same_file(&opened, expected) {
+                            return None;
+                        }
+                        matched_child = true;
+                    }
+                    has_data |= child.has_data(&fd, &path.join(text), uid, false, None)?;
                 }
-                FileType::RegularFile if self.file(text) => has_data |= !matches!(self, Self::Logs),
+                FileType::RegularFile if self.file(text) => {
+                    if matches!(self, Self::Logs)
+                        && let Some((_, surface)) = log_name(text)
+                    {
+                        let file = open_regular_at(dir, name)?;
+                        let opened = file.metadata().ok()?;
+                        let device: u64 = info.st_dev as _;
+                        if opened.nlink() != 1
+                            || device != opened.dev()
+                            || info.st_ino != opened.ino()
+                        {
+                            return None;
+                        }
+                        let mut line = Vec::new();
+                        BufReader::new(file.take((sai_core::log::MAX_LINE + 1) as u64))
+                            .read_until(b'\n', &mut line)
+                            .ok()?;
+                        if !sai_core::log::recognizes_line(&line, surface) {
+                            return None;
+                        }
+                    }
+                    if matches!(self, Self::Trader)
+                        && matches!(text, "sessions.json" | "session.json" | "intents.sqlite3")
+                    {
+                        let flags =
+                            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+                        let file = File::from(unix::openat(dir, name, flags, Mode::empty()).ok()?);
+                        let opened = file.metadata().ok()?;
+                        let device: u64 = info.st_dev as _;
+                        if opened.nlink() != 1
+                            || opened.len() == 0
+                            || device != opened.dev()
+                            || info.st_ino != opened.ino()
+                        {
+                            return None;
+                        }
+                        let evidence = if text == "intents.sqlite3" {
+                            intents::has_ledger_schema(path, &opened)
+                        } else {
+                            let envelope: Value = serde_json::from_reader(file).ok()?;
+                            sai_core::storage::is_session_envelope(text, &envelope)
+                        };
+                        let after = unix::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).ok()?;
+                        if !evidence || after.st_dev != info.st_dev || after.st_ino != info.st_ino {
+                            return None;
+                        }
+                        has_data = true;
+                    }
+                }
                 _ => return None,
             }
         }
-        Some(has_data)
+        matched_child.then_some(has_data)
     }
 }
 
-fn tighten_home(path: &Path) -> Option<String> {
+fn dedicated_profile(
+    path: &Path,
+    allow_loose_trader: bool,
+    expected_child: Option<(&str, &Metadata)>,
+) -> Option<(File, Metadata)> {
     let dir = open_directory(path).ok()?;
     let info = dir.metadata().ok()?;
     let mode = info.mode();
     if info.uid() != getuid().as_raw()
         || mode & SHARED != 0
-        || mode & GROUP_OR_OTHER == 0
-        || !ProfileDir::Root.has_data(&dir, info.uid())?
+        || !ProfileDir::Root.has_data(&dir, path, info.uid(), allow_loose_trader, expected_child)?
         || dir.metadata().ok()?.mode() != mode
     {
         return None;
     }
-    chmod(path, &dir, &info).ok().flatten()
+    let current = path.symlink_metadata().ok()?;
+    same_file(&info, &current).then_some((dir, info))
+}
+
+pub(super) fn diagnostic_log_dir(home: &Path) -> io::Result<Option<File>> {
+    verify_profile_owner(home)?;
+    let root = home.join("logs");
+    let dir = match open_directory(&root) {
+        Ok(dir) => dir,
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                && matches!(root.symlink_metadata(), Err(error) if error.kind() == io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let info = dir.metadata()?;
+    require_owner(&dir, &root)?;
+    let private = info.mode() & GROUP_OR_OTHER == 0
+        && Dir::read_from(&dir).is_ok_and(|mut entries| {
+            entries.all(|item| {
+                item.is_ok_and(|item| {
+                    let name = item.file_name();
+                    name.to_str().is_ok_and(|text| {
+                        log_name(text).is_none()
+                            || unix::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(
+                                |stat| {
+                                    !Mode::from_raw_mode(stat.st_mode)
+                                        .intersects(Mode::RWXG | Mode::RWXO)
+                                },
+                            )
+                    })
+                })
+            })
+        })
+        && ProfileDir::Logs
+            .has_data(&dir, &root, info.uid(), false, None)
+            .is_some()
+        && !home.is_symlink()
+        && root
+            .symlink_metadata()
+            .is_ok_and(|current| same_file(&info, &current));
+    if private || dedicated_profile(home, true, Some(("logs", &info))).is_some() {
+        Ok(Some(dir))
+    } else {
+        Err(io::ErrorKind::PermissionDenied.into())
+    }
+}
+
+fn repair_profile_root(path: &Path, apply: bool) -> Option<String> {
+    let (dir, info) = dedicated_profile(path, !apply, None)?;
+    if info.mode() & GROUP_OR_OTHER == 0 {
+        return None;
+    }
+    if apply {
+        chmod(path, &dir, &info).ok().flatten()
+    } else {
+        Some(Loose::new(path.to_owned())?.fix())
+    }
 }
 
 pub(super) fn home_check(home: &Path, fix: bool) -> Check {
@@ -322,24 +488,49 @@ pub(super) fn home_check(home: &Path, fix: bool) -> Check {
             .details(details);
     }
     let exists = root.is_dir();
+    let mut changes = Vec::new();
+    let mut failed = Vec::new();
+    if exists && !trader_loose.is_empty() {
+        let eligible;
+        (changes, failed, eligible) = tighten(&root, TRADER_FILES, fix, |opened| {
+            dedicated_profile(home, true, Some(("trader", opened))).is_some()
+        });
+        if !eligible && failed.is_empty() {
+            home_fix = SHARED_HOME_FIX;
+        }
+    }
+    if home_loose.is_some()
+        && failed.is_empty()
+        && let Some(change) = repair_profile_root(home, fix)
+    {
+        if fix {
+            changes.push(change);
+        } else {
+            changes.insert(0, change);
+        }
+        home_fix = "";
+    }
     if !fix {
         if !all_loose.is_empty() {
-            let trader_fix = trader_loose
-                .iter()
-                .map(Loose::fix)
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Check::new(
-                "home",
-                "warn",
-                format!(
-                    "{} in {} accessible by other users",
-                    plural(all_loose.len(), "path"),
-                    home.display()
-                ),
-            )
-            .fix(format!("{home_fix} {trader_fix}").trim())
-            .details(details);
+            let (status, summary) = if failed.is_empty() {
+                (
+                    "warn",
+                    format!(
+                        "{} in {} accessible by other users",
+                        plural(all_loose.len(), "path"),
+                        home.display()
+                    ),
+                )
+            } else {
+                (
+                    "fail",
+                    format!("Could not make {} private", plural(failed.len(), "path")),
+                )
+            };
+            let guidance = [failed, changes].concat().join("; ");
+            return Check::new("home", status, summary)
+                .fix(format!("{home_fix} {guidance}").trim())
+                .details(details);
         }
         if !exists {
             return Check::new(
@@ -353,29 +544,15 @@ pub(super) fn home_check(home: &Path, fix: bool) -> Check {
             .details(details);
         }
     }
-    let mut changes = Vec::new();
-    let mut failed = Vec::new();
-    if fix {
-        if exists && !trader_loose.is_empty() {
-            (changes, failed) = tighten(&root, TRADER_FILES);
+    if fix && !exists {
+        let home_exists = home.is_dir();
+        if let Err(error) = create_trader(home) {
+            return super::crashed("home", io_class(&error));
         }
-        if home_loose.is_some()
-            && failed.is_empty()
-            && let Some(change) = tighten_home(home)
-        {
-            changes.push(change);
-            home_fix = "";
+        if !home_exists {
+            changes.push(format!("created {} with mode 700", home.display()));
         }
-        if !exists {
-            let home_exists = home.is_dir();
-            if let Err(error) = create_trader(home) {
-                return super::crashed("home", io_class(&error));
-            }
-            if !home_exists {
-                changes.push(format!("created {} with mode 700", home.display()));
-            }
-            changes.push(format!("created {} with mode 700", root.display()));
-        }
+        changes.push(format!("created {} with mode 700", root.display()));
     }
     let check = if !failed.is_empty() {
         Check::new(
@@ -436,6 +613,12 @@ fn io_class(error: &io::Error) -> &'static str {
         io::ErrorKind::NotFound => "FileNotFoundError",
         _ => "OSError",
     }
+}
+
+fn open_regular_at(dir: &File, name: &std::ffi::CStr) -> Option<File> {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let file = File::from(unix::openat(dir, name, flags, Mode::empty()).ok()?);
+    file.metadata().ok()?.is_file().then_some(file)
 }
 
 fn log_name(name: &str) -> Option<(NaiveDate, &str)> {
@@ -588,27 +771,41 @@ pub(super) fn logs_check(env: &Environment, fix: bool, (on, keep_days): (bool, V
     let mut changes = Vec::new();
     let check = if loose.is_empty() {
         private()
-    } else if !fix {
-        Check::new(
-            "logs",
-            "warn",
-            format!(
-                "{} under {} readable by other users",
-                plural(loose.len(), "path"),
-                root.display()
-            ),
-        )
-        .fix(loose.iter().map(Loose::fix).collect::<Vec<_>>().join("; "))
     } else {
-        let failed;
-        (changes, failed) = tighten(&root, &names);
+        let (repairs, failed, eligible) = tighten(&root, &names, fix, |opened| {
+            dedicated_profile(&env.home, true, Some(("logs", opened))).is_some()
+        });
+        if fix {
+            changes = repairs.clone();
+        }
         if !failed.is_empty() {
+            let count = failed.len();
+            let guidance = if fix {
+                failed
+            } else {
+                [failed, repairs].concat()
+            };
             Check::new(
                 "logs",
                 "fail",
-                format!("Could not make {} private", plural(failed.len(), "path")),
+                format!("Could not make {} private", plural(count, "path")),
             )
-            .fix(failed.join("; "))
+            .fix(guidance.join("; "))
+        } else if !eligible || !fix {
+            Check::new(
+                "logs",
+                "warn",
+                format!(
+                    "{} under {} readable by other users",
+                    plural(loose.len(), "path"),
+                    root.display()
+                ),
+            )
+            .fix(if eligible {
+                repairs.join("; ")
+            } else {
+                SHARED_HOME_FIX.into()
+            })
         } else if changes.is_empty() {
             private()
         } else {
@@ -633,4 +830,52 @@ pub(super) fn open_regular(path: &Path) -> io::Result<File> {
         return Err(io::ErrorKind::InvalidData.into());
     }
     Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, Permissions};
+
+    #[test]
+    fn trader_repair_refuses_a_replacement_after_profile_validation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for apply in [false, true] {
+            let sandbox = tempfile::tempdir().unwrap();
+            let home = sandbox.path().join("sai");
+            let root = home.join("trader");
+            let previous = sandbox.path().join("previous");
+            fs::create_dir(&home).unwrap();
+            fs::set_permissions(&home, Permissions::from_mode(0o700)).unwrap();
+            let create_trader = || {
+                fs::create_dir(&root).unwrap();
+                fs::set_permissions(&root, Permissions::from_mode(0o755)).unwrap();
+                fs::write(
+                    root.join("sessions.json"),
+                    serde_json::json!({
+                        "version": 3,
+                        "nonce": "AAAAAAAAAAAAAAAA",
+                        "ciphertext": "AAAAAAAAAAAAAAAAAAAAAAA=",
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+            };
+            create_trader();
+            let (changes, failed, eligible) = tighten(&root, TRADER_FILES, apply, |opened| {
+                assert!(dedicated_profile(&home, true, Some(("trader", opened))).is_some());
+                fs::rename(&root, &previous).unwrap();
+                create_trader();
+                assert!(dedicated_profile(&home, true, None).is_some());
+                assert!(dedicated_profile(&home, true, Some(("trader", opened))).is_none());
+                true
+            });
+            assert!(!eligible);
+            assert!(changes.is_empty());
+            assert_eq!(failed.len(), 1);
+            assert_eq!(root.metadata().unwrap().mode() & 0o777, 0o755);
+            assert_eq!(previous.metadata().unwrap().mode() & 0o777, 0o755);
+        }
+    }
 }

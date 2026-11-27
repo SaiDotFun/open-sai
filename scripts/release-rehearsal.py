@@ -1065,12 +1065,13 @@ class Install:
     def verify_mcp(self, version: str) -> None:
         entries = self.json("Inspect MCP registrations", "mcp", "list")["clients"]
         command = [str(self.sai), "mcp", "serve"]
+        hidden = [str(self.sai), "<argument hidden 1 of 2>", "<argument hidden 2 of 2>"]
         for name in CLIENTS:
             row = next(entry for entry in entries if entry["client"] == name)
             require(
                 row["current"]
                 and row["scope"] == "user"
-                and row["registeredCommand"] == command,
+                and row["registeredCommand"] in (command, hidden),
                 f"{name} registration no longer points to the installed launcher",
             )
         replies = {}
