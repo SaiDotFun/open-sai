@@ -435,7 +435,7 @@ def fetch_wheel(
         if python_only:
             raise LookupFailed(f"Sai {version} has no full Python wheel for this host")
         problem = native_wheel_problem(
-            version, manifest, directory, base, web_base, deadline
+            wheel, version, manifest, directory, base, web_base, deadline
         )
         if problem is None:
             return digest
@@ -458,7 +458,48 @@ def is_shim_wheel(wheel: Path) -> bool:
         raise LookupFailed(f"{wheel.name} is not a valid wheel") from error
 
 
+SHIM_PROFILE_CHECK = """
+import sys
+sys.path.insert(0, sys.argv[1])
+from sai_cli.sai_cli import check_install_profile
+raise SystemExit(check_install_profile(sys.argv[2], sys.argv[3]))
+"""
+
+
+def shim_profile_problem(
+    wheel: Path, version: str, digest: str, deadline: float
+) -> str | None:
+    with tempfile.TemporaryFile() as output:
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-B",
+                    "-c",
+                    SHIM_PROFILE_CHECK,
+                    wheel,
+                    version,
+                    digest,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                timeout=min(VERIFY_TIMEOUT, left(deadline, "checking the Sai profile")),
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return "The verified shim could not check SAI_HOME"
+        if result.returncode == 0:
+            return None
+        output.seek(0)
+        reason = output.read(512).decode(errors="replace").strip()
+        return reason or "The verified shim could not check SAI_HOME"
+
+
 def native_wheel_problem(
+    wheel: Path,
     version: str,
     manifest: str,
     directory: Path,
@@ -478,6 +519,8 @@ def native_wheel_problem(
         raise LookupFailed(
             "the native installer requires official or loopback release URLs"
         )
+    if problem := shim_profile_problem(wheel, version, expected, deadline):
+        return problem
 
     with (
         tempfile.TemporaryDirectory(dir=directory, prefix="native-probe-") as scratch,
@@ -492,10 +535,8 @@ def native_wheel_problem(
         try:
             result = subprocess.run(
                 [binary, "--version"],
-                cwd=home,
                 env={
                     **os.environ,
-                    "SAI_HOME": str(home),
                     "SAI_LOG": "false",
                     "CI": "1",
                 },

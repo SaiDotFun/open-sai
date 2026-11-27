@@ -1530,7 +1530,69 @@ def test_default_installer_keeps_a_compatible_native_shim(
         f"{REPO}/releases/download/sai-cli/v{version}/{asset_name(version)}"
         in replay.requests
     )
+    assert not (install.profile / "bin").exists()
     install.pin(version)
+
+
+@pytest.mark.skipif(WINDOWS, reason="requires POSIX profile permissions")
+@pytest.mark.parametrize(
+    ("obstruction", "diagnostic"),
+    [
+        ("ancestor", "SAI_HOME has an untrusted ancestor directory"),
+        ("receipt", "The Sai native cache cannot replace the verified directory"),
+        ("read-only cache", "The Sai native cache directory is not writable"),
+    ],
+)
+def test_default_installer_keeps_python_when_shim_rejects_the_real_profile(
+    install: Install,
+    replay: Replay,
+    obstruction: str,
+    diagnostic: str,
+) -> None:
+    project = install.home / "project"
+    project.mkdir(mode=0o700)
+    install.profile = project / ".sai"
+    install.env["SAI_HOME"] = str(install.profile.relative_to(install.home))
+    previous = wheel_artifact("BRIDGE")
+    prepare_uv(install, previous, replay)
+    config, contents = save_profile(install, replay)
+    record = install.tools / ".sai-cli-release.json"
+    original_record = record.read_bytes()
+    launcher = install.launcher.lstat()
+    assert install.profile.stat().st_mode & 0o777 == 0o700
+    install.pin(wheel_version(previous))
+    version = add_shim(replay, wheel_artifact("SHIM"), artifact("RUST"))
+    target = asset_name(version).removeprefix(f"sai-{version}-").removesuffix(".tar.gz")
+    cache = install.profile / "bin"
+    if obstruction == "ancestor":
+        project.chmod(0o775)
+    else:
+        cache.mkdir(mode=0o700)
+        for part in (f"shim-loopback-{replay.server.server_port}", version, target):
+            cache /= part
+            cache.mkdir(mode=0o700)
+        if obstruction == "receipt":
+            (cache / "verified").mkdir(mode=0o700)
+        else:
+            cache.chmod(0o500)
+            if os.access(cache, os.W_OK):
+                pytest.skip("the test user can write to the read-only cache")
+    before = [(path, path.lstat().st_mode) for path in cache.rglob("*")]
+
+    result = install.install(replay)
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert diagnostic in result.stderr
+    assert install.launcher.lstat().st_ino == launcher.st_ino
+    assert record.read_bytes() == original_record
+    assert config.read_bytes() == contents
+    assert [(path, path.lstat().st_mode) for path in cache.rglob("*")] == before
+    if obstruction == "ancestor":
+        assert not cache.exists()
+    assert not (
+        install.profile / "cache/wheels" / f"sai_cli-{version}-py3-none-any.whl"
+    ).exists()
+    install.pin(wheel_version(previous))
 
 
 @pytest.mark.skipif(not WINDOWS, reason="requires Windows uv launcher copies")
