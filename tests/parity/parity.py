@@ -1163,6 +1163,13 @@ def run_case(
         project_reference_log_privacy(left, right)
         if case.name in {"mcp-install-invalid-scope", "mcp-install-empty-scope"}:
             left = project_reference_rejected_scope(left)
+        if case.accepted_divergence == "stale-env-count" and isinstance(
+            right.output, dict
+        ):
+            for client in right.output.get("clients", []):
+                for row in (client, *client.get("registrations", [])):
+                    if row.get("staleEnv") == ["FIXTURE_CREDENTIAL"]:
+                        row["staleEnv"] = ["1 other entry"]
         if case.accepted_divergence == "install-profile-report" and isinstance(
             right.output, dict
         ):

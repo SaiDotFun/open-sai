@@ -453,14 +453,19 @@ def reported_command(
 
 
 def reported_env_names(entries: tuple[str, ...]) -> list[str]:
-    """Show validated names from saved environment entries."""
-    names = (entry.partition("=")[0] for entry in entries)
-    return sorted(
-        {
-            name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) else HIDDEN
-            for name in names
-        }
-    )
+    """Show Sai names and count the remaining saved environment entries."""
+    names = set()
+    other = 0
+    for entry in entries:
+        name = entry.partition("=")[0]
+        if re.fullmatch(r"SAI_[A-Za-z0-9_]*", name):
+            names.add(name)
+        else:
+            other += 1
+    shown = sorted(names)
+    if other:
+        shown.append(f"{other} other {'entry' if other == 1 else 'entries'}")
+    return shown
 
 
 def launcher_target(launcher: str, environ: Mapping[str, str]) -> Target:
@@ -582,12 +587,12 @@ def entry_registration(
     env = entry.get("env")
     env = env if isinstance(env, dict) else {}
     home = env.get("SAI_HOME")
-    stale = {str(k) for k in env if k != "SAI_HOME"}
+    stale = [str(k) for k in env if k != "SAI_HOME"]
     passed = entry.get("env_vars")
     for item in passed if isinstance(passed, list) else []:
         name = item.get("name") if isinstance(item, dict) else item
         if isinstance(name, str):
-            stale.add(name)
+            stale.append(name)
     return Registration(
         argv,
         scope,

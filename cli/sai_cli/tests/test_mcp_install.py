@@ -2355,7 +2355,7 @@ def test_noninteractive_install_listing_hides_matching_cursor_arguments(
 
 
 @pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
-def test_mcp_listings_report_only_saved_environment_names(
+def test_mcp_listings_report_sai_environment_names_and_count_other_entries(
     install_preview: Path, json_output: bool
 ) -> None:
     root = install_preview.parent
@@ -2365,6 +2365,7 @@ def test_mcp_listings_report_only_saved_environment_names(
     (root / ".cursor").mkdir()
     command = [str(launcher), "mcp", "serve"]
     marker = "fixture-env-value"
+    bare_token = "fixtureBareToken_71"
     profile = str(root / "sai-home")
     json_entry = claude_entry(
         command,
@@ -2374,6 +2375,9 @@ def test_mcp_listings_report_only_saved_environment_names(
             f"APP_TOKEN={marker}=suffix": marker,
             "APP_TOKEN": marker,
             f"invalid name={marker}": marker,
+            bare_token: marker,
+            "SAI_WS_ENDPOINT": marker,
+            f"SAI_ENDPOINT={marker}": marker,
         },
     )
     codex_entry = claude_entry(command, {"SAI_HOME": profile})
@@ -2383,6 +2387,9 @@ def test_mcp_listings_report_only_saved_environment_names(
         "_APP_MODE_2",
         f"invalid name {marker}",
         f"={marker}",
+        bare_token,
+        bare_token,
+        f"SAI_LCD_ENDPOINT={marker}",
     ]
     files = {
         root / ".claude.json": json.dumps({"mcpServers": {"sai": json_entry}}),
@@ -2404,13 +2411,14 @@ def test_mcp_listings_report_only_saved_environment_names(
 
         assert result.exit_code == 0, result.output
         assert marker not in result.output
+        assert bare_token not in result.output
         rows = payload(result)["clients"]
         assert {row["client"] for row in rows} == {"claude", "codex", "cursor"}
         for row in rows:
             expected = (
-                ["<hidden>", "CODEX_TOKEN", "_APP_MODE_2"]
+                ["SAI_LCD_ENDPOINT", "7 other entries"]
                 if row["client"] == "codex"
-                else ["<hidden>", "APP_MODE", "APP_TOKEN"]
+                else ["SAI_ENDPOINT", "SAI_WS_ENDPOINT", "5 other entries"]
             )
             assert row["registered"] and not row["current"]
             assert row["staleEnv"] == expected
@@ -2725,7 +2733,7 @@ def test_list_reads_only_the_sai_entry_and_prints_no_secrets(env: Env):
     assert rows["claude"]["scope"] == "user"
     # The codex entry runs the right command but carries an extra env name.
     assert rows["codex"]["current"] is False
-    assert rows["codex"]["staleEnv"] == ["TOKEN"]
+    assert rows["codex"]["staleEnv"] == ["1 other entry"]
     assert rows["cursor"]["registered"] is False
     assert set(rows["claude"]) == {
         "client",

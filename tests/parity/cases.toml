@@ -1366,6 +1366,7 @@ client_seed = "empty"
 [[case]]
 name = "mcp-list-redacted"
 args = ["--json", "mcp", "list"]
+accepted_divergence = "stale-env-count"
 client_seed = "legacy"
 state = { "clients/.claude.json#changed" = false, "clients/.codex/config.toml#changed" = false, "clients/.cursor/mcp.json#changed" = false }
 
