@@ -1,5 +1,10 @@
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
+import pytest
 from manifest_gaps import ManifestGaps
 from release_mismatch import difference_signature
 
@@ -42,3 +47,39 @@ def test_configured_exception_cannot_mask_a_network_violation(tmp_path: Path) ->
     gaps = registry(tmp_path, difference)
     assert gaps.result("case:log-fields", [difference])[0] == "DIFF"
     assert gaps.finish() == 1
+
+
+CURRENT_GAPS = ManifestGaps(Path(__file__).with_name("python-main-gaps.toml"))
+
+
+@pytest.mark.parametrize("case_id", CURRENT_GAPS.gaps)
+def test_current_python_gap_against_native(
+    cli_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    case_id: str,
+) -> None:
+    directory = Path(__file__).parent
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(directory / "parity.py"),
+            "--reference",
+            str(Path(sys.executable).with_name("sai")),
+            "--case",
+            case_id.removeprefix("case:"),
+        ],
+        cwd=directory.parents[1],
+        env={**os.environ, "SAI_PARITY_BIN": cli_pair[1][0]},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    prefix = "CURRENT_PYTHON_ROW "
+    (row,) = [
+        json.loads(line.removeprefix(prefix))
+        for line in result.stdout.splitlines()
+        if line.startswith(prefix)
+    ]
+    assert row["id"] == case_id
+    assert row["status"] == "XFAIL"

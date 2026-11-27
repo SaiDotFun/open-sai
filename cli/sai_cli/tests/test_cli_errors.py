@@ -108,6 +108,9 @@ def test_command_failures_use_one_json_envelope(args, exit_code, code):
 def test_trade_rejects_malformed_numbers_as_usage_errors(
     command, defaults, field, malformed
 ):
+    if field == "--market" and malformed == "bad":
+        # Alphabetic market symbols now resolve through Keeper.
+        malformed = "?"
     args = ["--json", "trade", command, "--dry-run"]
     for key, value in {**defaults, field: malformed}.items():
         args.extend([key, value] if key.startswith("--") else [value])

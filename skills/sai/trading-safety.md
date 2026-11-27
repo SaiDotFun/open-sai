@@ -215,10 +215,17 @@ sai --as 0xYOUR_ADDR --json trade leverage 42 --leverage 5 --dry-run
 sai --as 0xYOUR_ADDR --json trade margin 42 --direction add --amount 5 \
   --dry-run
 sai --as 0xYOUR_ADDR --json trade close 42 --dry-run
-sai --as 0xYOUR_ADDR --json trade close 43 --cancel-order --dry-run
+sai --as 0xYOUR_ADDR --json trade cancel 43 --dry-run
 sai --json intent local 0xYOUR_ADDR
 sai --json intent wait INTENT_KEY --addr 0xYOUR_ADDR --timeout 30
 ```
+
+Leverage and margin dry runs show collateral before and after in USDC and USD.
+For a margin add, pass `--max-collateral-usd 5` with `--amount 1` to reduce
+the quoted add as needed to stay within $5 of estimated total collateral.
+Pass the same cap on submission. Perp settles the target leverage and can
+produce a different collateral amount if the position or oracle price moves.
+
 
 `--as ADDR` needs `ADDR` to be a connected account (`sai auth list`). Trade
 output names the account in field `addr`. Add the same `--endpoint URL` to
@@ -291,7 +298,8 @@ What each command checks:
   index and the contract disagree, the CLI refuses and submits nothing. Wait
   and retry.
 - **Close and cancel.** `trade close ID` closes an open position. To cancel a
-  pending limit or stop order, add `--cancel-order`. The CLI checks that the
+  pending limit or stop order, use `trade cancel ID`. The alias is
+  `trade close ID --cancel-order`. The CLI checks that the
   order is pending before preview and submit. If it fills after the check,
   Perp can close the filled position at market.
 
