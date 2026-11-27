@@ -1,8 +1,8 @@
 """Package every file of the agent skill, at any depth.
 
 `cli/sai_cli/skills` is a symlink to `skills/sai`. setuptools globs skip
-hidden directories, so this walks the tree and lists each file. Everything
-else about the package is in pyproject.toml.
+hidden directories, so this walks the tree and lists each file. The shared
+MCP environment names are also included as package data.
 """
 
 from __future__ import annotations
@@ -32,4 +32,4 @@ def skill_files(package: Path = PACKAGE) -> list[str]:
 
 
 if __name__ == "__main__":
-    setup(package_data={"sai_cli": skill_files()})
+    setup(package_data={"sai_cli": ["mcp_env_names.txt", *skill_files()]})
