@@ -261,7 +261,7 @@ impl Trading<'_> {
                     if confirming {
                         self.recheck_bound_open_route(preview).await?;
                     }
-                    preview.check_cli_execution(session.addr(), false)?;
+                    preview.check_cli_execution(session.addr())?;
                     return Err(error);
                 }
             }
@@ -376,7 +376,7 @@ impl Trading<'_> {
                     .await?;
                     // A definitive rejection can leave no collateral projection
                     // to compare with the approved digest.
-                    prepared.check_cli_execution(addr, false)?;
+                    prepared.check_cli_execution(addr)?;
                     if prepared.leverage_collateral_unverified() {
                         return Err(refusal(
                             &prepared,
@@ -429,7 +429,7 @@ impl Trading<'_> {
                 )
                 .await?;
                 self.recheck_open_route(lcd, route).await?;
-                preview.check_cli_execution(session.addr(), false)?;
+                preview.check_cli_execution(session.addr())?;
                 Err(error)
             }
         }
@@ -451,13 +451,9 @@ impl Trading<'_> {
 }
 
 impl TradePreview {
-    pub(super) fn check_cli_execution(
-        &self,
-        account: &str,
-        require_oracle_time: bool,
-    ) -> Result<(), SaiError> {
+    pub(super) fn check_cli_execution(&self, account: &str) -> Result<(), SaiError> {
         if let Some(reason) = self
-            .execution_refusal(require_oracle_time)
+            .execution_refusal()
             .and_then(|execution| execution["reason"].as_str())
         {
             let preview = self.cli_preview_output(Some(account));
