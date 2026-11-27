@@ -630,9 +630,7 @@ def _leverage_estimates(
     queued = fills_at_next_oracle_price(lcd, contract, height)
     price = None
     if not queued:
-        oracle = margin.perp_prices(lcd, state, height)["market"]
-        if not isinstance(oracle, dict):
-            raise TypeError("Invalid Perp market oracle price")
+        oracle = margin.market_oracle_price(lcd, contract, pair, height)
         published_at = oracle_publication_time(oracle)
         if published_at is not None and stale_oracle(
             lcd, contract, pair, height, published_at

@@ -758,20 +758,6 @@ def market_oracle_price(
     return rate
 
 
-def perp_prices(lcd: str, state: PositionSnapshot, height: str) -> Any:
-    return smart_value(
-        lcd,
-        state.contract,
-        {
-            "get_perp_prices": {
-                "market_index": state.raw["market_index"],
-                "collateral_index": state.raw["collateral_index"],
-            }
-        },
-        height=height,
-    )
-
-
 def leverage_inputs(
     lcd: str, state: PositionSnapshot, trade_id: int, *, height: str | None = None
 ) -> tuple[Decimal | None, dict[str, Any]]:
