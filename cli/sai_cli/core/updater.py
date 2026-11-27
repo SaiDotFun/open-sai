@@ -325,10 +325,15 @@ def sha256(path: Path) -> str:
 
 
 def fetch_wheel(
-    release: update.Release, directory: Path, timeout: float = DOWNLOAD_TIMEOUT
+    release: update.Release,
+    directory: Path,
+    timeout: float = DOWNLOAD_TIMEOUT,
+    *,
+    recorded_digest: str | None = None,
 ) -> tuple[Path, str]:
     """Download RELEASE's wheel and SHA256SUMS into DIRECTORY and return the
     wheel and its SHA-256, or raise UpdateFailed when the hash differs.
+    A rollback with a release record requires the original wheel digest.
 
     TIMEOUT is wall-clock time for both transfers, with their redirects and
     response headers. HTTPX timeouts apply per network operation, so the
@@ -348,11 +353,12 @@ def fetch_wheel(
             headers = {"User-Agent": "sai-cli"}
             with httpx.Client(headers=headers) as client:
                 _download(client, release.sums_url, sums, MAX_SUMS, deadline)
-                if (
-                    os.name == "nt"
-                    and expected_hash(sums.read_text(errors="replace"), bundle.name)
-                    is not None
-                ):
+                manifest = sums.read_text(errors="replace")
+                if recorded_digest is None:
+                    prefer_bundle = os.name == "nt"
+                else:
+                    prefer_bundle = expected_hash(manifest, name) != recorded_digest
+                if prefer_bundle and expected_hash(manifest, bundle.name) is not None:
                     asset = bundle
                     _download(
                         client,
@@ -362,6 +368,10 @@ def fetch_wheel(
                         deadline,
                     )
                 else:
+                    if prefer_bundle and recorded_digest is not None:
+                        raise UpdateFailed(
+                            f"{name} has no matching recorded rollback wheel"
+                        )
                     _download(client, release.wheel_url, wheel, MAX_WHEEL, deadline)
         except Exception as exc:  # noqa: BLE001 - re-raised in the caller
             outcome["error"] = exc
@@ -387,6 +397,8 @@ def fetch_wheel(
     if asset == bundle:
         unpack_python_wheel(bundle, wheel)
         actual = sha256(wheel)
+    if recorded_digest is not None and actual != recorded_digest:
+        raise UpdateFailed(f"{name} does not match the recorded rollback wheel")
     if os.name == "nt":
         try:
             if native_bridge.is_shim(wheel):
@@ -932,14 +944,22 @@ class Rollback:
 
 
 def _download_to_cache(
-    release: update.Release, options: Options
+    release: update.Release,
+    options: Options,
+    *,
+    recorded_digest: str | None = None,
 ) -> tuple[Path, str, bool]:
     """Download and verify RELEASE's wheel in a private directory, then keep
     it in the wheel cache. Return its absolute path, its SHA-256, and
     whether the cache had no such file before."""
     cache = private_cache()
     with tempfile.TemporaryDirectory(dir=cache, prefix=".download-") as temp:
-        wheel, digest = fetch_wheel(release, Path(temp), options.download_timeout)
+        wheel, digest = fetch_wheel(
+            release,
+            Path(temp),
+            options.download_timeout,
+            recorded_digest=recorded_digest,
+        )
         kept = cache / wheel.name
         created = not kept.exists()
         os.replace(wheel, kept)
@@ -1041,7 +1061,11 @@ def rollback_wheel(current: Current, options: Options) -> tuple[str, str, Path] 
     tag = update.tag_for(current.version)
     try:
         release = update.release_for(tag, options.web_base)
-        wheel, digest, _ = _download_to_cache(release, options)
+        wheel, digest, _ = _download_to_cache(
+            release,
+            options,
+            recorded_digest=record.sha256 if record is not None else None,
+        )
     except (UpdateFailed, OSError):
         return None
     return tag, digest, wheel

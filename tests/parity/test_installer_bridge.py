@@ -1427,27 +1427,35 @@ def zip_python_wheel(wheel: Path) -> bytes:
     return bundle.getvalue()
 
 
+@pytest.mark.parametrize("cached", [True, False])
 def test_managed_full_python_install_checks_and_applies_the_next_release(
     install: Install,
     replay: Replay,
     full_python_bundle: tuple[Path, bytes],
+    cached: bool,
 ) -> None:
     bridge = wheel_artifact("BRIDGE")
     prepare_uv(install, bridge, replay)
     version = wheel_version(bridge)
     ok(install.run("uv", "tool", "uninstall", "sai-cli"))
     bundle_name = f"sai-cli-{version}-full-python.zip"
-    replay.add(version, {bundle_name: zip_python_wheel(bridge)})
+    shim = wheel_artifact("SHIM")
+    replay.add(
+        version, {bridge.name: shim.read_bytes(), bundle_name: zip_python_wheel(bridge)}
+    )
     replay.requests.clear()
     ok(install.install(replay, "--full-python", "--version", version))
     folder = f"{REPO}/releases/download/sai-cli/v{version}"
     assert f"{folder}/{bundle_name}" in replay.requests
     assert f"{folder}/{bridge.name}" not in replay.requests
+    rollback_wheel = install.profile / "cache/wheels" / bridge.name
+    if not cached:
+        rollback_wheel.unlink()
+    replay.requests.clear()
 
     wheel, bundle = full_python_bundle
     target = wheel_version(wheel)
     if WINDOWS:
-        shim = wheel_artifact("SHIM")
         replay.add(
             target,
             {shim.name: shim.read_bytes(), f"sai-cli-{target}-full-python.zip": bundle},
@@ -1461,6 +1469,8 @@ def test_managed_full_python_install_checks_and_applies_the_next_release(
     assert check["updateAvailable"] is True
     result = json.loads(ok(install.update(replay)))
     assert (result["status"], result["target"]) == ("updated", target)
+    assert f"{folder}/{bridge.name}" not in replay.requests
+    assert rollback_wheel.read_bytes() == bridge.read_bytes()
     install.pin(target)
     current = json.loads(ok(install.update(replay, "--check")))
     assert (current["installed"], current["latest"]) == (target, target)

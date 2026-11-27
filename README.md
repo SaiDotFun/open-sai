@@ -382,8 +382,8 @@ The shim keeps the `sai-cli` package name and takes the standard wheel and
 sdist filenames on native releases. The Python bridge downloads the wheel
 by that filename and keeps the uv-managed `sai` launcher. The full Python
 build keeps both original filenames inside `sai-cli-X.Y.Z-full-python.zip`.
-For example, verify the ZIP against `SHA256SUMS` and extract it to install
-the full Python wheel from that version.
+Use the [managed Python installer](#trader-cli) with `--full-python --version X.Y.Z`
+to install that release and keep it eligible for updates.
 
 ### Release Python Only
 
