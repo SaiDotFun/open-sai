@@ -1307,16 +1307,28 @@ def test_pre_bridge_updater_can_skip_to_the_native_shim(
 
 
 @pytest.mark.skipif(WINDOWS, reason="native uv updates run on POSIX")
+@pytest.mark.parametrize("from_older_release", [False, True])
 def test_published_v013_updater_installs_the_native_shim(
-    install: Install, replay: Replay
+    install: Install,
+    replay: Replay,
+    from_older_release: bool,
 ) -> None:
     published = artifact("PUBLISHED_BRIDGE")
     assert hashlib.sha256(published.read_bytes()).hexdigest() == PUBLISHED_BRIDGE_SHA256
     assert wheel_version(published) == "0.1.3"
-    prepare_uv(install, published, replay)
+    if from_older_release:
+        baseline, script = pre_bridge_files()
+        prepare_uv(install, baseline, replay, script)
+        replay.add("0.1.3", {published.name: published.read_bytes()})
+    else:
+        prepare_uv(install, published, replay)
     launcher = install.launcher.resolve(strict=True)
     profile, contents = save_profile(install, replay)
     version = add_shim(replay, wheel_artifact("SHIM"), artifact("RUST"))
+    if from_older_release:
+        result = json.loads(ok(install.update(replay, "--to", "0.1.3")))
+        assert (result["status"], result["target"]) == ("updated", "0.1.3")
+        install.pin("0.1.3")
     result = json.loads(ok(install.update(replay)))
     assert (result["status"], result["target"]) == ("updated", version)
     assert install.launcher.resolve(strict=True) == launcher

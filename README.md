@@ -22,20 +22,21 @@ curl -fsSL https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/ins
 sai --help
 ```
 
-If you installed Sai from a release wheel with [uv](https://docs.astral.sh/uv/),
-find the full Python bridge version in the release notes. Install it explicitly
-before running the native update. The bridge is published after the first
-native release, whose version is higher, so an unpinned update can skip the
-bridge.
+On a host that can run native Sai, a [uv](https://docs.astral.sh/uv/) install
+from the Sai 0.1.3 release wheel can update directly.
 
 ```bash
-sai update --to BRIDGE_VERSION
 sai update
 ```
 
-Replace `BRIDGE_VERSION` with the version in the release notes. The second
-command selects the native release by its tag, verifies the matching shim,
-and keeps your uv launcher.
+If you installed an earlier release wheel, first update to the published
+full Python release `0.1.3`, then run the native update. The update verifies
+the shim and keeps your uv launcher.
+
+```bash
+sai update --to 0.1.3
+sai update
+```
 
 On Windows, use the Python installer. It verifies the release download against
 `SHA256SUMS` and installs the full Python wheel. Add `--version X.Y.Z` to pin
@@ -62,18 +63,16 @@ uv run --no-project python -m zipfile -e sai-cli-X.Y.Z-full-python.zip full-pyth
 uv tool install ./full-python/sai_cli-X.Y.Z-py3-none-any.whl
 ```
 
-For maintainers, ship the next regular Python release, then publish the
-native archives and matching shim. Cut the bridge afterward as the last full
-Python release in the existing series. Choose its version at cut time and set
-it in `pyproject.toml` for the ordinary Python release build. It must be newer
-than the earlier full Python releases and lower than the first native
-release. To rehearse a proposed version before bumping the package metadata,
-run `uv run python scripts/build-bridge.py --version BRIDGE_VERSION --out-dir dist`.
+If uv installed Sai from Git and you want to move to the native release, first
+switch to the published 0.1.3 wheel. The installer keeps a verified Python wheel
+for offline recovery. Your Sai profile stays in place when you replace the uv
+tool.
 
-If uv installed Sai from Git, run `uv tool uninstall sai-cli` and use the
-pinned installer above with the published full-Python bridge version. Then
-run `sai update`. The bridge keeps a verified Python wheel for offline
-recovery. Your Sai profile stays in place when you replace the uv tool.
+```bash
+uv tool uninstall sai-cli
+uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py --version 0.1.3
+sai update
+```
 
 If the uv switch is interrupted, run the saved recovery binary with the same
 uv settings:
