@@ -330,51 +330,51 @@ signature = "98f5dd7492def77fb178c16399871c092f2d154949da608c1a8aa1bd9b9e86f3"
 
 [gap."case:mcp-account-intent-reads"]
 owner = "#175"
-signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
+signature = "fbd816b5ab83888d71b7ca64d6c7f585ead5af4dc1e9ffb2da7d5dee26a4978b"
 
 [gap."case:mcp-argument-validation"]
 owner = "#175"
-signature = "d4119a915d0f0b35390f00c86378685b0d97121629ef381544693c9673fd42d7"
+signature = "c62028a8b11c4eb61c8f9640bdacb8081c45ad656084676e378b1f1bb4314652"
 
 [gap."case:mcp-auth-list"]
 owner = "#175"
-signature = "41ebbad706da597f5ddef5242d8a2e1381054defdc779d49ea71380e0ad2a35e"
+signature = "b27030b5aae31eab1be6b41651743158dea207c69ee75ec98c7897a6798b704d"
 
 [gap."case:mcp-auth-missing-expiry"]
 owner = "#175"
-signature = "3fe154cd9b982dc21579e33d739569a93b8b3bc23e33e6be63ee9517c9cf5c87"
+signature = "9193a4a863f39356ec8939a74fcf82dca2df06a8606a5a914bf356f34f1e0981"
 
 [gap."case:mcp-auth-numeric-expiry"]
 owner = "#175"
-signature = "3fe154cd9b982dc21579e33d739569a93b8b3bc23e33e6be63ee9517c9cf5c87"
+signature = "9193a4a863f39356ec8939a74fcf82dca2df06a8606a5a914bf356f34f1e0981"
 
 [gap."case:mcp-auth-redaction"]
 owner = "#175"
-signature = "e701399d65184751b6992d91e29eac9abe709e92a47ea27cabd2c177fd1b6852"
+signature = "6ba2adbf615243109a383d410fdb04d64876613b3961ebc66feb4af30b4df51a"
 
 [gap."case:mcp-auth-status"]
 owner = "#175"
-signature = "89a81777a934259c2bf15c673ff3f30f4768a6673e5cdf9cc98999e968b9f511"
+signature = "01f3f7af8c1d7d024de18381acb1242ecf5c8c048e8086851a52d0332e7c6808"
 
 [gap."case:mcp-auth-use"]
 owner = "#175"
-signature = "23b01e72ca40f5e9dc07907f0a0a71a273ea898331441bd439ec6b85e53d3e35"
+signature = "3d8710d133bf52a63939616eaf7befb61e66a400c48c9cf3122002b9a6fdf943"
 
 [gap."case:mcp-auth-use-invalid-expiry"]
 owner = "#175"
-signature = "e6ee66d0def5fea14b9391d449bd6b224ed32dc8925f81d51ffc90940b8b04d4"
+signature = "8bf6ffb4adc085662c509411153312ff7dbbf1a13f326286cf2f2d38b2d6e824"
 
 [gap."case:mcp-info-public-endpoints"]
 owner = "#175"
-signature = "3ca51a091b4473ccf12e9033bed55b7881a4fe5cf320290681ee44b5c99a8b1c"
+signature = "7762c19c2d83951a8b717629e6c6c495884c7d1f87a72659bbf030995cf984ce"
 
 [gap."case:mcp-initialize-legacy"]
 owner = "#175"
-signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
+signature = "fbd816b5ab83888d71b7ca64d6c7f585ead5af4dc1e9ffb2da7d5dee26a4978b"
 
 [gap."case:mcp-initialize-newer"]
 owner = "#175"
-signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
+signature = "fbd816b5ab83888d71b7ca64d6c7f585ead5af4dc1e9ffb2da7d5dee26a4978b"
 
 # Rust masks the SAI_HOME value in the reported Claude argv.
 [gap."case:mcp-install-all"]
@@ -407,19 +407,19 @@ signature = "72813cb0759d60f8662b6c203b97583483a017891fc981c01a12243aec443d4c"
 
 [gap."case:mcp-intent-wait-final"]
 owner = "#175"
-signature = "6996d3f5c4c1a2d23844507666af070711b3d82b66887cd88e5b3d4c5b1a2091"
+signature = "a2c2577839427523d5210b7600e6d42dce2bac87ee2f4c2240b9ce2dc76c9a03"
 
 [gap."case:mcp-intent-wait-pending"]
 owner = "#175"
-signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
+signature = "fbd816b5ab83888d71b7ca64d6c7f585ead5af4dc1e9ffb2da7d5dee26a4978b"
 
 [gap."case:mcp-intent-wait-validation"]
 owner = "#175"
-signature = "2337427d7dc1eaeaebd3ea46eb65ba12ee58533478529a6606aa7cba2a4b49bc"
+signature = "9328dfabdc42005ef43dd572f62f250ebd7e35a2ed62fc28d2b189dec6cf35b8"
 
 [gap."case:mcp-keeper-errors"]
 owner = "#175"
-signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
+signature = "fbd816b5ab83888d71b7ca64d6c7f585ead5af4dc1e9ffb2da7d5dee26a4978b"
 
 [gap."case:mcp-list-redacted"]
 owner = "#215"
@@ -427,31 +427,31 @@ signature = "d9f5e467d3ddb8590519768c8c7be8aa330fa39aae3316b7ea06a1d02febf39b"
 
 [gap."case:mcp-logs-intent-validation"]
 owner = "#175"
-signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
+signature = "fbd816b5ab83888d71b7ca64d6c7f585ead5af4dc1e9ffb2da7d5dee26a4978b"
 
 [gap."case:mcp-market-number-spelling"]
 owner = "#175"
-signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
+signature = "fbd816b5ab83888d71b7ca64d6c7f585ead5af4dc1e9ffb2da7d5dee26a4978b"
 
 [gap."case:mcp-overview-validation"]
 owner = "#175"
-signature = "14d1d7b99158f701039c5e90e1f4086474a738c3bc0b6b480768e43432dab7fb"
+signature = "74f131f3656235cfefea82065871f00b32cb0fb90ec7fb7dd6b568f380c757c4"
 
 [gap."case:mcp-session-refusals"]
 owner = "#175"
-signature = "d1b18d5a59bc4cd183ee0da04238c0d565185b31f7dce0fea50b9c5e8b454505"
+signature = "04c7a0c68d7b4468f6e79487052fc948494b31d6cfe8f1949e3f7af08428e7fd"
 
 [gap."case:mcp-session-reloads"]
 owner = "#175"
-signature = "941d3d05a55ca36b031a9ec651e3e01a0b3b6d9748d26491cb69389d27ddc3f7"
+signature = "eb92b5b13e3935eeece9d53322e6360e41605e3a848e9505def57214698d0cd3"
 
 [gap."case:mcp-stream-error"]
 owner = "#175"
-signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
+signature = "fbd816b5ab83888d71b7ca64d6c7f585ead5af4dc1e9ffb2da7d5dee26a4978b"
 
 [gap."case:mcp-tool-inventory"]
 owner = "#175"
-signature = "f477c014f28400affe6914cc2dbc47ad2c6dbb06c2b9368080f4303557f722cd"
+signature = "8a5f528700d878e55cd162b0ff6c28d574635f0a26626ab3508559050d31acd2"
 
 [gap."case:mcp-uninstall-all"]
 owner = "#215"
@@ -877,7 +877,7 @@ signature = "f796d5fd0e7d5c0c32766ed61c1802a6fec907517ed4e9bc7f5f6758c32e25ad"
 
 [gap."mcp:intent_wait"]
 owner = "#175"
-signature = "c4e865d743d86b5f78dced586f639d1e3b5bbf633dc8158adfb1bfcba8cf052b"
+signature = "47effd7e47971b7fa2901a8888fe1390858b7653b00b243792698a1af8275675"
 
 [gap."mcp:logs_intent"]
 owner = "#175"
