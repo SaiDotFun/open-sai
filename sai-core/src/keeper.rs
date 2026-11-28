@@ -2,6 +2,7 @@
 
 mod ca_dir;
 mod diagnostics;
+mod markets;
 mod proxy;
 mod public;
 mod queries;
@@ -20,6 +21,7 @@ use crate::{
 };
 
 pub use diagnostics::{lcd_network, websocket_handshake};
+pub use markets::{MarketSymbol, is_market_symbol, usdc_markets};
 pub(crate) use public::{
     intent_history, intent_log_fields, intent_record, known_intent_field, log_intent_record,
     request_hash, wait_error_code,

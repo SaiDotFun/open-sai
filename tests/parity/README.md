@@ -101,6 +101,14 @@ to keep untrusted text and private arguments out of diagnostics. During
 uninstall it also preserves read-only client files and restores the original
 Codex config if verification fails.
 
+The native MCP server accepts a market symbol in `market_id` for
+`preview_open` and `trade_open`
+([#267](https://github.com/SaiDotFun/open-sai/issues/267)). Its validation
+errors also omit Pydantic's documentation link. Before comparing MCP output,
+`compare.py` maps the native `market_id` schema and description to the Python
+spelling and removes the link from Python's errors. Every other part of the
+tool inventory and error text is still compared.
+
 Two of the #174 rows need dedicated follow-up. In `trade-partial-close-market-minimum`,
 Python previews a 99% partial close. Rust rejects the preview because the
 remainder falls below the fee-schedule minimum. In
