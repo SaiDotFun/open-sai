@@ -111,7 +111,7 @@ def _collateral_rows(preview: dict[str, Any]) -> dict[str, str] | None:
     return {"beforeUsd": usd(int(before)), "afterUsd": usd(int(after))}
 
 
-def as_native_usdc(value: Any) -> Any:
+def as_native_usdc(value: Any, *, collateral: bool = True) -> Any:
     """Project a Python main tool reply onto the native USDC fields.
 
     The fee price must be the $1 fixture rate, so the amounts already match.
@@ -121,12 +121,12 @@ def as_native_usdc(value: Any) -> Any:
     result = deepcopy(value)
     preview = result.get("preview")
     if isinstance(preview, dict):
-        result["preview"] = as_native_usdc(preview)
+        result["preview"] = as_native_usdc(preview, collateral=collateral)
     fees = (result.get("estimates") or {}).get("fees") or {}
     price = fees.get("collateralPriceUsd")
     if isinstance(price, dict) and price.get("price") == "1":
         fees["collateralPriceUsd"] = FIXED_USDC_PRICE
-    if "intent" in result and "collateral" not in result:
+    if collateral and "intent" in result and "collateral" not in result:
         rows = _collateral_rows(result)
         if rows is not None:
             items = list(result.items())

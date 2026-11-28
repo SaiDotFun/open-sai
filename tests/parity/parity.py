@@ -646,11 +646,10 @@ def observe(
                 if isinstance(payload, dict):
                     trade_estimate_clocks(payload.get("preview"))
                     preview = payload.get("preview", payload)
-                    if case.name == "mcp-trade-leverage-confirmation" and isinstance(
-                        preview, dict
-                    ):
-                        # The fixture checks each runtime's display before
+                    if isinstance(preview, dict):
+                        # The fixture checks each runtime's USD display before
                         # comparing the shared base-unit binding and digest.
+                        # Python v0.1.3 shows it for leverage changes only.
                         preview.pop("collateral", None)
     stderr = stderr_category(result.stderr)
     if case.accepted_divergence == "uninstall-read-only":
@@ -963,7 +962,7 @@ def project_reference_auth_status_errors(
     return "Native MCP auth status omits disconnected addresses" if changed else None
 
 
-def project_reference_native_usdc(output: Any) -> None:
+def project_reference_native_usdc(output: Any, *, collateral: bool) -> None:
     """Show Python tool replies with the native fixed USDC price and USD rows.
 
     Python is frozen and keeps the oracle rate (README "Fixed USDC Price").
@@ -977,7 +976,7 @@ def project_reference_native_usdc(output: Any) -> None:
         text = result.get("_toolText")
         for block in result.get("content", []):
             value = block.get("text")
-            projected = as_native_usdc(value)
+            projected = as_native_usdc(value, collateral=collateral)
             # Python serializes tool replies with json.dumps, so a changed
             # reply keeps its byte form only when the original round-trips.
             if projected == value or (text is not None and json.dumps(value) != text):
@@ -1287,7 +1286,7 @@ def run_case(
         diffs = cutover_differences(left, right)
     else:
         if rust and case.mode == "mcp":
-            project_reference_native_usdc(left.output)
+            project_reference_native_usdc(left.output, collateral=not case.mcp_trade)
         if rust and case.name == "trade-open-unknown-market-symbol":
             error = left.output.get("error", {})
             if (
