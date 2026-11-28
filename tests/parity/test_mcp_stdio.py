@@ -397,12 +397,7 @@ def validation_text(tool: str, *issues: tuple[str | None, str, str]) -> str:
     for field, detail, category in issues:
         if field is not None:
             lines.append(field)
-        lines.extend(
-            (
-                f"  {detail} [type={category}]",
-                f"    For further information visit https://errors.pydantic.dev/2.14/v/{category}",
-            )
-        )
+        lines.append(f"  {detail} [type={category}]")
     return "\n".join(lines)
 
 

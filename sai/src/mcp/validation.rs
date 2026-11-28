@@ -6,8 +6,6 @@ use rmcp::model::Tool;
 use sai_core::{keeper::is_market_symbol, settings::repr};
 use serde_json::{Map, Value};
 
-const PYDANTIC_ERRORS: &str = "https://errors.pydantic.dev/2.14/v";
-
 pub(super) fn arguments<'a>(
     tool: &'a Tool,
     args: &Map<String, Value>,
@@ -136,10 +134,7 @@ impl Rejected<'_> {
             if let Some(field) = field {
                 let _ = write!(message, "\n{field}");
             }
-            let _ = write!(
-                message,
-                "\n  {detail} [type={code}]\n    For further information visit {PYDANTIC_ERRORS}/{code}",
-            );
+            let _ = write!(message, "\n  {detail} [type={code}]");
         }
         message
     }

@@ -29,7 +29,8 @@ LOG_TIMESTAMP = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z"
 )
 # Native MCP changes from #267. Map the native market_id schema and docs to
-# the Python spelling so the comparison still checks everything else.
+# the Python spelling, and drop Pydantic's documentation link from Python
+# validation errors, so the comparison still checks everything else.
 NATIVE_MCP_SPELLINGS = (
     (
         (
@@ -45,6 +46,9 @@ NATIVE_MCP_SPELLINGS = (
         ),
         "market_id: Market id from market_list.",
     ),
+)
+PYDANTIC_LINK = re.compile(
+    r"\n    For further information visit https://errors\.pydantic\.dev/[\d.]+/v/\w+"
 )
 LOG_SCHEMA = Path(__file__).resolve().parents[2] / "docs" / "log-events.json"
 LEDGER = "trader/intents.sqlite3"
@@ -450,6 +454,7 @@ def normalize_mcp_result(result: dict[str, Any]) -> None:
         if not isinstance(text, str):
             raise TypeError("MCP text content must be a string")
         if result.get("isError"):
+            block["text"] = PYDANTIC_LINK.sub("", text)
             continue
         if result.get("structuredContent") != {"result": text}:
             raise ValueError("MCP structuredContent must carry the same JSON string")
