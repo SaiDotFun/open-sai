@@ -911,47 +911,23 @@ owner = "#245"
 title = "Differs from Python v0.1.3. Native fee estimates price USDC at a fixed $1."
 signature = "4074f08c7f835ec17ff448b8d9b8f85ae01384e0abfdcba96293a0d5615fc1a8"
 
-[gap."case:mcp-trade-margin-confirmation"]
-owner = "#231"
-title = "Differs from Python v0.1.3. Native MCP margin previews show collateral in USD."
-signature = "b19925a8768f241d7d7bf718603ce3e65bab795339548680410bd9cbee6a9ebd"
 
 [gap."case:mcp-trade-open-confirmation"]
 owner = "#245"
 title = "Differs from Python v0.1.3. Native fee estimates price USDC at a fixed $1."
 signature = "4074f08c7f835ec17ff448b8d9b8f85ae01384e0abfdcba96293a0d5615fc1a8"
 
-[gap."case:trade-partial-close-mcp-changed-leverage"]
-owner = "#231"
-title = "Differs from Python v0.1.3. Native partial-close previews read the market oracle and show collateral in USD."
-signature = "f3940a39308b97cebfd0a6e835aa89407d204301d1795f105ae0554bf4e6acb3"
 
 [gap."mcp:preview_close"]
 owner = "#245"
 title = "Native close fee estimates price USDC at a fixed $1."
 signature = "f8fe76c7620f140b21cf0865c32333c729715623d341970b129e70de75c0e511"
 
-[gap."mcp:preview_margin"]
-owner = "#231"
-title = "Native MCP margin previews show collateral in USD."
-signature = "c6dfaa6d7609b0559e6dcd8db7ebd7f73bd9f1161b7122785f4f5bb0e125bab6"
 
-[gap."mcp:preview_partial_close"]
-owner = "#231"
-title = "Native partial-close previews show collateral in USD."
-signature = "aad66ead45661afde6fb01aaefd79d54deff997f5ab53b53999f29df1c351e05"
 
 [gap."mcp:trade_close"]
 owner = "#245"
 title = "Native close fee estimates price USDC at a fixed $1."
 signature = "91b3f266946af7059d2e4d62276249dabfeb2956daac2e8c5a988a97cf6ff036"
 
-[gap."mcp:trade_margin"]
-owner = "#231"
-title = "Native MCP margin previews show collateral in USD."
-signature = "53d908bc1e21cecc5dad324113c4b925d6977ead6121a868359b5f24f85a537e"
 
-[gap."mcp:trade_partial_close"]
-owner = "#231"
-title = "Native partial-close previews show collateral in USD."
-signature = "19f2026ef28b7d21933dd10323dbff101048b932f4db2c08735fdce7b28b7399"
