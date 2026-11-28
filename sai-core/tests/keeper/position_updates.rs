@@ -909,6 +909,33 @@ async fn queued_leverage_change_reads_no_market_oracle() {
 }
 
 #[tokio::test]
+async fn unconfirmed_close_proceeds_without_a_readable_market_oracle() {
+    // Only a confirmation needs the verified oracle; Perp checks the price
+    // at execution.
+    let server = PositionServer::start(ACCOUNT, ACCOUNT);
+    let endpoint = format!("{}/query", server.url);
+    let home = tempfile::tempdir().unwrap();
+    let storage = fixture_storage(&home, &endpoint);
+    let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+    let session = trading.load_session(None).unwrap();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.close_height_check_index = Some(7);
+        state.stale_oracle = true;
+        state.oracle_unreadable = true;
+    }
+    let preview = close_preview("7", false).unwrap();
+
+    trading
+        .submit(&session, &preview, SubmitOptions::default())
+        .await
+        .unwrap();
+    let requests = server.requests();
+    assert!(requests.iter().any(|label| label == "oracle_address"));
+    assert!(requests.iter().any(|label| label == "admission"));
+}
+
+#[tokio::test]
 async fn unreadable_staleness_limit_leaves_the_estimate_unavailable() {
     // Perp checks staleness at execution, so an unreadable limit only
     // leaves the estimate unavailable.

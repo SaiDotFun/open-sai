@@ -130,7 +130,7 @@ impl TradePreview {
         if let Some(route) = &self.position_route {
             output["positionRoute"] = json!(route);
         }
-        if self.execution_refusal().is_none()
+        if self.execution_refusal(true).is_none()
             && !self.has_unknown_partial_leverage()
             && !self.leverage_collateral_unverified()
         {
@@ -171,7 +171,7 @@ impl TradePreview {
             }
             if self.position_owner_verified != Some(false)
                 && (!self.requires_market_price_refresh() || self.reference_price.is_some())
-                && self.execution_refusal().is_none()
+                && self.execution_refusal(true).is_none()
                 && !self.has_unknown_partial_leverage()
                 && !self.leverage_collateral_unverified()
             {
@@ -182,13 +182,16 @@ impl TradePreview {
         output
     }
 
-    fn execution_refusal(&self) -> Option<&Value> {
+    /// Report a quote that cannot be confirmed. An unverified market oracle
+    /// blocks only a confirmation; Perp checks the price at execution.
+    fn execution_refusal(&self, require_oracle: bool) -> Option<&Value> {
         let execution = &self.estimates.as_ref()?["execution"];
         (execution["status"] == "would_be_rejected"
-            || matches!(
-                execution["code"].as_str(),
-                Some("OraclePublicationTimeUnknown" | "OraclePriceUnavailable")
-            ))
+            || (require_oracle
+                && matches!(
+                    execution["code"].as_str(),
+                    Some("OraclePublicationTimeUnknown" | "OraclePriceUnavailable")
+                )))
         .then_some(execution)
     }
 
@@ -532,7 +535,7 @@ impl<'a> Trading<'a> {
             }
             return Err(error);
         }
-        preview.check_cli_execution(account)?;
+        preview.check_cli_execution(account, confirming)?;
 
         Ok((
             prepared.or_else(|| update.map(|update| update.preview)),
