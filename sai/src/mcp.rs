@@ -438,7 +438,7 @@ impl SaiMcp {
             "version": version,
             "installedVersion": installed.as_deref().unwrap_or("unknown"),
             "restartNeeded": restart_needed,
-            "latestVersion": latest_version(home),
+            "latestVersion": latest_version(home, version),
             "mcpVersion": Implementation::from_build_env().version,
             "provenance": {"kind": "installed", "path": install_dir},
             "endpoints": {
@@ -728,13 +728,25 @@ fn tool_result(value: Value) -> CallToolResult {
     result
 }
 
-fn latest_version(home: &Path) -> Option<String> {
+/// Read the latest release that `sai update --check` saved, with no network.
+///
+/// A saved release older than this stable build predates its install, so it
+/// is stale. Report it as unknown rather than suggest a downgrade.
+fn latest_version(home: &Path, running: &str) -> Option<String> {
     let cache: Value = serde_json::from_slice(&fs::read(home.join("update.json")).ok()?).ok()?;
     if cache["schema"] != 1 || !cache["checkedAt"].is_string() {
         return None;
     }
     let version = cache["latest"].as_str()?.strip_prefix("sai-cli/v")?;
-    install::is_version(version).then(|| version.to_owned())
+    if !install::is_version(version) {
+        return None;
+    }
+    let stale = semver::Version::parse(running)
+        .ok()
+        .filter(|running| running.pre.is_empty())
+        .zip(semver::Version::parse(version).ok())
+        .is_some_and(|(running, latest)| latest < running);
+    (!stale).then(|| version.to_owned())
 }
 
 #[cfg(test)]
@@ -807,5 +819,35 @@ mod tests {
             assert_eq!(result["code"], "OUTCOME_UNKNOWN");
             assert_eq!(elapsed.as_secs(), waited, "timeout {args:?}");
         }
+    }
+
+    #[test]
+    fn latest_version_ignores_a_check_older_than_the_running_release() {
+        let home = tempfile::tempdir().unwrap();
+        let cache = |latest: &str| {
+            let state =
+                json!({"schema": 1, "checkedAt": "2026-11-27T22:00:00+00:00", "latest": latest});
+            fs::write(home.path().join("update.json"), state.to_string()).unwrap();
+        };
+        cache("sai-cli/v0.1.3");
+        assert_eq!(latest_version(home.path(), "0.2.0"), None);
+        assert_eq!(
+            latest_version(home.path(), "0.1.3").as_deref(),
+            Some("0.1.3")
+        );
+        assert_eq!(
+            latest_version(home.path(), "0.1.2").as_deref(),
+            Some("0.1.3")
+        );
+        // A prerelease build does not know which stable release is latest.
+        assert_eq!(
+            latest_version(home.path(), "0.2.0-rc.1").as_deref(),
+            Some("0.1.3")
+        );
+        cache("sai-cli/v0.2.0");
+        assert_eq!(
+            latest_version(home.path(), "0.2.0").as_deref(),
+            Some("0.2.0")
+        );
     }
 }
