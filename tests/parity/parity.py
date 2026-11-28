@@ -963,6 +963,37 @@ def project_reference_auth_status_errors(
     return "Native MCP auth status omits disconnected addresses" if changed else None
 
 
+NATIVE_TOOLS = Path(__file__).resolve().parents[2] / "sai/src/mcp/tools.json"
+PYTHON_INTENT_WAIT_LIMIT = "Wait up to 10 seconds for a final outcome"
+
+
+def project_reference_intent_wait_limit(output: Any) -> None:
+    """Show Python's intent_wait listing with the native 55-second limit.
+
+    Python is frozen with a 10-second cap. The native server honors a
+    caller's timeout up to 55 seconds, under Codex's 60-second tool timeout.
+    """
+    [native] = [
+        tool["description"]
+        for tool in json.loads(NATIVE_TOOLS.read_text())
+        if tool["name"] == "intent_wait"
+    ]
+    for frame in output if isinstance(output, list) else ():
+        result = frame.get("result") if isinstance(frame, dict) else None
+        if not isinstance(result, dict) or "tools" not in result:
+            continue
+        for tool in result["tools"]:
+            python = tool.get("description")
+            if tool.get("name") != "intent_wait" or not str(python).startswith(
+                PYTHON_INTENT_WAIT_LIMIT
+            ):
+                continue
+            tool["description"] = native
+            result["_schemaWire"] = result["_schemaWire"].replace(
+                json.dumps(python)[1:-1], json.dumps(native)[1:-1], 1
+            )
+
+
 def as_native_receipt(value: Any) -> Any:
     """Add the receipt fields only the native CLI reports.
 
@@ -1195,6 +1226,8 @@ def run_case(
         )
     if case.mode == "mcp" and tool_evidence is not None:
         mcp_evidence(case, left, right, tool_evidence)
+    if rust and not cutover and case.mode == "mcp" and left is not None:
+        project_reference_intent_wait_limit(left.output)
     tools = {}
     inventory_case = case.mode == "mcp" and case.mcp_calls is None
     if inventory_case and left is not None:

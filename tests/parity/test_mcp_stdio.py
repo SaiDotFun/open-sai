@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from compare import Normalize, mask_overview_stdout, overview_clocks
+from compare import Normalize, mask_overview_stdout, overview_clocks, structured_text
 from mcp_cases import REJECTED_AUTH_ADDRESS, TRADE_TOOLS
 from overview_scenarios import HEX_MARKER, PRIVATE_URL, RELATIVE_URL, SESSION_MARKER
 from scenarios import (
@@ -854,13 +854,14 @@ def test_stdout_failure_ends_session_with_stdin_open(
 
 def tool_text(result: dict[str, Any]) -> str:
     assert result["isError"] is False
-    assert len(result["content"]) == 1
-    block = result["content"][0]
-    assert block["type"] == "text"
-    text = block["text"]
-    assert isinstance(text, str)
-    assert result["structuredContent"] == {"result": text}
-    return text
+    return structured_text(result)
+
+
+def listed_tool(tools: list[dict[str, Any]], name: str) -> dict[str, Any]:
+    """Return a tool's listing without the output schema, which differs by design."""
+    [tool] = [tool for tool in tools if tool["name"] == name]
+    assert tool.pop("outputSchema")["type"] == "object"
+    return tool
 
 
 def test_overview_v013_partial_response_and_session_reload(
@@ -874,11 +875,9 @@ def test_overview_v013_partial_response_and_session_reload(
                 initialize = stdio.initialize_result
                 assert initialize["serverInfo"].pop("version")
                 stdio.send("tools/list", id_=2)
-                [schema] = [
-                    tool
-                    for tool in stdio.receive()["result"]["tools"]
-                    if tool["name"] == "account_overview"
-                ]
+                schema = listed_tool(
+                    stdio.receive()["result"]["tools"], "account_overview"
+                )
                 missing = tool_text(stdio.call(3, "account_overview"))
                 assert json.loads(missing)["code"] == "SESSION_UNAVAILABLE"
 
@@ -1228,11 +1227,7 @@ def test_logs_intent_v013_offline_and_live(
             home = tmp_path / str(index)
             with server(executable, home, endpoints, seed="session") as stdio:
                 stdio.send("tools/list", id_=2)
-                [schema] = [
-                    tool
-                    for tool in stdio.receive()["result"]["tools"]
-                    if tool["name"] == "logs_intent"
-                ]
+                schema = listed_tool(stdio.receive()["result"]["tools"], "logs_intent")
                 row = write_intent_trail(home, endpoints, 1)
 
                 offline = tool_text(

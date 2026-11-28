@@ -43,11 +43,33 @@ use crate::reads::output;
 
 pub(crate) use install::launcher_path;
 
-const MCP_WAIT_LIMIT: Duration = Duration::from_secs(10);
+// Python's 10-second wait stays the default. A caller can ask for up to 55
+// seconds, which covers Keeper's finality lag and still replies before the
+// 60-second default MCP tool timeout in Codex.
+const MCP_WAIT_DEFAULT: Duration = Duration::from_secs(10);
+const MCP_WAIT_LIMIT: Duration = Duration::from_secs(55);
 const INSTRUCTIONS: &str = include_str!("mcp/instructions.txt");
 // Wire metadata captured from Python main at 1c671b231b0fc968a44ec8dd520e67ea28e25b7f.
+// The native server describes a longer intent_wait limit and replaces
+// Python's `{result: string}` output schema with each tool's result object.
 static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
-    serde_json::from_str(include_str!("mcp/tools.json")).expect("valid Python tool inventory")
+    let mut tools: Vec<Map<String, Value>> =
+        serde_json::from_str(include_str!("mcp/tools.json")).expect("valid Python tool inventory");
+    let mut schemas: Map<String, Value> =
+        serde_json::from_str(include_str!("mcp/output_schemas.json"))
+            .expect("valid output schemas");
+    for tool in &mut tools {
+        let name = tool["name"].as_str().expect("tool name");
+        let schema = schemas
+            .remove(name)
+            .expect("an output schema for each tool");
+        assert!(tool.insert("outputSchema".into(), schema).is_none());
+    }
+    assert!(schemas.is_empty(), "an output schema for an unknown tool");
+    tools
+        .into_iter()
+        .map(|tool| serde_json::from_value(Value::Object(tool)).expect("valid MCP tool"))
+        .collect()
 });
 
 pub(crate) fn argument_schema(name: &str) -> Option<&'static Map<String, Value>> {
@@ -341,7 +363,7 @@ impl SaiMcp {
         let seconds = args
             .get("timeout")
             .and_then(validation::float_value)
-            .unwrap_or(MCP_WAIT_LIMIT.as_secs_f64());
+            .unwrap_or(MCP_WAIT_DEFAULT.as_secs_f64());
         let timeout = wait::validate_timeout(seconds)?.min(MCP_WAIT_LIMIT);
         let key = args["key"]
             .as_str()
@@ -434,7 +456,7 @@ impl SaiMcp {
             "version": version,
             "installedVersion": installed.as_deref().unwrap_or("unknown"),
             "restartNeeded": restart_needed,
-            "latestVersion": latest_version(home),
+            "latestVersion": latest_version(home, version),
             "mcpVersion": Implementation::from_build_env().version,
             "provenance": {"kind": "installed", "path": install_dir},
             "endpoints": {
@@ -717,31 +739,44 @@ fn argument_metadata(value: &Value) -> Field {
     json!({"type": kind, "length": length}).into()
 }
 
+/// Return the JSON text that Python's server returns, plus the same value as
+/// structured content that matches the tool's output schema.
 fn tool_result(value: Value) -> CallToolResult {
     let text = output::inline(&value).expect("MCP tool values serialize to JSON");
-    let mut result = CallToolResult::success(vec![ContentBlock::text(text.clone())]);
-    result.structured_content = Some(json!({"result": text}));
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+    debug_assert!(value.is_object(), "MCP tool results are JSON objects");
+    result.structured_content = Some(value);
     result
 }
 
-fn latest_version(home: &Path) -> Option<String> {
+/// Read the latest release that `sai update --check` saved, with no network.
+///
+/// A saved release older than this stable build predates its install, so it
+/// is stale. Report it as unknown rather than suggest a downgrade.
+fn latest_version(home: &Path, running: &str) -> Option<String> {
     let cache: Value = serde_json::from_slice(&fs::read(home.join("update.json")).ok()?).ok()?;
     if cache["schema"] != 1 || !cache["checkedAt"].is_string() {
         return None;
     }
     let version = cache["latest"].as_str()?.strip_prefix("sai-cli/v")?;
-    install::is_version(version).then(|| version.to_owned())
+    if !install::is_version(version) {
+        return None;
+    }
+    let stale = semver::Version::parse(running)
+        .ok()
+        .filter(|running| running.pre.is_empty())
+        .zip(semver::Version::parse(version).ok())
+        .is_some_and(|(running, latest)| latest < running);
+    (!stale).then(|| version.to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn queued_timeout_omits_an_unresolved_address() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Environment::new(home.path().to_owned(), |_| None);
-        let server = SaiMcp {
+    fn queued_server(home: &Path) -> SaiMcp {
+        let env = Environment::new(home.to_owned(), |_| None);
+        SaiMcp {
             settings: Arc::new(Settings::load(&Flags::default(), &env).unwrap()),
             env,
             writer: None,
@@ -749,10 +784,17 @@ mod tests {
             local_ledger_slots: Arc::new(Semaphore::new(2)),
             trade_slots: Arc::new(Semaphore::new(2)),
             reconcile_slots: Arc::new(Semaphore::new(8)),
+            // No wait slot frees up, so each wait runs out its whole timeout.
             wait_slots: Arc::new(Semaphore::new(0)),
             log_slots: Arc::new(Semaphore::new(2)),
             overview_slots: Arc::new(Semaphore::new(2)),
-        };
+        }
+    }
+
+    #[test]
+    fn queued_timeout_omits_an_unresolved_address() {
+        let home = tempfile::tempdir().unwrap();
+        let server = queued_server(home.path());
         let args = json!({
             "addr": "https://keeper.invalid/?key=fixture-wait-addr",
             "key": "fixture-wait",
@@ -768,5 +810,123 @@ mod tests {
         assert_eq!(result["code"], "OUTCOME_UNKNOWN");
         assert_eq!(result["intentKey"], "fixture-wait");
         assert_eq!(result["addr"], Value::Null);
+        assert_fits_output_schema("intent_wait", &result);
+    }
+
+    /// Check each top-level field's JSON type against the tool's output schema.
+    fn assert_fits_output_schema(name: &str, value: &Value) {
+        let tool = TOOLS.iter().find(|tool| tool.name == name).unwrap();
+        let schema = tool.output_schema.as_deref().unwrap();
+        for (field, item) in value.as_object().expect("result object") {
+            let Some(types) = schema["properties"][field].get("type") else {
+                continue;
+            };
+            let kind = match item {
+                Value::Null => "null",
+                Value::Bool(_) => "boolean",
+                Value::Number(_) => "number",
+                Value::String(_) => "string",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+            };
+            let allowed = match types {
+                Value::Array(types) => types.iter().any(|allowed| allowed == kind),
+                allowed => allowed == kind,
+            };
+            assert!(allowed, "{name}.{field} is {kind}, schema allows {types}");
+        }
+    }
+
+    #[test]
+    fn unresolved_intent_wait_results_fit_the_output_schema() {
+        // Returned when the ledger is busy before the account resolves.
+        let result = wait_result(Map::new(), wait::unknown_result("fixture-wait"));
+        assert_eq!(result["addr"], Value::Null);
+        assert_fits_output_schema("intent_wait", &result);
+    }
+
+    #[test]
+    fn intent_wait_honors_timeouts_up_to_its_limit() {
+        let home = tempfile::tempdir().unwrap();
+        let server = queued_server(home.path());
+        // Tokio's paused clock skips ahead, so the waits finish at once.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        for (timeout, waited) in [
+            (None, 10),
+            (Some(json!(45)), 45),
+            (Some(json!(55)), 55),
+            (Some(json!(60)), 55),
+            (Some(json!(600)), 55),
+        ] {
+            let mut args = Map::from_iter([("key".into(), json!("fixture-wait"))]);
+            if let Some(timeout) = timeout {
+                args.insert("timeout".into(), timeout);
+            }
+            let (result, elapsed) = runtime.block_on(async {
+                let started = tokio::time::Instant::now();
+                let result = server.wait_for_intent(&args, "fixture-call").await;
+                (result.unwrap(), started.elapsed())
+            });
+            assert_eq!(result["code"], "OUTCOME_UNKNOWN");
+            assert_eq!(elapsed.as_secs(), waited, "timeout {args:?}");
+        }
+    }
+
+    #[test]
+    fn latest_version_ignores_a_check_older_than_the_running_release() {
+        let home = tempfile::tempdir().unwrap();
+        let cache = |latest: &str| {
+            let state =
+                json!({"schema": 1, "checkedAt": "2026-11-27T22:00:00+00:00", "latest": latest});
+            fs::write(home.path().join("update.json"), state.to_string()).unwrap();
+        };
+        cache("sai-cli/v0.1.3");
+        assert_eq!(latest_version(home.path(), "0.2.0"), None);
+        assert_eq!(
+            latest_version(home.path(), "0.1.3").as_deref(),
+            Some("0.1.3")
+        );
+        assert_eq!(
+            latest_version(home.path(), "0.1.2").as_deref(),
+            Some("0.1.3")
+        );
+        // A prerelease build does not know which stable release is latest.
+        assert_eq!(
+            latest_version(home.path(), "0.2.0-rc.1").as_deref(),
+            Some("0.1.3")
+        );
+        cache("sai-cli/v0.2.0");
+        assert_eq!(
+            latest_version(home.path(), "0.2.0").as_deref(),
+            Some("0.2.0")
+        );
+    }
+
+    #[test]
+    fn tool_results_carry_the_result_object_as_structured_content() {
+        let value =
+            json!({"addr": "0x1111111111111111111111111111111111111111", "perp": {"trades": []}});
+        let result = tool_result(value.clone());
+        let [ContentBlock::Text(text)] = result.content.as_slice() else {
+            panic!("one text block");
+        };
+        assert_eq!(serde_json::from_str::<Value>(&text.text).unwrap(), value);
+        assert_eq!(result.structured_content, Some(value));
+    }
+
+    #[test]
+    fn every_tool_lists_an_object_output_schema() {
+        for tool in TOOLS.iter() {
+            let schema = tool.output_schema.as_deref().expect("output schema");
+            assert_eq!(schema["type"], "object", "{}", tool.name);
+            assert_eq!(schema["additionalProperties"], true, "{}", tool.name);
+            let properties = schema["properties"].as_object().unwrap();
+            assert!(properties.contains_key("error"), "{}", tool.name);
+            assert!(!properties.contains_key("result"), "{}", tool.name);
+        }
     }
 }
