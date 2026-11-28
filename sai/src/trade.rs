@@ -21,7 +21,7 @@ use sai_core::{
 use serde_json::{Value, json};
 use tokio::signal::unix::Signal;
 
-use crate::{load_settings, local, reads::usdc_markets};
+use crate::{load_settings, local};
 
 #[derive(Subcommand)]
 pub enum TradeCommand {
@@ -238,47 +238,18 @@ impl Open {
         signal: &mut Signal,
     ) -> Result<String, SaiError> {
         let market = &self.market;
-        if !market.is_ascii() || !market.bytes().any(|byte| byte.is_ascii_alphabetic()) {
+        if !keeper::is_market_symbol(market) {
             return Ok(market.clone());
         }
-        let response = keeper
-            .read_until(
-                keeper::MARKETS,
-                Default::default(),
-                keeper::TIMEOUT,
-                async {
-                    signal.recv().await;
-                    local::wait_aborted()
-                },
-            )
-            .await?;
-        let ids: std::collections::BTreeSet<_> = usdc_markets(&response)?
-            .filter(|row| {
-                row["baseToken"]["symbol"]
-                    .as_str()
-                    .is_some_and(|symbol| symbol.eq_ignore_ascii_case(market))
-            })
-            .map(|row| row["marketId"].as_u64().ok_or_else(SaiError::internal))
-            .collect::<Result<_, _>>()?;
-        match ids.len() {
-            0 => Err(SaiError::new(
-                Code::InvalidRequest,
-                "Invalid value for '--market': unknown market symbol. Run sai market list.",
-            )),
-            1 => Ok(ids.first().expect("one market ID").to_string()),
-            _ => {
-                let symbol = repr(market);
-                let ids = ids
-                    .iter()
-                    .map(u64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                Err(SaiError::new(
-                    Code::InvalidRequest,
-                    format!("Ambiguous market symbol {symbol}. Pass a market ID: {ids}."),
-                ))
-            }
-        }
+        let interrupt = async {
+            signal.recv().await;
+            local::wait_aborted()
+        };
+        let id = keeper.market_symbol(market, interrupt).await?.id(
+            market,
+            "Invalid value for '--market': unknown market symbol. Run sai market list.",
+        )?;
+        Ok(id.to_string())
     }
 
     fn confirmation(&self) -> Result<Option<trade::Confirmation<'_>>, SaiError> {
