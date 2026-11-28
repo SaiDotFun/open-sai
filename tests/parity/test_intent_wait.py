@@ -36,10 +36,12 @@ from test_intent_status import (
 )
 
 # Rust adds a dollar field beside each receipt collateral amount in base
-# units. The pinned Python reports base units only (#231).
-RECEIPT_USD = re.compile(
+# units. The pinned Python reports base units only (#231). Rust also reports
+# a close's realized PnL (#268) and a placed order's ID (#271).
+RUST_RECEIPT_FIELDS = re.compile(
     rb', "(?:sizeCollateralUsd|escrowedCollateralUsd|collateralUsd|openCollateralUsd)"'
     rb': (?:null|"[0-9.]+")'
+    rb'|, "realizedPnl": null|, "orderId": (?:null|[0-9]+)'
 )
 REQUEST_BLOCK = 50109595
 
@@ -535,6 +537,140 @@ def test_wait_requires_execution_block_position_for_fill(
             assert not replies
 
 
+def closed(change: str = "position_closed_user", **trade: object) -> dict[str, Any]:
+    row = indexed(change)
+    row["trade"].update(
+        {
+            "isOpen": False,
+            "closeBlock": {"block": FILL_BLOCK},
+            "closePrice": 81001.25,
+            "collateralAmount": 3_950_000,
+            **trade,
+        }
+    )
+    return row
+
+
+def pnl_page(row_id: int = 1007, **fields: object) -> dict[str, Any]:
+    return {
+        "data": {
+            "perp": {
+                "tradeHistory": [
+                    {
+                        "id": 1008,
+                        "tradeChangeType": "position_opened",
+                        "grossPricePnlPct": None,
+                        "grossPricePnlCollateral": None,
+                    },
+                    {
+                        "id": row_id,
+                        "tradeChangeType": "position_closed_user",
+                        "grossPricePnlPct": -0.002531144239360719,
+                        "grossPricePnlCollateral": -5057.985533514525,
+                        **fields,
+                    },
+                ]
+            }
+        }
+    }
+
+
+REALIZED = {
+    "basis": "grossBeforeFees",
+    "collateralBaseUnits": -5057.985533514525,
+    "usd": "-0.005058",
+    "percent": "-0.2531144239360719",
+}
+
+
+@pytest.mark.parametrize(
+    ("kind", "row", "lookup", "price", "realized"),
+    [
+        ("CLOSE_POSITION", closed(), pnl_page(), 81001.25, REALIZED),
+        (
+            "CLOSE_POSITION",
+            closed(
+                perpBorrowing={"marketId": 0, "collateralToken": {"symbol": "stNIBI"}}
+            ),
+            pnl_page(),
+            81001.25,
+            {**REALIZED, "usd": None},
+        ),
+        ("CLOSE_POSITION", closed(), pnl_page(row_id=999), 81001.25, None),
+        (
+            "CLOSE_POSITION",
+            closed(),
+            pnl_page(grossPricePnlCollateral=None),
+            81001.25,
+            None,
+        ),
+        (
+            "CLOSE_POSITION",
+            closed(),
+            response({"errors": [{"message": OPAQUE}]}),
+            81001.25,
+            None,
+        ),
+        ("CLOSE_POSITION", closed(isOpen=True), None, None, None),
+        (
+            "CLOSE_POSITION",
+            closed(closeBlock={"block": FILL_BLOCK + 1}),
+            None,
+            None,
+            None,
+        ),
+        ("CLOSE_POSITION", closed(closePrice=0), None, None, None),
+        ("DECREASE_POSITION_SIZE", closed("trade_size_decrease"), None, None, None),
+    ],
+    ids=[
+        "full-close",
+        "non-usdc-collateral",
+        "pnl-row-missing",
+        "pnl-unreported",
+        "pnl-lookup-error",
+        "position-still-open",
+        "closed-in-later-block",
+        "missing-close-price",
+        "partial-close",
+    ],
+)
+def test_rust_close_receipt_fills_price_and_realized_pnl(
+    cli_pair: tuple[CLI, CLI],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    kind: str,
+    row: dict[str, Any],
+    lookup: dict[str, Any] | Reply | None,
+    price: float | None,
+    realized: dict[str, Any] | None,
+) -> None:
+    """Fill a close receipt only when Keeper ties it to the closing fill (#268)."""
+    with replay() as (endpoint, replies, requests):
+        home = tmp_path / "sai"
+        seed(home, endpoint, monkeypatch, "unknown")
+        replies.extend(map(response, (intent("filled", kind=kind), history(row))))
+        if lookup is not None:
+            replies.append(response(lookup))
+        result = invoke(
+            cli_pair[1], home, "--endpoint", endpoint, "--json", "intent", "wait", KEY
+        )
+        assert (result.returncode, result.stderr) == (0, b"")
+        assert OPAQUE.encode() not in result.stdout
+        document = json.loads(result.stdout)
+        assert document["outcome"] == "filled"
+        fill = document["receipt"]["fill"]
+        assert fill["price"] == price
+        assert fill["realizedPnl"] == realized
+        assert fill["oraclePrice"] == "81000.50"
+        assert not replies
+        assert len(requests) == 2 + (lookup is not None)
+        if lookup is not None:
+            query = json.loads(requests[-1].body)
+            assert "grossPricePnlCollateral" in query["query"]
+            assert query["variables"] == {"trader": ADDR, "limit": 25, "offset": 0}
+            assert "authorization" not in requests[-1].headers
+
+
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
 def test_intent_wait(
     wait_cli_pair: tuple[CLI, CLI],
@@ -628,13 +764,17 @@ def test_intent_wait(
                 if index:
                     assert fill.pop("sizeCollateralUsd") is None
                     assert fill.pop("escrowedCollateralUsd") == "4"
+                    if case.name == "market-close":
+                        assert fill.pop("realizedPnl") is None
                 assert fill == {
                     "price": None,
                     "sizeCollateralBaseUnits": None,
                     "oraclePrice": "81000.50",
                     "escrowedCollateralBaseUnits": 4_000_000,
                 }
-            output = RECEIPT_USD.sub(b"", result.stdout) if index else result.stdout
+            output = (
+                RUST_RECEIPT_FIELDS.sub(b"", result.stdout) if index else result.stdout
+            )
             if case.outcome == "unknown":
                 output = document if index else with_timeout_warning(document)
             observed.append((output, wire, ledger))
@@ -669,7 +809,120 @@ def test_wait_help(
         if exit_code == 0:
             assert not home.exists()
         outputs.append((result.stdout, result.stderr))
+    if args[0] == "intent" and args[1:2] == ("wait",):
+        # Rust documents the account-first form and the shared 60 s default (#271).
+        outputs = [
+            tuple(
+                output.replace(WAIT_HELP_RUST, WAIT_HELP_PYTHON) if index else output
+                for output in pair
+            )
+            for index, pair in enumerate(outputs)
+        ]
     assert outputs[0] == outputs[1]
+
+
+WAIT_HELP_PYTHON = b"""  Wait for an intent's final outcome and print its receipt.
+
+Options:
+  --addr TEXT      EVM or Nibiru address that submitted the intent.
+  --timeout FLOAT  Maximum wait in seconds.  [default: 30.0]
+"""
+WAIT_HELP_RUST = b"""  Wait for an intent's final outcome and print its receipt.
+
+  Pass the account and --key, as intent status does: ADDR --key KEY. With
+  only KEY, the account comes from the local ledger or the active session.
+  The older form KEY --addr ADDR still works.
+
+Options:
+  --key TEXT       Specific intent key.
+  --addr TEXT      EVM or Nibiru address that submitted the intent.
+  --timeout FLOAT  Maximum wait in seconds.  [default: 60.0]
+"""
+
+
+def test_rust_wait_documents_account_first_form_and_shared_default(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    result = invoke(cli_pair[1], tmp_path / "sai", "intent", "wait", "--help")
+    assert result.returncode == 0
+    assert WAIT_HELP_RUST in result.stdout
+    assert result.stdout.startswith(b"Usage: sai intent wait [OPTIONS] KEY")
+
+
+@pytest.mark.parametrize(
+    ("order_type", "rows", "order_id"),
+    [
+        ("limit", (indexed("limit_order_created"),), 7),
+        ("stop", (indexed("stop_order_created"),), 7),
+        ("limit", (), None),
+        ("market", (indexed(),), "absent"),
+    ],
+    ids=["limit", "stop", "limit-not-indexed", "market-fill"],
+)
+def test_rust_placed_receipt_names_the_order_id(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    order_type: str,
+    rows: tuple[dict[str, Any], ...],
+    order_id: int | str | None,
+) -> None:
+    """`sai trade cancel ID` takes the ID a placed order receipt names (#271)."""
+    with replay() as (endpoint, replies, _):
+        home = tmp_path / "sai"
+        seed(home, endpoint, monkeypatch, "unknown")
+        replies.extend(
+            map(
+                response,
+                (
+                    intent("filled", body={"orderType": order_type}),
+                    history(*rows),
+                    *([history()] if not rows else []),
+                ),
+            )
+        )
+        result = invoke(
+            cli_pair[1], home, "--endpoint", endpoint, "--json", "intent", "wait", KEY
+        )
+        assert result.returncode == 0, result
+        receipt = json.loads(result.stdout)["receipt"]
+        if order_id == "absent":
+            assert "orderId" not in receipt
+        else:
+            assert receipt["orderId"] == order_id
+            assert list(receipt)[:4] == [
+                "requestTxHash",
+                "requestBlock",
+                "action",
+                "orderId",
+            ]
+
+
+def test_rust_wait_defaults_to_trade_wait_budget(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with replay() as (endpoint, replies, _):
+        home = tmp_path / "sai"
+        seed(home, endpoint, monkeypatch, "unknown")
+        replies.extend(map(response, ("filled", history(indexed()))))
+        result = invoke(
+            cli_pair[1],
+            home,
+            "--endpoint",
+            endpoint,
+            "intent",
+            "wait",
+            ADDR,
+            "--key",
+            KEY,
+        )
+        assert result.returncode == 0, result
+        start = next(
+            event
+            for event in read_events(home, cli_pair[1])
+            if event["event"] == "intent.wait.start"
+        )
+        assert start["timeoutMs"] == 60_000
 
 
 def test_wait_account_first_matches_python(
@@ -724,9 +977,12 @@ def test_wait_usage(
         result = invoke(cli, home, "--json", "intent", "wait", *args)
         assert result.returncode == code, result
         assert result.stderr == b""
-        observed.append(
-            result.stdout if "--help" in args else json.loads(result.stdout)
-        )
+        if "--help" in args:
+            # Rust documents the account-first form and the 60 s default (#271).
+            stdout = result.stdout.replace(WAIT_HELP_RUST, WAIT_HELP_PYTHON)
+            observed.append(stdout if index else result.stdout)
+        else:
+            observed.append(json.loads(result.stdout))
     if code == 5:
         # The pinned CLI treated its own /query route as private.
         reference = observed[0]

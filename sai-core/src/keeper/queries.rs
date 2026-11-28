@@ -30,6 +30,16 @@ pub(crate) const FILL_POSITION: &str = "query($trader:String!, $id:Int!) {
     }
   }
 }";
+// Gross realized PnL for a close found in INTENT_HISTORY. Keeper indexes the
+// close moments before the receipt, so it is on the newest page.
+pub(crate) const CLOSE_PNL: &str = "query($trader:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    tradeHistory(where:{trader:$trader}, order_by:sequence, order_desc:true,
+                 limit:$limit, offset:$offset) {
+      id tradeChangeType grossPricePnlPct grossPricePnlCollateral
+    }
+  }
+}";
 pub const INTENTS: &str = "query($user:String!, $key:String) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }";
 pub const WAIT_INTENTS: &str = "query($user:String!, $key:String, $includeAction:Boolean! = false) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind body @include(if:$includeAction) lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }";
 pub const CHALLENGE: &str = "mutation($address:String!) { createUserIntentAuthChallenge(evmAddress:$address) { nonce evmAddress expiresAt chainId typedData } }";
@@ -39,7 +49,7 @@ pub const SUBMIT: &str = "mutation($input:RecordUserIntentInput!) { recordUserIn
 pub(super) fn operation(query: &str) -> &'static str {
     match query {
         CHALLENGE => "challenge",
-        HISTORY | INTENT_HISTORY => "history",
+        HISTORY | INTENT_HISTORY | CLOSE_PNL => "history",
         INTENTS | WAIT_INTENTS => "intents",
         MARKET => "market",
         MARKETS => "markets",

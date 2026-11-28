@@ -330,51 +330,51 @@ signature = "98f5dd7492def77fb178c16399871c092f2d154949da608c1a8aa1bd9b9e86f3"
 
 [gap."case:mcp-account-intent-reads"]
 owner = "#175"
-signature = "8fff052325c8f8e55ff2b1795de2140a6797c94d783fb4e17d0018b986b8e3cf"
+signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
 
 [gap."case:mcp-argument-validation"]
 owner = "#175"
-signature = "875a92b71e424c75b0724f59e0093beb36139e5317e1150202660da9e933d5dc"
+signature = "2ccf051db99853227a65fd08b3914227da1430e8c0c731257abdca7b7c80b979"
 
 [gap."case:mcp-auth-list"]
 owner = "#175"
-signature = "0691c519bbd3e9731d56dda086baeb11d61df35362b88017d1162e61505ea490"
+signature = "6354316f08ccae4e48566a16820e993f669c01487a1d8dbe74bd76a0b48344ae"
 
 [gap."case:mcp-auth-missing-expiry"]
 owner = "#175"
-signature = "6de7876cb5d93fb06514959b26e40b5acc18997ab3500d36c030bad45639309b"
+signature = "3fe154cd9b982dc21579e33d739569a93b8b3bc23e33e6be63ee9517c9cf5c87"
 
 [gap."case:mcp-auth-numeric-expiry"]
 owner = "#175"
-signature = "6de7876cb5d93fb06514959b26e40b5acc18997ab3500d36c030bad45639309b"
+signature = "3fe154cd9b982dc21579e33d739569a93b8b3bc23e33e6be63ee9517c9cf5c87"
 
 [gap."case:mcp-auth-redaction"]
 owner = "#175"
-signature = "472abbeabd4a7d4db42325381c57f50da66dbce4119ff40a5d909036012e3ed9"
+signature = "e701399d65184751b6992d91e29eac9abe709e92a47ea27cabd2c177fd1b6852"
 
 [gap."case:mcp-auth-status"]
 owner = "#175"
-signature = "203533b66f16aff3e4b2fa12bf2ac151b61d08c8916ab6478aa55b9b74062a76"
+signature = "ca886342313fa15496ed437dd690d2c098f87dacdcd72bd6e47b56b8bb072d77"
 
 [gap."case:mcp-auth-use"]
 owner = "#175"
-signature = "4eb8315207d0a737877565c6311efa635d0902a0fa6ef412662b626d4e4610f3"
+signature = "c325bb3ccfd9911cec95355d843a13e22936fbb2f0682746e5059bb529aabae8"
 
 [gap."case:mcp-auth-use-invalid-expiry"]
 owner = "#175"
-signature = "3c55ab06f44975554b1b35445933954cfecfba4988d4cc1ae72958c515dcb8c8"
+signature = "e6ee66d0def5fea14b9391d449bd6b224ed32dc8925f81d51ffc90940b8b04d4"
 
 [gap."case:mcp-info-public-endpoints"]
 owner = "#175"
-signature = "fd9dfba18f28493add98c431e338a0871111d0b131a0cd564131c869259f99db"
+signature = "3ca51a091b4473ccf12e9033bed55b7881a4fe5cf320290681ee44b5c99a8b1c"
 
 [gap."case:mcp-initialize-legacy"]
 owner = "#175"
-signature = "8fff052325c8f8e55ff2b1795de2140a6797c94d783fb4e17d0018b986b8e3cf"
+signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
 
 [gap."case:mcp-initialize-newer"]
 owner = "#175"
-signature = "8fff052325c8f8e55ff2b1795de2140a6797c94d783fb4e17d0018b986b8e3cf"
+signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
 
 # Rust masks the SAI_HOME value in the reported Claude argv.
 [gap."case:mcp-install-all"]
@@ -407,19 +407,20 @@ signature = "72813cb0759d60f8662b6c203b97583483a017891fc981c01a12243aec443d4c"
 
 [gap."case:mcp-intent-wait-final"]
 owner = "#175"
-signature = "05ae2906f06493fe9b2fbac05f67d996917fc5c3135ded30b35b4dcdb93a51ce"
+title = "The native close receipt also reports fill.realizedPnl (#268)."
+signature = "1b7ada25be3b4b7672f30773de10e52bc3bac7c67634593738adca20d596b49d"
 
 [gap."case:mcp-intent-wait-pending"]
 owner = "#175"
-signature = "8fff052325c8f8e55ff2b1795de2140a6797c94d783fb4e17d0018b986b8e3cf"
+signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
 
 [gap."case:mcp-intent-wait-validation"]
 owner = "#175"
-signature = "ac528f3d90ec5d654c15944f2047443354b83af4013b61d3c16050d9ccd545aa"
+signature = "815eedae4a501a25694670daa907bd6608661057eb66982826ec6e469c58d5d0"
 
 [gap."case:mcp-keeper-errors"]
 owner = "#175"
-signature = "8fff052325c8f8e55ff2b1795de2140a6797c94d783fb4e17d0018b986b8e3cf"
+signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
 
 [gap."case:mcp-list-redacted"]
 owner = "#215"
@@ -427,31 +428,31 @@ signature = "d9f5e467d3ddb8590519768c8c7be8aa330fa39aae3316b7ea06a1d02febf39b"
 
 [gap."case:mcp-logs-intent-validation"]
 owner = "#175"
-signature = "8fff052325c8f8e55ff2b1795de2140a6797c94d783fb4e17d0018b986b8e3cf"
+signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
 
 [gap."case:mcp-market-number-spelling"]
 owner = "#175"
-signature = "8fff052325c8f8e55ff2b1795de2140a6797c94d783fb4e17d0018b986b8e3cf"
+signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
 
 [gap."case:mcp-overview-validation"]
 owner = "#175"
-signature = "c3e3c515458bf6c8ad630866718a4cc55e93f12b4f348f803a5aab5d965509fb"
+signature = "bc8201904527ba70b036857a5cd0c356d5d910464a9f8312d4de390f7d222add"
 
 [gap."case:mcp-session-refusals"]
 owner = "#175"
-signature = "a7d72f2fe1503c6aa894142546afd51b5fb4947029e5f503be39fefd19cc5788"
+signature = "e140f60b4ec62cb0ce03fe8a9c8b233f42a9421323867cf432b5f9d3e4917977"
 
 [gap."case:mcp-session-reloads"]
 owner = "#175"
-signature = "8d46a0e62807d6cf517c3a4d52177c915ec2ec42ea833fd577f301581d28f595"
+signature = "c6b8d5c25cfa7db9dbb71fa643efadbc8b9c25b4cd7c472b9e1073a117b53d96"
 
 [gap."case:mcp-stream-error"]
 owner = "#175"
-signature = "8fff052325c8f8e55ff2b1795de2140a6797c94d783fb4e17d0018b986b8e3cf"
+signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
 
 [gap."case:mcp-tool-inventory"]
 owner = "#175"
-signature = "31b3be5e0ce5c163eb1451412e77d49746e4dab831b6c8863dc16d5a5b90d15e"
+signature = "f477c014f28400affe6914cc2dbc47ad2c6dbb06c2b9368080f4303557f722cd"
 
 [gap."case:mcp-uninstall-all"]
 owner = "#215"
@@ -877,7 +878,8 @@ signature = "b843cff8630c6f3d18730069b222ddcaeea7b625ed281ad7d73548f2a68747d2"
 
 [gap."mcp:intent_wait"]
 owner = "#175"
-signature = "fb83b6ff5042d2589e535903f11e8133be7966ae9506f0151cb4b7813827d185"
+title = "The native close receipt also reports fill.realizedPnl (#268)."
+signature = "744079a3af66d3a7dafb22a67a9f8f2681f447342d5d8d7b87738a157428747d"
 
 [gap."mcp:logs_intent"]
 owner = "#175"
