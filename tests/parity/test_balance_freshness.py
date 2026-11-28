@@ -58,7 +58,10 @@ def test_balance_snapshot_checks_source_block_age(
 
 @pytest.mark.parametrize("mode", [(), ("--json",)], ids=["text", "json"])
 def test_overview_labels_stale_balance(
-    balance_launcher: str, mode: tuple[str, ...], tmp_path: Path
+    balance_launcher: str,
+    mode: tuple[str, ...],
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
 ) -> None:
     with loopback("overview-balance-freshness") as endpoints:
         home = tmp_path / "rust"
@@ -86,7 +89,15 @@ def test_overview_labels_stale_balance(
             assert rows["credits"]["sourceAtBasis"] == "fetchedAt"
             return
         funds = result.stdout.split("Sai Funds", 1)[1].split("Open Positions", 1)[0]
-        assert re.search(rf"block {RISK_BLOCK - 1} \(15m \d+s old · stale\)", funds)
+        if request.node.callspec.params["balance_launcher"] == "python":
+            assert re.search(rf"block {RISK_BLOCK - 1} \(15m \d+s old · stale\)", funds)
+        else:
+            # The source block is the last balance change, so Rust names the
+            # age by that change instead of calling the read stale (#271).
+            assert re.search(
+                rf"block {RISK_BLOCK - 1} \(unchanged for 15m \d+s\)", funds
+            )
+            assert "stale" not in funds
         assert re.search(rf"block {RISK_BLOCK} \(0m \d+s old\)", funds)
 
 

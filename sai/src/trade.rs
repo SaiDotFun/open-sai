@@ -779,7 +779,7 @@ impl WaitTrade<'_> {
                 addr,
                 key,
                 wait::WaitOptions {
-                    timeout: Duration::from_secs(60),
+                    timeout: Duration::from_secs_f64(wait::DEFAULT_TIMEOUT),
                     started: Instant::now(),
                     remember_fill: Some(&remember_fill),
                 },

@@ -20,6 +20,7 @@ import threading
 import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -962,8 +963,36 @@ def project_reference_auth_status_errors(
     return "Native MCP auth status omits disconnected addresses" if changed else None
 
 
+def as_native_receipt(value: Any) -> Any:
+    """Add the receipt fields only the native CLI reports.
+
+    A closing fill carries realizedPnl (#268) and a placed order names its
+    orderId (#271). The pinned fixtures have no Keeper PnL or placement, so
+    the native values are null.
+    """
+    receipt = value.get("receipt") if isinstance(value, dict) else None
+    if not isinstance(receipt, dict):
+        return value
+    result = deepcopy(value)
+    receipt = result["receipt"]
+    change = (receipt.get("execution") or {}).get("tradeChangeType")
+    fill = receipt.get("fill")
+    closing = change in {"position_closed_user", "trade_size_decrease"}
+    if closing and isinstance(fill, dict) and "realizedPnl" not in fill:
+        fill["realizedPnl"] = None
+    if result.get("outcome") == "placed" and "orderId" not in receipt:
+        items = list(receipt.items())
+        receipt.clear()
+        for name, item in items:
+            receipt[name] = item
+            if name == "action":
+                receipt["orderId"] = (receipt.get("positionNow") or {}).get("id")
+    return result
+
+
 def project_reference_native_usdc(output: Any, *, collateral: bool) -> None:
-    """Show Python tool replies with the native fixed USDC price and USD rows.
+    """Show Python tool replies with the native fixed USDC price, USD rows,
+    and native-only receipt fields.
 
     Python is frozen and keeps the oracle rate (README "Fixed USDC Price").
     """
@@ -976,7 +1005,7 @@ def project_reference_native_usdc(output: Any, *, collateral: bool) -> None:
         text = result.get("_toolText")
         for block in result.get("content", []):
             value = block.get("text")
-            projected = as_native_usdc(value, collateral=collateral)
+            projected = as_native_receipt(as_native_usdc(value, collateral=collateral))
             # Python serializes tool replies with json.dumps, so a changed
             # reply keeps its byte form only when the original round-trips.
             if projected == value or (text is not None and json.dumps(value) != text):

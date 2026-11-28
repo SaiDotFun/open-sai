@@ -46,7 +46,7 @@ pub enum IntentCommand {
         /// EVM or Nibiru address that submitted the intent.
         #[arg(long, conflicts_with = "key")]
         addr: Option<String>,
-        /// Specific intent key when the positional argument is the account.
+        /// Specific intent key. The positional argument is then the account.
         #[arg(long)]
         key: Option<String>,
         /// Maximum wait in seconds.
@@ -67,7 +67,7 @@ pub fn intent_help(command: &str) -> Option<String> {
             "  List locally recorded intent identities for ADDR.\n\nOptions:\n  --help  Show this message and exit."
         }
         "intent wait" => {
-            "  Wait for an intent's final outcome and print its receipt.\n\nOptions:\n  --addr TEXT      EVM or Nibiru address that submitted the intent.\n  --timeout FLOAT  Maximum wait in seconds.  [default: 30.0]\n  --help           Show this message and exit."
+            "  Wait for an intent's final outcome and print its receipt.\n\n  Pass the account and --key, as intent status does: ADDR --key KEY. With\n  only KEY, the account comes from the local ledger or the active session.\n  The older form KEY --addr ADDR still works.\n\nOptions:\n  --key TEXT       Specific intent key.\n  --addr TEXT      EVM or Nibiru address that submitted the intent.\n  --timeout FLOAT  Maximum wait in seconds.  [default: 60.0]\n  --help           Show this message and exit."
         }
         _ => return None,
     };

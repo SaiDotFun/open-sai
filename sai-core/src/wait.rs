@@ -9,15 +9,17 @@ use crate::{
     errors::{Code, SaiError},
     keeper::{self, Keeper},
     log::{self, EventContext, Field, Level},
-    receipt::Evidence,
+    receipt::{Evidence, FillValues},
     reconcile::{self, PollError, WaitBudget, classify_outcome},
     storage::{Storage, StorageError},
 };
 
-pub const DEFAULT_TIMEOUT: f64 = 30.0;
+/// Default wait for `intent wait` and trade `--wait`.
+pub const DEFAULT_TIMEOUT: f64 = 60.0;
 const INITIAL_DELAY: Duration = Duration::from_millis(250);
 const MAX_DELAY: Duration = Duration::from_secs(2);
 const FILL_POSITION_TIMEOUT: Duration = Duration::from_secs(2);
+const CLOSE_PNL_PAGE: i64 = 25;
 
 #[derive(Clone, Copy, Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -292,14 +294,14 @@ pub async fn for_intent(
         );
         result(key, Some(addr), wait_log.outcome, &row, receipt)
     };
-    let mut fill_values = (Value::Null, None);
+    let mut fill_values = FillValues::default();
     let remaining = budget.remaining().min(FILL_POSITION_TIMEOUT);
     if wait_log.outcome == Outcome::Filled
         && !remaining.is_zero()
         && let Some((trade_id, block)) = evidence.opening_fill_position()
     {
         if let Some(remember_fill) = remember_fill {
-            remember_fill(build((Value::Null, None)));
+            remember_fill(build(FillValues::default()));
         }
         if let Ok(position) = keeper
             .wait_request(
@@ -313,6 +315,32 @@ pub async fn for_intent(
             .await
         {
             fill_values = evidence.opening_fill(&position, trade_id, block, &account);
+        }
+    } else if wait_log.outcome == Outcome::Filled
+        && let Some((history_id, price)) = evidence.closing_fill()
+    {
+        fill_values.price = price;
+        if !remaining.is_zero() {
+            if let Some(remember_fill) = remember_fill {
+                remember_fill(build(FillValues {
+                    price: fill_values.price.clone(),
+                    ..FillValues::default()
+                }));
+            }
+            if let Ok(page) = keeper
+                .wait_request(
+                    keeper::CLOSE_PNL,
+                    Map::from_iter([
+                        ("trader".into(), json!(addr)),
+                        ("limit".into(), json!(CLOSE_PNL_PAGE)),
+                        ("offset".into(), json!(0)),
+                    ]),
+                    remaining,
+                )
+                .await
+            {
+                fill_values.realized_pnl = evidence.closing_pnl(&page, history_id);
+            }
         }
     }
     Ok(build(fill_values))
@@ -345,7 +373,7 @@ fn empty_receipt(outcome: Outcome) -> Value {
         outcome,
         &Value::Null,
         &Value::Null,
-        (Value::Null, None),
+        FillValues::default(),
         |value| value,
     )
 }

@@ -407,7 +407,8 @@ signature = "72813cb0759d60f8662b6c203b97583483a017891fc981c01a12243aec443d4c"
 
 [gap."case:mcp-intent-wait-final"]
 owner = "#175"
-signature = "6996d3f5c4c1a2d23844507666af070711b3d82b66887cd88e5b3d4c5b1a2091"
+title = "The native close receipt also reports fill.realizedPnl (#268)."
+signature = "1b7ada25be3b4b7672f30773de10e52bc3bac7c67634593738adca20d596b49d"
 
 [gap."case:mcp-intent-wait-pending"]
 owner = "#175"
@@ -877,7 +878,8 @@ signature = "b843cff8630c6f3d18730069b222ddcaeea7b625ed281ad7d73548f2a68747d2"
 
 [gap."mcp:intent_wait"]
 owner = "#175"
-signature = "e807208bc514d5c4720f186900be7b1b2b41f7b6a2d54d5d0dd4b2ab9a546c28"
+title = "The native close receipt also reports fill.realizedPnl (#268)."
+signature = "744079a3af66d3a7dafb22a67a9f8f2681f447342d5d8d7b87738a157428747d"
 
 [gap."mcp:logs_intent"]
 owner = "#175"
