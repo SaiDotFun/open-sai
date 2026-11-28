@@ -159,17 +159,6 @@ impl Trading<'_> {
         let Some(Some(published_at)) = oracle_publication_time(&oracle) else {
             return unknown_oracle_time(result);
         };
-        let Some(market) = oracle
-            .get("base_per_quote")
-            .and_then(Value::as_str)
-            .and_then(|price| Price::new(price, "Sai Perp market oracle", Some(now())))
-        else {
-            return unverified_market_oracle(
-                result,
-                "OraclePriceUnavailable",
-                super::UNVERIFIED_MARKET_ORACLE,
-            );
-        };
         let queued = lcd
             .smart(json!({"market_order_config": {}}), Some(height))
             .await
@@ -184,6 +173,18 @@ impl Trading<'_> {
             }
             return Some(());
         }
+        // Only an immediate close reads the market price.
+        let Some(market) = oracle
+            .get("base_per_quote")
+            .and_then(Value::as_str)
+            .and_then(|price| Price::new(price, "Sai Perp market oracle", Some(now())))
+        else {
+            return unverified_market_oracle(
+                result,
+                "OraclePriceUnavailable",
+                super::UNVERIFIED_MARKET_ORACLE,
+            );
+        };
         // Without the staleness limit or block time the estimate is
         // unavailable, and Perp makes the staleness check at execution.
         let ttl = lcd.group(&pair, Some(height)).await?["stale_price_expiration_secs"].as_u64()?;

@@ -47,6 +47,7 @@ struct ReplyState {
     stale_oracle: bool,
     queued: bool,
     group_unreadable: bool,
+    oracle_unreadable: bool,
 }
 
 struct PositionServer {
@@ -79,6 +80,7 @@ impl PositionServer {
             stale_oracle: false,
             queued: false,
             group_unreadable: false,
+            oracle_unreadable: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let replies = Arc::clone(&state);
@@ -229,6 +231,7 @@ impl ReplyState {
         }
         if self.stale_oracle {
             let (name, value) = match message.as_object().unwrap().keys().next().unwrap().as_str() {
+                "get_oracle_address" if self.oracle_unreadable => ("oracle_address", Value::Null),
                 "get_oracle_address" => ("oracle_address", json!(ORACLE)),
                 "get_exchange_rate" => {
                     assert_eq!(
@@ -867,6 +870,42 @@ async fn queued_position_changes_ignore_a_stale_oracle() {
         assert!(requests.iter().any(|label| label == "market_order_config"));
         assert!(requests.iter().any(|label| label == "admission"));
     }
+}
+
+#[tokio::test]
+async fn queued_leverage_change_reads_no_market_oracle() {
+    // Perp reads no price when it queues the change.
+    let server = PositionServer::start(ACCOUNT, ACCOUNT);
+    let endpoint = format!("{}/query", server.url);
+    let home = tempfile::tempdir().unwrap();
+    let storage = fixture_storage(&home, &endpoint);
+    let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+    let session = trading.load_session(None).unwrap();
+    let preview = leverage_preview("7", "10").unwrap();
+    let digest = confirmed_digest(&trading, &session, &preview).await;
+    {
+        let mut state = server.state.lock().unwrap();
+        state.close_height_check_index = Some(7);
+        state.stale_oracle = true;
+        state.queued = true;
+        state.oracle_unreadable = true;
+        state.requests.clear();
+    }
+
+    trading
+        .submit(
+            &session,
+            &preview,
+            SubmitOptions {
+                confirmation: Some(Confirmation::new(&digest, None).unwrap()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let requests = server.requests();
+    assert!(!requests.iter().any(|label| label == "oracle_address"));
+    assert!(requests.iter().any(|label| label == "admission"));
 }
 
 #[tokio::test]

@@ -511,11 +511,8 @@ def dry_run_bytes(cli: CLI, home: Path, endpoints: Endpoints, command: CLI) -> b
         (
             LEVERAGE,
             "queued",
-            # Perp reads no price for a queued change, so no staleness reads.
-            LEVERAGE_MARKET_WIRE
-            + ["get_oracle_address", "get_exchange_rate"]
-            + LEVERAGE_LIMITS_WIRE
-            + ["get_fees"],
+            # Perp reads no price for a queued change, so neither runtime does.
+            LEVERAGE_MARKET_WIRE + LEVERAGE_LIMITS_WIRE + ["get_fees"],
             {**estimates(QUOTED_LIQUIDATION), "execution": unavailable(QUEUED)},
         ),
         (

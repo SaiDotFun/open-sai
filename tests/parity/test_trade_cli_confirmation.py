@@ -195,10 +195,11 @@ def test_market_oracle_failure_refuses_before_reservation(
     options: dict[str, Any],
 ) -> None:
     # Perp reads no price at request when it queues a trade, so both runtimes
-    # accept one on a stale oracle. Otherwise Python main reads
-    # the combined Perp price query instead of the market oracle (README
-    # "Fixed USDC Price"), so only the native CLI runs.
-    accepted = queued and market_oracle == "stale"
+    # accept one on a stale oracle, and a leverage or margin change without
+    # any oracle read. Otherwise Python main reads the combined Perp price
+    # query instead of the market oracle (README "Fixed USDC Price"), so only
+    # the native CLI runs.
+    accepted = queued and (market_oracle == "stale" or action in {"leverage", "margin"})
     for index, cli in enumerate(pair) if accepted else [(1, pair[1])]:
         home = tmp_path / f"submit-{index}"
         submit = command
