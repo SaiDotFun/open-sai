@@ -462,6 +462,9 @@ def test_position_size_wait_v012(
             ]
             if index:
                 result = without_receipt_usd(result)
+                if kind == "DECREASE_POSITION_SIZE":
+                    # Keeper reports no partial-close PnL (#268).
+                    assert result["receipt"]["fill"].pop("realizedPnl") is None
             observations.append(normalized(result, key))
     assert observations[0] == observations[1]
 
