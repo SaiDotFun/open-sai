@@ -14,7 +14,8 @@ use crate::{
     storage::{Storage, StorageError},
 };
 
-pub const DEFAULT_TIMEOUT: f64 = 30.0;
+/// Default wait for `intent wait` and trade `--wait`.
+pub const DEFAULT_TIMEOUT: f64 = 60.0;
 const INITIAL_DELAY: Duration = Duration::from_millis(250);
 const MAX_DELAY: Duration = Duration::from_secs(2);
 const FILL_POSITION_TIMEOUT: Duration = Duration::from_secs(2);

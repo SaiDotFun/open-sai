@@ -809,7 +809,44 @@ def test_wait_help(
         if exit_code == 0:
             assert not home.exists()
         outputs.append((result.stdout, result.stderr))
+    if args[0] == "intent" and args[1:2] == ("wait",):
+        # Rust documents the account-first form and the shared 60 s default (#271).
+        outputs = [
+            tuple(
+                output.replace(WAIT_HELP_RUST, WAIT_HELP_PYTHON) if index else output
+                for output in pair
+            )
+            for index, pair in enumerate(outputs)
+        ]
     assert outputs[0] == outputs[1]
+
+
+WAIT_HELP_PYTHON = b"""  Wait for an intent's final outcome and print its receipt.
+
+Options:
+  --addr TEXT      EVM or Nibiru address that submitted the intent.
+  --timeout FLOAT  Maximum wait in seconds.  [default: 30.0]
+"""
+WAIT_HELP_RUST = b"""  Wait for an intent's final outcome and print its receipt.
+
+  Pass the account and --key, as intent status does: ADDR --key KEY. With
+  only KEY, the account comes from the local ledger or the active session.
+  The older form KEY --addr ADDR still works.
+
+Options:
+  --key TEXT       Specific intent key.
+  --addr TEXT      EVM or Nibiru address that submitted the intent.
+  --timeout FLOAT  Maximum wait in seconds.  [default: 60.0]
+"""
+
+
+def test_rust_wait_documents_account_first_form_and_shared_default(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    result = invoke(cli_pair[1], tmp_path / "sai", "intent", "wait", "--help")
+    assert result.returncode == 0
+    assert WAIT_HELP_RUST in result.stdout
+    assert result.stdout.startswith(b"Usage: sai intent wait [OPTIONS] KEY")
 
 
 @pytest.mark.parametrize(
@@ -859,6 +896,33 @@ def test_rust_placed_receipt_names_the_order_id(
                 "action",
                 "orderId",
             ]
+
+
+def test_rust_wait_defaults_to_trade_wait_budget(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with replay() as (endpoint, replies, _):
+        home = tmp_path / "sai"
+        seed(home, endpoint, monkeypatch, "unknown")
+        replies.extend(map(response, ("filled", history(indexed()))))
+        result = invoke(
+            cli_pair[1],
+            home,
+            "--endpoint",
+            endpoint,
+            "intent",
+            "wait",
+            ADDR,
+            "--key",
+            KEY,
+        )
+        assert result.returncode == 0, result
+        start = next(
+            event
+            for event in read_events(home, cli_pair[1])
+            if event["event"] == "intent.wait.start"
+        )
+        assert start["timeoutMs"] == 60_000
 
 
 def test_wait_account_first_matches_python(
@@ -913,9 +977,12 @@ def test_wait_usage(
         result = invoke(cli, home, "--json", "intent", "wait", *args)
         assert result.returncode == code, result
         assert result.stderr == b""
-        observed.append(
-            result.stdout if "--help" in args else json.loads(result.stdout)
-        )
+        if "--help" in args:
+            # Rust documents the account-first form and the 60 s default (#271).
+            stdout = result.stdout.replace(WAIT_HELP_RUST, WAIT_HELP_PYTHON)
+            observed.append(stdout if index else result.stdout)
+        else:
+            observed.append(json.loads(result.stdout))
     if code == 5:
         # The pinned CLI treated its own /query route as private.
         reference = observed[0]

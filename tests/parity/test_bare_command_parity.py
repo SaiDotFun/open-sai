@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from sai_cli.sai_cli import main
 from sai_cli.tests.test_bare_help import required_commands
+from test_intent_wait import WAIT_HELP_PYTHON, WAIT_HELP_RUST
 
 with Path(__file__).with_name("cases.toml").open("rb") as manifest:
     BARE_LEAVES = [
@@ -72,7 +73,12 @@ def test_bare_leaf_prints_full_help_and_json_usage(
 
         assert bare.returncode == machine.returncode == 2
         assert bare.stdout == machine.stderr == b""
-        assert bare.stderr == expected.stdout
+        help_text = bare.stderr
+        if label == "rust" and args == ("intent", "wait"):
+            # Rust documents the account-first form and the 60 s default (#271).
+            assert WAIT_HELP_RUST in help_text
+            help_text = help_text.replace(WAIT_HELP_RUST, WAIT_HELP_PYTHON)
+        assert help_text == expected.stdout
         error = json.loads(machine.stdout)["error"]
         assert error["code"] == "INVALID_REQUEST"
         assert error["message"].startswith("Missing ")
