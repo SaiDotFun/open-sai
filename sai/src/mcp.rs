@@ -49,9 +49,26 @@ const MCP_WAIT_DEFAULT: Duration = Duration::from_secs(10);
 const MCP_WAIT_LIMIT: Duration = Duration::from_secs(60);
 const INSTRUCTIONS: &str = include_str!("mcp/instructions.txt");
 // Wire metadata captured from Python main at 1c671b231b0fc968a44ec8dd520e67ea28e25b7f.
-// The native intent_wait description states its longer limit.
+// The native server describes a longer intent_wait limit and replaces
+// Python's `{result: string}` output schema with each tool's result object.
 static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
-    serde_json::from_str(include_str!("mcp/tools.json")).expect("valid Python tool inventory")
+    let mut tools: Vec<Map<String, Value>> =
+        serde_json::from_str(include_str!("mcp/tools.json")).expect("valid Python tool inventory");
+    let mut schemas: Map<String, Value> =
+        serde_json::from_str(include_str!("mcp/output_schemas.json"))
+            .expect("valid output schemas");
+    for tool in &mut tools {
+        let name = tool["name"].as_str().expect("tool name");
+        let schema = schemas
+            .remove(name)
+            .expect("an output schema for each tool");
+        assert!(tool.insert("outputSchema".into(), schema).is_none());
+    }
+    assert!(schemas.is_empty(), "an output schema for an unknown tool");
+    tools
+        .into_iter()
+        .map(|tool| serde_json::from_value(Value::Object(tool)).expect("valid MCP tool"))
+        .collect()
 });
 
 pub(crate) fn argument_schema(name: &str) -> Option<&'static Map<String, Value>> {
@@ -721,10 +738,13 @@ fn argument_metadata(value: &Value) -> Field {
     json!({"type": kind, "length": length}).into()
 }
 
+/// Return the JSON text that Python's server returns, plus the same value as
+/// structured content that matches the tool's output schema.
 fn tool_result(value: Value) -> CallToolResult {
     let text = output::inline(&value).expect("MCP tool values serialize to JSON");
-    let mut result = CallToolResult::success(vec![ContentBlock::text(text.clone())]);
-    result.structured_content = Some(json!({"result": text}));
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+    debug_assert!(value.is_object(), "MCP tool results are JSON objects");
+    result.structured_content = Some(value);
     result
 }
 
@@ -849,5 +869,29 @@ mod tests {
             latest_version(home.path(), "0.2.0").as_deref(),
             Some("0.2.0")
         );
+    }
+
+    #[test]
+    fn tool_results_carry_the_result_object_as_structured_content() {
+        let value =
+            json!({"addr": "0x1111111111111111111111111111111111111111", "perp": {"trades": []}});
+        let result = tool_result(value.clone());
+        let [ContentBlock::Text(text)] = result.content.as_slice() else {
+            panic!("one text block");
+        };
+        assert_eq!(serde_json::from_str::<Value>(&text.text).unwrap(), value);
+        assert_eq!(result.structured_content, Some(value));
+    }
+
+    #[test]
+    fn every_tool_lists_an_object_output_schema() {
+        for tool in TOOLS.iter() {
+            let schema = tool.output_schema.as_deref().expect("output schema");
+            assert_eq!(schema["type"], "object", "{}", tool.name);
+            assert_eq!(schema["additionalProperties"], true, "{}", tool.name);
+            let properties = schema["properties"].as_object().unwrap();
+            assert!(properties.contains_key("error"), "{}", tool.name);
+            assert!(!properties.contains_key("result"), "{}", tool.name);
+        }
     }
 }

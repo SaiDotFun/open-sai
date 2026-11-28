@@ -189,10 +189,14 @@ SAI_PARITY_BIN=/absolute/path/to/rust/sai \
 
 The transcript checks server initialization, ordered tool metadata,
 strict argument errors, and the JSON string in each successful response's
-`content` and `structuredContent`. The native `intent_wait` description
-states its 60-second limit, and the transcript projects that text onto the
-Python listing outside release comparisons. It also replaces a fixture
-session between calls to check the trade refusal before argument validation.
+`content`. Python's `structuredContent` wraps that string as
+`{"result": text}`. The native server returns the parsed object and lists a
+per-tool `outputSchema`, so the comparison accepts either shape and masks
+output schemas. `test_mcp_output_schemas.py` validates every native tool
+result against its listed schema. The native `intent_wait` description
+states its 60-second limit, and the transcript projects that text onto
+the Python listing outside release comparisons. It also replaces a fixture session
+between calls to check the trade refusal before argument validation.
 Auth cases check expiry, strict arguments, and active account changes
 from both MCP and a separate CLI process. They also check credential
 redaction and verify that an invalid account summary leaves selection intact.

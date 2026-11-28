@@ -702,6 +702,53 @@ def test_mcp_compares_actual_json_text(tmp_path: Path, before: str, after: str) 
     assert first_difference(decode_tool(before), decode_tool(after), "MCP")
 
 
+def test_mcp_accepts_python_and_native_structured_content(tmp_path: Path) -> None:
+    text = '{"addr": "0x1", "perp": {"trades": []}}'
+
+    def decode_tool(structured: Any) -> Any:
+        frame = {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {
+                "content": [{"type": "text", "text": text}],
+                "structuredContent": structured,
+                "isError": False,
+            },
+        }
+        return stdout(json.dumps(frame), "mcp", "mcp serve", Normalize(tmp_path))
+
+    python = decode_tool({"result": text})
+    assert decode_tool(json.loads(text)) == python
+    with pytest.raises(ValueError, match="same JSON value"):
+        decode_tool({"addr": "0x2", "perp": {"trades": []}})
+
+
+def test_mcp_masks_output_schemas_in_parsed_and_wire_listings(tmp_path: Path) -> None:
+    def decode_inventory(schema: dict[str, Any]) -> Any:
+        tool = {
+            "name": "fixture",
+            "description": 'Lists "outputSchema": {} in prose.',
+            "inputSchema": {"type": "object"},
+            "outputSchema": schema,
+        }
+        frame = {"jsonrpc": "2.0", "id": 2, "result": {"tools": [tool]}}
+        return stdout(json.dumps(frame), "mcp", "mcp serve", Normalize(tmp_path))
+
+    python = decode_inventory(
+        {"type": "object", "properties": {"result": {"type": "string"}}}
+    )
+    native = decode_inventory(
+        {"type": "object", "properties": {"addr": {"type": "string"}}}
+    )
+    assert native == python
+    [listing] = native
+    assert listing["result"]["tools"][0]["outputSchema"] == "<outputSchema>"
+    assert '"outputSchema": "<outputSchema>"' in listing["result"]["_schemaWire"]
+    assert 'Lists \\"outputSchema\\": {} in prose.' in listing["result"]["_schemaWire"]
+    with pytest.raises(ValueError, match="describe an object"):
+        decode_inventory({"type": "string"})
+
+
 def test_mcp_compares_schema_property_order(tmp_path: Path) -> None:
     def decode_inventory(properties: dict[str, Any]) -> Any:
         frame = {

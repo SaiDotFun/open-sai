@@ -1,0 +1,434 @@
+{
+  "mcp_info": {
+    "type": "object",
+    "title": "mcp_infoOutput",
+    "description": "Server version, endpoints, logs, tools, and trading availability.",
+    "properties": {
+      "name": {"type": "string", "description": "Server name: sai."},
+      "package": {"type": "string", "description": "Package name: sai-cli."},
+      "version": {"type": "string", "description": "Version of the running server."},
+      "installedVersion": {"type": "string", "description": "Version installed on disk, or unknown."},
+      "restartNeeded": {"type": "boolean", "description": "True when the installed version differs from the running one. Restart the agent client to load it."},
+      "latestVersion": {"type": ["string", "null"], "description": "Latest release saved by sai update --check, or null when unknown."},
+      "mcpVersion": {"type": "string", "description": "Version of the MCP library."},
+      "provenance": {"type": "object", "description": "Where the running server is installed."},
+      "endpoints": {"type": "object", "description": "Keeper, WebSocket, and Nibiru REST origins the server uses."},
+      "configFile": {"type": "string", "description": "Path of the settings file."},
+      "logs": {"type": "object", "description": "Log directory and whether logging is enabled."},
+      "tools": {"type": "array", "description": "Names of every tool the server lists."},
+      "trading": {"type": "object", "description": "Whether trade tools can submit, and why not."},
+      "session": {"type": "object", "description": "Summary of the signed-in session for this endpoint."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "auth_status": {
+    "type": "object",
+    "title": "auth_statusOutput",
+    "description": "The active or requested connected account.",
+    "properties": {
+      "addr": {"type": "string", "description": "Connected account address."},
+      "expiresAt": {"type": ["string", "null"], "description": "When the session expires."},
+      "endpoint": {"type": "string", "description": "Keeper endpoint the session is for."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "auth_list": {
+    "type": "object",
+    "title": "auth_listOutput",
+    "description": "Connected accounts.",
+    "properties": {
+      "accounts": {"type": "array", "description": "Each connected account with its expiry, endpoint, and whether it is active and usable."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "auth_use": {
+    "type": "object",
+    "title": "auth_useOutput",
+    "description": "Connected accounts after switching the active one.",
+    "properties": {
+      "accounts": {"type": "array", "description": "Each connected account with its expiry, endpoint, and whether it is active and usable."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "market_list": {
+    "type": "object",
+    "title": "market_listOutput",
+    "description": "Sai markets from Keeper.",
+    "properties": {
+      "perp": {"type": ["object", "null"], "description": "Keeper's perp data, with one borrowings row per market and collateral."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "market_prices": {
+    "type": "object",
+    "title": "market_pricesOutput",
+    "description": "Oracle prices from Keeper.",
+    "properties": {
+      "oracle": {"type": ["object", "null"], "description": "Keeper's oracle data, with USD prices per token."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "account_positions": {
+    "type": "object",
+    "title": "account_positionsOutput",
+    "description": "Open positions and pending orders for an account.",
+    "properties": {
+      "addr": {"type": "string", "description": "Account the tool read, as an EVM address."},
+      "addrSource": {"type": "string", "description": "Where addr came from: argument, session, or ledger."},
+      "perp": {"type": ["object", "null"], "description": "Keeper's positions for the account."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "account_history": {
+    "type": "object",
+    "title": "account_historyOutput",
+    "description": "The latest 50 trade history rows for an account.",
+    "properties": {
+      "addr": {"type": "string", "description": "Account the tool read, as an EVM address."},
+      "addrSource": {"type": "string", "description": "Where addr came from: argument, session, or ledger."},
+      "perp": {"type": ["object", "null"], "description": "Keeper's trade history for the account."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "account_balances": {
+    "type": "object",
+    "title": "account_balancesOutput",
+    "description": "Token balances for an account.",
+    "properties": {
+      "addr": {"type": "string", "description": "Account the tool read, as an EVM address."},
+      "addrSource": {"type": "string", "description": "Where addr came from: argument, session, or ledger."},
+      "data": {"type": ["object", "null"], "description": "Balances from Keeper's WebSocket snapshot."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "intent_local": {
+    "type": "object",
+    "title": "intent_localOutput",
+    "description": "Intents this machine recorded, with their local status.",
+    "properties": {
+      "addr": {"type": "string", "description": "Account the tool read, as an EVM address."},
+      "addrSource": {"type": "string", "description": "Where addr came from: argument, session, or ledger."},
+      "intents": {"type": "array", "description": "Locally pending intents with their key, kind, and local status."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "intent_status": {
+    "type": "object",
+    "title": "intent_statusOutput",
+    "description": "Keeper's intent records; with a key, the reconciled intent.",
+    "properties": {
+      "addr": {"type": "string", "description": "Account the tool read, as an EVM address."},
+      "addrSource": {"type": "string", "description": "Where addr came from: argument, session, or ledger."},
+      "userIntents": {"type": ["array", "null"], "description": "Keeper's intent records."},
+      "matchedTradeHistory": {"type": ["array", "null"], "description": "Trade history rows matched to the intent."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "preview_open": {
+    "type": "object",
+    "title": "preview_openOutput",
+    "description": "Open-trade preview to show the user before trade_open.",
+    "properties": {
+      "addr": {"type": ["string", "null"], "description": "Account the preview acts as. Null for a signed-out open preview."},
+      "dryRun": {"type": "boolean", "description": "Always true: a preview submits nothing."},
+      "intent": {"type": "object", "description": "The intent kind and body a confirmed trade submits."},
+      "estimates": {"type": "object", "description": "Fee, execution, and position estimates. If execution.status is would_be_rejected, report its reason and stop."},
+      "positionRoute": {"type": "object", "description": "Chain and Perp contract the trade routes to."},
+      "previewDigest": {"type": "string", "description": "Digest to pass as preview_digest to the matching trade tool after the user confirms."},
+      "notices": {"type": "array", "description": "Notices to show the user with the preview."},
+      "requiresMarketPriceRefresh": {"type": "boolean", "description": "True for a market order, whose price trade_open checks again."},
+      "referencePrice": {"type": "string", "description": "Market price to pass as reference_price to trade_open."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "preview_close": {
+    "type": "object",
+    "title": "preview_closeOutput",
+    "description": "Close or cancel preview to show the user before trade_close.",
+    "properties": {
+      "addr": {"type": ["string", "null"], "description": "Account the preview acts as. Null for a signed-out open preview."},
+      "dryRun": {"type": "boolean", "description": "Always true: a preview submits nothing."},
+      "intent": {"type": "object", "description": "The intent kind and body a confirmed trade submits."},
+      "estimates": {"type": "object", "description": "Fee, execution, and position estimates. If execution.status is would_be_rejected, report its reason and stop."},
+      "positionRoute": {"type": "object", "description": "Chain and Perp contract the trade routes to."},
+      "previewDigest": {"type": "string", "description": "Digest to pass as preview_digest to the matching trade tool after the user confirms."},
+      "notices": {"type": "array", "description": "Notices to show the user with the preview."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "preview_tpsl": {
+    "type": "object",
+    "title": "preview_tpslOutput",
+    "description": "Take-profit and stop-loss preview to show the user before trade_tpsl.",
+    "properties": {
+      "addr": {"type": ["string", "null"], "description": "Account the preview acts as. Null for a signed-out open preview."},
+      "dryRun": {"type": "boolean", "description": "Always true: a preview submits nothing."},
+      "intent": {"type": "object", "description": "The intent kind and body a confirmed trade submits."},
+      "estimates": {"type": "object", "description": "Fee, execution, and position estimates. If execution.status is would_be_rejected, report its reason and stop."},
+      "positionRoute": {"type": "object", "description": "Chain and Perp contract the trade routes to."},
+      "previewDigest": {"type": "string", "description": "Digest to pass as preview_digest to the matching trade tool after the user confirms."},
+      "notices": {"type": "array", "description": "Notices to show the user with the preview."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "preview_leverage": {
+    "type": "object",
+    "title": "preview_leverageOutput",
+    "description": "Leverage preview to show the user before trade_leverage.",
+    "properties": {
+      "addr": {"type": ["string", "null"], "description": "Account the preview acts as. Null for a signed-out open preview."},
+      "dryRun": {"type": "boolean", "description": "Always true: a preview submits nothing."},
+      "intent": {"type": "object", "description": "The intent kind and body a confirmed trade submits."},
+      "estimates": {"type": "object", "description": "Fee, execution, and position estimates. If execution.status is would_be_rejected, report its reason and stop."},
+      "positionRoute": {"type": "object", "description": "Chain and Perp contract the trade routes to."},
+      "previewDigest": {"type": "string", "description": "Digest to pass as preview_digest to the matching trade tool after the user confirms."},
+      "notices": {"type": "array", "description": "Notices to show the user with the preview."},
+      "collateral": {"type": "object", "description": "Position collateral in USD before and after the change."},
+      "collateralBaseUnits": {"type": "object", "description": "The same collateral in USDC base units."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "preview_margin": {
+    "type": "object",
+    "title": "preview_marginOutput",
+    "description": "Margin preview to show the user before trade_margin.",
+    "properties": {
+      "addr": {"type": ["string", "null"], "description": "Account the preview acts as. Null for a signed-out open preview."},
+      "dryRun": {"type": "boolean", "description": "Always true: a preview submits nothing."},
+      "intent": {"type": "object", "description": "The intent kind and body a confirmed trade submits."},
+      "estimates": {"type": "object", "description": "Fee, execution, and position estimates. If execution.status is would_be_rejected, report its reason and stop."},
+      "positionRoute": {"type": "object", "description": "Chain and Perp contract the trade routes to."},
+      "previewDigest": {"type": "string", "description": "Digest to pass as preview_digest to the matching trade tool after the user confirms."},
+      "notices": {"type": "array", "description": "Notices to show the user with the preview."},
+      "collateral": {"type": "object", "description": "Position collateral in USD before and after the change."},
+      "quote": {"type": "object", "description": "Quote from exact contract state that the preview used."},
+      "warning": {"type": "string", "description": "Warning to show the user about how the margin change executes."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "preview_partial_close": {
+    "type": "object",
+    "title": "preview_partial_closeOutput",
+    "description": "Partial-close preview to show the user before trade_partial_close.",
+    "properties": {
+      "addr": {"type": ["string", "null"], "description": "Account the preview acts as. Null for a signed-out open preview."},
+      "dryRun": {"type": "boolean", "description": "Always true: a preview submits nothing."},
+      "intent": {"type": "object", "description": "The intent kind and body a confirmed trade submits."},
+      "estimates": {"type": "object", "description": "Fee, execution, and position estimates. If execution.status is would_be_rejected, report its reason and stop."},
+      "positionRoute": {"type": "object", "description": "Chain and Perp contract the trade routes to."},
+      "previewDigest": {"type": "string", "description": "Digest to pass as preview_digest to the matching trade tool after the user confirms."},
+      "notices": {"type": "array", "description": "Notices to show the user with the preview."},
+      "collateral": {"type": "object", "description": "Position collateral in USD before and after the change."},
+      "quote": {"type": "object", "description": "Quote from exact contract state that the preview used."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "logs_intent": {
+    "type": "object",
+    "title": "logs_intentOutput",
+    "description": "Local log events and Keeper's record for one intent.",
+    "properties": {
+      "intentKey": {"type": ["string", "null"], "description": "Intent key the log events carry."},
+      "events": {"type": "array", "description": "Local log events for the intent, oldest first."},
+      "gaps": {"type": "array", "description": "Missing or unreadable log ranges."},
+      "keeper": {"type": ["object", "null"], "description": "Keeper's record of the intent, or null offline or when Keeper has none."},
+      "txHash": {"type": ["string", "null"], "description": "Request transaction hash, when known."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "account_overview": {
+    "type": "object",
+    "title": "account_overviewOutput",
+    "description": "Balances, positions, orders, prices, blocking intents, and session in one read. Each section holds data or its own error.",
+    "properties": {
+      "addr": {"type": "string", "description": "Account the tool read, as an EVM address."},
+      "addrSource": {"type": "string", "description": "Where addr came from: argument, session, or ledger."},
+      "balances": {"type": "object", "description": "Balances section."},
+      "positions": {"type": "object", "description": "Open positions section."},
+      "pendingOrders": {"type": "object", "description": "Pending limit and stop orders section."},
+      "queuedMarketOrders": {"type": "object", "description": "Market orders waiting for execution."},
+      "prices": {"type": "object", "description": "Oracle prices section."},
+      "blockingIntents": {"type": "object", "description": "Unresolved intents that block new trades."},
+      "session": {"type": "object", "description": "Session section."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "intent_wait": {
+    "type": "object",
+    "title": "intent_waitOutput",
+    "description": "Intent receipt after waiting for a final outcome.",
+    "properties": {
+      "addr": {"type": "string", "description": "Account the tool read, as an EVM address."},
+      "addrSource": {"type": "string", "description": "Where addr came from: argument, session, or ledger."},
+      "intentKey": {"type": "string", "description": "The intent key."},
+      "outcome": {"type": "string", "description": "filled, placed, succeeded, failed, rejected, or another final outcome; unknown when the wait ended first."},
+      "receipt": {"type": ["object", "null"], "description": "Request transaction, execution block, fill, and resulting position, when Keeper has them."},
+      "hint": {"type": "string", "description": "What to do when the outcome is unknown."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
+    },
+    "additionalProperties": true
+  },
+  "trade_open": {
+    "type": "object",
+    "title": "trade_openOutput",
+    "description": "Submitted open intent, or why nothing was submitted.",
+    "properties": {
+      "intentKey": {"type": "string", "description": "Intent key to follow up with intent_status or intent_wait. Never resubmit while it is unresolved."},
+      "status": {"type": "string", "description": "accepted when Keeper admitted the intent. It does not mean the trade executed."},
+      "message": {"type": "string", "description": "Keeper's admission message."},
+      "addr": {"type": ["string", "null"], "description": "Account the trade acted as."},
+      "notices": {"type": "array", "description": "Notices to show the user with the result."},
+      "referencePrice": {"type": "string", "description": "Market price the open submitted."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."},
+      "intentKeys": {"type": "array", "description": "Intent keys to check with intent_status before retrying."},
+      "next": {"type": "string", "description": "The next tool call to make after this error."},
+      "preview": {"type": ["object", "null"], "description": "Replacement preview to show the user after PREVIEW_MISMATCH or PRICE_MOVED."},
+      "quoteStatus": {"type": "string", "description": "available when preview has a previewDigest to confirm; otherwise unavailable."},
+      "recovery": {"type": "object", "description": "Recovery action and message for a refused trade."}
+    },
+    "additionalProperties": true
+  },
+  "trade_close": {
+    "type": "object",
+    "title": "trade_closeOutput",
+    "description": "Submitted close intent, or why nothing was submitted.",
+    "properties": {
+      "intentKey": {"type": "string", "description": "Intent key to follow up with intent_status or intent_wait. Never resubmit while it is unresolved."},
+      "status": {"type": "string", "description": "accepted when Keeper admitted the intent. It does not mean the trade executed."},
+      "message": {"type": "string", "description": "Keeper's admission message."},
+      "addr": {"type": ["string", "null"], "description": "Account the trade acted as."},
+      "notices": {"type": "array", "description": "Notices to show the user with the result."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."},
+      "intentKeys": {"type": "array", "description": "Intent keys to check with intent_status before retrying."},
+      "next": {"type": "string", "description": "The next tool call to make after this error."},
+      "preview": {"type": ["object", "null"], "description": "Replacement preview to show the user after PREVIEW_MISMATCH or PRICE_MOVED."},
+      "quoteStatus": {"type": "string", "description": "available when preview has a previewDigest to confirm; otherwise unavailable."},
+      "recovery": {"type": "object", "description": "Recovery action and message for a refused trade."}
+    },
+    "additionalProperties": true
+  },
+  "trade_tpsl": {
+    "type": "object",
+    "title": "trade_tpslOutput",
+    "description": "Submitted tpsl intent, or why nothing was submitted.",
+    "properties": {
+      "intentKey": {"type": "string", "description": "Intent key to follow up with intent_status or intent_wait. Never resubmit while it is unresolved."},
+      "status": {"type": "string", "description": "accepted when Keeper admitted the intent. It does not mean the trade executed."},
+      "message": {"type": "string", "description": "Keeper's admission message."},
+      "addr": {"type": ["string", "null"], "description": "Account the trade acted as."},
+      "notices": {"type": "array", "description": "Notices to show the user with the result."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."},
+      "intentKeys": {"type": "array", "description": "Intent keys to check with intent_status before retrying."},
+      "next": {"type": "string", "description": "The next tool call to make after this error."},
+      "preview": {"type": ["object", "null"], "description": "Replacement preview to show the user after PREVIEW_MISMATCH or PRICE_MOVED."},
+      "quoteStatus": {"type": "string", "description": "available when preview has a previewDigest to confirm; otherwise unavailable."},
+      "recovery": {"type": "object", "description": "Recovery action and message for a refused trade."}
+    },
+    "additionalProperties": true
+  },
+  "trade_leverage": {
+    "type": "object",
+    "title": "trade_leverageOutput",
+    "description": "Submitted leverage intent, or why nothing was submitted.",
+    "properties": {
+      "intentKey": {"type": "string", "description": "Intent key to follow up with intent_status or intent_wait. Never resubmit while it is unresolved."},
+      "status": {"type": "string", "description": "accepted when Keeper admitted the intent. It does not mean the trade executed."},
+      "message": {"type": "string", "description": "Keeper's admission message."},
+      "addr": {"type": ["string", "null"], "description": "Account the trade acted as."},
+      "notices": {"type": "array", "description": "Notices to show the user with the result."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."},
+      "intentKeys": {"type": "array", "description": "Intent keys to check with intent_status before retrying."},
+      "next": {"type": "string", "description": "The next tool call to make after this error."},
+      "preview": {"type": ["object", "null"], "description": "Replacement preview to show the user after PREVIEW_MISMATCH or PRICE_MOVED."},
+      "quoteStatus": {"type": "string", "description": "available when preview has a previewDigest to confirm; otherwise unavailable."},
+      "recovery": {"type": "object", "description": "Recovery action and message for a refused trade."}
+    },
+    "additionalProperties": true
+  },
+  "trade_margin": {
+    "type": "object",
+    "title": "trade_marginOutput",
+    "description": "Submitted margin intent, or why nothing was submitted.",
+    "properties": {
+      "intentKey": {"type": "string", "description": "Intent key to follow up with intent_status or intent_wait. Never resubmit while it is unresolved."},
+      "status": {"type": "string", "description": "accepted when Keeper admitted the intent. It does not mean the trade executed."},
+      "message": {"type": "string", "description": "Keeper's admission message."},
+      "addr": {"type": ["string", "null"], "description": "Account the trade acted as."},
+      "notices": {"type": "array", "description": "Notices to show the user with the result."},
+      "quote": {"type": "object", "description": "Quote from exact contract state that the trade used."},
+      "warning": {"type": "string", "description": "Warning to show the user about how the margin change executes."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."},
+      "intentKeys": {"type": "array", "description": "Intent keys to check with intent_status before retrying."},
+      "next": {"type": "string", "description": "The next tool call to make after this error."},
+      "preview": {"type": ["object", "null"], "description": "Replacement preview to show the user after PREVIEW_MISMATCH or PRICE_MOVED."},
+      "quoteStatus": {"type": "string", "description": "available when preview has a previewDigest to confirm; otherwise unavailable."},
+      "recovery": {"type": "object", "description": "Recovery action and message for a refused trade."}
+    },
+    "additionalProperties": true
+  },
+  "trade_partial_close": {
+    "type": "object",
+    "title": "trade_partial_closeOutput",
+    "description": "Submitted partial-close intent, or why nothing was submitted.",
+    "properties": {
+      "intentKey": {"type": "string", "description": "Intent key to follow up with intent_status or intent_wait. Never resubmit while it is unresolved."},
+      "status": {"type": "string", "description": "accepted when Keeper admitted the intent. It does not mean the trade executed."},
+      "message": {"type": "string", "description": "Keeper's admission message."},
+      "addr": {"type": ["string", "null"], "description": "Account the trade acted as."},
+      "notices": {"type": "array", "description": "Notices to show the user with the result."},
+      "quote": {"type": "object", "description": "Quote from exact contract state that the trade used."},
+      "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
+      "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."},
+      "intentKeys": {"type": "array", "description": "Intent keys to check with intent_status before retrying."},
+      "next": {"type": "string", "description": "The next tool call to make after this error."},
+      "preview": {"type": ["object", "null"], "description": "Replacement preview to show the user after PREVIEW_MISMATCH or PRICE_MOVED."},
+      "quoteStatus": {"type": "string", "description": "available when preview has a previewDigest to confirm; otherwise unavailable."},
+      "recovery": {"type": "object", "description": "Recovery action and message for a refused trade."}
+    },
+    "additionalProperties": true
+  }
+}

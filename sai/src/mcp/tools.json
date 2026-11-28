@@ -8,7 +8,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "mcp_infoOutput", "type": "object"},
     "annotations": {"title": "MCP Info", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
   },
   {
@@ -22,7 +21,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "auth_statusOutput", "type": "object"},
     "annotations": {"title": "Auth Status", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
   },
   {
@@ -34,7 +32,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "auth_listOutput", "type": "object"},
     "annotations": {"title": "Connected Accounts", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
   },
   {
@@ -49,7 +46,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "auth_useOutput", "type": "object"},
     "annotations": {"title": "Switch Account", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
   },
   {
@@ -61,7 +57,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "market_listOutput", "type": "object"},
     "annotations": {"title": "Market List", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
   },
   {
@@ -73,7 +68,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "market_pricesOutput", "type": "object"},
     "annotations": {"title": "Market Prices", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
   },
   {
@@ -87,7 +81,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "account_positionsOutput", "type": "object"},
     "annotations": {"title": "Account Positions", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
   },
   {
@@ -101,7 +94,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "account_historyOutput", "type": "object"},
     "annotations": {"title": "Account History", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
   },
   {
@@ -115,7 +107,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "account_balancesOutput", "type": "object"},
     "annotations": {"title": "Account Balances", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
   },
   {
@@ -129,7 +120,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "intent_localOutput", "type": "object"},
     "annotations": {"title": "Local Intents", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
   },
   {
@@ -144,7 +134,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "intent_statusOutput", "type": "object"},
     "annotations": {"title": "Intent Status", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
   },
   {
@@ -168,7 +157,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "preview_openOutput", "type": "object"},
     "annotations": {"title": "Preview Open Trade", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
   },
   {
@@ -185,7 +173,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "preview_closeOutput", "type": "object"},
     "annotations": {"title": "Preview Close Trade", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
   },
   {
@@ -205,7 +192,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "preview_tpslOutput", "type": "object"},
     "annotations": {"title": "Preview TP/SL", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
   },
   {
@@ -222,7 +208,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "preview_leverageOutput", "type": "object"},
     "annotations": {"title": "Preview Leverage", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
   },
   {
@@ -240,7 +225,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "preview_marginOutput", "type": "object"},
     "annotations": {"title": "Preview Margin Change", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
   },
   {
@@ -257,7 +241,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "preview_partial_closeOutput", "type": "object"},
     "annotations": {"title": "Preview Partial Close", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
   },
   {
@@ -275,7 +258,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "logs_intentOutput", "type": "object"},
     "annotations": {"title": "Intent Log Trail", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
   },
   {
@@ -289,7 +271,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "account_overviewOutput", "type": "object"},
     "annotations": {"title": "Account Overview", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
   },
   {
@@ -306,7 +287,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "intent_waitOutput", "type": "object"},
     "annotations": {"title": "Wait for Intent", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
   },
   {
@@ -333,7 +313,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "trade_openOutput", "type": "object"},
     "annotations": {"title": "Open Trade", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true}
   },
   {
@@ -351,7 +330,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "trade_closeOutput", "type": "object"},
     "annotations": {"title": "Close Trade", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true}
   },
   {
@@ -372,7 +350,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "trade_tpslOutput", "type": "object"},
     "annotations": {"title": "Set TP/SL", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true}
   },
   {
@@ -390,7 +367,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "trade_leverageOutput", "type": "object"},
     "annotations": {"title": "Set Leverage", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true}
   },
   {
@@ -409,7 +385,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "trade_marginOutput", "type": "object"},
     "annotations": {"title": "Change Margin", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true}
   },
   {
@@ -427,7 +402,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "trade_partial_closeOutput", "type": "object"},
     "annotations": {"title": "Partial Close", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true}
   }
 ]

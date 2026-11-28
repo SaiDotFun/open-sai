@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from compare import structured_text
 from scenarios import ADDRESS, OTHER_ADDRESS, loopback, seed_home
 from test_mcp_stdio import server
 from test_trade import rows, run
@@ -39,9 +40,7 @@ def mcp_pair(cli_pair: tuple[tuple[str, ...], tuple[str, ...]]) -> tuple[Path, P
 
 def result(frame: dict[str, Any]) -> dict[str, Any]:
     assert frame["isError"] is False
-    text = frame["content"][0]["text"]
-    assert frame["structuredContent"] == {"result": text}
-    return json.loads(text)
+    return json.loads(structured_text(frame))
 
 
 def binding(preview: dict[str, Any]) -> dict[str, Any]:

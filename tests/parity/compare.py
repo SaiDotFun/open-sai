@@ -421,6 +421,50 @@ def rewrite_mcp_fields(text: str, updates: dict[str, Any]) -> str:
     return "".join(chunks)
 
 
+def structured_text(result: Mapping[str, Any]) -> str:
+    """Return a tool result's JSON text after checking its structured copy.
+
+    Python's FastMCP wraps the text as `{"result": text}`. The native server
+    returns the parsed object, matching its per-tool output schema.
+    """
+    [block] = result["content"]
+    text = block["text"]
+    if block.get("type") != "text" or not isinstance(text, str):
+        raise TypeError("MCP tool results carry one text block")
+    structured = result.get("structuredContent")
+    if structured != {"result": text} and structured != json.loads(text):
+        raise ValueError("MCP structuredContent must carry the same JSON value")
+    return text
+
+
+OUTPUT_SCHEMA = re.compile(r'(?<!\\)"outputSchema"\s*:\s*')
+
+
+def mask_output_schemas(result: dict[str, Any], frame: str) -> str:
+    """Hide each tool's output schema from comparisons, in parsed and wire form.
+
+    Python lists `{result: string}` for every tool. The native server lists
+    each tool's result object instead, and its tests validate every result
+    against that schema.
+    """
+    for tool in result["tools"]:
+        schema = tool.get("outputSchema")
+        if schema is not None:
+            if not isinstance(schema, dict) or schema.get("type") != "object":
+                raise ValueError("MCP output schemas must describe an object")
+            tool["outputSchema"] = "<outputSchema>"
+    decoder = json.JSONDecoder()
+    chunks, previous = [], 0
+    for match in OUTPUT_SCHEMA.finditer(frame):
+        if match.start() < previous:
+            continue
+        _, end = decoder.raw_decode(frame, match.end())
+        chunks.extend((frame[previous : match.end()], '"<outputSchema>"'))
+        previous = end
+    chunks.append(frame[previous:])
+    return "".join(chunks)
+
+
 def normalize_mcp_result(result: dict[str, Any]) -> None:
     info = result.get("serverInfo")
     if isinstance(info, dict):
@@ -433,8 +477,7 @@ def normalize_mcp_result(result: dict[str, Any]) -> None:
             raise TypeError("MCP text content must be a string")
         if result.get("isError"):
             continue
-        if result.get("structuredContent") != {"result": text}:
-            raise ValueError("MCP structuredContent must carry the same JSON string")
+        structured_text(result)
         value = json.loads(text)
         updates = {}
         if isinstance(value, dict) and value.get("name") == "sai":
@@ -468,7 +511,8 @@ def normalize_mcp_result(result: dict[str, Any]) -> None:
             value.update(updates)
         result["_toolText"] = rewrite_mcp_fields(text, updates)
         block["text"] = value
-        result["structuredContent"]["result"] = value
+        # Compare both servers' structured content in Python's wrapped form.
+        result["structuredContent"] = {"result": value}
 
 
 OVERVIEW_AGE = re.compile(r"(?<=\()-?[\d.,]+(?:e[+-]\d+)?(?= s\))")
@@ -661,7 +705,7 @@ def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
             for frame, record in zip(raw.splitlines(), records, strict=True):
                 result = record.get("result", {})
                 if "tools" in result:
-                    result["_schemaWire"] = frame
+                    result["_schemaWire"] = mask_output_schemas(result, frame)
                 normalize_mcp_result(result)
         return normalize.paths(records)
     value = normalize.paths(json.loads(raw))
