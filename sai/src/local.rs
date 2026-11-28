@@ -1,6 +1,8 @@
 mod python_numbers;
 mod receipt_output;
 
+pub(crate) use receipt_output::write_stderr_detached;
+
 use std::{
     fmt::Write as _,
     io::{self, Write},

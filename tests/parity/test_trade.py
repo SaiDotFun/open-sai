@@ -299,6 +299,49 @@ def rows(home: Path) -> list[tuple[Any, ...]]:
         ).fetchall()
 
 
+@pytest.mark.parametrize(
+    ("args", "scenario"),
+    [
+        (OPEN, "quote-market"),
+        (CLOSE, "quote-close"),
+        (("trade", "tpsl", "7", "--take-profit", "110"), "quote-close"),
+        (
+            ("trade", "leverage", "7", "--leverage", "1.818181818181818182"),
+            "quote-close",
+        ),
+    ],
+    ids=["open", "close", "tpsl", "leverage"],
+)
+def test_text_dry_run_matches_python_main_format(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, args: CLI, scenario: str
+) -> None:
+    """Text mode prints Python's notices, then the result as indented JSON."""
+    reference = str(Path(sys.executable).with_name("sai"))
+    notices = []
+    for index, cli in enumerate(((reference,), cli_pair[1])):
+        with loopback(scenario) as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            result = subprocess.run(
+                [*cli, *args, "--dry-run"],
+                cwd=home,
+                env={**child_env(home, endpoints), "SAI_UPDATE_AUTO": "0"},
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                encoding="utf-8",
+                timeout=30,
+                check=False,
+            )
+            assert (result.returncode, result.stderr) == (0, ""), result.stdout
+            lines = result.stdout.splitlines(keepends=True)
+            start = lines.index("{\n")
+            body = "".join(lines[start:])
+            assert body == json.dumps(json.loads(body), indent=2) + "\n"
+            notices.append(lines[:start])
+            assert not endpoints.errors
+    assert notices[0] == notices[1]
+
+
 def test_numeric_keeper_price_rounds_to_even(
     trade_pair: tuple[CLI, CLI], tmp_path: Path
 ) -> None:
