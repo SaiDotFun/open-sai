@@ -5,7 +5,8 @@ Dry run by default: it checks everything and prints the commands. Pass
 `--run` to create the annotated tag and push it.
 
 Checks: the working tree is clean, HEAD is origin/main after a fetch, the
-Python, Cargo, and shim versions agree, and the tag is unused.
+Python, Cargo, and shim versions agree, a stable native release has its
+upgrade guide in docs/releases, and the tag is unused.
 
 Use `--python-only` to release the full Python wheel and sdist.
 
@@ -34,6 +35,7 @@ from check_release import (
 
 REMOTE = "origin"
 BRANCH = "main"
+GUIDES = Path("docs/releases")
 
 Runner = Callable[[list[str]], str]
 
@@ -73,6 +75,18 @@ def read_state(git: Runner, tag: str) -> State:
         local_tag=bool(git(["tag", "--list", tag])),
         remote_tag=bool(git(["ls-remote", "--tags", REMOTE, f"refs/tags/{tag}"])),
     )
+
+
+def guide_error(version: str, root: Path = ROOT) -> str | None:
+    """Return why a native release of VERSION lacks its upgrade guide.
+
+    The workflow's assemble job renders the guide into the release notes
+    after the native build, so a missing guide fails the release late.
+    Release candidates need no guide."""
+    guide = GUIDES / f"sai-cli-v{version}.md"
+    if "-" in version or (root / guide).is_file():
+        return None
+    return f"missing release guide {guide.as_posix()}"
 
 
 def problems(tag: str, state: State) -> list[str]:
@@ -117,6 +131,8 @@ def release(
         else:
             native_version, _ = native_versions(root)
             check_tag(tag, native_version, python_version)
+            if error := guide_error(version, root):
+                raise ValueError(error)
     except (KeyError, OSError, TypeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

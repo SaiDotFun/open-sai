@@ -1566,17 +1566,21 @@ def test_wait_unknown_returns_call_again_hint(keeper_replay, surface):
 def test_wait_times_out_during_a_slow_mcp_response(keeper_replay):
     endpoint, replies = keeper_replay
     reserve(endpoint)
-    slow = SlowBody()
+    # The body stays held until the test releases it, so the wait can only
+    # return through its own deadline, however slow the host is.
+    slow = SlowBody(hold=True)
     replies.append(slow)
     started = time.monotonic()
     try:
-        result = mcp_wait(endpoint, timeout=0.25)
+        result = mcp_wait(endpoint, timeout=1)
         elapsed = time.monotonic() - started
+        held = not slow.finished.is_set()
     finally:
         slow.release.set()
     assert slow.finished.wait(2)
     assert slow.started.is_set()
-    assert elapsed < 0.5
+    assert held
+    assert elapsed < 5
     assert result["outcome"] == "unknown"
     assert status(endpoint) == "unknown"
 

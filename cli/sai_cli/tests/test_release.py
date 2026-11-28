@@ -75,6 +75,8 @@ def repo(tmp_path) -> Path:
     (work / "Cargo.toml").write_text('[workspace.package]\nversion = "1.2.3"\n')
     (work / "shim").mkdir()
     (work / "shim/pyproject.toml").write_text('[project]\nversion = "1.2.3"\n')
+    (work / "docs/releases").mkdir(parents=True)
+    (work / "docs/releases/sai-cli-v1.2.3.md").write_text("# Sai CLI v1.2.3\n")
     git(work, "add", ".")
     git(work, "commit", "-q", "-m", "init")
     git(work, "remote", "add", "origin", str(origin))
@@ -187,6 +189,27 @@ def test_accepts_matching_release_candidate_spellings(repo: Path, capsys):
     assert run(repo, "1.2.4-rc.1") == 0
     assert "git tag --annotate sai-cli/v1.2.4-rc.1" in capsys.readouterr().out
     assert git(repo, "ls-remote", "--tags", "origin") == ""
+
+
+def test_refuses_a_stable_native_release_without_its_guide(repo: Path, capsys):
+    """The assemble job renders this guide, so a tag without it would fail
+    after the native build."""
+    for path in ("pyproject.toml", "Cargo.toml", "shim/pyproject.toml"):
+        config = repo / path
+        config.write_text(config.read_text().replace("1.2.3", "1.2.4"))
+    git(repo, "commit", "-qam", "bump without a guide")
+    git(repo, "push", "-q", "origin", "main")
+
+    for go in (False, True):
+        assert run(repo, "1.2.4", go=go) == 1
+        assert "missing release guide docs/releases/sai-cli-v1.2.4.md" in (
+            capsys.readouterr().err
+        )
+    assert git(repo, "tag", "--list") == ""
+    assert git(repo, "ls-remote", "--tags", "origin") == ""
+
+    # Python-only releases render no guide.
+    assert run(repo, "1.2.4", python_only=True) == 0
 
 
 def test_refuses_version_mismatch_dirty_tree_and_unpushed_head(repo, capsys):
