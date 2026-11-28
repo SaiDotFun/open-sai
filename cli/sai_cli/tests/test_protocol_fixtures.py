@@ -54,9 +54,16 @@ def test_cli_replays_observed_mainnet_http(monkeypatch, args, file, field):
     monkeypatch.setattr(httpx, "post", post)
     result = CliRunner().invoke(main, ["--json", *args])
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output) == golden["data"]
+    expected = copy.deepcopy(golden["data"])
+    if field == "oracle":
+        for row in expected["oracle"]["tokenPricesUsd"]:
+            block = row["lastUpdatedBlock"]
+            if block["block_ts"] == "1970-01-01T00:00:00Z":
+                block["block_ts"] = None
+    decoded = json.loads(result.output)
+    assert decoded == expected
     assert len(calls) == 1
-    assert field in json.loads(result.output)
+    assert field in decoded
 
 
 def test_cli_replays_synthetic_positions(monkeypatch, synthetic):
@@ -111,7 +118,7 @@ def test_synthetic_trading_request_goldens(synthetic):
     )
     assert intents.close_intent(7) == expected["close"]
     assert intents.close_intent(7, cancel=True) == expected["cancel"]
-    assert intents.partial_intent(position, 50, Decimal(1)) == expected["partial_close"]
+    assert intents.partial_intent(position, 50) == expected["partial_close"]
     assert intents.tpsl_intent(7, "110", None, False, True) == expected["tpsl"]
     assert intents.leverage_intent(7, "5") == expected["leverage"]
     quote = margin.margin_quote(
@@ -119,7 +126,7 @@ def test_synthetic_trading_request_goldens(synthetic):
         {"available_to_trade": "10000000"},
         {"minLeverage": 1, "maxLeverage": 100},
         "add",
-        "5",
+        5_000_000,
         effective_leverage=Decimal(10),
     )
     assert (

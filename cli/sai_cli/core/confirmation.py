@@ -1,0 +1,107 @@
+"""Canonical trade preview digests for the CLI and MCP."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+from decimal import Decimal
+from typing import Any
+
+from .preview import close_oracle_time_unknown, rejection_reason
+
+PARTIAL_CLOSE_PRICE_FIELDS = {"collateralPriceUsd", "closedNotionalUsd"}
+
+
+def canonical_price(value: object) -> str:
+    """Write numerically equal prices as equal text."""
+    price = format(Decimal(str(value)), "f")
+    return price.rstrip("0").rstrip(".") if "." in price else price
+
+
+def digest_material(preview: dict[str, Any]) -> dict[str, Any]:
+    """Bind the account, intent, and any position route and quote.
+
+    For a market open, bind the confirmed reference price. The intent price
+    is refreshed before submission.
+    """
+    intent = copy.deepcopy(preview["intent"])
+    body = intent.get("body", {})
+    account = preview.get("addr")
+    material: dict[str, Any] = {
+        "addr": account.lower() if isinstance(account, str) else None,
+        "intent": intent,
+    }
+    if intent.get("kind") == "OPEN_TRADE" and body.get("orderType") == "market":
+        body.pop("intentPrice", None)
+        reference = preview.get("referencePrice")
+        material["referencePrice"] = (
+            canonical_price(reference) if reference is not None else None
+        )
+    if "quote" in preview:
+        quote = preview["quote"]
+        if intent.get("kind") == "DECREASE_POSITION_SIZE":
+            # The user must confirm again once a USD estimate is available.
+            usd_available = quote.get("closedNotionalUsd") is not None
+            quote = {
+                key: value
+                for key, value in quote.items()
+                if key not in PARTIAL_CLOSE_PRICE_FIELDS
+            }
+            quote["closedNotionalUsdAvailable"] = usd_available
+        material["quote"] = quote
+    if "collateralBaseUnits" in preview:
+        # The CLI leverage quote binds quantities. USD conversions are display data.
+        material["collateralBaseUnits"] = preview["collateralBaseUnits"]
+    if "positionRoute" in preview:
+        material["positionRoute"] = preview["positionRoute"]
+    return material
+
+
+def preview_digest(preview: dict[str, Any]) -> str:
+    """Hash the confirmed parts of the preview as canonical JSON."""
+    canonical = json.dumps(
+        digest_material(preview), sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def is_confirmable(preview: dict[str, Any]) -> bool:
+    """Require a verified route and a reference price for market opens."""
+    return (
+        "positionRoute" in preview
+        and preview.get("positionOwnerVerified") is not False
+        and (
+            not preview.get("requiresMarketPriceRefresh")
+            or preview.get("referencePrice") is not None
+        )
+    )
+
+
+def collateral_price_unverified(quote: dict[str, Any]) -> bool:
+    return "collateralPriceUsd" in quote and quote["collateralPriceUsd"] is None
+
+
+def with_digest(preview: dict[str, Any]) -> dict[str, Any]:
+    values = preview.get("estimates", {})
+    quote = preview.get("quote") or {}
+    intent = preview["intent"]
+    unknown_partial_leverage = (
+        intent["kind"] == "DECREASE_POSITION_SIZE"
+        and quote.get("effectiveLeverage") is None
+    )
+    unknown_leverage_collateral = (
+        intent["kind"] == "UPDATE_TRADE"
+        and "requestedLeverage" in intent["body"]
+        and "quote" not in preview
+        and "collateralBaseUnits" not in preview
+    )
+    if (
+        rejection_reason(values) is not None
+        or close_oracle_time_unknown(values)
+        or unknown_partial_leverage
+        or unknown_leverage_collateral
+        or collateral_price_unverified(quote)
+    ):
+        return {key: value for key, value in preview.items() if key != "previewDigest"}
+    return {**preview, "previewDigest": preview_digest(preview)}

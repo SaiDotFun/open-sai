@@ -1,10 +1,12 @@
 use std::{fs, os::unix::fs::PermissionsExt, str::FromStr};
 
 use chrono::{NaiveDateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior::Immediate, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior::Immediate, params};
 use serde::Serialize;
 
 use super::{Storage, StorageError, StorageEvent, endpoint_origin};
+
+const OPEN_TRADE: &str = "OPEN_TRADE";
 
 const SCHEMA_VERSION: i64 = 1;
 const LEDGER_FILE: &str = "intents.sqlite3";
@@ -62,6 +64,14 @@ pub struct IntentRow {
     pub status: String,
 }
 
+pub(crate) struct UnresolvedIntent {
+    pub key: String,
+    pub kind: String,
+    pub status: String,
+    pub entity: Option<String>,
+    pub created_at: Option<f64>,
+}
+
 fn schema_version(connection: &Connection) -> Result<i64, StorageError> {
     let version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version > SCHEMA_VERSION {
@@ -99,6 +109,48 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
+fn check_open_pending(
+    connection: &Connection,
+    endpoint: &str,
+    account: &str,
+    allow_concurrent_open: bool,
+    storage: &Storage<'_>,
+) -> Result<(), StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT id FROM intents WHERE endpoint=?1 AND account=?2 AND kind=?3
+             AND (keeper_status='pending' OR (NOT ?4 AND status IN ('unknown', 'accepted')))
+             ORDER BY rowid DESC",
+    )?;
+    let keys: Vec<String> = statement
+        .query_map(
+            params![
+                endpoint,
+                account.to_lowercase(),
+                OPEN_TRADE,
+                allow_concurrent_open
+            ],
+            |row| row.get(0),
+        )?
+        .collect::<Result<_, _>>()?;
+    if let Some(key) = keys.first() {
+        let hint = storage.intent_status_hint(endpoint, account, key);
+        let origin = endpoint_origin(endpoint);
+        for blocked_key in &keys {
+            storage.emit(StorageEvent::OpenBlocked {
+                key: blocked_key,
+                addr: account,
+                endpoint: &origin,
+            });
+        }
+        return Err(StorageError::RecentOpenPending {
+            key: key.clone(),
+            hint,
+            keys,
+        });
+    }
+    Ok(())
+}
+
 fn unix_time() -> f64 {
     let now = Utc::now();
     now.timestamp() as f64 + f64::from(now.timestamp_subsec_nanos()) / 1e9
@@ -118,15 +170,43 @@ fn key_time(key: &str) -> Option<f64> {
 }
 
 impl Storage<'_> {
+    /// Find a recorded account and its effective status on this Keeper endpoint.
+    pub fn intent_record(
+        &self,
+        endpoint: &str,
+        key: &str,
+    ) -> Result<Option<(String, String)>, StorageError> {
+        if !self.trader.join(LEDGER_FILE).try_exists()? {
+            return Ok(None);
+        }
+        Ok(self
+            .open_ledger()?
+            .query_row(
+                "SELECT account, COALESCE(keeper_status, status) FROM intents
+                 WHERE id=?1 AND endpoint=?2",
+                params![key, endpoint],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
     /// Open and migrate the ledger.
     pub fn open_ledger(&self) -> Result<Connection, StorageError> {
-        let path = self.directory()?.join(LEDGER_FILE);
-        // Closing a separate descriptor would release this process's SQLite
-        // POSIX locks. The enclosing directory is private even on first open.
-        let mut connection = Connection::open(&path)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        connection.busy_timeout(self.busy_timeout)?;
+        self.remaining_busy_timeout()?;
+        let mut connection = if self.preserve_ledger_modes {
+            let flags = OpenFlags::default() - OpenFlags::SQLITE_OPEN_CREATE;
+            Connection::open_with_flags(self.trader.join(LEDGER_FILE), flags)?
+        } else {
+            let path = self.directory()?.join(LEDGER_FILE);
+            // Closing a separate descriptor would release this process's SQLite
+            // POSIX locks. The enclosing directory is private even on first open.
+            let connection = Connection::open(&path)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            connection
+        };
+        connection.busy_timeout(self.remaining_busy_timeout()?)?;
         migrate(&mut connection)?;
+        connection.busy_timeout(self.remaining_busy_timeout()?)?;
         Ok(connection)
     }
 
@@ -139,19 +219,47 @@ impl Storage<'_> {
         kind: &str,
         entity: &str,
     ) -> Result<(), StorageError> {
+        self.reserve(key, endpoint, account, kind, entity, false)
+    }
+
+    /// Check early for an unresolved open. Reservation repeats the check under the write lock.
+    pub fn check_open_pending(
+        &self,
+        endpoint: &str,
+        account: &str,
+        allow_concurrent_open: bool,
+    ) -> Result<(), StorageError> {
+        let connection = self.open_ledger()?;
+        check_open_pending(&connection, endpoint, account, allow_concurrent_open, self)
+    }
+
+    /// An explicit override skips unknown or accepted opens, but never Keeper-pending rows.
+    pub fn reserve(
+        &self,
+        key: &str,
+        endpoint: &str,
+        account: &str,
+        kind: &str,
+        entity: &str,
+        allow_concurrent_open: bool,
+    ) -> Result<(), StorageError> {
         let mut connection = self.open_ledger()?;
         let transaction = connection.transaction_with_behavior(Immediate)?;
         let addr = account.to_lowercase();
+        let concurrent_open = kind == OPEN_TRADE && allow_concurrent_open;
+        if kind == OPEN_TRADE {
+            check_open_pending(&transaction, endpoint, account, concurrent_open, self)?;
+        }
         let unresolved: Option<String> = transaction
             .query_row(
                 "SELECT id FROM intents WHERE endpoint=?1 AND account=?2
-                 AND (status=?3 OR keeper_status=?4 OR (status=?5 AND entity <> '' AND entity=?6)) LIMIT 1",
+                 AND ((status='unknown' AND (NOT ?3 OR kind<>?4))
+                 OR keeper_status='pending' OR (status='accepted' AND entity <> '' AND entity=?5)) LIMIT 1",
                 params![
                     endpoint,
                     addr,
-                    IntentStatus::Unknown.as_str(),
-                    IntentStatus::Pending.as_str(),
-                    IntentStatus::Accepted.as_str(),
+                    concurrent_open,
+                    OPEN_TRADE,
                     entity
                 ],
                 |row| row.get(0),
@@ -316,6 +424,42 @@ impl Storage<'_> {
             endpoint: &endpoint_origin(endpoint),
         });
         Ok(Some(status.as_str().into()))
+    }
+
+    /// Read blockers from both ledger versions without creating or migrating a file.
+    pub(crate) fn unresolved_intents(
+        &self,
+        endpoint: &str,
+        account: &str,
+    ) -> Result<Vec<UnresolvedIntent>, StorageError> {
+        let path = self.trader.join(LEDGER_FILE);
+        if !path.try_exists()? {
+            return Ok(Vec::new());
+        }
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(self.busy_timeout)?;
+        let version = schema_version(&connection)?;
+        let created_at = if version >= 1 { "created_at" } else { "NULL" };
+        let status = if has_column(&connection, "keeper_status")? {
+            "COALESCE(keeper_status, status)"
+        } else {
+            "status"
+        };
+        let mut statement = connection.prepare(&format!(
+            "SELECT id, kind, {status}, entity, {created_at} FROM intents
+             WHERE endpoint=?1 AND account=?2 AND {status} IN ('unknown', 'accepted', 'pending')
+             ORDER BY rowid DESC"
+        ))?;
+        let rows = statement.query_map(params![endpoint, account.to_lowercase()], |row| {
+            Ok(UnresolvedIntent {
+                key: row.get(0)?,
+                kind: row.get(1)?,
+                status: row.get(2)?,
+                entity: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// List every local intent for the account, newest first.

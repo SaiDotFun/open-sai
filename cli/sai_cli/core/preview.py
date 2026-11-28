@@ -12,10 +12,44 @@ ATOM = Decimal("1e-18")
 LIQUIDATION_THRESHOLD = Decimal("0.90")
 LIQUIDATION_FEE_RATE = Decimal("0.05")
 READ_ERRORS = (ValueError, TypeError, KeyError, DecimalException, keeper.KeeperError)
+UNKNOWN_ORACLE_TIME = "OraclePublicationTimeUnknown"
+ESTIMATE_FIELDS = ("fees", "liquidationPrice", "worstCaseFill")
 
 
 def unavailable(reason: str) -> dict[str, Any]:
     return {"status": "unavailable", "reason": reason}
+
+
+def close_oracle_time_unknown(estimates: dict[str, Any]) -> bool:
+    return estimates.get("execution", {}).get("code") == UNKNOWN_ORACLE_TIME
+
+
+def rejected(code: str, reason: str) -> dict[str, Any]:
+    return {
+        **dict.fromkeys(ESTIMATE_FIELDS, unavailable(reason)),
+        "execution": {"status": "would_be_rejected", "code": code, "reason": reason},
+    }
+
+
+def rejection_reason(estimates: dict[str, Any]) -> str | None:
+    execution = estimates.get("execution", {})
+    return (
+        execution["reason"] if execution.get("status") == "would_be_rejected" else None
+    )
+
+
+def market_open_rejection(
+    pair: dict[str, Any], *, market_order: bool
+) -> dict[str, Any] | None:
+    """Check market state for opens and leverage updates."""
+    state = pair.get("market_trading_state")
+    if state == "close_only":
+        return rejected(
+            "MarketClosed", "Perp rejects this request in a close-only market."
+        )
+    if state == "closed" and market_order:
+        return rejected("MarketClosed", "Perp rejects this request in a closed market.")
+    return None
 
 
 def not_applicable(reason: str) -> dict[str, Any]:
@@ -39,23 +73,40 @@ def slippage_price(price: Decimal, slippage: Decimal, long: bool) -> Decimal:
         return price + distance if long else price - distance
 
 
+def market_price_move(
+    reference: Decimal, current: Decimal, slippage: str
+) -> str | None:
+    """Return the percentage moved if the refreshed price exceeds the quote tolerance."""
+    fraction = Decimal(slippage).scaleb(-2)
+    lower = slippage_price(reference, fraction, False)
+    upper = slippage_price(reference, fraction, True)
+    if lower <= current <= upper:
+        return None
+    with localcontext() as context:
+        context.prec = 90
+        moved = abs(current - reference) / reference * 100
+        return format(moved.quantize(Decimal("0.0001")), "f")
+
+
 def fill_range(
     order_type: str,
     long: bool,
     slippage: Decimal,
     reference: dict[str, Any] | None,
     *,
-    mcp_market: bool,
+    market_bound: bool,
 ) -> dict[str, Any]:
     if reference is None:
         return unavailable("Keeper market price is unavailable.")
     price = Decimal(reference["price"])
-    steps = 2 if order_type == "market" and mcp_market else 1
+    steps = 2 if order_type == "market" and market_bound else 1
     for _ in range(steps):
         price = slippage_price(price, slippage, long)
     price_text = format(price, "f")
     return {
-        "status": "estimate" if order_type == "market" and not mcp_market else "bound",
+        "status": "estimate"
+        if order_type == "market" and not market_bound
+        else "bound",
         "price": price_text.rstrip("0").rstrip(".")
         if "." in price_text
         else price_text,
@@ -182,10 +233,15 @@ def read_collateral_price(lcd: str, contract: str, token: str) -> dict[str, Any]
 
 
 def contract_market(
-    lcd: str, contract: str, market: str, *, height: str | None = None
+    lcd: str,
+    contract: str,
+    market: str,
+    *,
+    height: str | None = None,
+    fresh: bool = False,
 ) -> dict[str, Any]:
     pair = margin.smart_value(
-        lcd, contract, {"get_market": {"index": market}}, height=height
+        lcd, contract, {"get_market": {"index": market}}, height=height, fresh=fresh
     )
     if not isinstance(pair, dict):
         raise TypeError("Perp market is unavailable")
@@ -220,45 +276,41 @@ def _notional(collateral: int, leverage: Decimal) -> int:
 
 
 def open_estimates(
-    endpoint: str,
     lcd: str | None,
+    contract: str | None,
     body: dict[str, Any],
     row: dict[str, Any] | None,
     market_reference: dict[str, Any] | None,
     *,
-    mcp_market: bool,
+    market_bound: bool,
+    fresh_market: bool = False,
 ) -> dict[str, Any]:
     order_type, long = body["orderType"], body["side"] == "long"
     reference = market_reference
     if order_type != "market":
         reference = price_input(Decimal(body["intentPrice"]), "Order trigger", None)
-    elif not mcp_market and "intentPrice" in body:
-        reference = price_input(Decimal(body["intentPrice"]), "CLI --price", None)
 
     fill = fill_range(
         order_type,
         long,
         Decimal(body["maxSlippagePct"]).scaleb(-2),
         reference,
-        mcp_market=mcp_market,
+        market_bound=market_bound,
     )
     fees = unavailable("Perp fee schedule or collateral oracle price is unavailable.")
     liq = unavailable("An entry price and opening fee estimate are required.")
-    if lcd and row is not None:
+    if lcd and contract:
         try:
-            token_id = row["collateralToken"]["id"]
-            contract = margin.trading_contract(endpoint, lcd)
-            pair = contract_market(lcd, contract, body["market"]["marketIndex"])
-            if (
-                order_type != "market"
-                and pair.get("market_trading_state") == "close_only"
+            pair = contract_market(
+                lcd, contract, body["market"]["marketIndex"], fresh=fresh_market
+            )
+            if refusal := market_open_rejection(
+                pair, market_order=order_type == "market"
             ):
-                rejected = unavailable(
-                    "Perp rejects pending opens while the market is close-only."
-                )
-                return dict.fromkeys(
-                    ("fees", "liquidationPrice", "worstCaseFill"), rejected
-                )
+                return refusal
+            if row is None:
+                return {"fees": fees, "liquidationPrice": liq, "worstCaseFill": fill}
+            token_id = row["collateralToken"]["id"]
             leverage = Decimal(body["leverage"])
             within_leverage = leverage_allowed(
                 lcd, contract, pair, row["marketId"], leverage
@@ -304,20 +356,6 @@ def open_estimates(
     return {"fees": fees, "liquidationPrice": liq, "worstCaseFill": fill}
 
 
-def perp_prices(lcd: str, state: margin.PositionSnapshot, height: str) -> Any:
-    return margin.smart_value(
-        lcd,
-        state.contract,
-        {
-            "get_perp_prices": {
-                "market_index": state.raw["market_index"],
-                "collateral_index": state.raw["collateral_index"],
-            }
-        },
-        height=height,
-    )
-
-
 def fills_at_next_oracle_price(lcd: str, contract: str, height: str) -> bool:
     config = margin.smart_value(
         lcd, contract, {"market_order_config": {}}, height=height
@@ -353,11 +391,32 @@ def past_liquidation(price: Decimal, threshold: Decimal, long: bool) -> bool:
     return price <= threshold if long else price >= threshold
 
 
+def stored_liquidation_price(
+    lcd: str, state: margin.PositionSnapshot, height: str
+) -> Decimal:
+    threshold = margin.smart_value(
+        lcd,
+        state.contract,
+        {
+            "get_liquidation_price": {
+                "trade_id": state.raw["user_trade_index"],
+                "trader": state.raw["user"],
+                "include_borrowing_fees": True,
+            }
+        },
+        height=height,
+    )
+    return margin.contract_decimal(threshold["liquidation_price"])
+
+
 def close_estimates(
     lcd: str,
     state: margin.PositionSnapshot | None,
     trade_id: int,
     reduce_by: int | None,
+    *,
+    require_unchanged: bool = False,
+    rechecked: margin.RecheckedPosition | None = None,
 ) -> dict[str, Any]:
     """Check Perp's liquidation route before quoting the voluntary fee components."""
     unknown = unavailable(
@@ -379,48 +438,52 @@ def close_estimates(
 
     raw = state.raw
     try:
-        height = margin.verified_position_height(lcd, state, trade_id)
-        prices = perp_prices(lcd, state, height)
-        oracle = prices["market"]
-        if not isinstance(oracle, dict):
-            return result
-        published_at = oracle_publication_time(oracle)
+        try:
+            height = (
+                margin.verified_position_height(lcd, state, trade_id)
+                if rechecked is None
+                else rechecked.height
+            )
+            prices = (
+                margin.perp_prices(lcd, state, height)
+                if rechecked is None
+                else rechecked.close_prices
+            )
+            oracle = prices.get("market") if isinstance(prices, dict) else None
+            published_at = (
+                oracle_publication_time(oracle) if isinstance(oracle, dict) else None
+            )
+        except margin.PositionChanged:
+            raise
+        except READ_ERRORS:
+            prices, oracle, published_at = None, None, None
+        if (
+            not isinstance(prices, dict)
+            or not isinstance(oracle, dict)
+            or published_at is None
+        ):
+            missing_time = unavailable("The oracle price publication time is unknown.")
+            return {
+                **dict.fromkeys(result, missing_time),
+                "execution": {**missing_time, "code": UNKNOWN_ORACLE_TIME},
+            }
+        if fills_at_next_oracle_price(lcd, state.contract, height):
+            return dict.fromkeys(
+                result,
+                unavailable("Queued closes settle on a fresh oracle update."),
+            )
         pair = None
         if published_at is not None:
             pair = contract_market(
                 lcd, state.contract, raw["market_index"], height=height
             )
             if stale_oracle(lcd, state.contract, pair, height, published_at):
-                if fills_at_next_oracle_price(lcd, state.contract, height):
-                    return dict.fromkeys(
-                        result,
-                        unavailable("Queued closes settle on a fresh oracle update."),
-                    )
-                stale = unavailable(
-                    "Perp rejects the close at the observed stale oracle price."
+                return rejected(
+                    "OraclePriceStale",
+                    "Perp rejects the close at the observed stale oracle price.",
                 )
-                return {
-                    **dict.fromkeys(result, stale),
-                    "execution": {
-                        "status": "would_be_rejected",
-                        "code": "OraclePriceStale",
-                        "reason": stale["reason"],
-                    },
-                }
-        threshold = margin.smart_value(
-            lcd,
-            state.contract,
-            {
-                "get_liquidation_price": {
-                    "trade_id": raw["user_trade_index"],
-                    "trader": raw["user"],
-                    "include_borrowing_fees": True,
-                }
-            },
-            height=height,
-        )
         market = margin.contract_decimal(oracle["base_per_quote"])
-        trigger = margin.contract_decimal(threshold["liquidation_price"])
+        trigger = stored_liquidation_price(lcd, state, height)
         if market <= 0:
             return result
         observed_at = intents.now()
@@ -448,7 +511,11 @@ def close_estimates(
             }
 
         # A full close settles directly at effective leverage. A partial close runs the guard.
-        effective, _ = margin.leverage_inputs(lcd, state, trade_id, height=height)
+        effective = (
+            margin.leverage_inputs(lcd, state, trade_id, height=height)[0]
+            if rechecked is None
+            else rechecked.effective_leverage
+        )
         if effective is None or (
             reduce_by is not None
             and effective != margin.contract_decimal(raw["leverage"])
@@ -491,6 +558,9 @@ def close_estimates(
             triggered=reduce_by is not None,
             available_collateral=collateral,
         )
+    except margin.PositionChanged:
+        if require_unchanged:
+            raise
     except READ_ERRORS:
         pass
     return result
@@ -499,105 +569,208 @@ def close_estimates(
 def position_estimates(
     lcd: str,
     state: margin.PositionSnapshot | None,
-    effective: Decimal | None,
+    trade_id: int,
     *,
     target: Decimal | None = None,
-    updates_triggers: bool = False,
-    height: str | None = None,
+    quoted_effective: Decimal | None = None,
+    require_unchanged: bool = False,
+    show_collateral: bool = False,
+    bind_collateral: bool = False,
 ) -> dict[str, Any]:
     """Quote leverage or TP/SL changes after checking the after-hours guard."""
-    unknown = unavailable("Cannot verify that the Perp after-hours guard is inactive.")
-    result = dict.fromkeys(("fees", "liquidationPrice", "worstCaseFill"), unknown)
-    if state is None or effective is None:
+    unknown = unavailable(
+        "Cannot verify the Perp execution inputs and after-hours guard at one block."
+    )
+    result = dict.fromkeys(ESTIMATE_FIELDS, unknown)
+    if state is None:
         return result
+    height = None
     try:
+        height = margin.verified_position_height(lcd, state, trade_id)
         raw = state.raw
+        if target is not None:
+            return _leverage_estimates(
+                lcd,
+                state,
+                trade_id,
+                height,
+                target,
+                quoted_effective,
+                show_collateral,
+                bind_collateral,
+            )
+        effective, _ = margin.leverage_inputs(lcd, state, trade_id, height=height)
+        if effective is None:
+            return result
         if effective != margin.contract_decimal(raw["leverage"]):
             return dict.fromkeys(
                 result,
                 unavailable("The after-hours guard can change or close this position."),
             )
-        result["fees"] = {
+        return _position_change_estimates(
+            {
+                "status": "unchanged",
+                "reason": "This action changes only TP/SL triggers.",
+            },
+        )
+    except margin.PositionChanged:
+        # A pinned balance read can invalidate the projection while the
+        # starting collateral stays verified.
+        if require_unchanged and (height is None or not bind_collateral):
+            raise
+    except READ_ERRORS:
+        pass
+    return result
+
+
+def _position_change_estimates(liq: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "fees": {
             "status": "exact",
             "amountUsdc": "0",
             "excludes": ["Network fees"],
-        }
-        result["worstCaseFill"] = not_applicable("This action has no price fill.")
-        result["liquidationPrice"] = unavailable(
-            "Position entry price or projected collateral is unavailable."
+        },
+        "worstCaseFill": not_applicable("This action has no price fill."),
+        "liquidationPrice": liq,
+    }
+
+
+def _leverage_estimates(
+    lcd: str,
+    state: margin.PositionSnapshot,
+    trade_id: int,
+    height: str,
+    target: Decimal,
+    quoted_effective: Decimal | None,
+    show_collateral: bool,
+    bind_collateral: bool,
+) -> dict[str, Any]:
+    raw, contract = state.raw, state.contract
+    pair = contract_market(lcd, contract, raw["market_index"], height=height)
+    if refusal := market_open_rejection(pair, market_order=True):
+        return refusal
+
+    queued = fills_at_next_oracle_price(lcd, contract, height)
+    price = None
+    if not queued:
+        oracle = margin.perp_prices(lcd, state, height)["market"]
+        if not isinstance(oracle, dict):
+            raise TypeError("Invalid Perp market oracle price")
+        published_at = oracle_publication_time(oracle)
+        if published_at is not None and stale_oracle(
+            lcd, contract, pair, height, published_at
+        ):
+            return rejected(
+                "OraclePriceStale",
+                "Perp rejects the leverage change at the observed stale oracle price.",
+            )
+        price = margin.contract_decimal(oracle["base_per_quote"])
+        if price <= 0:
+            raise ValueError("Invalid Perp market oracle price")
+
+    effective, _ = margin.leverage_inputs(lcd, state, trade_id, height=height)
+    if effective is None:
+        raise ValueError("Cannot verify effective leverage")
+    if effective < margin.contract_decimal(raw["leverage"]):
+        long = raw.get("long")
+        # Perp checks the stored position before it applies the after-hours cap.
+        if (
+            price is not None
+            and type(long) is bool
+            and past_liquidation(
+                price, stored_liquidation_price(lcd, state, height), long
+            )
+        ):
+            return rejected(
+                "LiquidationReached",
+                "The after-hours guard reaches liquidation at the stored leverage.",
+            )
+        return dict.fromkeys(
+            ESTIMATE_FIELDS,
+            unavailable("The after-hours guard can change or close this position."),
         )
-        if updates_triggers:
-            result["liquidationPrice"] = {
-                "status": "unchanged",
-                "reason": "This action changes only TP/SL triggers.",
-            }
-        elif target is not None and type(raw.get("long")) is bool:
-            outside = unavailable(
-                "The leverage request is outside the market's collateral or leverage limits."
+    if quoted_effective is not None and quoted_effective != effective:
+        return dict.fromkeys(
+            ESTIMATE_FIELDS,
+            unavailable("Effective leverage changed while quoting margin."),
+        )
+
+    outside = unavailable(
+        "The leverage request is outside the market's collateral or leverage limits."
+    )
+    if not leverage_allowed(
+        lcd,
+        contract,
+        pair,
+        state.market["marketId"],
+        target,
+        current=effective,
+        height=height,
+    ):
+        return _position_change_estimates(outside)
+    schedule = fee_schedule(lcd, contract, pair, height=height)
+    open_rate = margin.contract_decimal(schedule["open_fee_p"])
+    with localcontext() as context:
+        context.prec = 90
+        before = int(raw["collateral_amount"])
+        collateral = int(before * effective / target)
+        minimum = int(_notional(before, effective) * open_rate)
+    if collateral <= minimum:
+        return _position_change_estimates(outside)
+
+    long = raw["long"]
+    if type(long) is not bool:
+        raise TypeError("Invalid Perp position direction")
+    entry = price_input(
+        intents.positive(raw["open_price"], "Entry price"),
+        "Sai Perp stored entry price",
+        state.observed_at,
+    )
+    liq = liquidation(entry, long, collateral, target)
+    # A crossing without borrowing is already conclusive. Between that
+    # threshold and the actual one, Perp's quote includes accrued borrowing.
+    if price is not None and (
+        past_liquidation(price, Decimal(liq["price"]), long)
+        or margin.quote_leverage_liquidates(lcd, state, target, height=height)
+    ):
+        return rejected(
+            "LiquidationReached",
+            "The observed oracle price has reached the prospective liquidation threshold.",
+        )
+
+    liq["assumption"] = (
+        "The target leverage takes effect if Perp's borrowing-inclusive "
+        "liquidation check passes."
+    )
+    result = _position_change_estimates(liq)
+    if queued:
+        result["execution"] = unavailable(
+            "Queued leverage changes settle on a fresh oracle update."
+        )
+
+    required = collateral - before
+    if required > 0:
+        funds = margin.exchange_balance(
+            lcd,
+            contract,
+            raw["user"],
+            raw["collateral_index"],
+            height=height,
+        )
+        available = int(funds["available_to_trade"])
+        if available < required:
+            funding = (
+                f"Perp requires {Decimal(required).scaleb(-6):f} USDC of additional margin. "
+                f"The observed available balance is {Decimal(available).scaleb(-6):f} USDC."
             )
-            pair = contract_market(
-                lcd, state.contract, raw["market_index"], height=height
-            )
-            if not leverage_allowed(
-                lcd,
-                state.contract,
-                pair,
-                state.market["marketId"],
-                target,
-                current=effective,
-                height=height,
-            ):
-                result["liquidationPrice"] = outside
-                return result
-            schedule = fee_schedule(lcd, state.contract, pair, height=height)
-            open_rate = margin.contract_decimal(schedule["open_fee_p"])
-            entry = price_input(
-                intents.positive(raw["open_price"], "Entry price"),
-                "Sai Perp stored entry price",
-                state.observed_at,
-            )
-            with localcontext() as context:
-                context.prec = 90
-                before = int(raw["collateral_amount"])
-                collateral = int(before * effective / target)
-                minimum = int(_notional(before, effective) * open_rate)
-            if collateral <= minimum:
-                result["liquidationPrice"] = outside
-                return result
-            liq = liquidation(entry, raw["long"], collateral, target)
-            result["liquidationPrice"] = liq
-            if liq["status"] == "estimate":
-                liq["assumption"] = (
-                    "The target leverage takes effect if Perp's borrowing-inclusive "
-                    "liquidation check passes."
-                )
-                if height is not None:
-                    prices = perp_prices(lcd, state, height)
-                    oracle = prices["market"]
-                    price = margin.contract_decimal(oracle["base_per_quote"])
-                    # Borrowing fees can only make this threshold more restrictive.
-                    if price > 0 and past_liquidation(
-                        price, Decimal(liq["price"]), raw["long"]
-                    ):
-                        if fills_at_next_oracle_price(lcd, state.contract, height):
-                            result["execution"] = unavailable(
-                                "Queued leverage changes settle on a fresh oracle update."
-                            )
-                            return result
-                        code = "LiquidationReached"
-                        reason = "The observed oracle price is past the prospective liquidation threshold."
-                        published_at = oracle_publication_time(oracle)
-                        if published_at is not None and stale_oracle(
-                            lcd, state.contract, pair, height, published_at
-                        ):
-                            code = "OraclePriceStale"
-                            reason = "Perp rejects the leverage change at the observed stale oracle price."
-                        result["execution"] = {
-                            "status": "would_be_rejected",
-                            "code": code,
-                            "reason": reason,
-                        }
-                        result["liquidationPrice"] = unavailable(reason)
-    except READ_ERRORS:
-        pass
+            if not queued:
+                return rejected("InsufficientDepositBalance", funding)
+            result["execution"]["warning"] = f"{funding} Perp checks funding at fill."
+    if bind_collateral:
+        result["collateralBaseUnits"] = {
+            "before": str(before),
+            "after": str(collateral),
+        }
+    if show_collateral:
+        result["collateral"] = margin.collateral_usd(before, collateral)
     return result

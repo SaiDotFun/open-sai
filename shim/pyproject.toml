@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sai-cli"
+version = "0.2.0"
+description = "Launch the matching native Sai command-line binary"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+
+[project.scripts]
+sai = "sai_cli.sai_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

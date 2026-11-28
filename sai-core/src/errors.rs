@@ -1,10 +1,10 @@
 //! Stable failure codes shared by commands, tools, and events.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Code {
     SignedOut,
@@ -54,9 +54,11 @@ pub struct SaiError {
     pub code: Code,
     pub message: String,
     pub exit_code: ExitCode,
+    pub show_usage: bool,
     pub intent_key: Option<String>,
     pub hint: Option<String>,
     pub details: Option<Box<serde_json::Map<String, Value>>>,
+    pub retryable_override: bool,
 }
 
 impl SaiError {
@@ -66,9 +68,11 @@ impl SaiError {
             code,
             message: message.into(),
             exit_code,
+            show_usage: true,
             intent_key: None,
             hint: (exit_code == ExitCode::SignIn).then(|| "sai auth login NAME".into()),
             details: None,
+            retryable_override: false,
         }
     }
 
@@ -84,6 +88,6 @@ impl SaiError {
     }
 
     pub fn retryable(&self) -> bool {
-        self.exit_code == ExitCode::Rejected
+        self.retryable_override || self.exit_code == ExitCode::Rejected
     }
 }

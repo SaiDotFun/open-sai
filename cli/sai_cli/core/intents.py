@@ -9,14 +9,19 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import ROUND_DOWN, Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation
 from secrets import choice
 from typing import Any
 
 from . import keeper, log, storage
-from .errors import Code
+from .errors import Code, ExitCode, SaiError
 
 IntentIdentity = tuple[str, str, str]  # Keeper endpoint, account, key
+TRADE_DECIMAL = re.compile(r"(0|[1-9][0-9]*)(\.[0-9]{1,18})?")
+
+
+def is_trade_integer(value: str) -> bool:
+    return value.isascii() and value.isdecimal()
 
 
 @dataclass
@@ -46,7 +51,7 @@ def now() -> str:
 
 def positive(value: str, name: str) -> Decimal:
     try:
-        if not re.fullmatch(r"(0|[1-9][0-9]*)(\.[0-9]{1,18})?", value):
+        if not TRADE_DECIMAL.fullmatch(value):
             raise ValueError
         result = Decimal(value)
         if not result.is_finite() or result <= 0 or result * 10**18 > 2**128 - 1:
@@ -77,11 +82,19 @@ def open_intent(
         raise ValueError("A trigger price is required for limit and stop orders")
     if Decimal(amount) * 1_000_000 != (Decimal(amount) * 1_000_000).to_integral_value():
         raise ValueError("Amount must have at most six decimal places")
-    if slippage != "0" and (
-        positive(slippage, "Slippage") > 100 or len(slippage.partition(".")[2]) > 16
-    ):
-        raise ValueError(
-            "Slippage must be between 0 and 100 with at most 16 decimal places"
+    try:
+        valid_slippage = (
+            positive(slippage, "Slippage") <= 100
+            and len(slippage.partition(".")[2].rstrip("0")) <= 16
+        )
+    except ValueError:
+        valid_slippage = False
+    if not valid_slippage:
+        raise SaiError(
+            "Slippage (--slippage) must be greater than 0 and at most 100 percent,"
+            " with at most 18 decimal places and only zeros after the 16th place",
+            Code.INVALID_REQUEST,
+            exit_code=ExitCode.USAGE,
         )
     body: dict[str, Any] = {
         "market": {"marketIndex": f"MarketIndex({market})"},
@@ -151,19 +164,19 @@ def tpsl_intent(
     }
 
 
-def partial_intent(
-    trade: dict[str, Any], percent: int, min_size: Decimal
-) -> dict[str, Any]:
+def partial_intent(trade: dict[str, Any], percent: int) -> dict[str, Any]:
     if percent < 1 or percent > 99:
         raise ValueError("Partial close percentage must be from 1 to 99")
-    amount = Decimal(str(trade["collateralAmount"]))
+    amount = int(trade["collateralAmount"])
     leverage = Decimal(str(trade["leverage"]))
-    delta = (amount * percent / 100).to_integral_value(rounding=ROUND_DOWN)
-    if delta <= 0 or (amount - delta) / Decimal(1_000_000) * leverage < min_size:
-        raise ValueError(
-            "Reduction is too small or leaves less than the market minimum"
-        )
-    usd = format(delta / Decimal(1_000_000), "f")
+    delta = amount * percent // 100
+    numerator, denominator = leverage.as_integer_ratio()
+    # Perp floors each notional before subtracting the closed slice.
+    size = amount * numerator // denominator
+    closed = delta * numerator // denominator
+    if delta <= 0 or size <= closed:
+        raise ValueError("Reduction rounds to zero or leaves no open position")
+    usd = format(Decimal(delta) / Decimal(1_000_000), "f")
     return {
         "kind": "DECREASE_POSITION_SIZE",
         "target": {"userTradeId": str(trade["id"])},
@@ -280,6 +293,7 @@ def submit(
         status = "rejected" if isinstance(exc, keeper.AdmissionRejected) else "not_sent"
         if failure := _record_submission_status(key, endpoint, account, status):
             exc.hint = storage.intent_status_hint(endpoint, account, key)
+            exc.recovery_account = account
             raise exc from failure
         raise
     except (
@@ -292,6 +306,7 @@ def submit(
         raise keeper.OutcomeUnknown(
             f"Outcome unknown for intent {key}; reconcile before another trade",
             key,
+            account=account,
             hint=storage.intent_status_hint(endpoint, account, key),
         ) from exc
     tx_hash, invalid_hash = keeper.request_hash(ack.get("txHash"))
@@ -310,6 +325,7 @@ def submit(
             f"Keeper accepted intent {key}, but the local ledger update failed;"
             " reconcile before another trade",
             key,
+            account=account,
             hint=storage.intent_status_hint(endpoint, account, key),
         ) from failure
     return {

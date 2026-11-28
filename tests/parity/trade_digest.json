@@ -1,0 +1,206 @@
+{
+  "pythonReference": "b777fe836d1ac57148606edb2c97177b66543b7a",
+  "cases": [
+    {
+      "preview": {
+        "addr": "0xAA00000000000000000000000000000000000001",
+        "intent": {
+          "kind": "OPEN_TRADE",
+          "body": {
+            "market": {
+              "marketIndex": "MarketIndex(3)"
+            },
+            "side": "long",
+            "orderType": "market",
+            "amountUsd": "20.12345600",
+            "leverage": "2",
+            "maxSlippagePct": "1",
+            "intentPrice": "100"
+          }
+        },
+        "referencePrice": "68669.9000"
+      },
+      "canonical": "{\"addr\":\"0xaa00000000000000000000000000000000000001\",\"intent\":{\"body\":{\"amountUsd\":\"20.12345600\",\"leverage\":\"2\",\"market\":{\"marketIndex\":\"MarketIndex(3)\"},\"maxSlippagePct\":\"1\",\"orderType\":\"market\",\"side\":\"long\"},\"kind\":\"OPEN_TRADE\"},\"referencePrice\":\"68669.9\"}",
+      "digest": "5abbc71de3933836ca6db245767cef223052d8caf6ac748e8c3fee0900d56488"
+    },
+    {
+      "preview": {
+        "addr": "0xAA00000000000000000000000000000000000001",
+        "intent": {
+          "kind": "OPEN_TRADE",
+          "body": {
+            "market": {
+              "marketIndex": "MarketIndex(3)"
+            },
+            "side": "long",
+            "orderType": "market",
+            "amountUsd": "20.12345600",
+            "leverage": "2",
+            "maxSlippagePct": "1",
+            "intentPrice": "100"
+          }
+        },
+        "referencePrice": "12345678901234567890.123456785000000000"
+      },
+      "canonical": "{\"addr\":\"0xaa00000000000000000000000000000000000001\",\"intent\":{\"body\":{\"amountUsd\":\"20.12345600\",\"leverage\":\"2\",\"market\":{\"marketIndex\":\"MarketIndex(3)\"},\"maxSlippagePct\":\"1\",\"orderType\":\"market\",\"side\":\"long\"},\"kind\":\"OPEN_TRADE\"},\"referencePrice\":\"12345678901234567890.123456785\"}",
+      "digest": "0bd194a1515909ed7f8629a1f8931e3a01371fd22621200a89a60fa64829587c"
+    },
+    {
+      "preview": {
+        "addr": null,
+        "intent": {
+          "kind": "OPEN_TRADE",
+          "body": {
+            "market": {
+              "marketIndex": "MarketIndex(3)"
+            },
+            "side": "long",
+            "orderType": "market",
+            "amountUsd": "20.12345600",
+            "leverage": "2",
+            "maxSlippagePct": "1",
+            "intentPrice": "100"
+          }
+        }
+      },
+      "canonical": "{\"addr\":null,\"intent\":{\"body\":{\"amountUsd\":\"20.12345600\",\"leverage\":\"2\",\"market\":{\"marketIndex\":\"MarketIndex(3)\"},\"maxSlippagePct\":\"1\",\"orderType\":\"market\",\"side\":\"long\"},\"kind\":\"OPEN_TRADE\"},\"referencePrice\":null}",
+      "digest": "488e0643186765471cac140ca05116328f9ceefd51e1a12fe988e5246fb03ff7"
+    },
+    {
+      "preview": {
+        "addr": "0xAA00000000000000000000000000000000000001",
+        "intent": {
+          "kind": "OPEN_TRADE",
+          "body": {
+            "market": {
+              "marketIndex": "MarketIndex(3)"
+            },
+            "side": "short",
+            "orderType": "limit",
+            "amountUsd": "20",
+            "leverage": "2",
+            "maxSlippagePct": "0",
+            "intentPrice": "100.0",
+            "takeProfit": "90",
+            "stopLoss": "120"
+          }
+        }
+      },
+      "canonical": "{\"addr\":\"0xaa00000000000000000000000000000000000001\",\"intent\":{\"body\":{\"amountUsd\":\"20\",\"intentPrice\":\"100.0\",\"leverage\":\"2\",\"market\":{\"marketIndex\":\"MarketIndex(3)\"},\"maxSlippagePct\":\"0\",\"orderType\":\"limit\",\"side\":\"short\",\"stopLoss\":\"120\",\"takeProfit\":\"90\"},\"kind\":\"OPEN_TRADE\"}}",
+      "digest": "c1286e636632a1095ffe147ee65c9885da7d0be124acb15d6ebd279713a344dd"
+    },
+    {
+      "preview": {
+        "addr": "0xAA00000000000000000000000000000000000001",
+        "intent": {
+          "kind": "CLOSE_POSITION",
+          "target": {
+            "userTradeId": "7"
+          },
+          "body": {}
+        }
+      },
+      "canonical": "{\"addr\":\"0xaa00000000000000000000000000000000000001\",\"intent\":{\"body\":{},\"kind\":\"CLOSE_POSITION\",\"target\":{\"userTradeId\":\"7\"}}}",
+      "digest": "2fe7db9e459989d0625fcfd63273ef7bb3a9f43b58f719376b99b0763a3890d0"
+    },
+    {
+      "preview": {
+        "addr": "0xAA00000000000000000000000000000000000001",
+        "intent": {
+          "kind": "CANCEL_PENDING_TRADE",
+          "target": {
+            "userTradeId": "7"
+          },
+          "body": {}
+        },
+        "quote": {
+          "\ud83e\uddea": "\u00e9\u007f",
+          "z": 1,
+          "a": true
+        }
+      },
+      "canonical": "{\"addr\":\"0xaa00000000000000000000000000000000000001\",\"intent\":{\"body\":{},\"kind\":\"CANCEL_PENDING_TRADE\",\"target\":{\"userTradeId\":\"7\"}},\"quote\":{\"a\":true,\"z\":1,\"\\ud83e\\uddea\":\"\\u00e9\\u007f\"}}",
+      "digest": "4bd99fc6c63ea6ac1cf497a11e6a536197e905195920ea890ff0f286a0196d64"
+    },
+    {
+      "preview": {
+        "addr": "0xAA00000000000000000000000000000000000001",
+        "intent": {
+          "kind": "OPEN_TRADE",
+          "body": {
+            "market": {
+              "marketIndex": "MarketIndex(3)"
+            },
+            "side": "long",
+            "orderType": "market",
+            "amountUsd": "20.12345600",
+            "leverage": "2",
+            "maxSlippagePct": "1",
+            "intentPrice": "100"
+          }
+        },
+        "referencePrice": "12345678901.123456789012345678",
+        "positionRoute": {
+          "chainId": "fixture-chain-1",
+          "contractAddress": "nibi1fixturecontract"
+        }
+      },
+      "canonical": "{\"addr\":\"0xaa00000000000000000000000000000000000001\",\"intent\":{\"body\":{\"amountUsd\":\"20.12345600\",\"leverage\":\"2\",\"market\":{\"marketIndex\":\"MarketIndex(3)\"},\"maxSlippagePct\":\"1\",\"orderType\":\"market\",\"side\":\"long\"},\"kind\":\"OPEN_TRADE\"},\"positionRoute\":{\"chainId\":\"fixture-chain-1\",\"contractAddress\":\"nibi1fixturecontract\"},\"referencePrice\":\"12345678901.123456789012345678\"}",
+      "digest": "76b884aa8ecba42df1e289f5d869a62cc5b08e20596f1fa5a1c34b253a4b6e7f"
+    },
+    {
+      "preview": {
+        "addr": "0xAA00000000000000000000000000000000000001",
+        "intent": {
+          "kind": "OPEN_TRADE",
+          "body": {
+            "market": {
+              "marketIndex": "MarketIndex(3)"
+            },
+            "side": "long",
+            "orderType": "market",
+            "amountUsd": "20.12345600",
+            "leverage": "2",
+            "maxSlippagePct": "1",
+            "intentPrice": "100"
+          }
+        },
+        "referencePrice": "12345678901.123456789012345679",
+        "positionRoute": {
+          "chainId": "fixture-chain-1",
+          "contractAddress": "nibi1fixturecontract"
+        }
+      },
+      "canonical": "{\"addr\":\"0xaa00000000000000000000000000000000000001\",\"intent\":{\"body\":{\"amountUsd\":\"20.12345600\",\"leverage\":\"2\",\"market\":{\"marketIndex\":\"MarketIndex(3)\"},\"maxSlippagePct\":\"1\",\"orderType\":\"market\",\"side\":\"long\"},\"kind\":\"OPEN_TRADE\"},\"positionRoute\":{\"chainId\":\"fixture-chain-1\",\"contractAddress\":\"nibi1fixturecontract\"},\"referencePrice\":\"12345678901.123456789012345679\"}",
+      "digest": "e3e1dffb7b8833d079f41a51194da3a80f8d3ea7adea649c5313ae536989468b"
+    },
+    {
+      "preview": {
+        "addr": "0xAA00000000000000000000000000000000000001",
+        "intent": {
+          "kind": "CANCEL_PENDING_TRADE",
+          "target": {
+            "userTradeId": "7"
+          },
+          "body": {}
+        }
+      },
+      "canonical": "{\"addr\":\"0xaa00000000000000000000000000000000000001\",\"intent\":{\"body\":{},\"kind\":\"CANCEL_PENDING_TRADE\",\"target\":{\"userTradeId\":\"7\"}}}",
+      "digest": "12532f15238f876cf470b8bd9e7f821f4f0bcbc4944108c79ecfeb3aee1a9301"
+    }
+  ],
+  "estimates": {
+    "fees": {
+      "status": "estimate",
+      "amountUsdc": "0.025"
+    },
+    "liquidationPrice": {
+      "status": "estimate",
+      "price": "60"
+    },
+    "worstCaseFill": {
+      "status": "bound",
+      "price": "101"
+    }
+  }
+}

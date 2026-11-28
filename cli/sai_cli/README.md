@@ -1,14 +1,16 @@
 # Sai CLI
 
-Install `sai` as the [root README](../../README.md) shows. From a checkout, run
-`uv sync`, then `uv run sai --help`.
-The CLI connects to mainnet Keeper by default.
+This guide covers the Python CLI in the
+[sai-cli v0.1.2 release](https://github.com/SaiDotFun/open-sai/releases/tag/sai-cli/v0.1.2).
+Notes about `main` describe changes after that release. See the
+[root README](../../README.md) to install Sai. The CLI connects to mainnet
+Keeper by default.
 
 ## Settings
 
 `$SAI_HOME/config.toml` (default `~/.sai/config.toml`) holds settings for both
-the CLI and `sai mcp serve`. Each setting comes from the first of these that sets
-it: a flag, an environment variable, the file, the mainnet default.
+the CLI and `sai mcp serve`. Sai checks flags first, then environment variables,
+then the file, then defaults.
 
 | Key                  | Flag             | Variable            | Default                 |
 | -------------------- | ---------------- | ------------------- | ----------------------- |
@@ -22,15 +24,36 @@ it: a flag, an environment variable, the file, the mainnet default.
 ```bash
 sai config list                      # every key, its value, and its source
 sai config get keeper.endpoint       # the exact value
-sai config set keeper.endpoint URL
+sai config set keeper.endpoint https://sai-keeper.nibiru.fi/query
 sai config unset keeper.endpoint
 ```
 
-`config list --json` returns `{"path", "settings": {KEY: {"value",
-"source", "env", "default"}}}`, where `source` is `flag`, `env`, `file`,
-`default`, `derived`, or `invalid` (a `logs.*` value sai could not read,
-which turns logging off). `list` drops credentials from URLs; `get` prints the
-exact value. An unknown key or invalid value exits 2 and lists the valid keys.
+`sai --json config list` returns `path` and `settings`. Each setting has
+`value`, `source`, `env`, and `default` fields. The `source` is `flag`,
+`env`, `file`, `default`, `derived`, or `invalid`.
+
+The list shows Keeper URLs as origins. In v0.1.2, the LCD URL can include
+a path. On `main`, `config list`, `doctor`, and `mcp_info` show endpoint
+URLs as origins. `sai config get KEY` prints the exact resolved value. With
+the global `--json` flag, it returns `key`, `value`, and `source`. An
+unknown key or an invalid value passed to `config set` is a usage error.
+Sai lists the valid keys and exits 2 with code `INVALID_REQUEST`.
+
+In v0.1.2, the exit status of `sai --json config list` depends on which
+override is invalid.
+
+| Invalid Override | Exit | Result |
+| --- | --- | --- |
+| `SAI_UPDATE_AUTO=maybe` | 1 | `INVALID_REQUEST` with a validation message. |
+| Malformed Keeper URL in `--endpoint` or `SAI_ENDPOINT` | 2 | `INVALID_REQUEST` with an endpoint validation message. |
+| `SAI_LOG=maybe` | 0 | Sai marks the `logs.enabled` source as `invalid` and turns logging off. |
+
+In v0.1.2, a bad `logs.keep_days` value has source `env` or `file`
+when logging is already disabled. On `main`, an invalid log setting has
+source `invalid` and disables logging while the command continues. Other
+invalid settings exit 2 with JSON code `INVALID_REQUEST`. The diagnostic
+names the key and the flag, environment variable, or config file path.
+It omits the invalid value.
 
 The first `set`, or an `unset` that removes a value, writes the whole file
 with every key commented out and explained, at mode 0600 in a 0700
@@ -38,8 +61,7 @@ directory. Unsetting a key that is already unset writes nothing. Later edits kee
 comments, and a lock file makes concurrent edits run one at a time. The
 CLI reads a section written as an inline table, dotted keys, or only
 subtables, but `set` and `unset` refuse to edit it (exit 2) until you rewrite
-it as a `[section]` table. Unsetting a key that is already unset leaves the
-file alone. Keys the CLI does not know produce a warning and are
+it as a `[section]` table. Keys the CLI does not know produce a warning and are
 ignored; a known section that is not a table is an error.
 
 A `keeper.ws_endpoint` from a lower layer than `keeper.endpoint` is ignored,
@@ -52,13 +74,22 @@ work and override the setting for that command.
 
 ```bash
 sai account overview
-sai account overview --as 0xYOUR_ADDR --json
+sai --json account overview --as 0x0000000000000000000000000000000000000001
 ```
 
-The command uses the active account on the configured Keeper endpoint.
-Pass `--as ADDR` to read another EVM account, including one you have never
-connected. The MCP tool `account_overview` takes an optional `addr` and
-returns the same fields as the CLI's JSON output.
+With no address, the command uses the active account on the configured
+Keeper endpoint. Pass `--as ADDR` to read any EVM account without signing
+in. For scripts, use `sai --json account overview` so failures return JSON
+on stdout. If Sai cannot select an account, it exits 1 with code
+`SESSION_UNAVAILABLE`. In v0.1.2, `sai account overview --json` formats
+successful results as JSON and prints errors on stderr. On `main`, the
+local flag also formats errors as JSON on stdout.
+The MCP tool `account_overview` takes an optional `addr` and returns the
+same overview fields.
+
+The fields `addr` and `addrSource` identify the account and how Sai selected
+it. Section fields are `balances`, `positions`, `pendingOrders`,
+`queuedMarketOrders`, `prices`, `blockingIntents`, and `session`.
 
 - **Sai funds.** Backed deposits, credits, and unsettled Teller funds that
   are available to trade are separate USD amounts. An omitted balance is
@@ -94,10 +125,13 @@ returns the same fields as the CLI's JSON output.
 - **Session.** The overview shows the expiry of a stored session for the
   selected account and warns in its last three days.
 
-Each section's `fetchedAt` records when the client read it, in UTC. Source
-timestamps and `sourceAgeSeconds` describe the data at fetch time. A
-position's indexed trade record, contract threshold, and oracle mark carry
-separate source times. Oracle metadata shows the publish block separately
+Each loaded section's `sourceAt` and `fetchedAt` record when the client read
+it, in UTC. A skipped section carries `status: "skipped"` and explains why
+in `skipReason`. Row-level timestamps and `sourceAgeSeconds` describe the
+data at fetch time. If a balance's block time is unavailable, its `sourceAt`
+records the read time, `sourceAtBasis` is `"fetchedAt"`, and `sourceAgeSeconds`
+is null. A position's indexed trade record, contract threshold, and oracle
+mark carry separate source times. Oracle metadata shows the publish block separately
 from the LCD read block. The estimate from Keeper has an unknown source time.
 The LCD supplies missing block times after its chain matches Keeper's. A
 custom Keeper requires an explicit LCD for that chain. An independently
@@ -105,9 +139,9 @@ overridden WebSocket is labeled as a balance source on an unverified chain.
 Local intent age starts at reservation. Session age starts at token issuance
 when the stored token provides that claim.
 
-A failed read produces a section `error` with a code and message. Other
-sections still return their data. An eight-second LCD deadline keeps already
-loaded rows when further chain reads stall. The overview flags a paginated
+A failed read adds a section `error` with a code and message. Other
+sections still return their data, and the command can exit 0. An eight-second
+LCD deadline limits the chain reads. The overview flags a paginated
 list when it cannot confirm the list on a second scan.
 
 ## Updates
@@ -115,7 +149,7 @@ list when it cannot confirm the list on a second scan.
 ```bash
 sai update                # install the latest release
 sai update --check        # report the installed and latest versions only
-sai update --to 0.2.0     # install that release; the only way to go back
+sai update --to 0.1.2     # install this specific release
 sai update --source       # build the release from Git instead of its wheel
 ```
 
@@ -149,9 +183,9 @@ belongs to another install.
 
 The update keeps the path to `~/.local/bin/sai` stable. After verifying the
 install, it checks MCP registrations and can repair stale Codex and Cursor
-launchers. For stale Claude Code registrations, it prints an explicit repair
-command. Background updates include that command in the next update notice
-for any stale user registration they find. A running `sai mcp serve` keeps
+launchers. For differing Claude Code registrations, it prints commands for
+updating them manually. Background updates include the commands in the next
+update notice for any differing user registration they find. A running `sai mcp serve` keeps
 the old code until its client restarts. The `mcp_info` tool reports
 `restartNeeded`.
 
@@ -226,19 +260,46 @@ signs, the CLI checks that the typed data has primary type
 `UserTradingSession`, domain `Sai` version `1`, your addr, and the issued
 challenge nonce.
 
+### Renewing Sessions
+
 Run `sai auth renew [ADDR]` to get a fresh session using the key saved by
-`sai auth login NAME`. With no address, it renews the active account. An
-explicit address renews that account and keeps the active selection. If a
-keystore session predates the saved key name, run `sai auth login NAME` once.
-For a session copied from Sai Web, copy a fresh token and run `sai auth
-import`.
+`sai auth login NAME`. An explicit address takes precedence over the global
+`--as` flag. If neither is set, Sai renews the active account. Renewal keeps
+the active selection. A signed-out renewal exits 6 with code `SIGNED_OUT`.
+
+If a keystore session predates the saved key name, run `sai auth login NAME`
+once. To renew a session copied from Sai Web, copy a fresh token for the
+same account. In v0.1.2, run `sai auth import` with the session's original
+Keeper endpoint. On `main`, run the reported `auth import --addr` command.
+It also works for older keystore sessions when you have a Sai Web token for
+that account.
 
 Status, list, doctor, the overview, and the MCP tool `mcp_info` report a
 warning when a session has less than three days left. Interactive commands
-can also print a one-line notice to stderr. JSON output carries the warning
-in the reported session data. Use the Keeper endpoint named in the renewal
-or import hint. If the hint asks you to reuse your settings, keep the original
-Keeper configuration when running the command.
+can also print a notice to stderr. In v0.1.2, the `renewalCommand` field can
+include explanatory text after the command.
+
+On `main`, the notice stays on one line. In `auth status` and `auth list`
+JSON output, the account overview, and MCP session reports, look for
+`expiryWarning`, the shell command `renewalCommand` when available, and
+optional `renewalGuidance`. Share the guidance separately when passing the
+command to someone else. If the stored account address is invalid, the
+report asks you to sign in again.
+
+The command specifies `--endpoint` so the destination shell uses the original
+Keeper. An origin-only URL or the public built-in Keeper URL appears directly
+in the command. A private URL uses the `SAI_RECONCILE_ENDPOINT` variable.
+If the command references `SAI_RECONCILE_ENDPOINT`, supply the full original
+URL privately in the same shell before running it. In Bash, you can enter
+the URL at a hidden prompt to keep it out of shell history.
+
+```bash
+read -rsp 'Original Keeper URL: ' SAI_RECONCILE_ENDPOINT
+printf '\n'
+export SAI_RECONCILE_ENDPOINT
+```
+
+### Choosing a Signing Key
 
 `auth login NAME` picks the key named `NAME`:
 
@@ -324,8 +385,13 @@ and `codex mcp add|remove`; Cursor through an atomic edit of
 only the `sai` entry's command, args, `SAI_HOME`, and the names of any other
 environment settings, and never run `claude mcp get`, which starts the
 server. The only environment value output shows is `SAI_HOME`, a path; other
-settings appear by name in `staleEnv`, and an entry with any of them, or a
-disabled Codex entry, is not current and gets replaced. `list` shows every
+settings appear by name in `staleEnv`. For Claude Code, install leaves a
+differing `sai` entry in place and reports its scope, config file, and
+differing fields. Run the printed launcher check before removing the
+existing entry in Claude from the project directory you normally use.
+After the check and removal succeed, run the printed `claude mcp add` command.
+The add includes `SAI_HOME` when the target uses one. Install adds missing
+entries and reports matching ones as unchanged. `list` shows every
 scope's entry under `registrations` and marks the one the client uses as
 `effective` (Claude Code: local, then project, then user; Cursor: project,
 then user). `uninstall` removes every scope's entry unless `--scope` names
@@ -363,8 +429,9 @@ or an unreadable file `SESSION_UNAVAILABLE`. Each message tells the agent to
 have the user run `sai auth login NAME` or `sai auth import`. A signed-in trade
 still needs the `previewDigest` of the preview the user confirmed.
 
-The partial-close digest covers the close percentage, starting collateral and
-leverage, and the contract inputs used to quote the requested slice. The
+The partial-close digest covers the close percentage, starting collateral,
+reduction amount, and leverage inputs. A tick in the collateral/USD price
+updates the USD estimate without changing the digest. The
 margin digest covers the full quote, including starting collateral, stored
 leverage, and the inputs that determine effective leverage. Before submitting,
 both tools re-read the position and the effective-leverage inputs, including
@@ -374,14 +441,41 @@ finds a change, it returns `PREVIEW_MISMATCH` and includes the latest preview
 when it can still quote the position. The direct leverage tool confirms the
 requested target leverage.
 
+On `main`, margin and partial-close previews bind the chain ID and Perp
+contract address in `positionRoute`. For CLI submissions, pass the dry run's
+`previewDigest` to `--preview-digest` to require a match. A different route
+requires a new preview and confirmation. A position preview with
+`positionOwnerVerified: false` has no MCP confirmation digest.
+
 ## Commands
 
 Commands include `market list`, `market prices`, `account positions ADDR`,
 `account balances ADDR`, `account history ADDR`, `trade open`, `trade
-close`, `trade partial-close`, `trade tpsl`, `intent wait KEY`,
-and live `watch` streams. Run any command with `--help` for details. Trading
-requires a funded account; funding is performed separately. Trade commands
-support `--dry-run` to inspect the local semantic request.
+close`, `trade cancel`, `trade partial-close`, `trade tpsl`, `intent wait KEY`,
+and live `watch` streams. Run any command with `--help` for details. Fund
+your Sai account in Sai Web before trading. Use `--dry-run` to inspect
+the intent and any available estimates. Some previews need a session and
+live position data. To preview an open without signing in, omit `--as`.
+
+The `account overview` and `account balances ADDR` commands value USDC
+balances at $1 per USDC from the raw balance. They show the source block
+and age beside each balance. Sai marks a source more than
+five minutes old as stale. This age describes the last balance update.
+If Sai cannot verify the block time, it displays an unknown age.
+
+Use `sai trade cancel ID --dry-run` to preview a pending order cancellation.
+The command accepts `--preview-digest` and `--wait` on submission. Existing
+scripts can still use `sai trade close ID --cancel-order`.
+
+On `main`, Sai refuses a position preview or submission if the position
+belongs to another account. A dry run with `positionOwnerVerified: false`
+is informational. Get a verified preview before submitting.
+
+Use `sai market list` to see the symbol, market ID, collateral token, and
+price. The `trade open --market` option accepts a case-insensitive symbol
+such as `BTC` or a numeric ID. If a symbol matches multiple market IDs,
+choose the ID from the table.
+
 For a live market order, the CLI refreshes the price before admission and
 reports that reference price after acceptance. A dry run marks the price as
 requiring refresh and may include an optional supplied reference. A partial
@@ -390,7 +484,8 @@ It quotes the requested slice in fields `quote.closedNotionalUsdc` and
 `quote.closedNotionalUsd` using the effective leverage, collateral/USD
 oracle price, and Perp's rounding. A missing sizing input sets
 `quote.closedNotionalIsEstimate` to true. If the collateral price is
-unavailable, the USD field is null.
+unavailable, the USD field is null. To submit a partial close, the CLI
+must verify the collateral price. Preview again after the price is available.
 The CLI rechecks the position before submission. Partial close accepts
 `--lcd-endpoint` like `trade margin`. Market schedule and other Keeper
 admission checks remain authoritative.
@@ -404,7 +499,17 @@ the direction. When the after-hours guard is pending,
 before the leverage change. Keeper submits the target leverage. Perp uses
 effective leverage at execution to determine the direction and amount.
 `--dry-run` reads live state and prints the quote without submitting an
-intent. Use `--lcd-endpoint` to select the matching network's
+intent. The preview shows collateral before and after in USD at $1 per
+USDC. In JSON, those values appear in `collateral.beforeUsd` and
+`collateral.afterUsd`.
+
+Use `--max-collateral-usd 5` with `trade margin --direction add --amount 1`
+to quote an add of up to 1 USDC with at most $5 of estimated total
+collateral. The CLI rounds down to whole base units and reduces the amount
+if needed. Pass the same cap when submitting. The contract executes the
+target leverage, so collateral at execution can differ from the quote.
+
+Use `--lcd-endpoint` to select the matching network's
 Nibiru REST service; the CLI checks that its chain matches Keeper.
 Margin changes and partial closes briefly re-read Keeper and the contract if
 their position data disagree. If the mismatch persists, the command stops
@@ -414,11 +519,11 @@ The CLI persists non-secret request identities under `$SAI_HOME/trader` or
 `~/.sai/trader`. A network error after submission leaves the outcome unknown,
 and an unknown intent blocks new trades on the account. Reconcile it with
 `sai intent wait KEY` or inspect the latest record with
-`sai intent status ADDR --key KEY`. If Keeper has no record of the key five
-minutes after submission, past Keeper's two-minute admission expiry, the CLI
-marks it `absent` and trading resumes. A connection that fails before the
-request is sent marks the intent `not_sent`, which does not block. Keeper
-admission does not establish execution or finality.
+`sai intent status ADDR --key KEY`. After five minutes, an empty Keeper
+result can mark an unresolved local intent `absent` and release the block.
+A delayed admission can still appear. The local status `not_sent` means
+the request failed before sending and does not block trading. Follow an
+admitted intent to its execution outcome.
 
 ### Wait for an Intent
 
@@ -426,22 +531,27 @@ admission does not establish execution or finality.
 sai --json intent wait INTENT_KEY --timeout 30
 ```
 
-The command uses the account recorded for the key on the configured Keeper
-endpoint, then the active account on that endpoint. Pass `--addr ADDR` to
-look up an intent from another machine or account. Add `--wait` to a live
-trade command to submit once and wait up to 30 seconds for that key. With
+The command tries `--addr ADDR`, the global `--as ADDR`, the account
+recorded for the key, then the active account on the configured Keeper
+endpoint. Pass `--addr ADDR` to look up an intent from another machine
+without signing in. The address can be EVM or Nibiru. If Sai cannot select
+an account, the command exits 1 with code `INVALID_REQUEST`. Add `--wait` to a live
+trade command to submit once and wait up to 60 seconds for that key. In text
+mode, the CLI prints one progress line to stderr when polling starts. With
 MCP, call `intent_wait` after the trade returns its key. The tool caps each
 call at 10 seconds.
 
-The result contains an `outcome` and a `receipt`. An unresolved timeout
-returns `unknown` with code `OUTCOME_UNKNOWN` and exits 5 in the CLI. Call
-wait again with the same key and account. If reconciliation releases the
+The JSON result contains `intentKey`, `addr`, `outcome`, and `receipt`.
+A failed outcome includes an `error` object in that same result. A timeout
+with an unresolved outcome returns `unknown` with code `OUTCOME_UNKNOWN`
+and exits 5. Call wait again with the same key and account. If reconciliation releases the
 local block after the admission grace period, the wait returns `absent`
 and exits 1. A delayed admission can still appear.
 If the ledger already has a final outcome and Keeper is unavailable, the
 wait returns `terminal` and exits 1 with the execution details unavailable.
 
-A confirmed failure exits 1, and an admission rejection exits 4. The
+A confirmed execution failure returns `failed`, includes `keeperErrorCode`,
+and exits 1. The outcomes `rejected` and `not_sent` exit 4. The
 outcomes `filled`, `placed`, and `succeeded` exit 0. A limit or stop
 order can return `placed` before its trigger. The receipt's `action`
 identifies the intent kind and order type when available.
@@ -459,8 +569,10 @@ that filled it. When history is available, `execution.historyId` identifies
 the matching row. `positionNow` shows Keeper's latest state for that trade,
 and `positionFeesUsd` gives cumulative fees. The fill can include an oracle
 quote and the escrowed collateral in base units from the matching market
-order. Actual fill price and size remain null when Keeper exposes only the
-current position.
+order. For a market opening, `fill.price` is the executed entry price and
+`fill.sizeCollateralBaseUnits` is the leveraged size after opening fees,
+rounded down to whole collateral base units. Each field is null when
+Keeper cannot tie its value to the fill.
 
 ### Doctor
 
@@ -477,19 +589,22 @@ rewrites the session, never writes through a symlink in `$SAI_HOME/trader`,
 and never prints the session token. Without fixes it reads the ledger from a
 temporary copy, so it writes nothing at all.
 
-Doctor can repair stale Codex and Cursor launchers. It prints a repair command
-for each stale Claude Code launcher, such as
-`sai mcp install --client claude --scope user --repair-existing sai`.
-Use the name and scope in the command doctor prints. Run project and local
-repairs from the directory doctor checked. The command preserves the
-registration's environment and compatible server arguments. If the command
-includes `--reset-args`, it uses default server arguments.
+Doctor can repair stale Codex and Cursor launchers. For a differing Claude
+Code `sai` entry, doctor prints a launcher check and a scoped `claude mcp add`
+command. Fill in any placeholders from the saved config before removing the
+entry. Run the check, remove the old entry in Claude, and run the add from
+the project directory where Claude uses the entry. For a stale legacy alias,
+doctor can suggest an explicit `--repair-existing` command that preserves
+compatible arguments.
 
-Each check prints pass, fixed, warn, fail, or skipped, with what changed or
-the command that fixes it. `sai --json doctor` prints a structured report on
-success. If a check fails, doctor exits 1 and the JSON error message lists the
-failed checks and their fixes. `--no-fix` reports without changing anything,
-log lines included, and `--offline` skips the network checks, which
+Each check reports `pass`, `fixed`, `warn`, `fail`, or `skipped` and
+may include a fix. `sai --json doctor` returns `schemaVersion`,
+`generatedAt`, `sai`, `overall`, and `checks`. A warning, including a
+signed-out session, can still exit 0. Failed checks put the report in
+`error.details` and normally exit 1. An invalid endpoint exits 2 with code
+`INVALID_REQUEST`. On `main`, that status also applies to other invalid
+settings that fail the check. Use `--no-fix` to inspect without writing or
+`--offline` to skip the network checks, which
 otherwise run in parallel and stop after 7 seconds in total. The
 endpoints come from [Settings](#settings); `sai doctor --ws-endpoint` and
 `--lcd-endpoint` override them for one run.
@@ -526,7 +641,8 @@ when the code is missing or unrecognized. The `errorMsg` field says
 Put `--json` before the command to read errors on stdout. A failed command
 writes one JSON object with `error.code`, `error.message`, and
 `error.retryable`. The error includes `intentKey` when it refers to a
-recorded intent and `hint` when a command can help. Failed doctor checks and
+recorded intent and `hint` when a command can help. Intent wait can include
+the outcome and receipt next to `error`. Failed doctor checks and
 MCP registration commands include their structured reports in
 `error.details`. The registration report includes `changed` per client and
 the aggregate `reconnectNeeded` flag. If a stream such as `watch` has already
@@ -538,7 +654,7 @@ starts the stdio transport, stdout carries MCP protocol traffic. Without
 | --- | --- | --- |
 | 0 | Success | Read the result. |
 | 1 | Other failure | Read `error.code` and the message before deciding what to do. |
-| 2 | Command usage error | Check the command's `--help`. |
+| 2 | Command usage error or invalid settings | Correct the indicated setting or check the command's `--help`. |
 | 3 | Unsupported install or environment | Follow the error's installation or terminal instructions. |
 | 4 | Request rejected or never sent | The request executed nothing. Review the error before retrying. |
 | 5 | Outcome unknown | Keep the intent key and reconcile it. Do not resubmit. |
@@ -655,23 +771,29 @@ whole number followed by `s`, `m`, `h`, `d`, or `w` to limit the lookback.
 The p50 and p95 use the nearest rank for each Keeper operation. Error totals
 count each coded event, so a failure can count at more than one level.
 
-Queries scan up to 128 files, 16 MiB, and 20,000 rows. Stats seek by UTC day
+Queries scan up to 128 files, 16 MiB, and 20,000 rows per call. Stats seek by UTC day
 and skip out-of-window rows before charging the row budget. The scan
 alternates surfaces within a day. Intent reports reserve part of the scan
 budget for finding command starts and anchors across midnight. A report contains
-up to 128 event or gap rows and uses a 96 KiB response budget. When
-`truncated` is true, use `nextBefore` with `--before` or the MCP `before`
-argument for earlier timestamps within the scan window. Use the files
-listed by `sai logs path` when the scan limit prevents reaching older rows
-or when events share the cutoff timestamp.
+up to 128 event or gap rows and uses a 96 KiB response budget. When a report
+includes a `nextBefore` cursor, pass it to `--before` or the MCP `before`
+argument to resume at the first unread position, including within a shared
+timestamp. Intent cursors use a private local cache of file positions that works
+across CLI invocations. If the cache is cleared, start a new query. If a scan
+returns `truncated: true` without `nextBefore`, inspect the retained files listed
+by `sai --json logs path`.
 
 Use `sai --json logs ...` for machine-readable output. The `intent` and
 `run` reports return arrays `events` and `gaps`. The intent report also
-returns `intentKey`, `keeper`, and `txHash`. A failed Keeper read adds
-`keeperError` alongside the local trail. The `stats` report maps operations
+returns `intentKey`, `keeper`, and `txHash`, which can be null. A failed
+Keeper read adds `keeperError` alongside the local trail. With no account
+in the local trail or session, pass `--addr ADDR` to query Keeper.
+The `stats` report maps operations
 to `count`, `p50Ms`, and `p95Ms` under `keeper`, with counts by code under
 `errors`. It also returns `gaps` and the UTC cutoff `since`, if set.
-The `tail` command prints one JSON object per line.
+The `tail` command prints one JSON object per line with the global `--json` flag.
+In text mode it prints a formatted line per event. The JSON output of
+`logs path` contains `dir`, `enabled`, `keepDays`, and `files`.
 
 A `keeper.request` has `status` `ok`, `error`, `rejected` (Keeper refused
 admission), or `not_sent` (the connection failed first). Its `operation` is
@@ -690,10 +812,10 @@ Sai logs allowlisted fields such as the account, intent key, and request
 transaction hash. It omits session tokens, signatures, clipboard text, and
 Keeper request and response payloads. The logger also scrubs every string.
 
-- A URL anywhere, including in `argv` and `endpoint`, is cut to its scheme,
-  host, and port, so an API key in a path or query is not written. In
-  running text a URL runs to the next space; in a command-line token or a
-  tool argument it runs to the end of the value.
+- `command.start` records command and option names. Options that accept
+  values end in `=`. The event omits option values and positional arguments.
+- URLs in fields such as `endpoint` are reduced to their scheme, host, and
+  port, which keeps path and query credentials out of the log.
 - Session tokens this process has seen are replaced when the event is
   made, so signing out afterwards cannot leave one in a line that was
   still waiting to be written. The background writer rereads the session
@@ -717,10 +839,8 @@ before this process's writer reaches a line that quotes it, only the token's
 shape can catch it. Sai session tokens are JWTs, which are always removed by
 shape. A token of some other form in that window would be written.
 
-Logging never slows a command or a trade. Events go on an in-memory queue of
-at most 2048 events and 4 MB, and one background thread scrubs and writes
-them, so a slow disk cannot delay an MCP reply or the step between reserving
-an intent and submitting it. If the queue fills, sai drops events and later
+The logger queues up to 2048 events and 4 MB in memory. A background thread
+scrubs and writes events. If the queue fills, Sai drops events and later
 writes one `log.dropped` line with the count. At exit sai waits up to 0.3
 seconds for the queue to empty and drops the rest.
 

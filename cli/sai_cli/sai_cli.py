@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import shlex
+import shutil
 import sqlite3
 import sys
 import time
@@ -13,6 +14,7 @@ import uuid
 from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
+from decimal import Decimal
 from functools import wraps
 from importlib import metadata
 from pathlib import Path
@@ -23,6 +25,7 @@ import click
 from . import mcp_install, skill
 from .core import (
     clipboard,
+    confirmation,
     intents,
     keeper,
     log,
@@ -36,6 +39,7 @@ from .core import (
     updater,
     wait,
 )
+from .core import preview as estimates
 from .core import session as sessions
 from .core import settings as sai_settings
 from .core.errors import Code, ExitCode, McpStdioError, SaiError, SessionError, describe
@@ -43,6 +47,7 @@ from .utils import overview_format
 from .utils.repl_skin import ReplSkin
 
 PACKAGE = "sai-cli"
+TRADE_WAIT_TIMEOUT = 60.0
 
 
 def package_version() -> str:
@@ -71,6 +76,7 @@ GLOBAL_FLAGS = (
     ("--ws-endpoint", "keeper.ws_endpoint"),
     ("--lcd-endpoint", "lcd.endpoint"),
 )
+LCD_TRADE_COMMANDS = frozenset({"trade margin", "trade partial-close"})
 
 
 def settings(ctx: click.Context) -> sai_settings.Settings:
@@ -91,34 +97,64 @@ def session(ctx: click.Context) -> dict[str, str]:
 
 
 def command_path(group: click.Group, args: list[str]) -> list[str]:
-    """The command names in ARGS, such as ["market", "prices"], found by
-    walking GROUP's commands past options and their values."""
+    """Find the command names past the options and their values."""
+    names, _, _ = _command_parts(group, args)
+    return names
+
+
+def _command_parts(
+    group: click.Group, args: list[str]
+) -> tuple[list[str], list[str], frozenset[str]]:
+    """Find command names, safe audit names, and explicit setting flags."""
     names: list[str] = []
+    audit_names: list[str] = []
     current: click.Command = group
-    skip = False
-    for token in args:
-        if skip:
-            skip = False
+    flag_keys: set[str] = set()
+    endpoint_options = dict(GLOBAL_FLAGS)
+    options = True
+    tokens = iter(args)
+    for token in tokens:
+        if options and token == "--":
+            options = False
             continue
-        if not isinstance(current, click.Group):
-            break
-        if token.startswith("-"):
+        if options and token.startswith("-"):
+            option_name, equals, _ = token.partition("=")
             option = next(
                 (
                     param
                     for param in current.params
-                    if isinstance(param, click.Option) and token in param.opts
+                    if isinstance(param, click.Option)
+                    and option_name in (*param.opts, *param.secondary_opts)
                 ),
                 None,
             )
-            skip = option is not None and not option.is_flag and not option.count
+            if option is None:
+                continue
+            if option.is_flag or option.count:
+                audit_names.append(option_name)
+            else:
+                # An empty assignment keeps the next option or command name
+                # from being read as a value in retained audit rows.
+                audit_names.append(f"{option_name}=")
+                supplied = bool(equals) or next(tokens, None) is not None
+                if supplied and (key := endpoint_options.get(option_name)):
+                    flag_keys.add(key)
+            continue
+        if not isinstance(current, click.Group):
             continue
         found = current.commands.get(token)
         if found is None:
             break
         names.append(token)
+        audit_names.append(token)
         current = found
-    return names
+        options = True
+    return names, audit_names, frozenset(flag_keys)
+
+
+def auth_attempt(names: list[str], argv: list[str]) -> bool:
+    """Also recognize auth after an unrecognized root option or operand."""
+    return names[:1] == ["auth"] or (not names and "auth" in argv)
 
 
 # Options that print something and exit before any command runs.
@@ -140,7 +176,7 @@ def json_requested(argv: Sequence[str]) -> bool:
 
 
 def cli_failure(exc: Exception) -> SaiError:
-    if isinstance(exc, sai_settings.InvalidEndpoint):
+    if isinstance(exc, sai_settings.InvalidSetting):
         return SaiError(str(exc), Code.INVALID_REQUEST, exit_code=ExitCode.USAGE)
     if isinstance(exc, click.ClickException):
         return SaiError(
@@ -224,6 +260,23 @@ class HelpOnMissingInput(click.Command):
             ctx.exit(ExitCode.USAGE)
 
 
+def auth_usage_error(exc: click.UsageError, command: str | None) -> click.UsageError:
+    """Keep Click's diagnostics for auth independent of supplied values."""
+    if isinstance(exc, click.NoSuchOption) and exc.option_name == "--json":
+        message = "No such option: --json"
+    elif command == "auth import":
+        message = "Unexpected arguments to auth import."
+    elif isinstance(exc, click.NoSuchOption):
+        message = "No such option for auth."
+    elif isinstance(exc, click.MissingParameter) and isinstance(
+        exc.param, click.Argument
+    ):
+        message = f"Missing argument '{exc.param.human_readable_name}'."
+    else:
+        message = "Invalid arguments to auth."
+    return click.UsageError(message, exc.ctx)
+
+
 class SaiGroup(click.Group):
     command_class = HelpOnMissingInput
     group_class = type
@@ -248,35 +301,52 @@ class LoggedGroup(SaiGroup):
         **extra: Any,
     ) -> Any:
         argv = list(sys.argv[1:] if args is None else args)
-        names = command_path(self, argv)
+        names, audit_names, flag_keys = _command_parts(self, argv)
+        private_args = auth_attempt(names, argv)
         quiet = unlogged(names, argv)
+        if names == ["doctor"] and not quiet:
+            from .doctor import can_log_to_profile
+
+            quiet = not can_log_to_profile()
         command = " ".join(names) or ("repl" if not argv else None)
+        # Keep only command words for auth, even if a parent parser fails.
+        logged_argv = names if private_args else audit_names
         surface = {"mcp serve": "mcp", "update": "update"}.get(command or "", "cli")
         started = time.monotonic()
         exit_code: int = ExitCode.OK
         failure: SaiError | None = None
         start_logged = False
+        obj = extra.get("obj")
+        if not isinstance(obj, dict):
+            obj = extra["obj"] = {}
+        obj["command"] = command
 
         def log_start() -> None:
             nonlocal start_logged
             if not quiet and not start_logged:
-                log.event("command.start", argv=log.argv(argv[:64]))
+                log.event("command.start", argv=logged_argv[:64])
                 start_logged = True
 
         with (
+            log.setting_flags(flag_keys),
             log.silenced()
             if quiet
-            else log.bind(surface=surface, command=command, commandId=uuid.uuid4().hex)
+            else log.bind(surface=surface, command=command, commandId=uuid.uuid4().hex),
+            log.keep_existing_modes()
+            if command == "doctor"
+            else contextlib.nullcontext(),
         ):
             if command == "doctor" and not quiet:
                 # Let doctor report directory creation before logging creates
                 # the profile to record its first event.
-                extra["obj"] = {
-                    **(extra.get("obj") or {}),
-                    "doctor_log_start": log_start,
-                }
+                obj["doctor_log_start"] = log_start
             else:
                 log_start()
+            if command == "mcp serve":
+                extra["obj"] = {
+                    **(extra.get("obj") or {}),
+                    "mcp_standalone": standalone_mode,
+                }
             try:
                 result = super().main(
                     args,
@@ -287,11 +357,20 @@ class LoggedGroup(SaiGroup):
                     **extra,
                 )
             except Exception as exc:
-                failure = cli_failure(exc)
+                safe_usage = (
+                    auth_usage_error(exc, command)
+                    if private_args and isinstance(exc, click.UsageError)
+                    else None
+                )
+                failure = cli_failure(safe_usage or exc)
                 exit_code = failure.exit_code
                 if not standalone_mode:
+                    if safe_usage is not None:
+                        raise safe_usage from None
                     raise
-                show_failure(exc, failure, json_requested(argv))
+                show_failure(
+                    safe_usage or exc, failure, obj.get("json", json_requested(argv))
+                )
             else:
                 # With standalone mode disabled, Click returns explicit exit codes.
                 if isinstance(result, int):
@@ -367,14 +446,11 @@ def main(
     passed = (endpoint, ws_endpoint, lcd_endpoint)
     flags = {key: value for (_, key), value in zip(GLOBAL_FLAGS, passed, strict=True)}
     ctx.obj.update(flags=flags, settings=None, json=json_output, as_addr=as_addr)
-    if ctx.invoked_subcommand not in {
-        "account",
-        "auth",
-        "doctor",
-        "mcp",
-        "logs",
-        "skill",
-    }:
+    if (
+        ctx.invoked_subcommand
+        not in {"account", "auth", "doctor", "mcp", "logs", "skill"}
+        and ctx.obj.get("command") not in LCD_TRADE_COMMANDS
+    ):
         session_notice(ctx, as_addr)
     if ctx.invoked_subcommand != "account" and auto_update_applies(
         ctx.invoked_subcommand, json_output
@@ -406,7 +482,7 @@ def show_expiry_notice(ctx: click.Context, fields: Mapping[str, Any]) -> None:
         and sys.stdin.isatty()
         and sys.stderr.isatty()
     ):
-        warn(f"{fields['expiryWarning']} Run {fields['renewalCommand']}.")
+        warn(sessions.expiry_notice_text(fields))
 
 
 # Commands that never start or announce an automatic update. `mcp` serves
@@ -454,6 +530,15 @@ def repl_args(line: str) -> list[str]:
     return args
 
 
+def store_repl_line_immediately(line: str) -> bool:
+    """Defer auth history until the command has run."""
+    try:
+        args = repl_args(line)
+    except ValueError:
+        return False
+    return not auth_attempt(command_path(main, args), args)
+
+
 def repl(ctx: click.Context, pt_input: Any = None, pt_output: Any = None) -> None:
     """Run the interactive shell.
 
@@ -465,7 +550,9 @@ def repl(ctx: click.Context, pt_input: Any = None, pt_output: Any = None) -> Non
     skin.print_banner()
     click.echo("Enter a command, 'help', or 'exit'.")
     pt_session = (
-        skin.create_prompt_session(input=pt_input, output=pt_output)
+        skin.create_prompt_session(
+            history_filter=store_repl_line_immediately, input=pt_input, output=pt_output
+        )
         if pt_input is not None or sys.stdin.isatty()
         else None
     )
@@ -480,18 +567,30 @@ def repl(ctx: click.Context, pt_input: Any = None, pt_output: Any = None) -> Non
         if line in ("exit", "quit"):
             break
         args: list[str] = []
+        command_obj: dict[str, Any] = {}
         try:
             args = repl_args(line)
             if args:
-                main.main(
+                result = main.main(
                     args=[*forwarded_flags(ctx.obj), *args],
                     prog_name="sai",
                     standalone_mode=False,
+                    obj=command_obj,
                 )
+                names = command_path(main, args)
+                if (
+                    pt_session is not None
+                    and result is None
+                    and names[:1] == ["auth"]
+                    and names != ["auth", "import"]
+                ):
+                    pt_session.history.record(line)
         except (click.Abort, KeyboardInterrupt):
             click.echo("Interrupted", err=True)
         except Exception as exc:  # noqa: BLE001 - keep the REPL open
-            show_failure(exc, cli_failure(exc), json_requested(args))
+            show_failure(
+                exc, cli_failure(exc), command_obj.get("json", json_requested(args))
+            )
 
 
 @main.group()
@@ -539,6 +638,7 @@ def login(ctx: click.Context, name: str, addr: str | None) -> None:
         result = signed_login(endpoint, name, addr)
         result["endpoint"] = endpoint
         result["keyName"] = name
+        sessions.validate_issued_session(result)
         storage.save_session(result)
         emit(ctx, sessions.summary(result))
     except NeedsTerminal as exc:
@@ -566,22 +666,31 @@ def renew(ctx: click.Context, addr: str | None) -> None:
         endpoint = keeper_url(ctx)
         if stored.get("endpoint") != endpoint:
             raise SessionError("Stored session belongs to another Keeper endpoint")
+        if not keeper.is_address(stored["evmAddress"]):
+            raise ValueError(sessions.INVALID_RENEWAL_ADDRESS)
         name = stored.get("keyName")
         if not name:
+            fields = sessions.renewal_fields(stored)
+            command = fields["renewalCommand"]
+            guidance = fields.get("renewalGuidance", "")
             if stored.get("source") == "imported":
-                raise ValueError(
-                    f"This session was imported. Run {sessions.renewal_command(stored)} with a fresh token."
+                message = (
+                    f"This session was imported. Run `{command}` with a fresh token."
                 )
-            raise ValueError(
-                f"This session has no saved key name. Run {sessions.renewal_command(stored)}."
-            )
+            else:
+                message = f"This session has no saved key name. Run `{command}`."
+            raise ValueError(f"{message} {guidance}".rstrip())
         result = signed_login(endpoint, name, stored["evmAddress"])
         result.update(endpoint=endpoint, keyName=name)
+        sessions.validate_issued_session(result)
         storage.replace_session(stored, result)
         emit(ctx, sessions.summary(result))
     except NeedsTerminal as exc:
+        fields = sessions.renewal_fields(stored)
+        command = fields["renewalCommand"]
+        guidance = fields.get("renewalGuidance", "")
         raise SaiError(
-            f"{exc} Run {sessions.renewal_command(stored)} in a terminal.",
+            f"{exc} Run `{command}` in a terminal. {guidance}".rstrip(),
             Code.SESSION_UNAVAILABLE,
         ) from exc
 
@@ -769,8 +878,11 @@ def read_token() -> str:
 
 
 @auth.command("import")
+@click.option(
+    "--addr", metavar="ADDR", help="Require the token to match this EVM address."
+)
 @click.pass_context
-def import_token(ctx: click.Context) -> None:
+def import_token(ctx: click.Context, addr: str | None) -> None:
     """Connect with a session token copied from Sai Web.
 
     In a terminal, paste the token at the hidden prompt or press Enter to read
@@ -780,6 +892,8 @@ def import_token(ctx: click.Context) -> None:
     """
     token = read_token()
     result = sessions.import_session(token, keeper_url(ctx))
+    if addr is not None and addr.lower() != result["evmAddress"].lower():
+        raise ValueError("The Sai session token is for a different account than --addr")
     storage.save_session(result)
     # Re-read: the person may have copied something else since, and that
     # must survive.
@@ -848,7 +962,14 @@ def auth_use(ctx: click.Context, addr: str) -> None:
     Commands without `--as` act on the active account. Sign in again to
     connect a new one: `sai auth login NAME` and `sai auth import` add accounts.
     """
-    emit(ctx, {**sessions.summary(storage.use_session(addr)), "active": True})
+
+    def response(accounts: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **sessions.summary(accounts["sessions"][accounts["active"]]),
+            "active": True,
+        }
+
+    emit(ctx, storage.use_session(addr, response))
 
 
 @auth.command("status")
@@ -871,14 +992,30 @@ def market() -> None:
 @click.pass_context
 def market_list(ctx: click.Context) -> None:
     """List Keeper borrowing markets."""
-    perform_query(ctx, keeper.MARKETS)
+    data = keeper.request(keeper_url(ctx), keeper.MARKETS)
+    if ctx.obj["json"]:
+        emit(ctx, data)
+        return
+    rows = trading.usdc_markets(data["perp"]["borrowings"])
+    ReplSkin("sai").table(
+        ["Symbol", "ID", "Collateral", "Price"],
+        [
+            [
+                row["baseToken"]["symbol"],
+                str(row["marketId"]),
+                row["collateralToken"]["symbol"],
+                str(row["price"]) if row["price"] is not None else "-",
+            ]
+            for row in rows
+        ],
+    )
 
 
 @market.command("prices")
 @click.pass_context
 def market_prices(ctx: click.Context) -> None:
     """List current indexed prices."""
-    perform_query(ctx, keeper.PRICES)
+    emit(ctx, keeper.market_prices(keeper_url(ctx)))
 
 
 @main.group()
@@ -886,7 +1023,8 @@ def market_prices(ctx: click.Context) -> None:
 def account(ctx: click.Context) -> None:
     """Inspect positions and account activity."""
     if ctx.invoked_subcommand != "overview":
-        session_notice(ctx, ctx.obj["as_addr"])
+        if ctx.invoked_subcommand != "balances":
+            session_notice(ctx, ctx.obj["as_addr"])
         if auto_update_applies("account", ctx.obj["json"]):
             updater.tick(warn)
 
@@ -904,12 +1042,16 @@ def perform_query(
 def account_overview(ctx: click.Context, addr: str | None, json_output: bool) -> None:
     """Show Sai funds, positions, orders, local blockers, and session expiry."""
     ctx.obj["json"] = ctx.obj["json"] or json_output
-    if auto_update_applies("account", ctx.obj["json"]):
-        updater.tick(warn)
     try:
-        result = overview.account_overview(settings(ctx), addr or ctx.obj["as_addr"])
+        result = overview.account_overview(
+            settings(ctx), addr if addr is not None else ctx.obj["as_addr"]
+        )
     except overview.AccountUnavailable as exc:
         raise SessionError(f"{exc}. Pass --as ADDR explicitly.") from exc
+    if auto_update_applies("account", ctx.obj["json"]):
+        updater.tick(warn)
+    for row in result["balances"].get("data", {}).values():
+        row["stale"] = overview.balance_stale(row["sourceAgeSeconds"])
     if ctx.obj["json"]:
         emit(ctx, result)
     else:
@@ -940,15 +1082,28 @@ def history(ctx: click.Context, addr: str) -> None:
 @click.pass_context
 def balances(ctx: click.Context, addr: str, ws_endpoint: str | None) -> None:
     """Read one account balance snapshot from Keeper's subscription."""
-    emit(
-        ctx,
-        stream.snapshot(
-            ws_url(ctx, ws_endpoint),
-            stream.BALANCES,
-            {"user": addr},
-            notify=warn,
-        ),
-    )
+    flags = ctx.obj["flags"]
+    if ws_endpoint is not None:
+        flags["keeper.ws_endpoint"] = ws_endpoint
+    explicit_ws = flags["keeper.ws_endpoint"]
+    if explicit_ws is not None:
+        ws_url(ctx, explicit_ws)
+    try:
+        resolved = settings(ctx)
+    except sai_settings.InvalidSetting:
+        if explicit_ws is None:
+            raise
+        # An explicit subscription can read balances without block times.
+        resolved = None
+        endpoint = explicit_ws
+    else:
+        session_notice(ctx, ctx.obj["as_addr"])
+        endpoint = resolved.ws_endpoint
+    snapshot = overview.balance_snapshot(resolved, endpoint, addr, notify=warn)
+    if ctx.obj["json"]:
+        emit(ctx, snapshot)
+    else:
+        overview_format.show_balances(snapshot["data"]["userBalances"])
 
 
 @main.group()
@@ -1117,7 +1272,7 @@ def wait_option(action: Callable[..., None]) -> Callable[..., None]:
         is_flag=True,
         expose_value=False,
         callback=record,
-        help=f"Wait up to {wait.DEFAULT_TIMEOUT:g} seconds for the intent outcome.",
+        help=f"Wait up to {TRADE_WAIT_TIMEOUT:g} seconds for the intent outcome.",
     )(run)
 
 
@@ -1125,6 +1280,7 @@ def emit_wait(ctx: click.Context, result: dict[str, Any]) -> None:
     outcome = result["outcome"]
     exit_code = ExitCode.OK
     if outcome == "unknown":
+        result["message"] = "The intent outcome is still unknown. Do not resubmit."
         addr_args = ["--addr", result["addr"]] if result.get("addr") else []
         result["hint"] = storage.keeper_command_hint(
             keeper_url(ctx),
@@ -1150,6 +1306,12 @@ def emit_wait(ctx: click.Context, result: dict[str, Any]) -> None:
         ctx.exit(exit_code)
 
 
+def poll_trade(ctx: click.Context, account: str, key: str) -> dict[str, Any]:
+    if not ctx.obj["json"]:
+        warn(f"Waiting for intent {key} to confirm...")
+    return wait.for_intent(keeper_url(ctx), account, key, timeout=TRADE_WAIT_TIMEOUT)
+
+
 def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
     """Print a trade result with the account it used or would use.
 
@@ -1171,15 +1333,39 @@ def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
         and account
         and result.get("status") == "accepted"
     ):
-        final = wait.for_intent(keeper_url(ctx), account, result["intentKey"])
+        final = poll_trade(ctx, account, result["intentKey"])
         # Keep trade quote metadata, but report the final outcome as the status.
         metadata = {key: value for key, value in result.items() if key != "message"}
         emit_wait(ctx, {**metadata, **final, "status": final["outcome"]})
         return
-    emit(ctx, {"addr": account, **result})
+    output: dict[str, Any] = {"addr": account, **result}
+    if confirmation.is_confirmable(output):
+        output = confirmation.with_digest(output)
+    if not ctx.obj["json"]:
+        collateral = output.get("collateral")
+        trade_estimates = output.get("estimates", {})
+        execution = trade_estimates.get("execution", {})
+        if (collateral or execution.get("code") == "InsufficientDepositBalance") and (
+            reason := estimates.rejection_reason(trade_estimates)
+        ):
+            raise trading.ExecutionRejected(reason, output)
+        if warning := execution.get("warning"):
+            click.echo(warning)
+        if collateral:
+            click.echo(
+                f"Estimated collateral: ${collateral['beforeUsd']} → ${collateral['afterUsd']}"
+            )
+            if output.get("warning"):
+                click.echo(output["warning"])
+    emit(ctx, output)
 
 
 def trade_error(ctx: click.Context, exc: Exception) -> None:
+    if isinstance(exc, trading.PositionChanged) and exc.preview is not None:
+        if ctx.obj["json"]:
+            exc.details = {"preview": confirmation.with_digest(exc.preview)}
+        else:
+            exc.message += " Run with --dry-run to review a fresh preview."
     if (
         ctx.meta.get("wait_for_trade")
         and isinstance(exc, (keeper.OutcomeUnknown, keeper.AdmissionRejected))
@@ -1190,7 +1376,7 @@ def trade_error(ctx: click.Context, exc: Exception) -> None:
             final = (
                 wait.rejected_result(exc.intent_key, account, str(exc))
                 if isinstance(exc, keeper.AdmissionRejected)
-                else wait.for_intent(keeper_url(ctx), account, exc.intent_key)
+                else poll_trade(ctx, account, exc.intent_key)
             )
             emit_wait(ctx, {**final, "status": final["outcome"]})
             return
@@ -1201,8 +1387,119 @@ def warn(message: str) -> None:
     click.echo(message, err=True)
 
 
+def trade_submit_check(
+    load: PinnedSession,
+    digest: str | None,
+    *,
+    reference_price: str | None = None,
+    slippage: str | None = None,
+) -> trading.SubmitCheck | None:
+    if digest is None:
+        return None
+    reference = (
+        intents.positive(reference_price, "Reference price")
+        if reference_price is not None
+        else None
+    )
+
+    def check(preview: dict[str, Any]) -> None:
+        confirmed = {**preview, "addr": load.addr}
+        if reference is not None:
+            confirmed["referencePrice"] = format(reference, "f")
+        if digest != confirmation.preview_digest(confirmed):
+            raise trading.PositionChanged(
+                "The trade no longer matches the confirmed preview. Run with"
+                " --dry-run to review a new preview before submitting."
+            )
+        if reference is not None and slippage is not None:
+            current = Decimal(str(preview["referencePrice"]))
+            moved = estimates.market_price_move(reference, current, slippage)
+            if moved is not None:
+                raise SaiError(
+                    f"The market price moved {moved}% from the confirmed reference,"
+                    f" more than the {slippage}% slippage. Run with --dry-run to"
+                    " review a new preview before submitting.",
+                    Code.PRICE_MOVED,
+                )
+
+    return check
+
+
+preview_digest_option = click.option(
+    "--preview-digest", help="Submit only if the trade matches this dry-run digest."
+)
+
+
+class TradeInt(click.IntRange):
+    name = "integer"
+
+    def convert(
+        self, value: Any, param: click.Parameter | None, ctx: click.Context | None
+    ) -> int:
+        if isinstance(value, str) and not intents.is_trade_integer(value):
+            self.fail(f"{value!r} is not a valid integer.", param, ctx)
+        return super().convert(value, param, ctx)
+
+
+class TradeDecimal(click.types.StringParamType):
+    name = "decimal"
+
+    def convert(
+        self, value: Any, param: click.Parameter | None, ctx: click.Context | None
+    ) -> str:
+        value = super().convert(value, param, ctx)
+        if not intents.TRADE_DECIMAL.fullmatch(value):
+            self.fail(f"{value!r} is not a valid decimal.", param, ctx)
+        return value
+
+
+TRADE_INT = TradeInt()
+TRADE_DECIMAL = TradeDecimal()
+
+
+class TradeMarket(click.ParamType):
+    def convert(
+        self, value: Any, param: click.Parameter | None, ctx: click.Context | None
+    ) -> int | str:
+        if (
+            isinstance(value, str)
+            and value.isascii()
+            and any(c.isalpha() for c in value)
+        ):
+            return value
+        return TRADE_INT.convert(value, param, ctx)
+
+
+def resolve_market(endpoint: str, market: int | str) -> int:
+    if isinstance(market, int):
+        return market
+    rows = keeper.request(endpoint, keeper.MARKETS)["perp"]["borrowings"]
+    matches = sorted(
+        {
+            row["marketId"]
+            for row in trading.usdc_markets(rows)
+            if row["baseToken"]["symbol"].casefold() == market.casefold()
+        }
+    )
+    if not matches:
+        raise ValueError(f"Unknown market symbol {market!r}. Run sai market list.")
+    if len(matches) > 1:
+        ids = ", ".join(map(str, matches))
+        raise ValueError(
+            f"Ambiguous market symbol {market!r}. Pass a market ID: {ids}."
+        )
+    return matches[0]
+
+
 @trade.command("open")
-@click.option("--market", "market_id", type=int, required=True)
+@click.option(
+    "--market",
+    "market_id",
+    type=TradeMarket(),
+    metavar="MARKET",
+    required=True,
+    help="Market ID or symbol, such as BTC.",
+)
 @click.option("--side", type=click.Choice(["long", "short"]), required=True)
 @click.option(
     "--type",
@@ -1210,15 +1507,21 @@ def warn(message: str) -> None:
     type=click.Choice(["market", "limit", "stop"]),
     required=True,
 )
-@click.option("--amount", required=True, help="USDC amount in USD.")
-@click.option("--leverage", required=True)
+@click.option("--amount", type=TRADE_DECIMAL, required=True, help="USDC amount in USD.")
+@click.option("--leverage", type=TRADE_DECIMAL, required=True)
 @click.option(
     "--price",
-    help="Required trigger for limit/stop; optional dry-run reference for market orders. Live market orders use a refreshed price.",
+    type=TRADE_DECIMAL,
+    help="Trigger for limit and stop orders. For market orders, pass the preview's"
+    " reference price when submitting with --preview-digest.",
 )
-@click.option("--slippage", required=True, help="Maximum slippage percentage.")
-@click.option("--take-profit")
-@click.option("--stop-loss")
+@click.option(
+    "--slippage",
+    required=True,
+    help="Maximum slippage percentage, greater than 0 and at most 100.",
+)
+@click.option("--take-profit", type=TRADE_DECIMAL)
+@click.option("--stop-loss", type=TRADE_DECIMAL)
 @click.option(
     "--allow-concurrent-open",
     is_flag=True,
@@ -1227,11 +1530,12 @@ def warn(message: str) -> None:
     " including a late acknowledgement.",
 )
 @click.option("--dry-run", is_flag=True)
+@preview_digest_option
 @wait_option
 @click.pass_context
 def trade_open(
     ctx: click.Context,
-    market_id: int,
+    market_id: int | str,
     side: str,
     order_type: str,
     amount: str,
@@ -1242,15 +1546,23 @@ def trade_open(
     stop_loss: str | None,
     allow_concurrent_open: bool,
     dry_run: bool,
+    preview_digest: str | None,
 ) -> None:
     """Open a market, limit, or stop trade."""
     try:
+        market_confirmation = (
+            order_type == "market" and not dry_run and preview_digest is not None
+        )
+        if market_confirmation and price is None:
+            raise ValueError(
+                "Pass the confirmed market preview's referencePrice via --price"
+            )
         emit_trade(
             ctx,
             trading.open_trade(
                 keeper_url(ctx),
                 loader(ctx),
-                market_id=market_id,
+                market_id=resolve_market(keeper_url(ctx), market_id),
                 side=side,
                 order_type=order_type,
                 amount=amount,
@@ -1263,6 +1575,19 @@ def trade_open(
                 dry_run=dry_run,
                 lcd_endpoint=settings(ctx).lcd_endpoint,
                 notify=warn,
+                before_price_refresh=(
+                    trade_submit_check(
+                        loader(ctx), preview_digest, reference_price=price
+                    )
+                    if market_confirmation
+                    else None
+                ),
+                before_submit=trade_submit_check(
+                    loader(ctx),
+                    preview_digest,
+                    reference_price=price if market_confirmation else None,
+                    slippage=slippage if market_confirmation else None,
+                ),
             ),
         )
     except (ValueError, KeyError, keeper.KeeperError) as exc:
@@ -1270,19 +1595,50 @@ def trade_open(
 
 
 @trade.command("close")
-@click.argument("trade_id", type=int)
+@click.argument("trade_id", type=TRADE_INT)
 @click.option(
     "--cancel-order",
     is_flag=True,
     help="Cancel a pending order instead of closing a position.",
 )
 @click.option("--dry-run", is_flag=True)
+@preview_digest_option
 @wait_option
 @click.pass_context
 def trade_close(
-    ctx: click.Context, trade_id: int, cancel_order: bool, dry_run: bool
+    ctx: click.Context,
+    trade_id: int,
+    cancel_order: bool,
+    dry_run: bool,
+    preview_digest: str | None,
 ) -> None:
     """Close a position or cancel a pending order."""
+    close_or_cancel(ctx, trade_id, cancel_order, dry_run, preview_digest)
+
+
+@trade.command("cancel")
+@click.argument("trade_id", type=TRADE_INT)
+@click.option("--dry-run", is_flag=True)
+@preview_digest_option
+@wait_option
+@click.pass_context
+def trade_cancel(
+    ctx: click.Context,
+    trade_id: int,
+    dry_run: bool,
+    preview_digest: str | None,
+) -> None:
+    """Cancel a pending order."""
+    close_or_cancel(ctx, trade_id, True, dry_run, preview_digest)
+
+
+def close_or_cancel(
+    ctx: click.Context,
+    trade_id: int,
+    cancel_order: bool,
+    dry_run: bool,
+    preview_digest: str | None,
+) -> None:
     try:
         emit_trade(
             ctx,
@@ -1293,6 +1649,7 @@ def trade_close(
                 cancel_order=cancel_order,
                 dry_run=dry_run,
                 lcd_endpoint=settings(ctx).lcd_endpoint,
+                before_submit=trade_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, keeper.KeeperError) as exc:
@@ -1300,12 +1657,13 @@ def trade_close(
 
 
 @trade.command("tpsl")
-@click.argument("trade_id", type=int)
-@click.option("--take-profit")
-@click.option("--stop-loss")
+@click.argument("trade_id", type=TRADE_INT)
+@click.option("--take-profit", type=TRADE_DECIMAL)
+@click.option("--stop-loss", type=TRADE_DECIMAL)
 @click.option("--clear-take-profit", is_flag=True)
 @click.option("--clear-stop-loss", is_flag=True)
 @click.option("--dry-run", is_flag=True)
+@preview_digest_option
 @wait_option
 @click.pass_context
 def trade_tpsl(
@@ -1316,6 +1674,7 @@ def trade_tpsl(
     clear_take_profit: bool,
     clear_stop_loss: bool,
     dry_run: bool,
+    preview_digest: str | None,
 ) -> None:
     """Set or clear take-profit and stop-loss prices."""
     try:
@@ -1331,6 +1690,7 @@ def trade_tpsl(
                 clear_stop_loss=clear_stop_loss,
                 dry_run=dry_run,
                 lcd_endpoint=settings(ctx).lcd_endpoint,
+                before_submit=trade_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, keeper.KeeperError) as exc:
@@ -1338,13 +1698,23 @@ def trade_tpsl(
 
 
 @trade.command("leverage")
-@click.argument("trade_id", type=int)
-@click.option("--leverage", required=True, help="Target leverage as a decimal.")
+@click.argument("trade_id", type=TRADE_INT)
+@click.option(
+    "--leverage",
+    type=TRADE_DECIMAL,
+    required=True,
+    help="Target leverage as a decimal.",
+)
 @click.option("--dry-run", is_flag=True)
+@preview_digest_option
 @wait_option
 @click.pass_context
 def trade_leverage(
-    ctx: click.Context, trade_id: int, leverage: str, dry_run: bool
+    ctx: click.Context,
+    trade_id: int,
+    leverage: str,
+    dry_run: bool,
+    preview_digest: str | None,
 ) -> None:
     """Set target leverage without changing TP or SL."""
     try:
@@ -1357,19 +1727,36 @@ def trade_leverage(
                 leverage=leverage,
                 dry_run=dry_run,
                 lcd_endpoint=settings(ctx).lcd_endpoint,
+                before_submit=trade_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, keeper.KeeperError) as exc:
         trade_error(ctx, exc)
 
 
+def lcd_trade_settings(
+    ctx: click.Context, lcd_endpoint: str | None
+) -> sai_settings.Settings:
+    """Apply a position command's LCD flag before resolving its settings."""
+    if lcd_endpoint is not None:
+        ctx.obj["flags"]["lcd.endpoint"] = lcd_endpoint
+    session_notice(ctx, ctx.obj["as_addr"])
+    return settings(ctx)
+
+
 @trade.command("margin")
-@click.argument("trade_id", type=int)
+@click.argument("trade_id", type=TRADE_INT)
 @click.option("--direction", type=click.Choice(["add", "remove"]), required=True)
 @click.option(
     "--amount",
+    type=TRADE_DECIMAL,
     required=True,
     help="USDC amount for a leverage quote, not an execution cap.",
+)
+@click.option(
+    "--max-collateral-usd",
+    type=TRADE_DECIMAL,
+    help="Cap the margin quote only. Actual collateral in USD can exceed this cap.",
 )
 @click.option(
     "--lcd-endpoint",
@@ -1377,6 +1764,7 @@ def trade_leverage(
     " lcd.endpoint setting.",
 )
 @click.option("--dry-run", is_flag=True)
+@preview_digest_option
 @wait_option
 @click.pass_context
 def trade_margin(
@@ -1384,24 +1772,29 @@ def trade_margin(
     trade_id: int,
     direction: str,
     amount: str,
+    max_collateral_usd: str | None,
     lcd_endpoint: str | None,
     dry_run: bool,
+    preview_digest: str | None,
 ) -> None:
     """Add or remove margin through a target-leverage intent.
 
     The amount is a quote, not a cap: collateral can change before execution.
     """
+    resolved = lcd_trade_settings(ctx, lcd_endpoint)
     try:
         emit_trade(
             ctx,
             trading.change_margin(
-                keeper_url(ctx),
+                resolved.endpoint,
                 loader(ctx),
                 trade_id=trade_id,
                 direction=direction,
                 amount=amount,
-                lcd_endpoint=lcd_url(ctx, lcd_endpoint),
+                max_collateral_usd=max_collateral_usd,
+                lcd_endpoint=resolved.lcd_endpoint,
                 dry_run=dry_run,
+                before_submit=trade_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, KeyError, TypeError, keeper.KeeperError) as exc:
@@ -1409,14 +1802,15 @@ def trade_margin(
 
 
 @trade.command("partial-close")
-@click.argument("trade_id", type=int)
-@click.option("--percent", type=click.IntRange(1, 99), required=True)
+@click.argument("trade_id", type=TRADE_INT)
+@click.option("--percent", type=TradeInt(1, 99), required=True)
 @click.option(
     "--lcd-endpoint",
     help="Nibiru REST endpoint for exact contract state. Defaults to the"
     " lcd.endpoint setting.",
 )
 @click.option("--dry-run", is_flag=True)
+@preview_digest_option
 @wait_option
 @click.pass_context
 def partial_close(
@@ -1425,18 +1819,21 @@ def partial_close(
     percent: int,
     lcd_endpoint: str | None,
     dry_run: bool,
+    preview_digest: str | None,
 ) -> None:
     """Reduce an open USDC position by a whole percentage."""
+    resolved = lcd_trade_settings(ctx, lcd_endpoint)
     try:
         emit_trade(
             ctx,
             trading.partial_close(
-                keeper_url(ctx),
+                resolved.endpoint,
                 loader(ctx),
                 trade_id=trade_id,
                 percent=percent,
-                lcd_endpoint=lcd_url(ctx, lcd_endpoint),
+                lcd_endpoint=resolved.lcd_endpoint,
                 dry_run=dry_run,
+                before_submit=trade_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, KeyError, TypeError, keeper.KeeperError) as exc:
@@ -1474,7 +1871,7 @@ def doctor_command(
     It reports stale Claude Code registrations with a command to repair
     each existing entry. It never deletes or rewrites the session, and
     never prints its token. Each check prints pass, fixed, warn, fail, or
-    skipped. Doctor exits 1 if any check still fails.
+    skipped. Doctor exits 2 for invalid settings and 1 for other failed checks.
     """
     from . import doctor
 
@@ -1520,7 +1917,7 @@ def doctor_command(
             report,
             code,
             details=doctor.report(checks) if ctx.obj["json"] else None,
-            exit_code=ExitCode.USAGE if config_check.invalid_endpoint else None,
+            exit_code=ExitCode.USAGE if config_check.invalid_setting else None,
         )
     if ctx.obj["json"]:
         click.echo(doctor.render_json(doctor.report(checks)))
@@ -1575,17 +1972,11 @@ def watch_price(ctx: click.Context, token_id: int, ws_endpoint: str | None) -> N
 def ws_url(ctx: click.Context, ws_endpoint: str | None) -> str:
     """The command's --ws-endpoint, else the resolved WebSocket setting."""
     if ws_endpoint is not None:
-        sai_settings.check_value("keeper.ws_endpoint", ws_endpoint)
+        sai_settings.check_value(
+            "keeper.ws_endpoint", ws_endpoint, source="--ws-endpoint"
+        )
         return ws_endpoint
     return settings(ctx).ws_endpoint
-
-
-def lcd_url(ctx: click.Context, lcd_endpoint: str | None) -> str:
-    """The command's --lcd-endpoint, else the resolved LCD setting."""
-    if lcd_endpoint is not None:
-        sai_settings.check_value("lcd.endpoint", lcd_endpoint)
-        return lcd_endpoint
-    return settings(ctx).lcd_endpoint
 
 
 def watch_stream(ws_endpoint: str, query: str, variables: dict[str, Any]) -> None:
@@ -1636,7 +2027,7 @@ def config_file() -> Path:
 def config_list(ctx: click.Context) -> None:
     """Show every setting with its value and source.
 
-    The source is flag, env, file, default, or derived. Keeper URLs are
+    The source is flag, env, file, default, or derived. Endpoint URLs are
     shown as origins. `sai config get` prints the exact value.
     """
     shown = sai_settings.public(settings(ctx))
@@ -1686,7 +2077,15 @@ def config_set(ctx: click.Context, key: str, value: str) -> None:
         )
     except sai_settings.UneditableSection as exc:
         raise click.UsageError(str(exc)) from exc
-    report_change(ctx, spec, {"key": spec.key, "value": parsed, "path": str(path)})
+    report_change(
+        ctx,
+        spec,
+        {
+            "key": spec.key,
+            "value": sai_settings.public_value(spec, parsed),
+            "path": str(path),
+        },
+    )
 
 
 @config_group.command("unset")
@@ -1788,7 +2187,7 @@ def mcp_serve(
     )
     if sys.stdin.isatty():
         click.echo(SERVE_TTY_NOTICE, err=True)
-    server.serve(flags)
+    server.serve(flags, standalone=ctx.obj.get("mcp_standalone", False))
 
 
 def serve_flags(
@@ -1898,7 +2297,13 @@ def finish(ctx: click.Context, results: list[mcp_install.Result]) -> None:
                 lines.append("Client registrations changed.")
             details = "\n".join(lines)
         else:
-            details = json.dumps(summary, indent=2)
+            hints = [r.fix for r in results if r.fix]
+            text_results = [r.to_json() for r in results]
+            for row in text_results:
+                row.pop("fix", None)
+            details = json.dumps({**summary, "results": text_results}, indent=2)
+            if hints:
+                details += "\n" + "\n".join(hints)
         report = {
             **summary,
             "results": [{**r.to_json(), "changed": r.changed} for r in results],
@@ -1947,7 +2352,7 @@ def mcp_list(ctx: click.Context) -> None:
 @click.option(
     "--repair-existing",
     type=click.Choice(mcp_install.SERVER_NAMES),
-    help="Repair only this existing Claude Code entry in the selected scope.",
+    help="Report a differing Claude Code entry or repair a legacy alias in this scope.",
 )
 @click.option(
     "--reset-args",
@@ -1975,14 +2380,21 @@ def mcp_install_command(
     checkout, give the server command after `--`, for example
     `sai mcp install claude -- uv run --directory ~/open-sai sai mcp serve`.
 
+    When a Claude Code entry differs, prints the commands for updating it manually.
+
     With no CLIENT and no --all, a terminal asks which clients to register;
     without a terminal, this lists detected clients and changes nothing.
     """
+    server_argv = ctx.meta.get("server_argv")
+    if server_argv and shutil.which(server_argv[0]) is None:
+        raise click.UsageError(
+            "Give an existing executable as the server launcher after `--`.", ctx
+        )
     names = chosen_clients((*clients, *client_options))
     if reset_args and repair_existing is None:
         raise click.UsageError("--reset-args requires --repair-existing.")
     if repair_existing is not None and (
-        names != ["claude"] or all_clients or ctx.meta.get("server_argv")
+        names != ["claude"] or all_clients or server_argv
     ):
         raise click.UsageError(
             "--repair-existing requires --client claude and the default server command."
@@ -2014,8 +2426,10 @@ def mcp_install_command(
             emit(
                 ctx,
                 {
-                    "command": target.argv,
-                    "clients": mcp_install.list_clients(found, target),
+                    "command": target.reported_argv(),
+                    "clients": mcp_install.list_clients(
+                        found, target, install_report=True
+                    ),
                 },
             )
             warn(
@@ -2197,7 +2611,7 @@ def print_log_limit(report: dict[str, Any]) -> None:
 @click.argument("key")
 @click.option("--offline", is_flag=True, help="Read local logs only.")
 @click.option("--addr", help="EVM address to use for the Keeper lookup.")
-@click.option("--before", help="Read earlier events before this UTC timestamp.")
+@click.option("--before", help="Resume from a cursor or read before a UTC timestamp.")
 @click.pass_context
 def logs_intent(
     ctx: click.Context, key: str, offline: bool, addr: str | None, before: str | None
@@ -2205,7 +2619,7 @@ def logs_intent(
     """Show an intent's CLI and MCP trail and its current Keeper record."""
     endpoint = ctx.obj["flags"].get("keeper.endpoint") if offline else keeper_url(ctx)
     if offline and endpoint is not None:
-        sai_settings.check_value("keeper.endpoint", endpoint)
+        sai_settings.check_value("keeper.endpoint", endpoint, source="--endpoint")
     account = addr if addr is not None else ctx.obj["as_addr"]
     report = log_queries.intent(
         key, endpoint=endpoint, addr=account, offline=offline, before=before

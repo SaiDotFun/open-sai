@@ -1,0 +1,1653 @@
+"""Replay the public installer and Python updater against local release assets."""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import tarfile
+import tomllib
+import zipfile
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from email import message_from_bytes
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from threading import Thread
+from urllib.parse import unquote
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+INSTALLER = ROOT / "scripts" / "install.py"
+REPO = "/SaiDotFun/open-sai"
+PRE_BRIDGE_COMMIT = "8557a7e13dceab0accc369191182c8e01423c91b"
+PUBLISHED_BRIDGE_SHA256 = (
+    "65e736ea6468144e93b4fb0de1f2c16f949e81d78cd27c56c449943e821b3bc0"
+)
+OLD_MCP_COMMAND = "sai" + "-mcp"
+WINDOWS = os.name == "nt"
+
+
+DENY_SYSCALLS = """
+import ctypes, errno, os, sys
+syscalls, binary, *args = sys.argv[1:]
+lib = ctypes.CDLL('libseccomp.so.2')
+lib.seccomp_init.argtypes = [ctypes.c_uint32]
+lib.seccomp_init.restype = ctypes.c_void_p
+lib.seccomp_rule_add_array.argtypes = [
+    ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p]
+lib.seccomp_load.argtypes = [ctypes.c_void_p]
+lib.seccomp_release.argtypes = [ctypes.c_void_p]
+ctx = lib.seccomp_init(0x7fff0000)  # SCMP_ACT_ALLOW
+assert ctx
+for name in syscalls.split(","):
+    syscall = lib.seccomp_syscall_resolve_name(name.encode())
+    assert syscall >= 0
+    assert lib.seccomp_rule_add_array(ctx, 0x00050000 | errno.ENOSYS, syscall, 0, None) == 0
+assert lib.seccomp_load(ctx) == 0
+lib.seccomp_release(ctx)
+os.execv(binary, [binary, *args])
+"""
+
+
+def checkout_version() -> str:
+    return tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+
+
+def wheel_version(wheel: Path) -> str:
+    with zipfile.ZipFile(wheel) as archive:
+        (metadata,) = (
+            name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+        )
+        version = message_from_bytes(archive.read(metadata))["Version"]
+    assert version
+    return version
+
+
+def asset_name(version: str) -> str:
+    system = {"Linux": "unknown-linux-gnu", "Darwin": "apple-darwin"}[platform.system()]
+    cpu = "aarch64" if platform.machine().lower() in {"arm64", "aarch64"} else "x86_64"
+    return f"sai-{version}-{cpu}-{system}.tar.gz"
+
+
+def archive(binary: Path | None = None, *, member: str = "sai") -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(
+        fileobj=buffer, mode="w:gz", format=tarfile.USTAR_FORMAT
+    ) as output:
+        if binary is None:
+            entry = tarfile.TarInfo(member)
+            entry.size = 1
+            output.addfile(entry, io.BytesIO(b"x"))
+        else:
+            output.add(binary, arcname=member)
+    return buffer.getvalue()
+
+
+class Replay:
+    def __init__(self) -> None:
+        self.releases: dict[str, None] = {}
+        self.requests: list[str] = []
+        self.assets: dict[str, bytes] = {}
+        self.redirects: dict[str, str] = {}
+        replay = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                path = unquote(self.path.split("?", 1)[0])
+                if path != "/":
+                    replay.requests.append(path)
+                if location := replay.redirects.get(path):
+                    self.send_response(302)
+                    self.send_header("Location", location)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if path == f"/repos{REPO}/releases":
+                    body = json.dumps(
+                        [
+                            {"tag_name": "other/v99.0.0"},
+                            {"tag_name": "sai-cli/v99.0.0-rc.1", "prerelease": True},
+                            *(
+                                replay.details(version)
+                                for version in reversed(replay.releases)
+                            ),
+                            {"tag_name": "sai-cli/v0.0.1"},
+                        ]
+                    ).encode()
+                else:
+                    body = replay.assets.get(path)
+                self.send_response(200 if body is not None else 404)
+                self.send_header("Content-Length", str(len(body or b"")))
+                self.end_headers()
+                self.wfile.write(body or b"")
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+
+    def add(self, version: str, files: dict[str, bytes]) -> None:
+        self.releases[version] = None
+        folder = f"{REPO}/releases/download/sai-cli/v{version}"
+        manifest = "".join(
+            f"{hashlib.sha256(data).hexdigest()}  {name}\n"
+            for name, data in files.items()
+        )
+        self.assets.update({f"{folder}/{name}": data for name, data in files.items()})
+        self.assets[f"{folder}/SHA256SUMS"] = manifest.encode()
+
+    def details(self, version: str) -> dict[str, object]:
+        folder = f"{REPO}/releases/download/sai-cli/v{version}/"
+        return {
+            "tag_name": f"sai-cli/v{version}",
+            "assets": [
+                {"name": path[len(folder) :], "state": "uploaded"}
+                for path in self.assets
+                if path.startswith(folder)
+            ],
+        }
+
+
+@pytest.fixture
+def replay() -> Iterator[Replay]:
+    release = Replay()
+    worker = Thread(target=release.server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        yield release
+    finally:
+        release.server.shutdown()
+        release.server.server_close()
+        worker.join()
+
+
+@dataclass
+class Install:
+    home: Path
+    profile: Path
+    launcher: Path
+    tools: Path
+    env: dict[str, str] = field(repr=False)
+
+    def run(
+        self, *args: str | Path, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            args,
+            cwd=self.home,
+            env=self.env if env is None else env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+
+    def install(
+        self, replay: Replay, *args: str, script: Path = INSTALLER
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run(
+            sys.executable,
+            script,
+            "--api-base",
+            replay.base,
+            "--web-base",
+            replay.base,
+            *args,
+        )
+
+    def update(self, replay: Replay, *args: str) -> subprocess.CompletedProcess[str]:
+        return self.run(
+            self.launcher,
+            "--json",
+            "update",
+            "--api-base",
+            replay.base,
+            "--web-base",
+            replay.base,
+            *args,
+        )
+
+    def pin(self, version: str) -> None:
+        output = ok(self.run(self.launcher, "--version"))
+        assert output.strip() in (f"sai {version}", f"sai, version {version}")
+
+
+@pytest.fixture
+def install(tmp_path: Path, replay: Replay) -> Install:
+    home = tmp_path / "user home"
+    home.mkdir(mode=0o700)
+    profile = home / ".sai"
+    bin_dir = home / ".local" / "bin"
+    bin_dir.parent.mkdir(mode=0o700)
+    tools = home / "uv-tools"
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "CODEX_HOME": str(home / ".codex"),
+        "CLAUDE_CONFIG_DIR": str(home / ".claude"),
+        "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+        "SAI_HOME": str(profile),
+        "SAI_LOG": "false",
+        "CI": "1",
+        "UV_PYTHON": sys.executable,
+        "UV_PYTHON_DOWNLOADS": "never",
+        "UV_TOOL_DIR": str(tools),
+        "UV_TOOL_BIN_DIR": str(bin_dir),
+        "SAI_NATIVE_RELEASE_BASE": replay.base,
+        "HTTP_PROXY": "http://127.0.0.1:1",
+        "HTTPS_PROXY": "http://127.0.0.1:1",
+        "ALL_PROXY": "http://127.0.0.1:1",
+        "NO_PROXY": "127.0.0.1",
+        "UV_OFFLINE": "1",
+    }
+    for key in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        env.pop(key, None)
+    return Install(
+        home, profile, bin_dir / ("sai.exe" if WINDOWS else "sai"), tools, env
+    )
+
+
+def ok(result: subprocess.CompletedProcess[str]) -> str:
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    return result.stdout
+
+
+def artifact(name: str) -> Path:
+    value = os.environ.get(f"SAI_C10B_{name}")
+    if value is None:
+        assert not os.environ.get("SAI_C10B_REQUIRED"), (
+            f"the rehearsal requires SAI_C10B_{name}"
+        )
+        pytest.skip(f"set SAI_C10B_{name} to the locally built release artifact")
+    return Path(value).resolve(strict=True)
+
+
+def only_wheel(directory: Path) -> Path:
+    wheels = list(directory.glob("sai_cli-*.whl"))
+    assert len(wheels) == 1, f"expected one Sai wheel in {directory}, found {wheels}"
+    return wheels[0]
+
+
+def wheel_artifact(name: str) -> Path:
+    path = artifact(name)
+    return only_wheel(path) if path.is_dir() else path
+
+
+def test_bridge_rehearsal_refuses_the_checkout_version(install: Install) -> None:
+    scripts = install.home / "scripts"
+    scripts.mkdir()
+    for name in ("build-bridge.py", "check_release.py"):
+        shutil.copy2(ROOT / "scripts" / name, scripts)
+    major, minor, patch = map(int, checkout_version().split("."))
+    version = f"{major}.{minor}.{patch + 1}"
+    (install.home / "pyproject.toml").write_text(f'[project]\nversion = "{version}"\n')
+    result = install.run(
+        sys.executable,
+        scripts / "build-bridge.py",
+        "--version",
+        version,
+        "--out-dir",
+        install.home / "dist",
+    )
+    assert result.returncode == 2
+    assert f"requires a distinct stable version newer than {version}" in result.stderr
+    assert not (install.home / "dist").exists()
+
+
+def save_profile(install: Install, replay: Replay) -> tuple[Path, bytes]:
+    ok(
+        install.run(
+            install.launcher, "config", "set", "keeper.endpoint", f"{replay.base}/query"
+        )
+    )
+    path = install.profile / "config.toml"
+    return path, path.read_bytes()
+
+
+def prepare_uv(
+    install: Install, wheel: Path, replay: Replay, script: Path = INSTALLER
+) -> None:
+    uv = shutil.which("uv")
+    assert uv is not None
+    # Seed the dependency cache before restricting all release traffic to loopback.
+    prime_env = {
+        **os.environ,
+        "UV_PYTHON_DOWNLOADS": "never",
+        "UV_PYTHON": sys.executable,
+    }
+    default_cache = Path(ok(install.run(uv, "cache", "dir", env=prime_env)).strip())
+    install.env["UV_CACHE_DIR"] = str(default_cache)
+    ok(
+        install.run(
+            uv,
+            "pip",
+            "install",
+            "--target",
+            install.home / "dependencies",
+            wheel,
+            env=prime_env,
+        )
+    )
+    version = wheel_version(wheel)
+    replay.add(version, {wheel.name: wheel.read_bytes()})
+    # The pinned pre-bridge installer predates the version option.
+    pin = ("--version", version) if script == INSTALLER else ()
+    ok(install.install(replay, *pin, script=script))
+    install.pin(version)
+
+
+def pending(install: Install) -> Path:
+    return install.launcher.parent / ".sai-native" / "pending.json"
+
+
+def native_artifact(replay: Replay, name: str = "RUST") -> str:
+    binary = artifact(name)
+    version = (
+        ok(
+            subprocess.run(
+                [binary, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        )
+        .strip()
+        .split()[1]
+    )
+    replay.add(version, {asset_name(version): archive(binary)})
+    return version
+
+
+def pre_mcp_xfail(result: subprocess.CompletedProcess[str]) -> None:
+    if (
+        not os.environ.get("SAI_C10B_REQUIRED")
+        and not (ROOT / "sai/src/mcp.rs").is_file()
+        and "No such command 'mcp'" in result.stderr
+    ):
+        pytest.xfail("Native MCP startup requires PR #120")
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+def test_standalone_installs_release(install: Install, replay: Replay) -> None:
+    version = native_artifact(replay)
+    result = install.install(replay, "--native")
+    pre_mcp_xfail(result)
+    ok(result)
+    install.pin(version)
+    assert ok(install.run("sai", "--version")).strip() == f"sai {version}"
+    assert install.launcher.readlink() == Path(".sai-native/current")
+    target = install.launcher.resolve(strict=True)
+    assert target.parent.name.startswith(f"{version}-")
+    assert target.name == "sai"
+    assert (install.launcher.stat().st_mode & 0o777) == 0o700
+    assert not pending(install).exists()
+    assert not install.profile.exists()
+    assert replay.requests[-1].endswith(asset_name(version))
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+def test_native_dry_run_selects_an_explicit_prerelease(
+    install: Install, replay: Replay
+) -> None:
+    version = f"{checkout_version()}-rc.1"
+    command = install.install(replay, "--native", "--dry-run", "--version", version)
+    assert asset_name(version) in ok(command)
+    assert not replay.requests
+    assert not install.launcher.parent.exists()
+    assert not install.profile.exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+def test_native_selection_skips_releases_without_a_platform_archive_and_checksum(
+    install: Install, replay: Replay
+) -> None:
+    native, unlisted, other_platform, python = "0.1.4", "0.1.5", "0.1.6", "0.1.7"
+    unavailable, malformed, oversized = "0.1.8", "0.1.9", "0.1.10"
+    replay.add(native, {asset_name(native): archive()})
+    replay.add(unlisted, {asset_name(unlisted): archive()})
+    replay.assets[f"{REPO}/releases/download/sai-cli/v{unlisted}/SHA256SUMS"] = b""
+    replay.add(other_platform, {f"sai-{other_platform}-other.tar.gz": archive()})
+    replay.add(python, {f"sai_cli-{python}-py3-none-any.whl": b"full Python"})
+    replay.add(unavailable, {asset_name(unavailable): archive()})
+    replay.redirects[f"{REPO}/releases/download/sai-cli/v{unavailable}/SHA256SUMS"] = (
+        "/missing-checksum"
+    )
+    replay.add(malformed, {asset_name(malformed): archive()})
+    replay.assets[f"{REPO}/releases/download/sai-cli/v{malformed}/SHA256SUMS"] = b"\xff"
+    replay.add(oversized, {asset_name(oversized): archive()})
+    oversized_manifest = f"{REPO}/releases/download/sai-cli/v{oversized}/SHA256SUMS"
+    replay.assets[oversized_manifest] = b"x" * (65536 + 1)
+
+    preview = install.install(replay, "--native", "--dry-run")
+    assert asset_name(native) in ok(preview)
+    assert replay.requests == [
+        f"/repos{REPO}/releases",
+        oversized_manifest,
+        f"{REPO}/releases/download/sai-cli/v{malformed}/SHA256SUMS",
+        f"{REPO}/releases/download/sai-cli/v{unavailable}/SHA256SUMS",
+        "/missing-checksum",
+        f"{REPO}/releases/download/sai-cli/v{unlisted}/SHA256SUMS",
+        f"{REPO}/releases/download/sai-cli/v{native}/SHA256SUMS",
+    ]
+    assert not install.launcher.parent.exists()
+
+    replay.requests.clear()
+    too_large = install.install(replay, "--native", "--version", oversized)
+    assert too_large.returncode == 1, too_large.stdout
+    assert "SHA256SUMS is larger than expected" in too_large.stderr
+    assert replay.requests == [oversized_manifest]
+
+    replay.requests.clear()
+    pinned = install.install(replay, "--native", "--version", python)
+    assert pinned.returncode == 1, pinned.stdout
+    assert asset_name(python) in pinned.stderr
+    assert all(f"/sai-cli/v{python}/" in path for path in replay.requests)
+    assert replay.requests
+    assert not install.launcher.exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+def test_standalone_reports_both_paths_for_uv_owned_launcher(
+    install: Install, replay: Replay
+) -> None:
+    prepare_uv(install, wheel_artifact("BRIDGE"), replay)
+    requests = len(replay.requests)
+    previous = install.launcher.lstat()
+    uv_target = install.launcher.resolve(strict=True)
+    result = install.install(replay, "--native")
+    assert result.returncode == 1
+    assert str(install.launcher) in result.stderr
+    assert str(uv_target) in result.stderr
+    assert os.path.samestat(previous, install.launcher.lstat())
+    assert len(replay.requests) == requests
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+def test_standalone_preserves_a_concurrent_launcher(
+    install: Install, replay: Replay
+) -> None:
+    native_artifact(replay)
+    # Publish a competing launcher at the syscall boundary, after all reads.
+    probe = """
+import os, runpy, sys
+from pathlib import Path
+script, destination, *args = sys.argv[1:]
+def race(event, values):
+    if event == 'sai.launcher.rename' and os.fsdecode(values[1]) == destination:
+        try:
+            with Path(destination).open('x') as file:
+                file.write('another installer owns this launcher')
+        except FileExistsError:
+            pass
+sys.addaudithook(race)
+sys.argv = [script, *args]
+runpy.run_path(script, run_name='__main__')
+"""
+    result = install.run(
+        sys.executable,
+        "-c",
+        probe,
+        INSTALLER,
+        install.launcher,
+        "--native",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert install.launcher.read_text() == "another installer owns this launcher"
+    assert not pending(install).exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+def test_standalone_leaves_an_older_displaced_launcher_for_inspection(
+    install: Install, replay: Replay
+) -> None:
+    root = pending(install).parent
+    stage = root / ".launcher-switch"
+    stage.mkdir(mode=0o700, parents=True)
+    root.chmod(0o700)
+    competitor = stage / "sai"
+    competitor.write_text("another install")
+    entry = competitor.stat()
+
+    result = install.install(replay, "--native")
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert str(competitor) in result.stderr
+    assert str(install.launcher) in result.stderr
+    assert os.path.samestat(competitor.stat(), entry)
+    assert not os.path.lexists(install.launcher)
+    assert not replay.requests
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux seccomp")
+def test_standalone_reinstall_keeps_public_inode_without_link_or_renameat2(
+    install: Install, replay: Replay
+) -> None:
+    native_artifact(replay)
+    ok(install.install(replay, "--native"))
+    public = install.launcher.lstat()
+    selected = install.launcher.resolve(strict=True)
+    result = install.run(
+        sys.executable,
+        "-c",
+        DENY_SYSCALLS,
+        "renameat2,link,linkat",
+        sys.executable,
+        INSTALLER,
+        "--native",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    ok(result)
+    assert os.path.samestat(install.launcher.lstat(), public)
+    assert install.launcher.resolve(strict=True) == selected
+    assert not pending(install).exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+@pytest.mark.parametrize("boundary", ["selector", "public-startup", "doctor"])
+def test_standalone_refuses_to_commit_after_the_launcher_is_replaced(
+    install: Install, replay: Replay, boundary: str
+) -> None:
+    native_artifact(replay)
+    ok(install.install(replay, "--native"))
+    binary = install.launcher.resolve(strict=True)
+    target = install.launcher.readlink()
+    started = install.home / "competing-launcher-started"
+    if boundary == "public-startup":
+        target = install.home / "replacement"
+        target.write_text('#!/bin/sh\n: > "$HOME/competing-launcher-started"\n')
+        target.chmod(0o700)
+    competitor = install.launcher.with_name("competing-sai")
+    competitor.symlink_to(target)
+    expected = competitor.lstat()
+    destination = competitor.resolve(strict=True)
+    selector = pending(install).parent / "current"
+    probe = """
+import os, runpy, sys
+script, launcher, competitor, selector, boundary, binary, *args = sys.argv[1:]
+def race(event, values):
+    if boundary == 'selector' and event == 'os.rename' and values[1] == selector:
+        os.replace(competitor, launcher)
+    if boundary == 'public-startup' and event == 'subprocess.Popen':
+        if [os.fsdecode(arg) for arg in values[1]] == [launcher, '--version']:
+            os.replace(competitor, launcher)
+    if boundary == 'doctor' and event == 'subprocess.Popen' and 'doctor' in values[1]:
+        os.replace(competitor, launcher)
+        assert os.fsdecode(values[0]) == binary
+sys.addaudithook(race)
+sys.argv = [script, *args]
+runpy.run_path(script, run_name='__main__')
+"""
+    result = install.run(
+        sys.executable,
+        "-c",
+        probe,
+        INSTALLER,
+        install.launcher,
+        competitor,
+        selector,
+        boundary,
+        binary,
+        "--native",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "launcher changed" in result.stderr
+    assert str(install.launcher) in result.stderr and str(binary) in result.stderr
+    assert "Installed sai" not in result.stdout
+    assert os.path.samestat(install.launcher.lstat(), expected)
+    assert install.launcher.resolve(strict=True) == destination
+    assert not started.exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+def test_standalone_refuses_an_indirect_managed_target(
+    install: Install, replay: Replay
+) -> None:
+    root = install.launcher.parent / ".sai-native"
+    binary = root / (f"{checkout_version()}-" + "a" * 64) / "sai"
+    binary.parent.mkdir(mode=0o700, parents=True)
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o700)
+    alias = install.home / "external-alias"
+    alias.symlink_to(binary)
+    install.launcher.symlink_to(alias)
+    result = install.install(replay, "--native", "--dry-run")
+    assert result.returncode == 1 and "through its installer" in result.stderr
+    assert install.launcher.readlink() == alias
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+@pytest.mark.parametrize(
+    "fault", ["wrong target", "digest", "duplicate manifest", "traversal"]
+)
+def test_native_rejects_invalid_assets(
+    install: Install, replay: Replay, fault: str
+) -> None:
+    version = checkout_version()
+    name = asset_name(version)
+    data = archive(member="../sai")
+    if fault == "wrong target":
+        replay.add(version, {f"sai-{version}-elsewhere.tar.gz": data})
+        expected = "HTTP 404"
+    else:
+        replay.add(version, {name: data})
+        folder = f"{REPO}/releases/download/sai-cli/v{version}"
+        if fault == "digest":
+            replay.assets[f"{folder}/{name}"] += b"changed"
+            expected = "does not match its SHA256SUMS"
+        elif fault == "duplicate manifest":
+            manifest = f"{folder}/SHA256SUMS"
+            replay.assets[manifest] *= 2
+            expected = "must contain one checksum"
+        else:
+            expected = "one regular file named sai"
+    target = (
+        ("--version", version)
+        if fault in ("wrong target", "duplicate manifest")
+        else ()
+    )
+    result = install.install(replay, "--native", *target)
+    assert result.returncode == 1
+    assert expected in result.stderr
+    assert not install.launcher.is_symlink()
+    assert not install.profile.exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+@pytest.mark.parametrize("fault", ["owner", "path", "permissions", "lock"])
+def test_native_refuses_unsafe_destination(
+    install: Install, replay: Replay, fault: str
+) -> None:
+    import fcntl
+
+    install.launcher.parent.mkdir(mode=0o700)
+    with (install.launcher.parent / ".sai-update.lock").open("w") as lock:
+        os.fchmod(lock.fileno(), 0o600)
+        if fault == "lock":
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            expected = "another Sai install or update"
+        elif fault == "permissions":
+            install.launcher.parent.chmod(0o777)
+            expected = "safe permissions"
+        else:
+            path = install.launcher
+            if fault == "path":
+                shadow = install.home / "shadow"
+                shadow.mkdir()
+                install.env["PATH"] = str(shadow) + os.pathsep + install.env["PATH"]
+                path = shadow / "sai"
+            path.write_text("#!/bin/sh\nexit 0\n")
+            path.chmod(0o700)
+            expected = "which shadows" if fault == "path" else "through its installer"
+        result = install.install(replay, "--native")
+        assert result.returncode == 1
+        assert expected in result.stderr
+    assert not pending(install).exists()
+    assert not any("/releases/download/" in path for path in replay.requests)
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+@pytest.mark.parametrize("fresh", [True, False])
+def test_native_rolls_back_a_binary_that_fails_only_through_the_public_launcher(
+    install: Install, replay: Replay, fresh: bool
+) -> None:
+    artifact("MUTANT")
+    old = None
+    if not fresh:
+        version = native_artifact(replay)
+        ok(install.install(replay, "--native"))
+        old = install.launcher.resolve(strict=True)
+        entry = install.launcher.lstat()
+        config, content = save_profile(install, replay)
+    else:
+        install.profile.mkdir(mode=0o700)
+        config = install.profile / "config.toml"
+        content = b"[update]\nauto = false\n"
+        config.write_bytes(content)
+    version = native_artifact(replay, "MUTANT")
+    result = install.install(replay, "--native", "--version", version)
+    assert result.returncode == 1
+    assert "Rolled back the selection" in result.stderr
+    assert "installed MCP startup mutation" in result.stderr
+    assert "mcp serve" in result.stderr
+    assert "Installed sai" not in result.stdout
+    if old is None:
+        assert install.launcher.is_symlink() and not install.launcher.exists()
+    else:
+        assert install.launcher.resolve(strict=True) == old
+        assert os.path.samestat(install.launcher.lstat(), entry)
+    assert not pending(install).exists()
+    assert config.read_bytes() == content
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux seccomp")
+def test_standalone_publishes_without_rename_noreplace(
+    install: Install, replay: Replay
+) -> None:
+    version = native_artifact(replay)
+    # Simulate a kernel without renameat2 without replacing any installer code.
+    result = install.run(
+        sys.executable,
+        "-c",
+        DENY_SYSCALLS,
+        "renameat2",
+        sys.executable,
+        INSTALLER,
+        "--native",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    ok(result)
+    install.pin(version)
+    assert not pending(install).exists()
+
+
+def interrupt_install(install: Install, replay: Replay, boundary: str) -> None:
+    probe = """
+import os, runpy, signal, sys
+script, launcher, record, boundary, *args = sys.argv[1:]
+def interrupt(event, values):
+    if (
+        (boundary == 'record' and event == 'os.rename' and os.fsdecode(values[1]) == record)
+        or (boundary == 'link' and event == 'sai.launcher.rename' and os.fsdecode(values[1]) == launcher)
+        or (boundary == 'published' and event == 'sai.launcher.renamed'
+            and os.fsdecode(values[1]) == launcher)
+        or (boundary == 'commit' and event == 'os.remove' and os.fsdecode(values[0]) == record)
+    ):
+        os.kill(os.getpid(), signal.SIGKILL)
+sys.addaudithook(interrupt)
+sys.argv = [script, *args]
+runpy.run_path(script, run_name='__main__')
+"""
+    result = install.run(
+        sys.executable,
+        "-c",
+        probe,
+        INSTALLER,
+        install.launcher,
+        pending(install),
+        boundary,
+        "--native",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    pre_mcp_xfail(result)
+    assert result.returncode == -9, (result.stdout, result.stderr)
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+@pytest.mark.parametrize("boundary", ["record", "link", "published", "commit"])
+def test_standalone_recovers_an_interrupted_first_switch(
+    install: Install, replay: Replay, boundary: str
+) -> None:
+    native_artifact(replay)
+    interrupt_install(install, replay, boundary)
+    assert pending(install).exists() == (boundary == "commit")
+    assert install.launcher.is_symlink() == (boundary != "link")
+    assert install.launcher.exists() == (boundary == "commit")
+    replay.redirects[f"/repos{REPO}/releases"] = "/unavailable"
+    result = install.install(replay, "--native")
+    assert result.returncode == 1 and "HTTP 302" in result.stderr
+    assert not install.launcher.exists()
+    assert not pending(install).exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+def test_native_updater_recovers_an_interrupted_first_install(
+    install: Install, replay: Replay
+) -> None:
+    native_artifact(replay, "RECOVERY_RUST")
+    interrupt_install(install, replay, "commit")
+    public = install.launcher.lstat()
+    record = json.loads(pending(install).read_text())
+    assert record["old"] is None
+    assert record["launcher"] == [public.st_dev, public.st_ino]
+    result = install.run(
+        install.launcher, "update", "--api-base", replay.base, "--web-base", replay.base
+    )
+    assert "first Sai install was rolled back" in result.stderr
+    assert not install.launcher.exists()
+    assert os.path.samestat(install.launcher.lstat(), public)
+    assert not pending(install).exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+@pytest.mark.parametrize("runtime", ["installer", "rust"])
+def test_pending_recovery_preserves_a_replaced_same_version_launcher(
+    install: Install, replay: Replay, runtime: str
+) -> None:
+    native_artifact(replay, "RECOVERY_RUST")
+    interrupt_install(install, replay, "commit")
+    record = pending(install).read_bytes()
+    target = install.launcher.resolve(strict=True)
+    competitor = install.launcher.with_name("competitor")
+    competitor.symlink_to(install.launcher.readlink())
+    entry = competitor.lstat()
+    competitor.replace(install.launcher)
+
+    result = (
+        install.install(replay, "--native")
+        if runtime == "installer"
+        else install.update(replay)
+    )
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "launcher changed" in (result.stdout + result.stderr).lower()
+    assert os.path.samestat(install.launcher.lstat(), entry)
+    assert install.launcher.resolve(strict=True) == target
+    assert pending(install).read_bytes() == record
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+def test_standalone_reinstall_repairs_cursor(install: Install, replay: Replay) -> None:
+    native_artifact(replay)
+    result = install.install(replay, "--native")
+    pre_mcp_xfail(result)
+    ok(result)
+    cursor = install.home / ".cursor" / "mcp.json"
+    cursor.parent.mkdir()
+    other = {"url": f"{replay.base}/service"}
+    servers = {
+        "sai": {"command": OLD_MCP_COMMAND, "env": {"SAI_HOME": str(install.profile)}},
+        "other": other,
+    }
+    cursor.write_text(json.dumps({"mcpServers": servers}))
+    ok(install.install(replay, "--native"))
+    repaired = json.loads(cursor.read_text())["mcpServers"]
+    assert repaired["sai"] == {
+        "command": str(install.launcher),
+        "args": ["mcp", "serve"],
+        "env": {"SAI_HOME": str(install.profile)},
+    }
+    assert repaired["other"] == other
+    assert not install.profile.exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+@pytest.mark.parametrize("profile_case", ["default", "matching", "different"])
+def test_standalone_reports_only_the_current_profiles_mcp_warnings(
+    install: Install, replay: Replay, profile_case: str
+) -> None:
+    native_artifact(replay)
+    if profile_case == "default":
+        del install.env["SAI_HOME"]
+    ok(install.install(replay, "--native"))
+    cursor = install.home / ".cursor" / "mcp.json"
+    cursor.parent.mkdir(mode=0o700)
+    registration = {"command": str(install.launcher), "args": ["mcp", "serve"]}
+    if profile_case != "default":
+        profile = (
+            install.profile if profile_case == "matching" else install.home / "other"
+        )
+        registration["env"] = {"SAI_HOME": str(profile)}
+    original = json.dumps({"mcpServers": {"sai": registration}})
+    cursor.write_text(original)
+    result = install.install(replay, "--native")
+    ok(result)
+    assert "Could not finish MCP registration repair" not in result.stderr
+    assert ("different SAI_HOME setting" in result.stderr) == (
+        profile_case == "different"
+    )
+    assert cursor.read_text() == original
+    assert not install.profile.exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+@pytest.mark.parametrize(
+    ("scope", "filename"), [("user", ".claude/.claude.json"), ("project", ".mcp.json")]
+)
+def test_standalone_reinstall_prints_claude_repair_scopes(
+    install: Install, replay: Replay, scope: str, filename: str
+) -> None:
+    version = native_artifact(replay)
+    ok(install.install(replay, "--native"))
+    (install.launcher.parent / "claude").symlink_to("/bin/false")
+    original = json.dumps(
+        {
+            "mcpServers": {
+                "sai": {"type": "stdio", "command": OLD_MCP_COMMAND, "args": []}
+            }
+        }
+    )
+    config = install.home / filename
+    config.parent.mkdir(exist_ok=True)
+    config.write_text(original)
+    result = install.install(replay, "--native")
+    ok(result)
+    assert (
+        f"sai mcp install --client claude --scope {scope} --repair-existing sai"
+        in result.stderr
+    )
+    assert config.read_text() == original
+    assert not pending(install).exists()
+    install.pin(version)
+
+
+def add_shim(replay: Replay, wheel: Path, binary: Path | None = None) -> str:
+    version = wheel_version(wheel)
+    files = {wheel.name: wheel.read_bytes()}
+    if binary is not None:
+        files[asset_name(version)] = archive(binary)
+    replay.add(version, files)
+    return version
+
+
+@pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.skipif(WINDOWS, reason="Windows has a separate compatibility rehearsal")
+def test_python_bridge_preserves_uv_and_rolls_back(
+    install: Install, replay: Replay, failure: bool
+) -> None:
+    wheel = wheel_artifact("SHIM")
+    python_wheel = wheel_artifact("BRIDGE")
+    binary = artifact("MUTANT" if failure else "RUST")
+    bridge_version = wheel_version(python_wheel)
+    if not failure:
+        baseline, script = pre_bridge_files()
+        prepare_uv(install, baseline, replay, script)
+    # The native tag is already published when the bridge becomes available.
+    version = add_shim(replay, wheel, binary)
+    if failure:
+        prepare_uv(install, python_wheel, replay)
+    else:
+        replay.add(bridge_version, {python_wheel.name: python_wheel.read_bytes()})
+        chosen = json.loads(ok(install.update(replay, "--to", bridge_version)))
+        assert (chosen["status"], chosen["target"]) == ("updated", bridge_version)
+        install.pin(bridge_version)
+    previous = install.launcher.resolve(strict=True)
+    profile, contents = save_profile(install, replay)
+    python = install.tools / "sai-cli" / "bin" / "python"
+    ok(
+        install.run(
+            python,
+            "-I",
+            "-c",
+            "import sys; from sai_cli.core.storage import pending; pending(*sys.argv[1:])",
+            "20261124T120000000Z_0123456789ABCDEF",
+            f"{replay.base}/query",
+            "0x" + "1" * 40,
+            "CLOSE_POSITION",
+            "7",
+        )
+    )
+    ledger = install.profile / "trader" / "intents.sqlite3"
+    before = ledger.read_bytes()
+    inode = ledger.stat().st_ino
+    cursor = install.home / ".cursor" / "mcp.json"
+    cursor.parent.mkdir()
+    other = {"url": f"{replay.base}/service"}
+    original = {
+        "mcpServers": {
+            "sai": {
+                "command": OLD_MCP_COMMAND,
+                "env": {"SAI_HOME": str(install.profile)},
+            },
+            "other": other,
+        }
+    }
+    cursor.write_text(json.dumps(original))
+    result = install.update(replay)
+    pre_mcp_xfail(result)
+    report = json.loads(result.stdout)
+    if failure:
+        assert result.returncode == 1
+        message = report["error"]["message"]
+        assert f"Could not update to {version}" in message
+        assert f"Rolled back to sai {bridge_version}" in message
+        assert "mcp serve" in message
+        install.pin(bridge_version)
+        assert json.loads(cursor.read_text()) == original
+    else:
+        ok(result)
+        assert f"Updated sai from {bridge_version} to {version}" in report["message"]
+        archive_path = (
+            f"{REPO}/releases/download/sai-cli/v{version}/{asset_name(version)}"
+        )
+        del replay.assets[archive_path]
+        requests = len(replay.requests)
+        install.pin(version)
+        assert len(replay.requests) == requests
+        assert len(list(install.tools.glob(".sai-cli-rollback-*"))) == 1
+        repaired = json.loads(cursor.read_text())["mcpServers"]
+        assert repaired["sai"] == {
+            "command": str(install.launcher),
+            "args": ["mcp", "serve"],
+            "env": {"SAI_HOME": str(install.profile)},
+        }
+        assert repaired["other"] == other
+    assert install.launcher.resolve(strict=True) == previous
+    assert profile.read_bytes() == contents
+    assert ledger.read_bytes() == before and ledger.stat().st_ino == inode
+    assert not (install.launcher.parent / ".sai-native").exists()
+
+
+def pre_bridge_files() -> tuple[Path, Path]:
+    baseline = artifact("PRE_BRIDGE")
+    assert (baseline / "commit").read_text().strip() == PRE_BRIDGE_COMMIT
+    return only_wheel(baseline), baseline / "install.py"
+
+
+@pytest.mark.skipif(WINDOWS, reason="native uv recovery runs on POSIX")
+def test_native_updater_recovers_an_interrupted_bridge(
+    install: Install, replay: Replay
+) -> None:
+    python_wheel, shim = wheel_artifact("BRIDGE"), wheel_artifact("SHIM")
+    binary = artifact("RECOVERY_RUST")
+    prepare_uv(install, python_wheel, replay)
+    profile, contents = save_profile(install, replay)
+    previous = install.launcher.resolve(strict=True)
+    version = add_shim(replay, shim, binary)
+    kill_after_uv = """
+import os, signal, sys
+from sai_cli.sai_cli import main
+launcher, *args = sys.argv[1:]
+def interrupt(event, values):
+    if (event == 'subprocess.Popen'
+        and [os.fsdecode(value) for value in values[1]] == [os.path.realpath(launcher), '--version']):
+        os.kill(os.getpid(), signal.SIGKILL)
+sys.addaudithook(interrupt)
+sys.argv = [launcher, *args]
+main()
+"""
+    result = install.run(
+        install.tools / "sai-cli" / "bin" / "python",
+        "-I",
+        "-c",
+        kill_after_uv,
+        install.launcher,
+        "update",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    pre_mcp_xfail(result)
+    assert result.returncode == -9, (result.stdout, result.stderr)
+    record = install.tools / ".sai-cli-native-pending.json"
+    assert json.loads(record.read_text())["next"]["version"] == version
+    archive_path = f"{REPO}/releases/download/sai-cli/v{version}/{asset_name(version)}"
+    native_archive = replay.assets.pop(archive_path)
+    install.pin(version)
+    result = install.run(
+        install.launcher,
+        "--json",
+        "update",
+        "--recover",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    assert json.loads(ok(result))["status"] == "recovered"
+    install.pin(wheel_version(python_wheel))
+    assert install.launcher.resolve(strict=True) == previous
+    assert profile.read_bytes() == contents
+    assert not record.exists()
+
+    # Retry after the old wheel becomes unavailable from the release server.
+    replay.assets[archive_path] = native_archive
+    old_release = f"{REPO}/releases/download/sai-cli/v{wheel_version(python_wheel)}/"
+    del replay.assets[old_release + "SHA256SUMS"]
+    del replay.assets[old_release + python_wheel.name]
+    requests = len(replay.requests)
+    result = install.update(replay)
+    assert json.loads(ok(result))["status"] == "updated"
+    assert not any(path.startswith(old_release) for path in replay.requests[requests:])
+    install.pin(version)
+    assert profile.read_bytes() == contents
+
+
+@pytest.mark.skipif(WINDOWS, reason="native uv recovery runs on POSIX")
+def test_bridge_recovers_when_uv_removed_the_environment_and_launcher(
+    install: Install, replay: Replay
+) -> None:
+    python_wheel = wheel_artifact("BRIDGE")
+    prepare_uv(install, python_wheel, replay)
+    profile, contents = save_profile(install, replay)
+    candidate = add_shim(replay, wheel_artifact("SHIM"), artifact("RECOVERY_RUST"))
+    original_env = install.env.copy()
+    uv = shutil.which("uv", path=original_env["PATH"])
+    assert uv is not None
+    interceptor = install.home / "interrupt"
+    interceptor.mkdir()
+    wrapper = interceptor / "uv"
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import os, signal, subprocess, sys\n"
+        f"uv = {uv!r}\n"
+        "if sys.argv[1:4] == ['pip', 'install', '--reinstall-package']:\n"
+        "    subprocess.run([uv, 'tool', 'uninstall', 'sai-cli'], check=True)\n"
+        "    os.kill(os.getppid(), signal.SIGKILL)\n"
+        "else:\n"
+        "    os.execv(uv, [uv, *sys.argv[1:]])\n"
+    )
+    wrapper.chmod(0o700)
+    install.env["PATH"] = str(interceptor) + os.pathsep + original_env["PATH"]
+    result = install.update(replay)
+    install.env = original_env
+    assert result.returncode == -9, (result.stdout, result.stderr)
+    assert not (install.tools / "sai-cli").exists()
+    assert not os.path.lexists(install.launcher)
+
+    record = install.tools / ".sai-cli-native-pending.json"
+    recovery = Path(json.loads(record.read_text())["recovery"])
+    assert recovery.parent == install.tools
+    assert str(recovery) in result.stderr and "update --recover" in result.stderr
+    del replay.assets[
+        f"{REPO}/releases/download/sai-cli/v{candidate}/{asset_name(candidate)}"
+    ]
+    result = install.run(
+        recovery,
+        "--json",
+        "update",
+        "--recover",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    assert json.loads(ok(result))["status"] == "recovered"
+    install.pin(wheel_version(python_wheel))
+    assert profile.read_bytes() == contents
+    assert not record.exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="native uv recovery runs on POSIX")
+def test_bridge_requires_an_offline_rollback_install(
+    install: Install, replay: Replay
+) -> None:
+    python_wheel, shim = wheel_artifact("BRIDGE"), wheel_artifact("SHIM")
+    prepare_uv(install, python_wheel, replay)
+    add_shim(replay, shim, artifact("RUST"))
+    install.env["UV_CACHE_DIR"] = str(install.home / "empty-uv-cache")
+    result = install.update(replay)
+    pre_mcp_xfail(result)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert (
+        "rollback wheel failed its offline trial install"
+        in json.loads(result.stdout)["error"]["message"]
+    )
+    install.pin(wheel_version(python_wheel))
+    assert not (install.tools / ".sai-cli-native-pending.json").exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="native uv recovery runs on POSIX")
+def test_bridge_honors_opt_out_during_the_offline_rollback_trial(
+    install: Install, replay: Replay
+) -> None:
+    python_wheel = wheel_artifact("BRIDGE")
+    prepare_uv(install, python_wheel, replay)
+    add_shim(replay, wheel_artifact("SHIM"), artifact("RUST"))
+    profile, _ = save_profile(install, replay)
+    opt_out = """
+import sys
+from pathlib import Path
+from sai_cli.sai_cli import main
+profile, launcher, *args = sys.argv[1:]
+def during_trial(event, values):
+    if event == 'subprocess.Popen' and list(values[1])[1:4] == ['pip', 'install', '--offline']:
+        with Path(profile).open('a') as config:
+            config.write('\\n[update]\\nauto = false\\n')
+sys.addaudithook(during_trial)
+sys.argv = [launcher, *args]
+main()
+"""
+    result = install.run(
+        install.tools / "sai-cli" / "bin" / "python",
+        "-I",
+        "-c",
+        opt_out,
+        profile,
+        install.launcher,
+        "update",
+        "--background",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    ok(result)
+    assert "auto = false" in profile.read_text()
+    state = json.loads((install.profile / "update.json").read_text())
+    assert state["result"]["status"] == "available"
+    install.pin(wheel_version(python_wheel))
+    assert not (install.tools / ".sai-cli-native-pending.json").exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="native uv recovery runs on POSIX")
+def test_bridge_explains_how_to_convert_an_official_uv_git_install(
+    install: Install, replay: Replay
+) -> None:
+    python_wheel = wheel_artifact("BRIDGE")
+    prepare_uv(install, python_wheel, replay)
+    version = wheel_version(python_wheel)
+    profile, contents = save_profile(install, replay)
+    prefix = install.tools / "sai-cli"
+    (direct_url,) = prefix.glob(
+        "lib/python*/site-packages/sai_cli-*.dist-info/direct_url.json"
+    )
+    # Replay PEP 610 metadata from an official Git install without fetching GitHub.
+    direct_url.write_text(
+        json.dumps(
+            {
+                "url": "https://github.com/SaiDotFun/open-sai",
+                "vcs_info": {"vcs": "git", "commit_id": PRE_BRIDGE_COMMIT},
+            }
+        )
+    )
+    candidate = add_shim(replay, wheel_artifact("SHIM"), artifact("RUST"))
+    result = install.update(replay)
+    assert result.returncode == 1
+    instruction = json.loads(result.stdout)["error"]["message"]
+    assert "uv tool uninstall sai-cli" in instruction
+    assert "scripts/install.py --version VERSION" in instruction
+    assert not any(path.endswith(asset_name(candidate)) for path in replay.requests)
+    install.pin(version)
+
+    ok(install.run("uv", "tool", "uninstall", "sai-cli"))
+    ok(install.install(replay, "--version", version))
+    install.pin(version)
+    assert profile.read_bytes() == contents
+
+
+def test_python_bridge_rejects_cross_origin_manifest_redirect(
+    install: Install, replay: Replay
+) -> None:
+    python_wheel = wheel_artifact("BRIDGE")
+    wheel = wheel_artifact("SHIM")
+    prepare_uv(install, python_wheel, replay)
+    version = add_shim(replay, wheel)
+    manifest = f"{REPO}/releases/download/sai-cli/v{version}/SHA256SUMS"
+    with ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler) as other:
+        replay.redirects[manifest] = f"http://127.0.0.1:{other.server_port}/SHA256SUMS"
+        result = install.update(replay)
+    assert result.returncode == 1
+    assert (
+        "redirected outside its download hosts"
+        in json.loads(result.stdout)["error"]["message"]
+    )
+    install.pin(wheel_version(python_wheel))
+
+
+@pytest.mark.skipif(WINDOWS, reason="Windows has a separate compatibility rehearsal")
+def test_pre_bridge_updater_can_skip_to_the_native_shim(
+    install: Install, replay: Replay
+) -> None:
+    baseline, script = pre_bridge_files()
+    prepare_uv(install, baseline, replay, script)
+    profile, contents = save_profile(install, replay)
+    version = add_shim(replay, wheel_artifact("SHIM"), artifact("RUST"))
+    result = json.loads(ok(install.update(replay)))
+    assert result["status"] == "updated"
+    install.pin(version)
+    assert profile.read_bytes() == contents
+
+
+@pytest.mark.skipif(WINDOWS, reason="native uv updates run on POSIX")
+@pytest.mark.parametrize("from_older_release", [False, True])
+def test_published_v013_updater_installs_the_native_shim(
+    install: Install,
+    replay: Replay,
+    from_older_release: bool,
+) -> None:
+    published = artifact("PUBLISHED_BRIDGE")
+    assert hashlib.sha256(published.read_bytes()).hexdigest() == PUBLISHED_BRIDGE_SHA256
+    assert wheel_version(published) == "0.1.3"
+    if from_older_release:
+        baseline, script = pre_bridge_files()
+        prepare_uv(install, baseline, replay, script)
+        replay.add("0.1.3", {published.name: published.read_bytes()})
+    else:
+        prepare_uv(install, published, replay)
+    launcher = install.launcher.resolve(strict=True)
+    profile, contents = save_profile(install, replay)
+    version = add_shim(replay, wheel_artifact("SHIM"), artifact("RUST"))
+    if from_older_release:
+        result = json.loads(ok(install.update(replay, "--to", "0.1.3")))
+        assert (result["status"], result["target"]) == ("updated", "0.1.3")
+        install.pin("0.1.3")
+    result = json.loads(ok(install.update(replay)))
+    assert (result["status"], result["target"]) == ("updated", version)
+    assert install.launcher.resolve(strict=True) == launcher
+    assert profile.read_bytes() == contents
+
+    del replay.assets[
+        f"{REPO}/releases/download/sai-cli/v{version}/{asset_name(version)}"
+    ]
+    requests = len(replay.requests)
+    install.pin(version)
+    assert len(replay.requests) == requests
+
+
+@pytest.mark.skipif(not WINDOWS, reason="requires a Windows uv launcher")
+@pytest.mark.parametrize("pre_bridge", [False, True])
+def test_windows_keeps_a_runnable_python_launcher(
+    install: Install, replay: Replay, pre_bridge: bool
+) -> None:
+    wheel = wheel_artifact("SHIM")
+    if pre_bridge:
+        python_wheel, script = pre_bridge_files()
+    else:
+        python_wheel = wheel_artifact("BRIDGE")
+        script = INSTALLER
+    prepare_uv(install, python_wheel, replay, script)
+    profile, contents = save_profile(install, replay)
+    launcher = install.launcher.read_bytes()
+    version = add_shim(replay, wheel)
+    result = install.update(replay)
+    assert result.returncode == (1 if pre_bridge else 3), (result.stdout, result.stderr)
+    message = json.loads(result.stdout)["error"]["message"]
+    expected = (
+        "Native Sai supports Linux and macOS"
+        if pre_bridge
+        else f"sai-cli=={wheel_version(python_wheel)}"
+    )
+    assert expected in message
+    assert not any(f"/sai-{version}-" in path for path in replay.requests)
+    install.pin(wheel_version(python_wheel))
+    assert install.launcher.read_bytes() == launcher
+    assert profile.read_bytes() == contents
+
+
+@pytest.mark.skipif(not WINDOWS, reason="requires Windows uv launcher copies")
+def test_windows_refuses_a_replaced_uv_launcher(
+    install: Install, replay: Replay
+) -> None:
+    python_wheel = wheel_artifact("BRIDGE")
+    prepare_uv(install, python_wheel, replay)
+    add_shim(replay, wheel_artifact("SHIM"))
+    contents = b"another install occupies this launcher"
+    competitor = install.launcher.with_name("competing-sai.exe")
+    competitor.write_bytes(contents)
+    competitor.replace(install.launcher)
+    inside = install.tools / "sai-cli" / "Scripts" / "sai.exe"
+    result = install.run(
+        inside, "--json", "update", "--api-base", replay.base, "--web-base", replay.base
+    )
+    assert result.returncode == 3
+    message = json.loads(result.stdout)["error"]["message"]
+    assert "runs another install" in message
+    assert str(install.launcher) in message and str(inside) in message
+    assert install.launcher.read_bytes() == contents
+
+
+@pytest.fixture(scope="module")
+def full_python_bundle(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[Path, bytes]:
+    version = wheel_version(wheel_artifact("SHIM"))
+    output = tmp_path_factory.mktemp("full-python-wheel")
+    ok(
+        subprocess.run(
+            [
+                sys.executable,
+                ROOT / "scripts/build-bridge.py",
+                "--version",
+                version,
+                "--out-dir",
+                output,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    )
+    wheel = only_wheel(output)
+    return wheel, zip_python_wheel(wheel)
+
+
+def zip_python_wheel(wheel: Path) -> bytes:
+    bundle = io.BytesIO()
+    with zipfile.ZipFile(bundle, "w") as archive:
+        archive.write(wheel, wheel.name)
+    return bundle.getvalue()
+
+
+@pytest.mark.parametrize("cached", [True, False])
+def test_managed_full_python_install_checks_and_applies_the_next_release(
+    install: Install,
+    replay: Replay,
+    full_python_bundle: tuple[Path, bytes],
+    cached: bool,
+) -> None:
+    bridge = wheel_artifact("BRIDGE")
+    prepare_uv(install, bridge, replay)
+    version = wheel_version(bridge)
+    ok(install.run("uv", "tool", "uninstall", "sai-cli"))
+    bundle_name = f"sai-cli-{version}-full-python.zip"
+    shim = wheel_artifact("SHIM")
+    replay.add(
+        version, {bridge.name: shim.read_bytes(), bundle_name: zip_python_wheel(bridge)}
+    )
+    replay.requests.clear()
+    ok(install.install(replay, "--full-python", "--version", version))
+    folder = f"{REPO}/releases/download/sai-cli/v{version}"
+    assert f"{folder}/{bundle_name}" in replay.requests
+    assert f"{folder}/{bridge.name}" not in replay.requests
+    rollback_wheel = install.profile / "cache/wheels" / bridge.name
+    if not cached:
+        rollback_wheel.unlink()
+    replay.requests.clear()
+
+    wheel, bundle = full_python_bundle
+    target = wheel_version(wheel)
+    if WINDOWS:
+        replay.add(
+            target,
+            {shim.name: shim.read_bytes(), f"sai-cli-{target}-full-python.zip": bundle},
+        )
+    else:
+        replay.add(target, {wheel.name: wheel.read_bytes()})
+
+    check = json.loads(ok(install.update(replay, "--check")))
+    assert (check["installed"], check["latest"]) == (version, target)
+    assert check["install"]["kind"] == "uv-tool-release"
+    assert check["updateAvailable"] is True
+    result = json.loads(ok(install.update(replay)))
+    assert (result["status"], result["target"]) == ("updated", target)
+    assert f"{folder}/{bridge.name}" not in replay.requests
+    assert rollback_wheel.read_bytes() == bridge.read_bytes()
+    install.pin(target)
+    current = json.loads(ok(install.update(replay, "--check")))
+    assert (current["installed"], current["latest"]) == (target, target)
+    assert current["updateAvailable"] is False
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires a Linux native archive")
+@pytest.mark.parametrize("has_bundle", [True, False])
+def test_default_installer_checks_native_compatibility_before_replacing_uv(
+    install: Install,
+    replay: Replay,
+    full_python_bundle: tuple[Path, bytes],
+    has_bundle: bool,
+) -> None:
+    bridge = wheel_artifact("BRIDGE")
+    prepare_uv(install, bridge, replay)
+    profile, contents = save_profile(install, replay)
+    shim = wheel_artifact("SHIM")
+    version = wheel_version(shim)
+    binary = install.home / "incompatible-sai"
+    binary.write_text("#!/no/such/dynamic-loader\n")
+    binary.chmod(0o700)
+    target = asset_name(version)
+    files = {shim.name: shim.read_bytes(), target: archive(binary)}
+    wheel, bundle = full_python_bundle
+    if has_bundle:
+        files[f"sai-cli-{version}-full-python.zip"] = bundle
+    replay.add(version, files)
+
+    result = install.install(replay)
+    assert f"{REPO}/releases/download/sai-cli/v{version}/{target}" in replay.requests
+    if has_bundle:
+        ok(result)
+        assert "Installing the full Python wheel instead" in result.stderr
+        install.pin(version)
+        assert (
+            install.profile / "cache/wheels" / wheel.name
+        ).read_bytes() == wheel.read_bytes()
+    else:
+        assert result.returncode == 1, (result.stdout, result.stderr)
+        assert "no full Python wheel" in result.stderr
+        install.pin(wheel_version(bridge))
+    assert profile.read_bytes() == contents
+
+
+@pytest.mark.skipif(WINDOWS, reason="requires a native uv shim")
+def test_default_installer_keeps_a_compatible_native_shim(
+    install: Install,
+    replay: Replay,
+) -> None:
+    shim = wheel_artifact("SHIM")
+    version = add_shim(replay, shim, artifact("RUST"))
+    result = install.install(replay)
+    ok(result)
+    assert "Installing the full Python wheel instead" not in result.stderr
+    assert (
+        f"{REPO}/releases/download/sai-cli/v{version}/{asset_name(version)}"
+        in replay.requests
+    )
+    assert not (install.profile / "bin").exists()
+    install.pin(version)
+
+
+@pytest.mark.skipif(WINDOWS, reason="requires POSIX profile permissions")
+@pytest.mark.parametrize(
+    ("obstruction", "diagnostic"),
+    [
+        ("ancestor", "SAI_HOME has an untrusted ancestor directory"),
+        ("receipt", "The Sai native cache cannot replace the verified directory"),
+        ("read-only cache", "The Sai native cache directory is not writable"),
+    ],
+)
+def test_default_installer_keeps_python_when_shim_rejects_the_real_profile(
+    install: Install,
+    replay: Replay,
+    obstruction: str,
+    diagnostic: str,
+) -> None:
+    project = install.home / "project"
+    project.mkdir(mode=0o700)
+    install.profile = project / ".sai"
+    install.env["SAI_HOME"] = str(install.profile.relative_to(install.home))
+    previous = wheel_artifact("BRIDGE")
+    prepare_uv(install, previous, replay)
+    config, contents = save_profile(install, replay)
+    record = install.tools / ".sai-cli-release.json"
+    original_record = record.read_bytes()
+    launcher = install.launcher.lstat()
+    assert install.profile.stat().st_mode & 0o777 == 0o700
+    install.pin(wheel_version(previous))
+    version = add_shim(replay, wheel_artifact("SHIM"), artifact("RUST"))
+    target = asset_name(version).removeprefix(f"sai-{version}-").removesuffix(".tar.gz")
+    cache = install.profile / "bin"
+    if obstruction == "ancestor":
+        project.chmod(0o775)
+    else:
+        cache.mkdir(mode=0o700)
+        for part in (f"shim-loopback-{replay.server.server_port}", version, target):
+            cache /= part
+            cache.mkdir(mode=0o700)
+        if obstruction == "receipt":
+            (cache / "verified").mkdir(mode=0o700)
+        else:
+            cache.chmod(0o500)
+            if os.access(cache, os.W_OK):
+                pytest.skip("the test user can write to the read-only cache")
+    before = [(path, path.lstat().st_mode) for path in cache.rglob("*")]
+
+    result = install.install(replay)
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert diagnostic in result.stderr
+    assert install.launcher.lstat().st_ino == launcher.st_ino
+    assert record.read_bytes() == original_record
+    assert config.read_bytes() == contents
+    assert [(path, path.lstat().st_mode) for path in cache.rglob("*")] == before
+    if obstruction == "ancestor":
+        assert not cache.exists()
+    assert not (
+        install.profile / "cache/wheels" / f"sai_cli-{version}-py3-none-any.whl"
+    ).exists()
+    install.pin(wheel_version(previous))
+
+
+@pytest.mark.skipif(not WINDOWS, reason="requires Windows uv launcher copies")
+@pytest.mark.parametrize(
+    ("entry", "corrupt"), [("install", False), ("update", False), ("update", True)]
+)
+def test_windows_uses_the_verified_full_python_bundle(
+    install: Install,
+    replay: Replay,
+    full_python_bundle: tuple[Path, bytes],
+    entry: str,
+    corrupt: bool,
+) -> None:
+    bridge = wheel_artifact("BRIDGE")
+    prepare_uv(install, bridge, replay)
+    profile, contents = save_profile(install, replay)
+    launcher = install.launcher.read_bytes()
+    if entry == "install":
+        ok(install.run("uv", "tool", "uninstall", "sai-cli"))
+        assert not install.launcher.exists()
+    shim = wheel_artifact("SHIM")
+    version = wheel_version(shim)
+    wheel, bundle = full_python_bundle
+    bundle_name = f"sai-cli-{version}-full-python.zip"
+    folder = f"{REPO}/releases/download/sai-cli/v{version}"
+    replay.add(version, {shim.name: shim.read_bytes(), bundle_name: bundle})
+    if corrupt:
+        replay.assets[f"{folder}/{bundle_name}"] += b"unverified bytes"
+
+    result = install.install(replay) if entry == "install" else install.update(replay)
+    assert f"{folder}/{bundle_name}" in replay.requests
+    assert f"{folder}/{shim.name}" not in replay.requests
+    if corrupt:
+        assert result.returncode == 1, (result.stdout, result.stderr)
+        assert "does not match its SHA256SUMS entry" in result.stdout
+        install.pin(wheel_version(bridge))
+    else:
+        ok(result)
+        install.pin(version)
+        cached = install.profile / "cache/wheels" / wheel.name
+        assert cached.read_bytes() == wheel.read_bytes()
+        record = json.loads((install.tools / ".sai-cli-release.json").read_text())
+        assert record["sha256"] == hashlib.sha256(wheel.read_bytes()).hexdigest()
+    if entry == "update":
+        assert install.launcher.read_bytes() == launcher
+    assert profile.read_bytes() == contents
+
+
+@pytest.mark.skipif(not WINDOWS, reason="requires Windows uv launcher copies")
+def test_windows_installer_refuses_a_shim_only_release(
+    install: Install,
+    replay: Replay,
+) -> None:
+    add_shim(replay, wheel_artifact("SHIM"))
+    result = install.install(replay)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "full Python" in result.stderr
+    assert not install.launcher.exists()

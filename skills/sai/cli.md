@@ -4,41 +4,49 @@ Use this page to run `sai` commands. For trades, also read
 [trading-safety.md](trading-safety.md). When Sai MCP tools are available,
 prefer them and read [mcp.md](mcp.md).
 
-Command `sai --help` lists the command groups: `account`, `auth`, `config`,
-`doctor`, `intent`, `logs`, `market`, `mcp`, `trade`, `update`, and `watch`,
-plus `skill` on versions that have it. Global options go before the command:
+Use `sai --help` to list the commands. Put global options before the command.
 
 ```bash
 sai --json market prices
-sai account overview
-sai account overview --as 0xYOUR_ADDR --json
-sai --as 0xOTHER_ADDR --json account positions 0xOTHER_ADDR
+sai --json account overview --as 0x0000000000000000000000000000000000000001
 ```
 
-`--json` prints compact JSON. `--as ADDR` runs one command as another
-connected account. `sai` with no arguments opens an interactive shell, which
-an agent has no use for.
+`--json` prints JSON. Authenticated commands use `--as ADDR` to select
+a connected account. Account reads can use a public address without a session.
+Supply a command when invoking Sai from an agent. A bare `sai` opens a shell.
+
+Use `sai market list` to see the symbol, market ID, collateral token, and
+price. The `trade open --market` option accepts a case-insensitive symbol
+such as `BTC` or a numeric ID. If a symbol matches multiple market IDs,
+choose the ID from the table.
 
 ## Read Markets and Accounts
 
 ```bash
 sai --json market list
 sai --json market prices
-sai --json account positions 0xYOUR_ADDR
-sai --json account balances 0xYOUR_ADDR
-sai --json account history 0xYOUR_ADDR
+sai --json account positions 0x0000000000000000000000000000000000000001
+sai --json account balances 0x0000000000000000000000000000000000000001
+sai --json account history 0x0000000000000000000000000000000000000001
 sai --json watch price 3
 ```
 
-- `market list` returns Keeper's borrowing markets, and `market prices` the
-  current indexed prices.
+- `market list` returns Keeper's borrowing markets. The `market prices` command
+  and MCP tool `market_prices` return indexed prices. The
+  `lastUpdatedBlock.block_ts` field is `string | null`. A `null` timestamp means
+  the block time is unknown. The `lastUpdatedBlock.block` field still reports
+  the height.
 - `account overview` reads the active account unless you pass `--as ADDR`.
-  Check each section's fetch time, source age, and any error before using
-  the funds, position risk, orders, or local intent data. Queued market
-  orders are waiting for the next oracle price.
-- `account positions ADDR` lists positions and pending orders.
-  `account balances ADDR` reads one balance snapshot. `account history
-  ADDR` reads trade history. These reads need no sign-in.
+  Without either, it exits 1 with `SESSION_UNAVAILABLE`. The result has
+  `addr`, `addrSource`, and sections such as `balances`, `positions`,
+  and `queuedMarketOrders`. Check each section's fetch time, source age,
+  and `error`. A section can fail when the command exits 0.
+- `account positions ADDR` returns `perp.trades`, including pending orders.
+  `account balances ADDR` shows source block and age in text mode and returns
+  one snapshot in JSON field `data.userBalances`. Both balance reads mark a
+  source more than five minutes old as stale. An unverifiable block time has
+  an unknown age.
+  `account history ADDR` returns `perp.tradeHistory`.
 - `watch price TOKEN_ID`, `watch positions ADDR`, and `watch balances
   ADDR` stream JSON lines until interrupted. A stream reconnects after a
   transport interruption and emits a fresh snapshot.
@@ -119,7 +127,7 @@ Once connected, commands need no prompt until the session expires.
 | `sai auth list` | Every connected account, its expiry, and which is active. |
 | `sai auth use ADDR` | Switch the active account. Only when the person asks. |
 | `sai --as ADDR ...` | Run one command as another connected account. |
-| `sai auth renew [ADDR]` | Renew a keystore session with its saved key name. Keeps the active account selected. |
+| `sai auth renew [ADDR]` | Renew a keystore session with its saved key name. Uses the explicit address, global `--as`, or active account, in that order. Keeps the active account selected. |
 | `sai auth logout [ADDR]` | Remove one account, by default the active one. |
 
 Status, list, doctor, and the overview warn with less than three days left.
@@ -207,8 +215,8 @@ fix file modes under `$SAI_HOME/trader`, repair stale Codex and Cursor
 launchers, migrate the ledger, and settle unknown intents by reading Keeper.
 It never trades, rewrites the session, or prints the token.
 
-- Each check has a `status` of `pass`, `fixed`, `warn`, `fail`, or `skipped`,
-  and a `fix` command when one applies. `changes` lists what doctor changed.
+- Each item in `checks` has a `status` of `pass`, `fixed`, `warn`, `fail`,
+  or `skipped`. The check can include a `fix` and a list of `changes`.
 - Show the person what doctor changed, then the checks that still fail and
   their fixes.
 - For a stale Claude Code registration, show the person the exact command in
@@ -216,14 +224,15 @@ It never trades, rewrites the session, or prints the token.
   scope. Project and local repairs run from the directory doctor checked.
 - `--no-fix` reports without changing anything. `--offline` skips the network
   checks.
-- Doctor exits 1 while any check still fails.
+- Warnings can still exit 0. Failed checks normally exit 1 and return the
+  report in `error.details`. An invalid endpoint exits 2 with code
+  `INVALID_REQUEST`.
 
 ## Logs
 
-sai records what it does as JSON lines under `~/.sai/logs` (`$SAI_HOME/logs`):
-each CLI command, each MCP tool call, each Keeper request, and each intent
-status change. It never writes the session token. Read the logs when a
-command or tool call failed, timed out, or left a trade's outcome unclear.
+Sai writes commands, MCP calls, Keeper requests, and intent status changes
+as JSON lines under `$SAI_HOME/logs`, which defaults to `~/.sai/logs`.
+It redacts session tokens. Use the logs to diagnose failures and timeouts.
 
 ```bash
 sai --json logs tail -n 50
@@ -239,8 +248,14 @@ sai logs path
   per UTC day.
 - `--event NAME` matches one event or a family by prefix: `intent`,
   `keeper`, `mcp`, `command`, `update`.
-- `sai logs path` prints the directory. Tool `mcp_info` reports the same
-  directory as `logs.dir`.
+- `sai logs path` prints the directory. Its JSON result includes `dir`,
+  `enabled`, `keepDays`, and `files`. The MCP tool `mcp_info` reports
+  the directory as `logs.dir`.
+- `logs intent KEY` joins local events and can read Keeper. Pass
+  `--addr ADDR` to query Keeper for a key with no local trail or active
+  account, or `--offline` to use local logs only. `logs run ID` accepts
+  a process `runId` or MCP `callId`. `logs stats --since 24h` reports
+  request latency and counts by error code.
 
 | Event | Fields to read |
 | --- | --- |
@@ -318,7 +333,8 @@ If `sai skill` answers "No such command", the installed CLI predates it. Use
 
 `trade open`, `trade close`, `trade partial-close`, `trade tpsl`, `trade
 leverage`, and `trade margin` submit intents. Add `--wait` to a live trade
-to wait for its outcome, or run `sai intent wait KEY --timeout 30` with an
-existing key. The commands `intent local` and `intent status` show the
+to wait for its outcome. In text mode, the CLI prints one progress line to
+stderr when polling starts. For an existing key, run
+`sai intent wait KEY --timeout 30`. The commands `intent local` and `intent status` show the
 local ledger and Keeper's latest records. [Trading safety](trading-safety.md)
 has the approval, dry-run, and follow-up steps.

@@ -9,8 +9,7 @@ and reconciles unknown intents for the signed-in account with Keeper
 (a read; no trade is placed or cancelled). It never deletes or rewrites the
 session. `--no-fix` reports without changing anything.
 
-Rendered diagnostics redact session tokens. Keeper endpoints are shown as
-origins.
+Rendered diagnostics redact session tokens and show endpoint origins.
 
 To add a check, write a function that takes a `Context` and returns a
 `Check` or a list of them (a check that repeats, such as one per MCP client),
@@ -22,6 +21,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -30,11 +31,12 @@ import threading
 import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
@@ -51,7 +53,7 @@ from .core import (
     update,
     updater,
 )
-from .core.settings import Settings, public_url
+from .core.settings import Settings
 from .mcp_server import info, tools
 
 SCHEMA_VERSION = 1
@@ -63,6 +65,7 @@ STATUSES = ("pass", "fixed", "warn", "fail", "skipped")
 SIGN_IN = "sai auth login NAME, or sai auth import"
 REINSTALL = update.INSTALL_COMMAND
 FILE_MODE = 0o600
+CHAIN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,49}")
 
 
 @dataclass
@@ -74,7 +77,8 @@ class Check:
     details: dict[str, Any] = field(default_factory=dict)
     duration_ms: int = 0
     changes: list[str] = field(default_factory=list)
-    invalid_endpoint: bool = False
+    invalid_setting: bool = False
+    _lcd_chain_id: str | None = field(default=None, repr=False)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -110,42 +114,34 @@ CheckFn = Callable[[Context], "Check | Sequence[Check]"]
 def check_config(
     flags: dict[str, str | None],
 ) -> tuple[Check, Settings | None]:
-    """Validate file settings before resolving flag and environment overrides."""
+    """Validate the settings that apply to this invocation."""
     path = settings.config_path(os.environ)
-    fix = "Edit config.toml in the Sai home directory and rerun `sai doctor`"
+    file_fix = "Edit config.toml in the Sai home directory and rerun `sai doctor`"
+    fix = file_fix
     try:
-        values, warnings = settings.read_file(path)
-    except settings.ConfigError as exc:
-        return Check(
-            "config",
-            "fail",
-            exc.diagnostic,
-            fix,
-            invalid_endpoint=isinstance(exc, settings.InvalidEndpoint),
-        ), None
-    try:
+        values, warnings = settings.read_effective_file(path, flags, os.environ)
+        fix = "Check the settings listed by `sai config --help`"
         config = settings.resolve(flags, os.environ, values)
-    except settings.InvalidEndpoint as exc:
+    except settings.ConfigError as exc:
+        return Check("config", "fail", exc.diagnostic, fix), None
+    except settings.InvalidSetting as exc:
         return Check(
             "config",
             "fail",
             str(exc),
-            "Check the settings listed by `sai config --help`",
-            invalid_endpoint=True,
-        ), None
-    except ValueError:
-        return Check(
-            "config",
-            "fail",
-            "A flag or environment setting is invalid",
-            "Check the settings listed by `sai config --help`",
+            fix,
+            invalid_setting=True,
         ), None
     invalid = [
         key for key, value in values.items() if isinstance(value, settings.Invalid)
     ]
     if invalid:
         return Check(
-            "config", "fail", f"Invalid config.toml settings: {', '.join(invalid)}", fix
+            "config",
+            "fail",
+            f"Invalid settings in {path}: {', '.join(invalid)}",
+            file_fix,
+            invalid_setting=True,
         ), config
     invalid_env = [
         f"{spec.env} ({spec.key})"
@@ -162,7 +158,7 @@ def check_config(
         ), config
     if warnings:
         return Check(
-            "config", "warn", "config.toml contains unknown settings", fix
+            "config", "warn", "config.toml contains unknown settings", file_fix
         ), config
     return Check("config", "pass", "Config file settings are valid"), config
 
@@ -355,6 +351,7 @@ MANAGED = (
     "intents.sqlite3-journal",
     "history",
 )
+TRADER_DATA = ("intents.sqlite3", "sessions.json", "session.json")
 PROFILE_FILES = {
     "": (
         settings.FILE_NAME,
@@ -406,14 +403,16 @@ def loose_modes(paths: Sequence[Path]) -> list[tuple[Path, int, int]]:
     return loose
 
 
-def tighten(root: Path, names: Sequence[str]) -> tuple[list[str], list[str]]:
-    """Clear group and other bits on ROOT and each of NAMES in it.
+def tighten(
+    root: Path, names: Sequence[str], *, apply: bool = True
+) -> tuple[list[str], list[str], bool]:
+    """Apply or plan mode repairs on ROOT and its managed files.
 
     Every chmod goes through a descriptor opened with O_NOFOLLOW, and the
     files open relative to the directory's descriptor, so a path swapped for
     a symlink after the checks fails to open instead of redirecting the
-    chmod. Returns the changes made and the fix commands for paths it could
-    not change.
+    chmod. Return changes or safe commands, paths needing manual attention,
+    and whether the parent is eligible for a mode repair.
     """
     changes: list[str] = []
     failed: list[str] = []
@@ -421,8 +420,9 @@ def tighten(root: Path, names: Sequence[str]) -> tuple[list[str], list[str]]:
     try:
         dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | nofollow)
     except OSError:
-        return changes, [f"chmod go-rwx {root}"]
+        return changes, [f"Could not open {root} safely; inspect it by hand"], False
     try:
+        eligible = recognized_profile(root.parent, child=(root.name, os.fstat(dir_fd)))
         for name in (None, *names):
             path = root if name is None else root / name
             try:
@@ -436,35 +436,92 @@ def tighten(root: Path, names: Sequence[str]) -> tuple[list[str], list[str]]:
             except FileNotFoundError:
                 continue
             except OSError:
-                failed.append(f"chmod go-rwx {path}")
+                failed.append(f"Could not open {path} safely; inspect it by hand")
                 continue
             try:
                 info_ = os.fstat(fd)
-                if (
-                    name is None
-                    and hasattr(os, "getuid")
-                    and info_.st_uid != os.getuid()
-                ):
+                if hasattr(os, "getuid") and info_.st_uid != os.getuid():
                     failed.append(f"{path} belongs to another user; fix by hand")
-                    break
+                    if name is None:
+                        break
+                    continue
                 if name is not None and info_.st_nlink > 1:
                     failed.append(f"{path} has other hard links; fix by hand")
                     continue
+                if name is not None and not stat.S_ISREG(info_.st_mode):
+                    failed.append(f"{path} is not a regular file; fix by hand")
+                    continue
                 mode = stat.S_IMODE(info_.st_mode)
-                if mode & 0o077:
-                    os.fchmod(fd, mode & ~0o077)
-                    changes.append(f"chmod {path} {mode:o} -> {mode & ~0o077:o}")
+                if eligible and mode & 0o077:
+                    if apply:
+                        os.fchmod(fd, mode & ~0o077)
+                        changes.append(f"chmod {path} {mode:o} -> {mode & ~0o077:o}")
+                    else:
+                        changes.append(f"chmod go-rwx {shlex.quote(str(path))}")
             except OSError:
-                failed.append(f"chmod go-rwx {path}")
+                failed.append(f"Could not repair {path} safely; inspect it by hand")
             finally:
                 if fd != dir_fd:
                     os.close(fd)
     finally:
         os.close(dir_fd)
-    return changes, failed
+    return changes, failed, eligible
 
 
-def profile_has_data(fd: int, owner: int, directory: str = "") -> bool | None:
+@contextmanager
+def open_regular(path: str | Path, *, dir_fd: int | None = None) -> Generator[BinaryIO]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    with os.fdopen(os.open(path, flags, dir_fd=dir_fd), "rb") as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise OSError("Expected a regular file")
+        yield source
+
+
+def trader_file_is_evidence(fd: int, name: str, info: os.stat_result) -> bool:
+    if not info.st_size or info.st_nlink != 1:
+        return False
+    try:
+        if name == "intents.sqlite3":
+            with ledger_snapshot(Path(name), dir_fd=fd) as connection:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                if not matches_ledger_schema(connection, version):
+                    return False
+            return os.path.samestat(
+                info, os.stat(name, dir_fd=fd, follow_symlinks=False)
+            )
+        with open_regular(name, dir_fd=fd) as source:
+            return os.path.samestat(info, os.fstat(source.fileno())) and (
+                storage.is_session_envelope(name, json.load(source))
+            )
+    except (LedgerChanged, OSError, RecursionError, ValueError, sqlite3.Error):
+        return False
+
+
+def is_sai_log(fd: int, name: str, info: os.stat_result, surface: str) -> bool:
+    if info.st_nlink != 1:
+        return False
+    try:
+        with open_regular(name, dir_fd=fd) as source:
+            if not os.path.samestat(info, os.fstat(source.fileno())):
+                return False
+            line = source.readline(log.MAX_LINE + 1)
+        if not line.endswith(b"\n"):
+            return False
+        row = json.loads(line)
+        return (
+            isinstance(row, dict)
+            # Sai v0.1.0 wrote the same common fields without a schema marker.
+            and row.get("schema", log.SCHEMA_VERSION) == log.SCHEMA_VERSION
+            and row.get("surface") == surface
+            and all(key in row for key in log.COMMON if key != "schema")
+        )
+    except (OSError, RecursionError, ValueError):
+        return False
+
+
+def profile_has_data(
+    fd: int, owner: int, directory: str = "", *, allow_loose_trader: bool = False
+) -> bool | None:
     """Check for Sai data. Return None if the layout contains an unfamiliar entry."""
     has_data = False
     for name in os.listdir(fd):
@@ -472,7 +529,11 @@ def profile_has_data(fd: int, owner: int, directory: str = "") -> bool | None:
         if info.st_uid != owner:
             return None
         if name in PROFILE_DIRS.get(directory, ()) and stat.S_ISDIR(info.st_mode):
-            if info.st_mode & PROFILE_SHARED_MODE:
+            mode = info.st_mode
+            if allow_loose_trader and not directory and name == "trader":
+                # check_home clears these bits before applying a root repair.
+                mode &= ~0o077
+            if mode & PROFILE_SHARED_MODE:
                 return None
             child = os.open(
                 name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
@@ -489,32 +550,101 @@ def profile_has_data(fd: int, owner: int, directory: str = "") -> bool | None:
                 os.close(child)
         elif not stat.S_ISREG(info.st_mode) or not (
             name in PROFILE_FILES.get(directory, ())
-            or (directory == "logs" and log.parse_name(name) is not None)
+            or (
+                directory == "logs"
+                and (parsed := log.parse_name(name)) is not None
+                and is_sai_log(fd, name, info, parsed[1])
+            )
             or (directory == "cache/wheels" and update.is_wheel_name(name))
         ):
             return None
-        elif directory != "logs":
-            # Doctor creates diagnostics when it runs. Those alone do not
-            # establish that the user had a Sai profile here.
+        elif directory == "trader" and name in TRADER_DATA:
+            if not trader_file_is_evidence(fd, name, info):
+                return None
             has_data = True
     return has_data
 
 
-def tighten_profile_root(path: Path) -> str | None:
-    """Repair a dedicated, user-owned profile during an explicit doctor fix."""
+def dedicated_profile(
+    fd: int, path: Path, *, allow_loose_trader: bool
+) -> os.stat_result | None:
+    info = os.fstat(fd)
+    if info.st_uid != os.getuid() or info.st_mode & PROFILE_SHARED_MODE:
+        return None
+    if (
+        profile_has_data(fd, info.st_uid, allow_loose_trader=allow_loose_trader)
+        and os.fstat(fd).st_mode == info.st_mode
+        and os.path.samestat(info, path.lstat())
+    ):
+        return info
+    return None
+
+
+def recognized_profile(
+    path: Path, *, child: tuple[str, os.stat_result] | None = None
+) -> bool:
+    if os.name == "nt":
+        return False
     try:
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            info = os.fstat(fd)
-            mode = stat.S_IMODE(info.st_mode)
+            if dedicated_profile(fd, path, allow_loose_trader=True) is None:
+                return False
+            if child is None:
+                return True
+            name, opened = child
+            return os.path.samestat(
+                opened, os.stat(name, dir_fd=fd, follow_symlinks=False)
+            )
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+
+
+def can_log_to_profile() -> bool:
+    """Avoid the writer's automatic chmod in an existing, ambiguous logs directory."""
+    if os.name == "nt":
+        return True
+    # A preceding command may still be creating its log or endpoint key.
+    log.flush(1.0)
+    root = log.directory()
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    try:
+        info = os.fstat(fd)
+        if not info.st_mode & 0o077:
+            # Existing private Sai logs still accept diagnostics while signed out.
+            paths = [path for _, _, path in log.log_files(root)]
             if (
-                info.st_uid != os.getuid()
-                or mode & PROFILE_SHARED_MODE
-                or not mode & 0o077
-                or not profile_has_data(fd, info.st_uid)
-                or os.fstat(fd).st_mode != info.st_mode
+                info.st_uid == os.getuid()
+                and not loose_modes(paths)
+                and profile_has_data(fd, info.st_uid, "logs") is not None
+                and os.path.samestat(info, root.lstat())
             ):
+                return True
+        return recognized_profile(root.parent, child=(root.name, info))
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def repair_profile_root(path: Path, *, apply: bool) -> str | None:
+    """Report or apply the mode repair for a dedicated, user-owned profile."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = dedicated_profile(fd, path, allow_loose_trader=not apply)
+            if info is None or not info.st_mode & 0o077:
                 return None
+            mode = stat.S_IMODE(info.st_mode)
+            if not apply:
+                return f"chmod go-rwx {shlex.quote(str(path))}"
             private_mode = mode & ~0o077
             os.fchmod(fd, private_mode)
         finally:
@@ -548,35 +678,43 @@ def check_home(ctx: Context) -> Check:
             {**details, "symlinks": [str(path) for path in links]},
         )
     trader_exists = root.is_dir()
-    if loose and not ctx.fix:
-        trader_fix = "; ".join(f"chmod go-rwx {path}" for path, _, _ in trader_loose)
-        return Check(
-            "home",
-            "warn",
-            f"{plural(len(loose), 'path')} in {sai_home} accessible by other users",
-            f"{home_fix} {trader_fix}".strip(),
-            details,
-        )
-    if not trader_exists and not ctx.fix:
-        return Check(
-            "home",
-            "pass",
-            f"{root} does not exist yet; sai creates it on first use",
-            None,
-            details,
-        )
     changes: list[str] = []
     failed: list[str] = []
+    eligible = True
     if trader_exists and trader_loose:
-        changes, failed = tighten(root, MANAGED)
-    if home_loose and not failed:
-        change = tighten_profile_root(sai_home)
+        changes, failed, eligible = tighten(root, MANAGED, apply=ctx.fix)
+        if not eligible and not failed:
+            home_fix = SAI_HOME_MODE_FIX
+    if home_loose and eligible and not failed:
+        change = repair_profile_root(sai_home, apply=ctx.fix)
         if change is not None:
-            changes.append(change)
+            if ctx.fix:
+                changes.append(change)
+            else:
+                changes.insert(0, change)
             home_fix = ""
+    if not ctx.fix and loose:
+        return Check(
+            "home",
+            "fail" if failed else "warn",
+            f"Could not make {plural(len(failed), 'path')} private"
+            if failed
+            else f"{plural(len(loose), 'path')} in {sai_home} accessible by other users",
+            f"{home_fix} {'; '.join([*failed, *changes])}".strip(),
+            details,
+        )
     if not trader_exists:
+        if not ctx.fix:
+            return Check(
+                "home",
+                "pass",
+                f"{root} does not exist yet; sai creates it on first use",
+                None,
+                details,
+            )
         home_exists = sai_home.is_dir()
-        storage.directory()
+        paths.private_directory(sai_home, profile_root=True)
+        paths.private_directory(root, only_new=True)
         if not home_exists:
             changes.append(f"created {sai_home} with mode {paths.PRIVATE_MODE:o}")
         changes.append(f"created {root} with mode {paths.PRIVATE_MODE:o}")
@@ -593,7 +731,7 @@ def check_home(ctx: Context) -> Check:
         return Check(
             "home",
             "warn",
-            f"{sai_home} is accessible by other users",
+            f"{sai_home if home_loose else root} is accessible by other users",
             home_fix,
             details,
             changes=changes,
@@ -671,23 +809,23 @@ def check_logs(ctx: Context) -> Check:
     private = Check("logs", "pass", f"{root} is private{off}", None, details)
     if not loose:
         return private
-    if not ctx.fix:
+    changes, failed, eligible = tighten(root, names, apply=ctx.fix)
+    if not failed and (not eligible or not ctx.fix):
         return Check(
             "logs",
             "warn",
             f"{plural(len(loose), 'path')} under {root} readable by other users",
-            "; ".join(f"chmod go-rwx {path}" for path, _, _ in loose),
+            "; ".join(changes) if eligible else SAI_HOME_MODE_FIX,
             details,
         )
-    changes, failed = tighten(root, names)
     if failed:
         return Check(
             "logs",
             "fail",
             f"Could not make {plural(len(failed), 'path')} private",
-            "; ".join(failed),
+            "; ".join([*failed, *changes] if not ctx.fix else failed),
             details,
-            changes=changes,
+            changes=changes if ctx.fix else [],
         )
     if not changes:
         return private
@@ -720,6 +858,7 @@ def check_session(ctx: Context) -> Check:
             {"signedIn": False},
         )
     addr = state["addr"]
+    guidance = state.get("renewalGuidance")
     details = {
         "addr": addr,
         "expiresAt": state["expiresAt"],
@@ -727,11 +866,12 @@ def check_session(ctx: Context) -> Check:
         "endpointMatches": state["endpointMatches"],
     }
     if state["expired"]:
+        summary = f"Session for {short(addr)} expired at {state['expiresAt']}"
         return Check(
             "session",
             "fail",
-            f"Session for {short(addr)} expired at {state['expiresAt']}",
-            state.get("renewalCommand", SIGN_IN),
+            f"{summary}. {guidance}" if guidance else summary,
+            state.get("renewalCommand", None if guidance else SIGN_IN),
             details,
         )
     if not state["endpointMatches"]:
@@ -760,8 +900,8 @@ def check_session(ctx: Context) -> Check:
         return Check(
             "session",
             "warn",
-            warning,
-            state["renewalCommand"],
+            f"{warning} {guidance}" if guidance else warning,
+            state.get("renewalCommand"),
             details,
         )
     return Check(
@@ -787,12 +927,16 @@ class LedgerChanged(Exception):
     """Another process kept writing the ledger while doctor copied it."""
 
 
-def ledger_fingerprint(path: Path) -> list[tuple[int, int, int] | None]:
+def ledger_fingerprint(
+    path: Path, *, dir_fd: int | None = None
+) -> list[tuple[int, int, int] | None]:
     """Size, mtime, and inode of the ledger and each journal, or None."""
     marks: list[tuple[int, int, int] | None] = []
     for suffix in ("", *LEDGER_JOURNALS):
         try:
-            info_ = path.with_name(path.name + suffix).stat()
+            info_ = os.stat(
+                path.with_name(path.name + suffix), dir_fd=dir_fd, follow_symlinks=False
+            )
         except FileNotFoundError:
             marks.append(None)
             continue
@@ -801,7 +945,9 @@ def ledger_fingerprint(path: Path) -> list[tuple[int, int, int] | None]:
 
 
 @contextmanager
-def ledger_snapshot(path: Path) -> Generator[sqlite3.Connection]:
+def ledger_snapshot(
+    path: Path, *, dir_fd: int | None = None
+) -> Generator[sqlite3.Connection]:
     """Read a private copy of the ledger at PATH with its WAL or rollback
     journal.
 
@@ -818,14 +964,20 @@ def ledger_snapshot(path: Path) -> Generator[sqlite3.Connection]:
     with tempfile.TemporaryDirectory(prefix="sai-doctor-") as temp:
         copy = Path(temp) / path.name
         for _attempt in range(SNAPSHOT_ATTEMPTS):
-            before = ledger_fingerprint(path)
+            before = ledger_fingerprint(path, dir_fd=dir_fd)
             for suffix in ("", *LEDGER_JOURNALS):
                 source = path.with_name(path.name + suffix)
                 target = copy.with_name(copy.name + suffix)
                 target.unlink(missing_ok=True)
-                if source.is_file():
-                    shutil.copyfile(source, target)
-            if ledger_fingerprint(path) == before:
+                try:
+                    with (
+                        open_regular(source, dir_fd=dir_fd) as infile,
+                        target.open("wb") as outfile,
+                    ):
+                        shutil.copyfileobj(infile, outfile)
+                except FileNotFoundError:
+                    continue
+            if ledger_fingerprint(path, dir_fd=dir_fd) == before:
                 break
         else:
             raise LedgerChanged
@@ -836,23 +988,46 @@ def ledger_snapshot(path: Path) -> Generator[sqlite3.Connection]:
             connection.close()
 
 
+def matches_ledger_schema(connection: sqlite3.Connection, version: int) -> bool:
+    if version not in (0, storage.SCHEMA_VERSION):
+        return False
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='intents'"
+    ).fetchone()
+    if table is None:
+        return False
+    columns = {
+        name: (kind.upper(), not_null, primary_key)
+        for _, name, kind, not_null, _, primary_key in connection.execute(
+            "PRAGMA table_info(intents)"
+        )
+    }
+    expected = {
+        name: ("TEXT", 1, 0)
+        for name in ("endpoint", "account", "kind", "status", "entity")
+    }
+    expected["id"] = ("TEXT", 0, 1)
+    if version >= 1:
+        expected["created_at"] = ("REAL", 0, 0)
+    if "keeper_status" in columns:
+        expected["keeper_status"] = ("TEXT", 0, 0)
+    return columns == expected
+
+
 def read_ledger(path: Path) -> tuple[int, str, list[tuple[str, str, str]]]:
     """Return the ledger's schema version, quick_check result, and
     (key, endpoint, account) for each unknown intent."""
     with ledger_snapshot(path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         integrity = connection.execute("PRAGMA quick_check").fetchone()[0]
-        tables = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='intents'"
-        ).fetchone()
-        rows = (
-            connection.execute(
-                "SELECT id, endpoint, account FROM intents"
-                " WHERE status='unknown' ORDER BY rowid DESC"
-            ).fetchall()
-            if tables and integrity == "ok"
-            else []
-        )
+        if integrity != "ok" or version > storage.SCHEMA_VERSION:
+            return version, integrity, []
+        if not matches_ledger_schema(connection, version):
+            raise sqlite3.DatabaseError("Unrecognized Sai intent schema")
+        rows = connection.execute(
+            "SELECT id, endpoint, account FROM intents"
+            " WHERE status='unknown' ORDER BY rowid DESC"
+        ).fetchall()
     return version, integrity, rows
 
 
@@ -877,7 +1052,7 @@ class WriteGate:
                 raise TimeoutError("doctor's deadline passed; not writing")
             # A write that waits on another process's lock gives up at the
             # deadline instead of holding the gate past it.
-            with storage.busy_timeout(left):
+            with storage.busy_timeout(left), storage.keep_ledger_modes():
                 yield
 
 
@@ -912,7 +1087,7 @@ def reconcile_keys(
         except Exception as exc:  # noqa: BLE001 - reported, not raised
             outcome["error"] = type(exc).__name__
 
-    thread = threading.Thread(target=work, daemon=True)
+    thread = threading.Thread(target=copy_context().run, args=(work,), daemon=True)
     thread.start()
     thread.join(deadline)
     gate.shut()
@@ -1025,7 +1200,8 @@ def check_intents(ctx: Context) -> Check:
         if version < storage.SCHEMA_VERSION and ctx.fix:
             if refused := moved():
                 return refused
-            storage.db().close()
+            with storage.keep_ledger_modes():
+                storage.db().close()
             changes.append(
                 f"migrated the ledger from schema {version} to {storage.SCHEMA_VERSION}"
             )
@@ -1201,12 +1377,11 @@ def check_websocket(ctx: Context) -> Check:
 
 
 def check_lcd(ctx: Context) -> Check:
-    url = public_url(ctx.config.lcd_endpoint)
+    url = log.origin(ctx.config.lcd_endpoint)
     start = time.monotonic()
     try:
         node = margin._get_json(
-            f"{ctx.config.lcd_endpoint.rstrip('/')}"
-            "/cosmos/base/tendermint/v1beta1/node_info",
+            margin.lcd_url(ctx.config.lcd_endpoint, margin.NODE_INFO_PATH),
             timeout=NETWORK_TIMEOUT,
         )
     except ValueError as exc:
@@ -1219,20 +1394,20 @@ def check_lcd(ctx: Context) -> Check:
         )
     info_block = node.get("default_node_info")
     network = info_block.get("network") if isinstance(info_block, dict) else None
-    if not isinstance(network, str) or not network:
+    if not isinstance(network, str) or CHAIN_ID.fullmatch(network) is None:
         return Check(
             "lcd",
             "fail",
-            f"{url} answered without a chain network in node_info",
+            f"{url} returned a missing or invalid chain ID in node_info network",
             "Check --lcd-endpoint points at a Nibiru REST (LCD) service",
             {"endpoint": url},
         )
     return Check(
         "lcd",
         "pass",
-        f"{url} answered in {elapsed_ms(start)} ms (network {network})",
-        None,
-        {"endpoint": url, "network": network},
+        f"{url} answered in {elapsed_ms(start)} ms",
+        details={"endpoint": url},
+        _lcd_chain_id=network,
     )
 
 
@@ -1246,11 +1421,17 @@ def cross_check_network(checks: list[Check]) -> None:
     if keeper_check is None or lcd_check is None or lcd_check.status != "pass":
         return
     chain = keeper_check.details.get("chainId")
-    network = lcd_check.details.get("network")
-    if chain and network and chain != network:
-        lcd_check.status = "warn"
-        lcd_check.summary += f"; Keeper trades on {chain}"
-        lcd_check.fix = "Pass the --lcd-endpoint for Keeper's chain"
+    network = lcd_check._lcd_chain_id
+    if not isinstance(chain, str) or not chain or network is None:
+        return
+    matches = chain == network
+    lcd_check.details["matchesKeeperChain"] = matches
+    if matches:
+        lcd_check.summary += f" (matches Keeper chain {chain})"
+        return
+    lcd_check.status = "warn"
+    lcd_check.summary += f"; LCD network differs from Keeper chain {chain}"
+    lcd_check.fix = "Pass the --lcd-endpoint for Keeper's chain"
 
 
 LOCAL_CHECKS: list[tuple[str, CheckFn]] = [
@@ -1304,7 +1485,7 @@ def run_network(ctx: Context, deadline: float) -> list[Check]:
         results[name] = timed(name, fn, ctx)
 
     threads = [
-        threading.Thread(target=work, args=(name, fn), daemon=True)
+        threading.Thread(target=copy_context().run, args=(work, name, fn), daemon=True)
         for name, fn in NETWORK_CHECKS
     ]
     end = time.monotonic() + deadline

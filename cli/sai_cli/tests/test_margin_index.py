@@ -15,7 +15,7 @@ from sai_cli.core import keeper, storage
 from sai_cli.sai_cli import main
 
 ADDR = "0x" + "a" * 40
-TRADER = "nibi1trader"
+TRADER = "nibi1424242424242424242424242424242422mldj0"
 NETWORK = "cataclysm-1"
 
 
@@ -198,7 +198,10 @@ def test_remove_margin_when_index_lags_or_changes(scenario):
         assert submitted[0]["intent"]["body"]["requestedLeverage"] == "5.5"
     elif scenario == "lags":
         assert result.exit_code == 1, result.output
-        assert "Retry after Keeper synchronizes" in result.output
+        error = json.loads(result.stdout)["error"]
+        assert error["code"] == "INVALID_REQUEST"
+        assert "Retry after Keeper synchronizes" in error["message"]
+        assert error["retryable"] is True
         assert submitted == []
         assert storage.list_pending(endpoint, ADDR) == []
     else:

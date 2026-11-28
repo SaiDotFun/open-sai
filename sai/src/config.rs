@@ -84,12 +84,17 @@ impl ConfigCommand {
                 let value = key.parse_value(&value).map_err(|error| {
                     SaiError::usage(format!("{error}. Valid keys: {}", settings::valid_keys()))
                 })?;
-                settings::set(path, key, &value)?;
+                settings::edit_setting(
+                    path,
+                    key,
+                    Some(&value),
+                    crate::repl::interrupt_flag().as_deref(),
+                )?;
                 if let Some(path) = json_path {
                     println!(
                         "{{\"key\": {}, \"value\": {}, \"path\": {path}}}",
                         format_json(&json!(key.spec().name)),
-                        format_json(&value)
+                        format_json(&key.public_value(&value))
                     );
                 } else {
                     println!("Set {} in {}", key.spec().name, path.display());
@@ -98,7 +103,12 @@ impl ConfigCommand {
             }
             Self::Unset { key } => {
                 let key = parse_key(&key)?;
-                let removed = settings::unset(path, key)?;
+                let removed = settings::edit_setting(
+                    path,
+                    key,
+                    None,
+                    crate::repl::interrupt_flag().as_deref(),
+                )?;
                 if let Some(path) = json_path {
                     println!(
                         "{{\"key\": {}, \"removed\": {removed}, \"path\": {path}}}",
@@ -136,7 +146,7 @@ pub fn help(command: &str) -> Option<String> {
         }
         "config get" => "Print the exact value of KEY as resolved now.",
         "config list" => {
-            "Show every setting with its value and source.\n\n  The source is flag, env, file, default, or derived. URLs are shown without\n  credentials; `sai config get` prints the exact value."
+            "Show every setting with its value and source.\n\n  The source is flag, env, file, default, or derived. Endpoint URLs are\n  shown as origins. `sai config get` prints the exact value."
         }
         "config set" => "Set KEY to VALUE in the config file, keeping its comments.",
         "config unset" => "Remove KEY from the config file so the default applies again.",

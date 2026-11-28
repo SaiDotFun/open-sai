@@ -24,9 +24,6 @@ pub(super) fn add_roots(store: &mut CaStore, dir: &Path) {
                 break;
             }
             // OpenSSL 3.5 stops at an absent index and skips entries it cannot load.
-            if !path.is_file() {
-                continue;
-            }
             let Ok(certs) = ca_pem::certificates(&path) else {
                 continue;
             };

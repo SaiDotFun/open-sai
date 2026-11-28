@@ -6,7 +6,9 @@ use std::{
 
 use flate2::read::{DeflateDecoder, MultiGzDecoder, ZlibDecoder};
 use http_body_util::{BodyExt, Full};
-use hyper::{Request, StatusCode, Uri, body::Bytes, client::conn::http1, header};
+use hyper::{
+    HeaderMap, Method, Request, StatusCode, Uri, body::Bytes, client::conn::http1, header,
+};
 use hyper_timeout::TimeoutConnector;
 use hyper_util::{
     client::legacy::connect::{Connected, Connection, proxy::Tunnel},
@@ -41,6 +43,34 @@ pub(super) async fn post(
     token: Option<&str>,
     timeout: Duration,
 ) -> Result<(StatusCode, Vec<u8>), SaiError> {
+    let (status, _, bytes) = send(
+        endpoint,
+        Method::POST,
+        Some(body),
+        token,
+        HeaderMap::new(),
+        timeout,
+    )
+    .await?;
+    Ok((status, bytes))
+}
+
+pub(crate) async fn get(
+    endpoint: &str,
+    headers: HeaderMap,
+    timeout: Duration,
+) -> Result<(StatusCode, HeaderMap, Vec<u8>), SaiError> {
+    send(endpoint, Method::GET, None, None, headers, timeout).await
+}
+
+async fn send(
+    endpoint: &str,
+    method: Method,
+    body: Option<Vec<u8>>,
+    token: Option<&str>,
+    headers: HeaderMap,
+    timeout: Duration,
+) -> Result<(StatusCode, HeaderMap, Vec<u8>), SaiError> {
     let mut url = Url::parse(endpoint).map_err(|_| request_failed())?;
     url.set_fragment(None);
     let destination = url.as_str().parse::<Uri>().map_err(|_| request_failed())?;
@@ -57,14 +87,23 @@ pub(super) async fn post(
                 .clone(),
         )
     };
-    let mut request = Request::post(target)
+    let mut request = Request::builder()
+        .method(method)
+        .uri(target)
         .header(header::HOST, authority.as_str())
         .header(header::ACCEPT, "*/*")
         .header(header::ACCEPT_ENCODING, "gzip, deflate")
         .header(header::CONNECTION, "keep-alive")
-        .header(header::USER_AGENT, "python-httpx/0.28.1")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::CONTENT_LENGTH, body.len());
+        .header(header::USER_AGENT, "python-httpx/0.28.1");
+    if let Some(body) = &body {
+        request = request
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, body.len());
+    }
+    request
+        .headers_mut()
+        .ok_or_else(request_failed)?
+        .extend(headers);
     if let Some(token) = token {
         let mut authorization = header::HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|_| request_failed())?;
@@ -75,27 +114,68 @@ pub(super) async fn post(
         request = request.header(header::PROXY_AUTHORIZATION, auth);
     }
     let request = request
-        .body(Full::new(Bytes::from(body)))
+        .body(Full::new(Bytes::from(body.unwrap_or_default())))
         .map_err(|_| request_failed())?;
-    let tls = Arc::new(keeper_tls_config()?);
-    let socket = if let Some(proxy) = proxy {
-        let proxy_tls = if proxy.uri().scheme_str() == Some("https") {
-            Arc::new(proxy_tls_config())
-        } else {
-            Arc::clone(&tls)
-        };
-        let socket = connect(proxy.uri(), &proxy_tls, timeout).await?;
+    let socket = open_socket(&destination, proxy, forward, timeout).await?;
+    exchange(socket, request, timeout).await
+}
+
+pub(super) async fn doctor_websocket_socket(
+    endpoint: &Url,
+    timeout: Duration,
+) -> Result<SocketBox, SaiError> {
+    let mut url = endpoint.clone();
+    let scheme = match url.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        _ => return Err(request_failed()),
+    };
+    url.set_scheme(scheme).map_err(|_| request_failed())?;
+    url.set_fragment(None);
+    let destination = url.as_str().parse::<Uri>().map_err(|_| request_failed())?;
+    let proxy = proxy::for_endpoint(&url, &destination);
+    open_socket(&destination, proxy, false, timeout).await
+}
+
+async fn open_socket(
+    destination: &Uri,
+    proxy: Option<hyper_util::client::proxy::matcher::Intercept>,
+    forward: bool,
+    timeout: Duration,
+) -> Result<SocketBox, SaiError> {
+    let secure_proxy = proxy
+        .as_ref()
+        .is_some_and(|proxy| proxy.uri().scheme_str() == Some("https"));
+    // Native and configured trust stores are blocking filesystem reads. Run
+    // them off the reactor so an outer probe timeout can cancel the request.
+    let (tls, proxy_tls) = tokio::task::spawn_blocking(move || {
+        let tls = Arc::new(keeper_tls_config()?);
+        let proxy_tls = secure_proxy.then(|| Arc::new(proxy_tls_config()));
+        Ok::<_, SaiError>((tls, proxy_tls))
+    })
+    .await
+    .map_err(|_| SaiError::internal())??;
+    if let Some(proxy) = proxy {
+        let proxy_tls = proxy_tls.as_ref().unwrap_or(&tls);
+        let socket = connect(proxy.uri(), proxy_tls, timeout).await?;
         if forward {
-            socket
+            Ok(socket)
         } else {
             let socket =
-                tunnel(with_inactivity(socket, timeout).await, &proxy, &destination).await?;
-            start_tls(socket, &destination, tls, timeout).await?
+                tunnel(with_inactivity(socket, timeout).await, &proxy, destination).await?;
+            if destination.scheme_str() == Some("https") {
+                start_tls(socket, destination, tls, timeout)
+                    .await
+                    .map_err(Into::into)
+            } else {
+                Ok(socket)
+            }
         }
     } else {
-        connect(&destination, &tls, timeout).await?
-    };
-    exchange(socket, request, timeout).await
+        connect(destination, &tls, timeout)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 pub(super) enum ConnectError {
@@ -260,7 +340,7 @@ async fn exchange(
     socket: SocketBox,
     request: Request<Full<Bytes>>,
     timeout: Duration,
-) -> Result<(StatusCode, Vec<u8>), SaiError> {
+) -> Result<(StatusCode, HeaderMap, Vec<u8>), SaiError> {
     // Like the top-level httpx.post, this exchange owns its connection. There
     // is no shared pool to wait on and no automatic retry.
     let io = with_inactivity(socket, timeout).await;
@@ -269,16 +349,20 @@ async fn exchange(
         .handshake(io)
         .await
         .map_err(|_| request_failed())?;
-    let driver = tokio::spawn(connection);
-    let result = receive(&mut sender, request).await;
-    driver.abort();
-    result
+    let response = receive(&mut sender, request);
+    tokio::pin!(response);
+    // Keep the driver in this future so cancellation also drops the socket.
+    tokio::select! {
+        biased;
+        result = &mut response => result,
+        _ = connection => response.await,
+    }
 }
 
 async fn receive(
     sender: &mut http1::SendRequest<Full<Bytes>>,
     request: Request<Full<Bytes>>,
-) -> Result<(StatusCode, Vec<u8>), SaiError> {
+) -> Result<(StatusCode, HeaderMap, Vec<u8>), SaiError> {
     let response = sender
         .send_request(request)
         .await
@@ -312,7 +396,7 @@ async fn receive(
         .map_err(|_| request_failed())?;
         bytes = decoded;
     }
-    Ok((parts.status, bytes))
+    Ok((parts.status, parts.headers, bytes))
 }
 
 fn keeper_tls_config() -> Result<ClientConfig, SaiError> {

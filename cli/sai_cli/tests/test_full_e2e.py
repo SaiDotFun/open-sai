@@ -18,8 +18,10 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
+from loopback_keeper import POSITION_ROUTE, PositionKeeperHandler, position_data
 from sai_cli.core import keeper, log, storage
 from sai_cli.tests.loopback import fixture, graphql_ws, http_server
 from websockets.exceptions import ConnectionClosed
@@ -42,11 +44,16 @@ def save_trade_session(endpoint: str) -> None:
 
 @contextmanager
 def submission_keeper(reply: Callable[[str], dict | None]) -> Generator[str]:
-    class Handler(BaseHTTPRequestHandler):
+    class Handler(PositionKeeperHandler):
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            assert body["query"] == keeper.SUBMIT
-            response = reply(body["variables"]["input"]["intentKey"])
+            if body["query"] == keeper.POSITION:
+                response = {"data": position_data(body["variables"])}
+            elif body["query"] == keeper.ROUTE:
+                response = {"data": POSITION_ROUTE}
+            else:
+                assert body["query"] == keeper.SUBMIT
+                response = reply(body["variables"]["input"]["intentKey"])
             if response is not None:
                 payload = json.dumps(response).encode()
                 self.send_response(200)
@@ -71,7 +78,19 @@ def submission_keeper(reply: Callable[[str], dict | None]) -> Generator[str]:
 
 
 def close_trade_args(endpoint: str) -> list[str]:
-    return [*_resolve_cli(), "--endpoint", endpoint, "--json", "trade", "close", "7"]
+    return [*cli_at(endpoint), "trade", "close", "7"]
+
+
+def cli_at(endpoint: str) -> list[str]:
+    url = urlsplit(endpoint)
+    return [
+        *_resolve_cli(),
+        "--endpoint",
+        endpoint,
+        "--lcd-endpoint",
+        f"{url.scheme}://{url.netloc}",
+        "--json",
+    ]
 
 
 @pytest.fixture
@@ -175,7 +194,17 @@ def test_installed_cli_receives_balance_snapshot():
             check=True,
             timeout=10,
         )
-        assert json.loads(result.stdout) == golden
+        rows = json.loads(result.stdout)["data"]["userBalances"]
+        assert rows == [
+            {
+                **row,
+                "sourceBlock": None,
+                "sourceAt": None,
+                "sourceAgeSeconds": None,
+                "stale": None,
+            }
+            for row in golden["data"]["userBalances"]
+        ]
         assert [
             row["token_info"]["name"] for row in golden["data"]["userBalances"]
         ] == ["USDC on Sai", "USDC Credits on Sai"]
@@ -241,7 +270,7 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
     recorded = []
     history_visible = False
 
-    class Handler(BaseHTTPRequestHandler):
+    class Handler(PositionKeeperHandler):
         def do_POST(self):
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             query = request["query"]
@@ -251,7 +280,11 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
                 self.connection.shutdown(socket.SHUT_RDWR)
                 self.connection.close()
                 return
-            if "userIntents" in query:
+            if query == keeper.POSITION:
+                data = position_data(request["variables"])
+            elif query == keeper.ROUTE:
+                data = POSITION_ROUTE
+            elif "userIntents" in query:
                 key = recorded[0]["intentKey"]
                 data = {
                     "userIntents": [
@@ -310,7 +343,7 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
 
     def invoke(*args):
         return subprocess.run(
-            [*_resolve_cli(), "--endpoint", endpoint, "--json", *args],
+            [*cli_at(endpoint), *args],
             capture_output=True,
             check=False,
             text=True,
@@ -426,7 +459,28 @@ def test_connect_refusal_survives_a_failed_ledger_write(fail_ledger_updates):
         endpoint = f"http://127.0.0.1:{unavailable.getsockname()[1]}/query"
         save_trade_session(endpoint)
         result = subprocess.run(
-            close_trade_args(endpoint),
+            [
+                *_resolve_cli(),
+                "--endpoint",
+                endpoint,
+                "--json",
+                "trade",
+                "open",
+                "--market",
+                "0",
+                "--side",
+                "long",
+                "--type",
+                "limit",
+                "--amount",
+                "10",
+                "--leverage",
+                "2",
+                "--price",
+                "100",
+                "--slippage",
+                "1",
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -750,7 +804,7 @@ def test_unrecorded_intent_expires_and_unblocks_close(tmp_path, monkeypatch):
     monkeypatch.setenv("SAI_HOME", str(tmp_path))
     recorded = []
 
-    class Handler(BaseHTTPRequestHandler):
+    class Handler(PositionKeeperHandler):
         def do_POST(self):
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             query = request["query"]
@@ -760,8 +814,14 @@ def test_unrecorded_intent_expires_and_unblocks_close(tmp_path, monkeypatch):
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
-            assert "userIntents" in query, query
-            encoded = json.dumps({"data": {"userIntents": []}}).encode()
+            if query == keeper.POSITION:
+                data = position_data(request["variables"])
+            elif query == keeper.ROUTE:
+                data = POSITION_ROUTE
+            else:
+                assert "userIntents" in query, query
+                data = {"userIntents": []}
+            encoded = json.dumps({"data": data}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(encoded)))
@@ -786,7 +846,7 @@ def test_unrecorded_intent_expires_and_unblocks_close(tmp_path, monkeypatch):
 
     def invoke(*args):
         return subprocess.run(
-            [*_resolve_cli(), "--endpoint", endpoint, "--json", *args],
+            [*cli_at(endpoint), *args],
             capture_output=True,
             check=False,
             text=True,

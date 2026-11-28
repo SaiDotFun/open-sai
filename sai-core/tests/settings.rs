@@ -18,7 +18,7 @@ fn resolves_all_layers_and_uses_websocket_from_the_same_or_higher_layer() {
     let env = fixture(
         home.path(),
         &[
-            ("SAI_ENDPOINT", " https://env.example/query "),
+            ("SAI_ENDPOINT", "https://env.example/query"),
             ("SAI_WS_ENDPOINT", "wss://other.example/ws"),
             ("SAI_LOG_KEEP_DAYS", " \t"),
         ],
@@ -34,14 +34,14 @@ fn resolves_all_layers_and_uses_websocket_from_the_same_or_higher_layer() {
     assert_eq!(from_env.source(Key::LcdEndpoint), Source::File);
     assert_eq!(from_env.source(Key::LogsKeepDays), Source::Default);
     let flags = Flags {
-        endpoint: Some("HTTP://user:pw@localhost:42/a/../b?key=secret#fragment".into()),
+        endpoint: Some("HTTP://user:pw@localhost:42/a/../b?key=secret".into()),
         ..Flags::default()
     };
     let from_flag = Settings::load(&flags, &env).unwrap();
     assert_eq!(from_flag.source(Key::KeeperEndpoint), Source::Flag);
     assert_eq!(
         from_flag.ws_endpoint(),
-        "ws://user:pw@localhost:42/a/../b?key=secret#fragment"
+        "ws://user:pw@localhost:42/a/../b?key=secret"
     );
     assert_eq!(from_flag.source(Key::KeeperWsEndpoint), Source::Derived);
 }
@@ -83,6 +83,39 @@ fn file_type_errors_are_reported_before_overrides_except_for_logging() {
                 .to_owned(),
         ]
     );
+}
+
+#[test]
+fn update_override_wins_for_runtime_but_doctor_checks_the_stored_value() {
+    let home = tempdir().unwrap();
+    let env = fixture(home.path(), &[("SAI_UPDATE_AUTO", "invalid")]);
+    fs::write(env.path(), "[update]\nauto = \"invalid\"\n").unwrap();
+
+    let effective = Settings::load(&Flags::default(), &env).unwrap_err();
+    assert!(effective.is_invalid_setting());
+    assert_eq!(
+        effective.to_string(),
+        "SAI_UPDATE_AUTO: Invalid value for update.auto: expected true or false"
+    );
+
+    let (diagnostic, _) = Settings::for_doctor(&Flags::default(), &env).unwrap();
+    let diagnostic = diagnostic.unwrap_err();
+    assert!(diagnostic.is_invalid_setting());
+    assert_eq!(diagnostic.to_string(), effective.to_string());
+
+    let valid_env = fixture(home.path(), &[("SAI_UPDATE_AUTO", "false")]);
+    let stored = Settings::for_doctor(&Flags::default(), &valid_env).unwrap_err();
+    assert_eq!(
+        stored.to_string(),
+        format!(
+            "{}: Invalid value for update.auto: expected true or false",
+            env.path().display()
+        )
+    );
+
+    fs::write(env.path(), "[update]\nauto = \n").unwrap();
+    let syntax = Settings::for_doctor(&Flags::default(), &env).unwrap_err();
+    assert!(syntax.is_malformed_toml());
 }
 
 #[test]

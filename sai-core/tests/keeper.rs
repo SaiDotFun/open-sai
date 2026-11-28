@@ -1,22 +1,29 @@
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sai_core::{
     errors::Code,
-    keeper::{INTENTS, Keeper, SUBMIT},
+    keeper::{INTENTS, Keeper, MARKET, MARKETS, POSITION, ROUTE, SUBMIT},
     log::{EventContext, Surface},
+    storage::{Session, Storage},
+    trade::{Confirmation, PositionAction, PositionMode, SubmitOptions, Trading},
 };
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
+use zeroize::Zeroizing;
 
-const EVENTS: EventContext<'_> = EventContext {
-    writer: None,
-    surface: Surface::Cli,
-    command: None,
-};
+#[path = "keeper/position_updates.rs"]
+mod position_updates;
+
+const EVENTS: EventContext<'_> = EventContext::new(None, Surface::Cli, None);
 
 fn listener() -> TcpListener {
     TcpListener::bind(("127.0.0.1", 0)).unwrap()
@@ -44,10 +51,39 @@ fn read_request(stream: &mut TcpStream) -> (Vec<String>, Vec<u8>) {
                 .parse()
                 .ok()
         })
-        .unwrap();
+        .unwrap_or(0);
     let mut body = vec![0; length];
     reader.read_exact(&mut body).unwrap();
     (lines, body)
+}
+
+#[tokio::test]
+async fn lcd_probe_appends_path_before_query() {
+    let listener = listener();
+    let endpoint = format!(
+        "http://{}/prefix/?project=fixture",
+        listener.local_addr().unwrap()
+    );
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let (headers, _) = read_request(&mut stream);
+        let body = r#"{"default_node_info":{"network":"fixture-chain"}}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        headers[0].clone()
+    });
+    assert_eq!(
+        sai_core::keeper::lcd_network(&endpoint, Duration::from_secs(1)).await,
+        Ok(Some("fixture-chain".into()))
+    );
+    assert_eq!(
+        server.join().unwrap(),
+        "GET /prefix/cosmos/base/tendermint/v1beta1/node_info?project=fixture HTTP/1.1"
+    );
 }
 
 #[tokio::test]
@@ -183,4 +219,161 @@ async fn admission_requires_explicit_rejection_and_no_data() {
         assert_eq!(error.code, expected);
         server.join().unwrap();
     }
+}
+
+#[tokio::test]
+async fn position_confirmation_rejects_a_new_contract_on_the_same_chain() {
+    const ACCOUNT: &str = "0x1111111111111111111111111111111111111111";
+    const ORACLE: &str = "nibi1fixtureoracle";
+    const OLD_CONTRACT: &str = "nibi1oldcontract";
+    const NEW_CONTRACT: &str = "nibi1newcontract";
+    let listener = listener();
+    let socket = listener.local_addr().unwrap();
+    let http = format!("http://{socket}");
+    let endpoint = format!("{http}/query");
+    let switched = Arc::new(AtomicBool::new(false));
+    let server_switched = switched.clone();
+    let server = thread::spawn(move || {
+        let owner =
+            bech32::encode::<bech32::Bech32>(bech32::Hrp::parse("nibi").unwrap(), &[0x11; 20])
+                .unwrap();
+        let token = json!({"id": 1, "symbol": "USDC"});
+        let market = json!({"marketId": 3, "isOpen": true, "minPositionSizeUSD": 1, "collateralToken": token});
+        let mut submitted = 0;
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let (headers, body) = read_request(&mut stream);
+            let path = headers[0].split_whitespace().nth(1).unwrap();
+            let contract = if server_switched.load(Ordering::SeqCst) {
+                NEW_CONTRACT
+            } else {
+                OLD_CONTRACT
+            };
+            let data = match path {
+                "/done" => break,
+                "/query" => {
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    match request["query"].as_str().unwrap() {
+                        ROUTE => json!({"data": {"oneClickTrading": {
+                            "enabled": true, "chainId": "fixture-1", "contractAddress": contract,
+                        }}}),
+                        POSITION => json!({"data": {"perp": {"trade": {
+                            "id": 7, "trader": owner, "isOpen": true, "tradeType": "trade",
+                            "collateralAmount": 10000000, "leverage": 2.0, "perpBorrowing": market,
+                        }}}}),
+                        MARKET => json!({"data": {"perp": {"borrowing": market}}}),
+                        MARKETS => json!({"data": {"perp": {"borrowings": [market]}}}),
+                        SUBMIT => {
+                            submitted += 1;
+                            json!({"data": {"recordUserIntent": {
+                                "intentKey": request["variables"]["input"]["intentKey"],
+                                "lifecycleStep": "jwt_pass", "execActor": "server", "evmAddress": ACCOUNT,
+                            }}})
+                        }
+                        other => panic!("Unexpected GraphQL query: {other}"),
+                    }
+                }
+                "/cosmos/base/tendermint/v1beta1/node_info" => {
+                    json!({"default_node_info": {"network": "fixture-1"}})
+                }
+                _ => {
+                    let prefix = format!("/cosmwasm/wasm/v1/contract/{contract}/smart/");
+                    let encoded = path
+                        .strip_prefix(&prefix)
+                        .or_else(|| {
+                            path.strip_prefix(&format!(
+                                "/cosmwasm/wasm/v1/contract/{ORACLE}/smart/"
+                            ))
+                        })
+                        .unwrap()
+                        .split('?')
+                        .next()
+                        .unwrap();
+                    let decoded = url::form_urlencoded::parse(encoded.as_bytes())
+                        .next()
+                        .unwrap()
+                        .0;
+                    let request: Value =
+                        serde_json::from_slice(&STANDARD.decode(decoded.as_bytes()).unwrap())
+                            .unwrap();
+                    let result = match request.as_object().unwrap().keys().next().unwrap().as_str()
+                    {
+                        "get_trade_raw" => json!({
+                            "user": owner, "user_trade_index": "UserTradeIndex(7)",
+                            "market_index": "MarketIndex(3)", "collateral_index": "TokenIndex(1)",
+                            "is_open": true, "trade_type": "trade", "collateral_amount": "10000000",
+                            "leverage": "2.0",
+                        }),
+                        "get_exchange_balance" => json!({"collateral_index": "TokenIndex(1)"}),
+                        "is_after_hours_market" => json!(false),
+                        "get_market" => json!({
+                            "base": "TokenIndex(7)", "quote": "TokenIndex(0)",
+                            "group_index": "GroupIndex(0)",
+                        }),
+                        "get_oracle_address" => json!(ORACLE),
+                        "get_exchange_rate" => {
+                            assert_eq!(
+                                request,
+                                json!({"get_exchange_rate": {"base": 7, "quote": 0}})
+                            );
+                            json!({"base_per_quote": "100", "base_last_update_time": 1})
+                        }
+                        "market_order_config" => json!({"fill_at_next_oracle_price": false}),
+                        "get_group" => json!({"stale_price_expiration_secs": 0}),
+                        other => panic!("Unexpected LCD query: {other}"),
+                    };
+                    json!({"data": result})
+                }
+            };
+            let body = data.to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\ngrpc-metadata-x-cosmos-block-height: 120\r\n\r\n{body}", body.len()).unwrap();
+        }
+        submitted
+    });
+
+    let home = tempfile::tempdir().unwrap();
+    let storage = Storage::new(home.path());
+    storage
+        .save_session(Session::new(
+            Zeroizing::new("fixture-token".into()),
+            ACCOUNT.into(),
+            "2099-01-01T00:00:00Z".into(),
+            endpoint.clone(),
+        ))
+        .unwrap();
+    let trading = Trading::new(&endpoint, &storage, EVENTS);
+    let action = PositionAction::PartialClose { percent: 50 };
+    let original = trading
+        .position_trade(None, &http, "7", action, PositionMode::Preview)
+        .await
+        .unwrap();
+    switched.store(true, Ordering::SeqCst);
+    let confirmation =
+        Confirmation::new(original["previewDigest"].as_str().unwrap(), None).unwrap();
+    let result = trading
+        .position_trade(
+            None,
+            &http,
+            "7",
+            action,
+            PositionMode::Submit(SubmitOptions {
+                confirmation: Some(confirmation),
+                ..SubmitOptions::default()
+            }),
+        )
+        .await;
+    TcpStream::connect(socket)
+        .unwrap()
+        .write_all(b"GET /done HTTP/1.1\r\n\r\n")
+        .unwrap();
+    let submitted = server.join().unwrap();
+
+    let refusal = result.expect_err("the original digest should refuse a different contract");
+    assert_eq!(refusal.code, Code::PreviewMismatch);
+    let replacement = &refusal.details.unwrap()["preview"];
+    assert_eq!(replacement["intent"], original["intent"]);
+    assert_eq!(replacement["quote"], original["quote"]);
+    assert_ne!(replacement["previewDigest"], original["previewDigest"]);
+    assert_eq!(submitted, 0);
+    assert!(!home.path().join("trader/intents.sqlite3").exists());
 }

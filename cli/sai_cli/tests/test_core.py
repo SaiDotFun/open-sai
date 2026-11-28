@@ -8,6 +8,7 @@ from decimal import Decimal
 import httpx
 import pytest
 from click.testing import CliRunner
+from loopback_keeper import KeeperHandler, keeper_server, position_data
 from sai_cli.core import intents, keeper, margin, storage
 from sai_cli.sai_cli import main
 
@@ -41,11 +42,16 @@ def test_open_and_partial_close_payload():
     )
     assert payload["body"]["market"] == {"marketIndex": "MarketIndex(3)"}
     trade = {"id": 7, "collateralAmount": 10_000_001, "leverage": 2}
-    result = intents.partial_intent(trade, 50, Decimal(1))
+    result = intents.partial_intent(trade, 50)
     assert result["body"]["collateral"] == {"amountUsdc": "5000000", "amountUsd": "5"}
     assert result["body"]["leverageDelta"] == "0"
-    with pytest.raises(ValueError):
-        intents.partial_intent(trade, 99, Decimal(2))
+
+
+@pytest.mark.parametrize(("amount", "leverage"), [(1, "2"), (3, "0.5")])
+def test_partial_close_rejects_zero_reduction_or_remainder(amount, leverage):
+    trade = {"id": 7, "collateralAmount": amount, "leverage": leverage}
+    with pytest.raises(ValueError, match="Reduction rounds to zero or leaves no open"):
+        intents.partial_intent(trade, 99)
 
 
 def test_tpsl_has_keeper_field_patch():
@@ -134,35 +140,45 @@ def test_keeper_only_classifies_explicit_rejection(monkeypatch):
         keeper.request("https://example.com", keeper.SUBMIT)
 
 
-def test_cli_dry_run_does_not_create_session_or_send():
+def test_cli_position_dry_run_requires_a_session():
     result = CliRunner().invoke(main, ["--json", "trade", "close", "4", "--dry-run"])
-    assert result.exit_code == 0
-    assert '"CLOSE_POSITION"' in result.output
+    assert result.exit_code == 6
+    assert json.loads(result.stdout)["error"]["code"] == "SIGNED_OUT"
     assert not storage.home().exists()
 
 
 def test_cli_dry_run_names_the_account_it_would_use(session):
-    session = {**session, "endpoint": "http://127.0.0.1:1/query"}
-    other = {**session, "evmAddress": "0x" + "c" * 40, "token": "other-token"}
-    storage.save_session(session)
-    storage.save_session(other)
-    args = [
-        "--endpoint",
-        session["endpoint"],
-        "--json",
-        "trade",
-        "close",
-        "4",
-        "--dry-run",
-    ]
-    active = CliRunner().invoke(main, args)
-    assert json.loads(active.output)["addr"] == other["evmAddress"]
-    chosen = CliRunner().invoke(main, ["--as", session["evmAddress"], *args])
-    assert json.loads(chosen.output)["addr"] == session["evmAddress"]
-    assert "token" not in active.output + chosen.output
-    missing = CliRunner().invoke(main, ["--as", "0x" + "d" * 40, *args])
-    assert missing.exit_code != 0
-    assert "is not connected" in missing.output
+    class Handler(KeeperHandler):
+        def do_POST(self):
+            body = self.read_json()
+            if body["query"] == keeper.ROUTE:
+                self.reply({"errors": [{"message": "Route unavailable"}]})
+                return
+            assert body["query"] == keeper.POSITION
+            self.reply({"data": position_data(body["variables"])})
+
+    with keeper_server(Handler) as base:
+        session = {**session, "endpoint": f"{base}/query"}
+        other = {**session, "evmAddress": "0x" + "c" * 40, "token": "other-token"}
+        storage.save_session(session)
+        storage.save_session(other)
+        args = [
+            "--endpoint",
+            session["endpoint"],
+            "--json",
+            "trade",
+            "close",
+            "4",
+            "--dry-run",
+        ]
+        active = CliRunner().invoke(main, args)
+        assert json.loads(active.output)["addr"] == other["evmAddress"]
+        chosen = CliRunner().invoke(main, ["--as", session["evmAddress"], *args])
+        assert json.loads(chosen.output)["addr"] == session["evmAddress"]
+        assert "token" not in active.output + chosen.output
+        missing = CliRunner().invoke(main, ["--as", "0x" + "d" * 40, *args])
+        assert missing.exit_code != 0
+        assert "is not connected" in missing.output
 
 
 def test_trade_session_stays_on_the_account_it_first_loaded(session):
@@ -240,6 +256,21 @@ def test_sign_in_and_logout_recover_from_an_unreadable_store(session):
     path.write_text(json.dumps({"version": 99}))
     assert storage.delete_session() == storage.UNREADABLE_REMOVED
     assert not storage.session_exists()
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_logout_without_a_matching_session_does_not_create_a_lock(session, explicit):
+    storage.save_session(session)
+    other = {**session, "evmAddress": "0x" + "c" * 40}
+    storage.save_session(other)
+    assert storage.delete_session() == other["evmAddress"]
+    lock = storage.home() / "sessions.lock"
+    lock.unlink()
+
+    missing = other["evmAddress"] if explicit else None
+    assert storage.delete_session(missing) is None
+    assert not lock.exists()
+    assert storage.load_session(session["evmAddress"]) == session
 
 
 @pytest.mark.parametrize("failure", ["expired", "wrong_endpoint"])
@@ -401,32 +432,30 @@ def test_margin_quote_uses_exact_contract_integer_math():
     effective = Decimal(10)
     assert (
         margin.margin_quote(
-            raw, funds, market, "add", "10", effective_leverage=effective
+            raw, funds, market, "add", 10_000_000, effective_leverage=effective
         )["requestedLeverage"]
         == "5"
     )
     assert (
         margin.margin_quote(
-            raw, funds, market, "remove", "5", effective_leverage=effective
+            raw, funds, market, "remove", 5_000_000, effective_leverage=effective
         )["requestedLeverage"]
         == "20"
     )
     with pytest.raises(ValueError, match="six decimal"):
-        margin.margin_quote(
-            raw, funds, market, "add", "0.0000001", effective_leverage=effective
-        )
+        margin.margin_amount_usdc("0.0000001")
     with pytest.raises(ValueError, match="Insufficient"):
         margin.margin_quote(
             raw,
             {"available_to_trade": "1"},
             market,
             "add",
-            "1",
+            1_000_000,
             effective_leverage=effective,
         )
     with pytest.raises(ValueError, match="Keep some margin"):
         margin.margin_quote(
-            raw, funds, market, "remove", "10", effective_leverage=effective
+            raw, funds, market, "remove", 10_000_000, effective_leverage=effective
         )
 
 
@@ -462,7 +491,7 @@ def test_margin_rounding_vectors(
         {"available_to_trade": "9000000"},
         {"minLeverage": 1, "maxLeverage": 100},
         direction,
-        amount,
+        margin.margin_amount_usdc(amount),
         effective_leverage=Decimal(leverage),
     )
     assert quote["requestedLeverage"] == result
@@ -475,7 +504,11 @@ def test_margin_rejects_wrong_lcd_network(monkeypatch):
         keeper,
         "request",
         lambda *args, **kwargs: {
-            "oneClickTrading": {"enabled": True, "chainId": "cataclysm-1"}
+            "oneClickTrading": {
+                "enabled": True,
+                "chainId": "cataclysm-1",
+                "contractAddress": "test-contract",
+            }
         },
     )
     monkeypatch.setattr(
@@ -483,11 +516,14 @@ def test_margin_rejects_wrong_lcd_network(monkeypatch):
         "_get_json",
         lambda url: {"default_node_info": {"network": "nibiru-testnet-2"}},
     )
-    with pytest.raises(ValueError, match="network do not match"):
+    with pytest.raises(margin.TradingNetworkMismatch, match="network do not match"):
         margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", "0xabc", 1)
 
 
 def test_margin_snapshot_checks_raw_position_and_available_funds(monkeypatch):
+    addr = "0x" + "a" * 40
+    trader = "nibi1424242424242424242424242424242422mldj0"
+
     def gql(endpoint, query, variables=None, token=None, timeout=20):
         if query == keeper.ROUTE:
             return {
@@ -502,7 +538,7 @@ def test_margin_snapshot_checks_raw_position_and_available_funds(monkeypatch):
                 "perp": {
                     "trade": {
                         "id": 7,
-                        "trader": "nibi1trader",
+                        "trader": trader,
                         "isOpen": True,
                         "tradeType": "trade",
                         "collateralAmount": 10000000,
@@ -527,7 +563,7 @@ def test_margin_snapshot_checks_raw_position_and_available_funds(monkeypatch):
         }
 
     raw = {
-        "user": "nibi1trader",
+        "user": trader,
         "user_trade_index": "UserTradeIndex(7)",
         "market_index": "MarketIndex(0)",
         "collateral_index": "TokenIndex(1)",
@@ -550,7 +586,7 @@ def test_margin_snapshot_checks_raw_position_and_available_funds(monkeypatch):
             raw if "get_trade_raw" in message else funds
         ),
     )
-    snapshot = margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", "0xabc", 7)
+    snapshot = margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", addr, 7)
     assert snapshot.raw == raw
     assert snapshot.funds == funds
     assert snapshot.market["marketId"] == 0
@@ -558,13 +594,12 @@ def test_margin_snapshot_checks_raw_position_and_available_funds(monkeypatch):
     # Matching their binary64 representations must not reject this snapshot.
     raw["leverage"] = "10.00000000000000001"
     assert (
-        margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", "0xabc", 7).raw
-        == raw
+        margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", addr, 7).raw == raw
     )
     raw["leverage"] = "10"
     raw["collateral_amount"] = "9000000"
     with pytest.raises(ValueError, match="Indexed position differs"):
-        margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", "0xabc", 7)
+        margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", addr, 7)
 
 
 def test_leverage_is_separate_update_intent():
@@ -594,12 +629,19 @@ def test_margin_dry_run_and_recheck(session, monkeypatch):
     monkeypatch.setattr(
         margin,
         "snapshot",
-        lambda *args: margin.PositionSnapshot(raw, funds, market, "test-contract"),
+        lambda *args, **kwargs: margin.PositionSnapshot(
+            raw,
+            funds,
+            market,
+            {"chainId": "test-1", "contractAddress": "test-contract"},
+        ),
     )
     result = CliRunner().invoke(
         main,
         [
             "--json",
+            "--lcd-endpoint",
+            "http://127.0.0.1:1",
             "trade",
             "margin",
             "7",
@@ -630,18 +672,18 @@ def test_margin_refuses_changed_position(session, monkeypatch):
                 {**newer, "collateral_amount": "10000000"},
                 {"available_to_trade": "20000000"},
                 {"minLeverage": 1, "maxLeverage": 100},
-                "test-contract",
+                {"chainId": "test-1", "contractAddress": "test-contract"},
             ),
             margin.PositionSnapshot(
                 newer,
                 {"available_to_trade": "20000000"},
                 {"minLeverage": 1, "maxLeverage": 100},
-                "test-contract",
+                {"chainId": "test-1", "contractAddress": "test-contract"},
             ),
         ]
     )
     monkeypatch.setattr("sai_cli.sai_cli.session", lambda ctx: session)
-    monkeypatch.setattr(margin, "snapshot", lambda *args: next(items))
+    monkeypatch.setattr(margin, "snapshot", lambda *args, **kwargs: next(items))
     monkeypatch.setattr(margin, "_latest_position", lambda *args: (newer, "120"))
     monkeypatch.setattr(
         margin,

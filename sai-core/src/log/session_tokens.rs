@@ -202,7 +202,7 @@ mod tests {
                 Surface::Cli,
                 "fixture",
                 Level::Info,
-                [("field", Field::Arg(token.clone()))],
+                [("field", Field::Text(token.clone()))],
             );
             assert!(logger.finish(Duration::from_secs(5)));
 

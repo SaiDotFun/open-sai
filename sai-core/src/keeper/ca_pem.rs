@@ -1,7 +1,6 @@
 //! Read PEM CA certificates and OpenSSL's optional X509_CERT_AUX trust policy.
 
 use std::{
-    fs::File,
     io::{self, BufRead, BufReader},
     iter,
     path::Path,
@@ -61,7 +60,7 @@ struct CertificateAux {
 pub(super) fn certificates(
     path: &Path,
 ) -> io::Result<impl Iterator<Item = io::Result<CaCertificate>>> {
-    let mut lines = Some(BufReader::new(File::open(path)?).split(b'\n'));
+    let mut lines = Some(BufReader::new(crate::files::open_regular(path)?).split(b'\n'));
     Ok(iter::from_fn(move || {
         let result = read_certificate(lines.as_mut()?);
         if result.is_err() {

@@ -2,6 +2,7 @@ import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 from compare import (
@@ -13,11 +14,96 @@ from compare import (
     Normalize,
     first_difference,
     ledger,
+    mask_doctor_stream,
+    mask_overview_stdout,
     snapshot,
     sqlite_schema,
     stdout,
 )
-from parity import Observation, differences
+from parity import Case, Observation, differences
+
+
+def test_case_command_skips_global_options() -> None:
+    case = Case(
+        name="config-list",
+        args=["--endpoint", "https://keeper.invalid", "--json", "config", "list"],
+    )
+
+    assert case.command == "config list"
+
+
+def test_doctor_stream_masks_clock_and_build_values_and_keeps_other_bytes() -> None:
+    text = "warn    lcd        http://127.0.0.1:9090 answered in 14 ms; another chain\n"
+    assert mask_doctor_stream(text) == text.replace("14 ms", "<durationMs> ms")
+    raw = (
+        '{"generatedAt":"2026-11-24T01:00:00.123Z","checks":[{"id":"lcd",'
+        '"durationMs":14,"details":{"matchesKeeperChain":false}}]}\n'
+    )
+    expected = raw.replace("2026-11-24T01:00:00.123Z", "<generatedAt>").replace(
+        '"durationMs":14', '"durationMs":"<durationMs>"'
+    )
+    assert mask_doctor_stream(raw) == expected
+    malformed = '{"generatedAt":"invalid","durationMs":14.5}\n'
+    assert mask_doctor_stream(malformed) == malformed
+    build = '{"version":"0.1.2","summary":"sai 0.1.2 installed"}\n'
+    assert (
+        mask_doctor_stream(build)
+        == '{"version":"<version>","summary":"sai <version> installed"}\n'
+    )
+
+
+def test_release_doctor_stream_masks_each_checkouts_git_state() -> None:
+    sha = "a" * 40
+    raw = f'{{"git":{{"commit":"{sha}","dirty":false}},"summary":"other chain"}}'
+    other = raw.replace(sha, "b" * 40).replace("false", "true")
+    expected = '{"git":{"commit":"<commit>","dirty":"<dirty>"},"summary":"other chain"}'
+    assert mask_doctor_stream(raw) == raw
+    assert mask_doctor_stream(raw, checkout=True) == expected
+    assert mask_doctor_stream(other, checkout=True) == expected
+    assert mask_doctor_stream(raw.replace(sha, "invalid"), checkout=True) != expected
+
+
+def test_start_log_compares_command_and_argv_shape(tmp_path: Path) -> None:
+    normalize = Normalize(tmp_path)
+    start = {
+        "ts": "2026-11-24T01:00:00.000Z",
+        "event": "command.start",
+        "command": "mcp install",
+        "argv": ["mcp", "install", "--scope", "project"],
+    }
+    expected = normalize.log_event(start)
+    names_only = {**start, "argv": ["mcp", "install", "--scope="]}
+
+    assert normalize.log_event(names_only) == expected
+    assert normalize.log_event({**names_only, "command": "mcp list"}) != expected
+    assert normalize.log_event({**names_only, "argv": [42]}) != expected
+    end = {**names_only, "event": "command.end"}
+    assert normalize.log_event(end)["argv"] == names_only["argv"]
+
+
+def test_log_schema_selects_volatile_fields(tmp_path: Path) -> None:
+    schema = tmp_path / "log-events.json"
+    schema.write_text(json.dumps({"volatileFields": ["ts", "durationMs"]}), "utf-8")
+    normalize = Normalize(tmp_path, log_schema=schema)
+    event = {"ts": "2026-11-24T01:00:00.000Z", "durationMs": 12, "pid": 99}
+
+    assert normalize.log_event(event) == {
+        "ts": "<ts>",
+        "durationMs": "<durationMs>",
+        "pid": 99,
+    }
+    assert normalize.log_event({**event, "durationMs": "12"})["durationMs"] == "12"
+    assert "durationMs" not in normalize.log_event({"ts": event["ts"]})
+
+
+def test_log_schema_requires_a_rule_for_each_volatile_field(tmp_path: Path) -> None:
+    schema = tmp_path / "log-events.json"
+    schema.write_text(json.dumps({"volatileFields": ["undocumentedId"]}), "utf-8")
+
+    with pytest.raises(
+        ValueError, match="Missing log normalization rule for undocumentedId"
+    ):
+        Normalize(tmp_path, log_schema=schema)
 
 
 @pytest.mark.parametrize(
@@ -71,6 +157,22 @@ def test_log_ids_preserve_joins_and_sequence(
         first_difference(reference, Normalize(tmp_path).log_records(candidate), "logs")
         == "logs[0].event"
     )
+
+
+def test_log_error_normalizes_truncated_fixture_home(tmp_path: Path) -> None:
+    def error(home: str, clipped: str) -> str:
+        result = Normalize(tmp_path / home).log_event(
+            {
+                "event": "command.end",
+                "ts": "2026-11-24T01:00:00.000Z",
+                "error": f"Fix: --env=SAI_HOME={tmp_path / clipped}... [20 more characters]",
+            }
+        )
+        return result["error"]
+
+    expected = "Fix: --env=SAI_HOME=<HOME>... [20 more characters]"
+    assert error("reference", "refer") == error("candidate", "candi") == expected
+    assert error("reference", "unrelated") != expected
 
 
 def test_snapshot_compares_log_endpoint_key_mode_and_length(tmp_path: Path) -> None:
@@ -228,6 +330,151 @@ def test_ledger_ignores_equivalent_index_collations(
 
     reference = read("declared", declared)
     assert first_difference(reference, read("equivalent", equivalent), "ledger") is None
+
+
+@requires_sqlite_schema
+def test_ledger_compares_index_predicates_and_expressions(tmp_path: Path) -> None:
+    ddl = """
+        CREATE INDEX by_status ON intents (
+            id, replace(status COLLATE RTRIM, 'where, )', 'COLLATE') COLLATE NOCASE
+        ) WHERE status <> 'failed';
+    """
+
+    def read(name: str, index: str) -> dict:
+        path = tmp_path / name
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TABLE intents (id TEXT PRIMARY KEY, status TEXT)")
+            db.execute(index)
+            db.execute("INSERT INTO intents VALUES ('saved', 'pending')")
+        return ledger(path, Normalize(tmp_path))
+
+    reference = read("reference.sqlite3", ddl)
+    formatted = """
+        create index by_status on intents
+            (ID, REPLACE ( STATUS collate [rtrim] , 'where, )', 'COLLATE' )
+                collate /* index order */ "nocase")
+        where /* partial index */ STATUS<>'failed';
+    """
+    assert reference == read("formatted.sqlite3", formatted)
+
+    for filename, changed, field in (
+        ("predicate", ddl.replace("'failed'", "'rejected'"), "where"),
+        ("expression", ddl.replace("replace(status", "substr(status"), "expressions.1"),
+        ("collation", ddl.replace("RTRIM", "BINARY"), "expressions.1"),
+    ):
+        actual = read(f"{filename}.sqlite3", changed)
+        assert reference["tables"] == actual["tables"]
+        difference = first_difference(reference, actual, "ledger")
+        assert difference and difference.startswith(
+            f"ledger.schema.tables.intents.indexes.by_status.{field}"
+        )
+
+
+@requires_sqlite_schema
+def test_ledger_compares_collations_in_view_definitions(tmp_path: Path) -> None:
+    def read(name: str, view: str) -> dict:
+        path = tmp_path / name
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TABLE intents (status TEXT)")
+            db.execute(view)
+        return ledger(path, Normalize(tmp_path))
+
+    reference = read(
+        "reference.sqlite3",
+        "CREATE VIEW statuses AS SELECT status COLLATE NOCASE AS label FROM intents",
+    )
+    assert reference == read(
+        "formatted.sqlite3",
+        "create view statuses as select STATUS collate /* label */ [nocase]\n"
+        " as label from intents",
+    )
+    changed = read(
+        "changed.sqlite3",
+        "CREATE VIEW statuses AS SELECT status COLLATE BINARY AS label FROM intents",
+    )
+    difference = first_difference(reference, changed, "ledger")
+    assert difference and difference.startswith(
+        "ledger.schema.tables.statuses.definition"
+    )
+
+
+@requires_sqlite_schema
+@pytest.mark.parametrize(
+    ("reference_sql", "equivalent", "changed"),
+    (
+        (
+            "CREATE INDEX indexed ON intents(status) WHERE status <> 'failed'",
+            (
+                "CREATE INDEX indexed ON intents(status) WHERE ((status <> 'failed'))",
+                "CREATE INDEX indexed ON intents(status) WHERE \"status\" <> 'failed'",
+                "CREATE INDEX indexed ON intents(status) WHERE (status) <> ('failed')",
+            ),
+            "CREATE INDEX indexed ON intents(status) WHERE status <> 'status'",
+        ),
+        (
+            "CREATE INDEX indexed ON intents(lower(status) DESC)",
+            (
+                "CREATE INDEX indexed ON intents((lower(status)) DESC)",
+                'CREATE INDEX indexed ON intents(lower("STATUS") DESC)',
+            ),
+            "CREATE INDEX indexed ON intents(lower('status') DESC)",
+        ),
+        (
+            "CREATE INDEX indexed ON intents(lower(status) COLLATE NOCASE)",
+            ("CREATE INDEX indexed ON intents(((lower((status)))) COLLATE NOCASE)",),
+            "CREATE INDEX indexed ON intents(lower(status) COLLATE BINARY)",
+        ),
+        (
+            "CREATE INDEX indexed ON intents(17 DESC, lower(état))",
+            ('CREATE INDEX indexed ON intents(((17)) DESC, lower("état"))',),
+            "CREATE INDEX indexed ON intents(18 DESC, lower(état))",
+        ),
+        (
+            "CREATE VIEW projected AS SELECT lower(status) AS label FROM intents WHERE priority + 1 * 2 > 3",
+            (
+                "CREATE VIEW projected AS SELECT (lower(status)) AS label FROM intents WHERE (priority + 1 * 2 > 3)",
+                'CREATE VIEW projected AS SELECT lower("status") AS "label" FROM [intents] WHERE `priority` + 1 * 2 > 3',
+            ),
+            "CREATE VIEW projected AS SELECT lower(status) AS label FROM intents WHERE (priority + 1) * 2 > 3",
+        ),
+        (
+            "CREATE VIEW projected AS SELECT lower(intents.status) COLLATE NOCASE AS label FROM intents WHERE priority IN (-2)",
+            (
+                "CREATE VIEW projected AS SELECT (lower((intents.status))) COLLATE NOCASE AS label FROM intents WHERE (priority) IN ((-2))",
+            ),
+            "CREATE VIEW projected AS SELECT lower(intents.status) COLLATE NOCASE AS label FROM intents WHERE priority IN (3)",
+        ),
+        (
+            "CREATE VIEW projected AS SELECT label FROM (SELECT lower(status) label FROM intents)",
+            (
+                'CREATE VIEW projected AS SELECT label FROM (SELECT (lower("status")) label FROM intents)',
+            ),
+            "CREATE VIEW projected AS SELECT label FROM (SELECT upper(status) label FROM intents)",
+        ),
+        (
+            'CREATE VIEW projected AS SELECT "true" AS label FROM intents',
+            ('CREATE VIEW projected AS SELECT ("true") AS label FROM intents',),
+            "CREATE VIEW projected AS SELECT true AS label FROM intents",
+        ),
+    ),
+)
+def test_schema_normalizes_only_safe_expression_formatting(
+    tmp_path: Path, reference_sql: str, equivalent: tuple[str, ...], changed: str
+) -> None:
+    def read(name: str, sql: str) -> dict:
+        path = tmp_path / name
+        with sqlite3.connect(path) as db:
+            db.execute(
+                "CREATE TABLE intents (status TEXT, priority INTEGER, état TEXT)"
+            )
+            db.execute(sql)
+        return ledger(path, Normalize(tmp_path))
+
+    reference = read("reference.sqlite3", reference_sql)
+    for i, sql in enumerate(equivalent):
+        assert reference == read(f"equivalent-{i}.sqlite3", sql)
+    difference = first_difference(reference, read("changed.sqlite3", changed), "ledger")
+    assert difference and difference.startswith("ledger.schema.tables.")
 
 
 @requires_sqlite_schema
@@ -429,3 +676,119 @@ def test_noncanonical_log_time_fails_in_files_and_tail(
         )
     with pytest.raises(InvalidLogTime, match="UTC millisecond format"):
         stdout(json.dumps({"ts": stamp}), "jsonl", "logs tail", Normalize(tmp_path))
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ('{"price": 1.0, "size": 2}', '{"price": 1, "size": 2}'),
+        ('{"price": 1e+02}', '{"price": 100.0}'),
+        ('{"price": 1, "size": 2}', '{"size": 2, "price": 1}'),
+    ],
+)
+def test_mcp_compares_actual_json_text(tmp_path: Path, before: str, after: str) -> None:
+    def decode_tool(text: str) -> Any:
+        frame = {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {
+                "content": [{"type": "text", "text": text}],
+                "structuredContent": {"result": text},
+                "isError": False,
+            },
+        }
+        return stdout(json.dumps(frame), "mcp", "mcp serve", Normalize(tmp_path))
+
+    assert first_difference(decode_tool(before), decode_tool(after), "MCP")
+
+
+def test_mcp_accepts_python_and_native_structured_content(tmp_path: Path) -> None:
+    text = '{"addr": "0x1", "perp": {"trades": []}}'
+
+    def decode_tool(structured: Any) -> Any:
+        frame = {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {
+                "content": [{"type": "text", "text": text}],
+                "structuredContent": structured,
+                "isError": False,
+            },
+        }
+        return stdout(json.dumps(frame), "mcp", "mcp serve", Normalize(tmp_path))
+
+    python = decode_tool({"result": text})
+    assert decode_tool(json.loads(text)) == python
+    with pytest.raises(ValueError, match="same JSON value"):
+        decode_tool({"addr": "0x2", "perp": {"trades": []}})
+
+
+def test_mcp_masks_output_schemas_in_parsed_and_wire_listings(tmp_path: Path) -> None:
+    def decode_inventory(schema: dict[str, Any]) -> Any:
+        tool = {
+            "name": "fixture",
+            "description": 'Lists "outputSchema": {} in prose.',
+            "inputSchema": {"type": "object"},
+            "outputSchema": schema,
+        }
+        frame = {"jsonrpc": "2.0", "id": 2, "result": {"tools": [tool]}}
+        return stdout(json.dumps(frame), "mcp", "mcp serve", Normalize(tmp_path))
+
+    python = decode_inventory(
+        {"type": "object", "properties": {"result": {"type": "string"}}}
+    )
+    native = decode_inventory(
+        {"type": "object", "properties": {"addr": {"type": "string"}}}
+    )
+    assert native == python
+    [listing] = native
+    assert listing["result"]["tools"][0]["outputSchema"] == "<outputSchema>"
+    assert '"outputSchema": "<outputSchema>"' in listing["result"]["_schemaWire"]
+    assert 'Lists \\"outputSchema\\": {} in prose.' in listing["result"]["_schemaWire"]
+    with pytest.raises(ValueError, match="describe an object"):
+        decode_inventory({"type": "string"})
+
+
+def test_mcp_compares_schema_property_order(tmp_path: Path) -> None:
+    def decode_inventory(properties: dict[str, Any]) -> Any:
+        frame = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "tools": [
+                    {"name": "fixture", "inputSchema": {"properties": properties}}
+                ]
+            },
+        }
+        return stdout(json.dumps(frame), "mcp", "mcp serve", Normalize(tmp_path))
+
+    one = {"type": "integer"}
+    two = {"type": "string"}
+    assert first_difference(
+        decode_inventory({"first": one, "second": two}),
+        decode_inventory({"second": two, "first": one}),
+        "MCP",
+    )
+
+
+def test_overview_text_ignores_clock_driven_table_widths():
+    def table(age: str, status: str = "accepted") -> str:
+        source = f"2000-01-01T00:00:00+00:00 ({age} s)"
+        return (
+            f"  {'Status':<8} │ {'Reserved (Age)':<{len(source)}}\n"
+            f"  {'─' * (8 + 3 + len(source))}\n"
+            f"  {status:<8} │ {source}\n"
+            f"  {'unknown':<8} │ {'unknown':<{len(source)}}\n"
+        )
+
+    short = mask_overview_stdout(table("8.49e+08"), "text")
+    long = mask_overview_stdout(table("8.4900001e+08"), "text")
+    assert short == long
+    leading_table = "  ID │ Price\n  ──────────\n  7  │ 100  \n"
+    assert mask_overview_stdout(leading_table + table("8.49e+08"), "text") == (
+        leading_table + long
+    )
+    assert short != mask_overview_stdout(table("8.49e+08", "rejected"), "text")
+    assert short != mask_overview_stdout(
+        table("8.49e+08").replace("──", "─", 1), "text"
+    )

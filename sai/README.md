@@ -19,17 +19,35 @@ GraphQL envelope and projects each row to validated public fields. The `account 
 command reads one WebSocket snapshot. Use `watch price TOKEN_ID`, `watch
 balances ADDR`, or `watch positions ADDR` to stream JSON lines.
 
+`sai trade open`, `sai trade close`, and `sai trade cancel` support
+`--dry-run`. Python spells cancellation `sai trade close ID --cancel-order`,
+which the Rust CLI also accepts. A live submission reserves the intent
+before it contacts Keeper. If the send outcome is unknown, use the intent
+key to reconcile it before trading again.
+
+`sai mcp serve` exposes the Sai tool inventory over stdio. The Rust server
+handles `mcp_info`, auth tools, market and account reads, and local and
+Keeper intent lookups and waits. The account overview reads the active
+account on each call and retains available sections when a source fails.
+The `logs_intent` tool reads retained events and can look up the current
+Keeper record. Auth tools read the shared session store on each call.
+Valid preview calls return `NOT_IMPLEMENTED`. Trade calls
+check the stored session first, then return `NOT_IMPLEMENTED` when the
+session and arguments pass validation.
+
 ## Port Order
 
-C2 and C3 use Python tag `sai-cli/v0.1.1` as their parity reference. C4
-uses Python commit `5b6e5fbf26975a837dfd0a0cad1d1fd40c5b2bdf` for
-Keeper requests, reconciliation, structured errors, and emitted events.
-Every Keeper query logs only public GraphQL error codes and an error count,
-following the current Python reference below.
-Logging v2 and intent wait have their own port work. [Port tracker #49](https://github.com/SaiDotFun/open-sai/issues/49).
+C2 and C3 started against Python tag `sai-cli/v0.1.1`. Rust CI checks C4
+against the published Python tag `sai-cli/v0.1.2` at commit
+`8557a7e13dceab0accc369191182c8e01423c91b`. That release shipped logging
+schema v2 and intent wait. [Port tracker #49](https://github.com/SaiDotFun/open-sai/issues/49).
 C5 compares read and watch commands against Python on `main` at
 `ea09f0d417a53a71079bb8c5e426005fa29051a4`. These commands emit schema v2
 events, including keyed endpoint IDs for Keeper HTTP reads.
+C8 compares stdio against Python at
+`ea09f0d417a53a71079bb8c5e426005fa29051a4` with CPython 3.12.
+The [MCP parity command](../tests/parity/README.md#compare-mcp-stdio) uses
+its own Python executable.
 
 | Lane | Acceptance criteria |
 | --- | --- |
@@ -83,6 +101,16 @@ after `just rust-build` to compare `sai intent status` against the Python
 package in this checkout. The tests reuse the recorded Keeper outcomes
 and compare request bytes and counts, ledger rows, and log events.
 
+The C7a open and close cases and digest fixtures use Python commit
+`ea09f0d417a53a71079bb8c5e426005fa29051a4`. Set `SAI_PARITY_C7_PYTHON` to
+the absolute path of a `sai` binary installed from that checkout when
+running `pytest tests/parity/test_trade.py` with `SAI_PARITY_BIN`.
+Without that override the open and close tests use Python from the current
+workspace. The cancellation cases use Python commit
+`bdc11da6c9938aa0371835d921f27d45daa77c36`. Set `SAI_PARITY_WAIT_PYTHON` to
+the absolute path of its `sai` launcher. Cancellation and wait tests share
+this checkout in CI.
+
 Compare the read and watch commands with the Python package in this
 checkout using the loopback replay cases:
 
@@ -98,6 +126,48 @@ full Python updater installs the shim through uv and retains a rollback
 for the existing uv-owned launcher. Fresh native installs use a standalone
 launcher. The installer checks ownership and reports PATH shadowing.
 Windows stays on Python until native support passes.
+
+The native updater uses the C10 archive name `sai-<version>-<target>.tar.gz`
+and verifies it against `SHA256SUMS`. A standalone launcher is a symlink
+named `sai` beside a private `.sai-native` directory. Its target is
+`.sai-native/current`, which selects `<version>-<archive-sha256>/sai`
+inside the private directory. The updater holds `.sai-update.lock`
+beside the launcher and changes only the private selector during
+updates and ordinary rollback. Earlier launchers that link directly to
+a versioned binary need their original installer for updates.
+
+For uv installs, the shim passes its own `sys.prefix` as
+`SAI_NATIVE_UV_PREFIX` when it execs the cached binary. Rust checks that
+prefix's uv receipt, the registered launcher, and the current uv tool
+directories before asking uv to install a verified wheel. A pinned
+`uvx` environment has no matching tool receipt, so its version stays pinned.
+
+If an interrupted update leaves the uv launcher missing, run
+`sai update --recover` from the same profile using a trusted native Sai
+binary. If `sai` is unavailable on PATH, use the absolute path to the
+retained binary in the profile's verified shim cache:
+
+```sh
+"/absolute/path/to/profile/bin/shim/<version>/<target>/<archive-sha256>/sai" update --recover
+```
+
+Use the original profile. Set `SAI_HOME` to its absolute path if you
+change directories. Use the uv settings that selected the interrupted install. For relative uv directories, start from the original
+working directory or give `UV_TOOL_DIR` and `UV_TOOL_BIN_DIR` their absolute
+paths. If the launcher directory itself was removed, recreate it at its
+original path and retry. Recovery uses the pending record in `uv tool dir`
+and its cached rollback wheel. If the pending record or wheel is missing,
+reinstall a known good, verified wheel through uv using those same directories:
+
+```sh
+uv tool install --offline --force "/absolute/path/to/sai_cli-<version>-py3-none-any.whl"
+```
+
+C9c compares `sai update --check` with Python commit
+`ea09f0d417a53a71079bb8c5e426005fa29051a4`. Run the `update-*` cases in
+the parity driver and `tests/parity/test_native_update.py` with `SAI_PARITY_BIN`
+pointing to the Rust build. The native install tests serve fixture
+archives and wheels on loopback and run real uv tools in temporary homes.
 
 Updates and `sai doctor` keep valid MCP registrations and repair only
 recognized stale Sai entries after the launcher passes its health checks.

@@ -36,12 +36,15 @@ fn read_json(output: &Output) -> Value {
 fn prints_workspace_version_without_reading_config() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("config.toml"), "invalid TOML").unwrap();
-    let output = sai(root.path()).arg("--version").output().unwrap();
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        format!("sai {}\n", env!("CARGO_PKG_VERSION"))
-    );
+    for args in [&["--version"][..], &["--json", "--version"]] {
+        let output = sai(root.path()).args(args).output().unwrap();
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("sai {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
     assert!(!root.path().join("logs").exists());
 }
 
@@ -51,8 +54,10 @@ fn lists_values_and_sources_with_redacted_urls_and_unknown_key_warnings() {
     let path = root.path().join("config.toml");
     let contents = "[keeper]\nendpoint = \"https://who:fixture@EXAMPLE.invalid:443/query?token=fixture\"\nfuture_setting = 1\n[update]\nauto = false\n";
     fs::write(&path, contents).unwrap();
+    let lcd_origin = "https://lcd.example:8443";
+    let lcd = format!("{lcd_origin}/fixture-lcd-path?key=fixture-lcd-query");
     let output = sai(root.path())
-        .args(["--json", "config", "list"])
+        .args(["--lcd-endpoint", &lcd, "--json", "config", "list"])
         .output()
         .unwrap();
     let result = read_json(&output);
@@ -60,15 +65,15 @@ fn lists_values_and_sources_with_redacted_urls_and_unknown_key_warnings() {
     assert_eq!(
         result["settings"]["keeper.endpoint"],
         json!({
-            "value": "https://example.invalid:443/query",
+            "value": "https://example.invalid:443",
             "source": "file",
             "env": "SAI_ENDPOINT",
-            "default": "https://sai-keeper.nibiru.fi/query",
+            "default": "https://sai-keeper.nibiru.fi",
         })
     );
     assert_eq!(
         result["settings"]["keeper.ws_endpoint"]["value"],
-        "wss://example.invalid:443/query"
+        "wss://example.invalid:443"
     );
     assert_eq!(
         result["settings"]["keeper.ws_endpoint"]["source"],
@@ -76,11 +81,95 @@ fn lists_values_and_sources_with_redacted_urls_and_unknown_key_warnings() {
     );
     assert_eq!(result["settings"]["update.auto"]["value"], false);
     assert_eq!(result["settings"]["logs.keep_days"]["value"], 14);
+    assert_eq!(result["settings"]["lcd.endpoint"]["value"], lcd_origin);
+    assert_eq!(result["settings"]["lcd.endpoint"]["source"], "flag");
     assert!(
         String::from_utf8_lossy(&output.stderr)
             .contains("ignoring unknown setting 'keeper.future_setting'")
     );
     assert_eq!(fs::read_to_string(path).unwrap(), contents);
+
+    let logs: String = fs::read_dir(root.path().join("logs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect();
+    assert!(logs.contains(r#""--lcd-endpoint","[redacted]""#));
+    for secret in ["fixture-lcd-path", "fixture-lcd-query"] {
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+        assert!(!logs.contains(secret));
+    }
+    let exact = sai(root.path())
+        .args(["--lcd-endpoint", &lcd, "config", "get", "lcd.endpoint"])
+        .output()
+        .unwrap();
+    assert!(exact.status.success());
+    assert_eq!(String::from_utf8(exact.stdout).unwrap(), format!("{lcd}\n"));
+}
+
+#[test]
+fn config_set_acknowledges_only_the_endpoint_origin() {
+    for (key, scheme) in [
+        ("lcd.endpoint", "https"),
+        ("keeper.endpoint", "https"),
+        ("keeper.ws_endpoint", "wss"),
+    ] {
+        let root = tempdir().unwrap();
+        let origin = format!("{scheme}://provider.example:8443");
+        let endpoint = format!("{origin}/fixture-private-path?key=fixture-private-query");
+        let set = sai(root.path())
+            .args(["--json", "config", "set", key, &endpoint])
+            .output()
+            .unwrap();
+        assert_eq!(read_json(&set)["value"], origin);
+        for secret in ["fixture-private-path", "fixture-private-query"] {
+            assert!(!String::from_utf8_lossy(&set.stdout).contains(secret));
+            assert!(!String::from_utf8_lossy(&set.stderr).contains(secret));
+        }
+        let get = sai(root.path())
+            .args(["config", "get", key])
+            .output()
+            .unwrap();
+        assert_eq!(get.stdout, format!("{endpoint}\n").as_bytes());
+        assert!(get.status.success());
+    }
+}
+
+#[test]
+fn config_list_shows_idna_origin_for_internationalized_lcd() {
+    for (host, ascii_host) in [
+        ("bücher.example", "xn--bcher-kva.example"),
+        ("faß.example", "xn--fa-hia.example"),
+    ] {
+        let root = tempdir().unwrap();
+        let endpoint =
+            format!("https://{host}:8443/fixture-private-path?key=fixture-private-query");
+        let set = sai(root.path())
+            .args(["config", "set", "lcd.endpoint", &endpoint])
+            .output()
+            .unwrap();
+        assert!(set.status.success());
+        let expected = format!("https://{ascii_host}:8443");
+        let listed = sai(root.path())
+            .args(["--json", "config", "list"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            read_json(&listed)["settings"]["lcd.endpoint"]["value"],
+            expected
+        );
+        let get = sai(root.path())
+            .args(["config", "get", "lcd.endpoint"])
+            .output()
+            .unwrap();
+        assert_eq!(get.stdout, format!("{endpoint}\n").as_bytes());
+        assert!(get.status.success());
+    }
 }
 
 #[test]
@@ -209,21 +298,13 @@ fn command_logs_scrub_argv_and_record_exit_errors() {
     assert_eq!(events.len(), 2);
     assert_eq!(events[0]["event"], "command.start");
     assert_eq!(events[0]["command"], "config set");
-    assert_eq!(
-        events[0]["argv"][0],
-        "--endpoint=https://keeper.example:443"
-    );
+    assert_eq!(events[0]["argv"][0], "--endpoint=[redacted]");
     assert_eq!(events[1]["event"], "command.end");
     assert_eq!(events[1]["level"], "warn");
     assert_eq!(events[1]["exitCode"], 2);
     assert_eq!(events[1]["seq"], 2);
     assert_eq!(events[0]["runId"], events[1]["runId"]);
-    assert!(
-        events[1]["error"]
-            .as_str()
-            .unwrap()
-            .contains("Invalid value for logs.keep_days")
-    );
+    assert_eq!(events[1]["error"], "[redacted]");
 }
 
 #[cfg(unix)]
@@ -340,7 +421,7 @@ fn nested_cli_usage_stays_on_stderr() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
-    assert_eq!(output.stderr, b"Usage: sai config list [OPTIONS]\nTry 'sai config list --help' for help.\n\nError: Got unexpected extra arguments (extra second)\n");
+    assert_eq!(output.stderr, b"Usage: sai config list [OPTIONS]\nTry 'sai config list --help' for help.\n\nError: Got unexpected extra arguments.\n");
 }
 
 #[cfg(unix)]
@@ -393,7 +474,7 @@ fn undecodable_environment_values_keep_their_precedence() {
         .args(["config", "get", "keeper.endpoint"])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     assert_eq!(output.stderr, b"Error: SAI_ENDPOINT: Invalid value for keeper.endpoint: expected a URL starting with https:// or http://\n");
 
@@ -415,7 +496,7 @@ fn undecodable_environment_values_keep_their_precedence() {
     assert_eq!(result["settings"]["logs.enabled"]["source"], "invalid");
     assert_eq!(
         output.stderr,
-        b"SAI_LOG: Invalid value for logs.enabled: expected true, false, yes, no, on, off, 1, or 0; logging is off until it is fixed\n",
+        b"SAI_LOG: invalid value for logs.enabled; logging is off until it is fixed\n",
     );
     assert!(!root.path().join("logs").exists());
 }
@@ -429,26 +510,21 @@ fn invalid_environment_settings_never_echo_values_to_stderr() {
             "SAI_ENDPOINT",
             "keeper.endpoint",
             "a URL starting with https:// or http://",
-            1,
+            2,
         ),
         (
             "SAI_WS_ENDPOINT",
             "keeper.ws_endpoint",
             "a URL starting with wss:// or ws://",
-            1,
+            2,
         ),
         (
             "SAI_LCD_ENDPOINT",
             "lcd.endpoint",
             "a URL starting with https:// or http://",
-            1,
+            2,
         ),
-        (
-            "SAI_UPDATE_AUTO",
-            "update.auto",
-            "true, false, yes, no, on, off, 1, or 0",
-            1,
-        ),
+        ("SAI_UPDATE_AUTO", "update.auto", "true or false", 2),
         (
             "SAI_LOG",
             "logs.enabled",
@@ -528,13 +604,10 @@ fn repeating_the_key_reports_only_the_extra_operand() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         output.stderr,
-        b"Usage: sai config get [OPTIONS] KEY\nTry 'sai config get --help' for help.\n\nError: Got unexpected extra argument (logs.enabled)\n",
+        b"Usage: sai config get [OPTIONS] KEY\nTry 'sai config get --help' for help.\n\nError: Got unexpected extra arguments.\n",
     );
     let events = logs(root.path());
-    assert_eq!(
-        events[1]["error"],
-        "Got unexpected extra argument (logs.enabled)"
-    );
+    assert_eq!(events[1]["error"], "[redacted]");
 }
 
 #[test]
@@ -544,8 +617,7 @@ fn usage_errors_keep_json_at_every_supported_option_position() {
         ["--json", "intent", "status"],
         ["intent", "--json", "status"],
         ["intent", "status", "--json"],
-        ["auth", "--json", "use"],
-        ["auth", "use", "--json"],
+        ["--json", "auth", "use"],
     ] {
         let output = sai(home.path()).args(args).output().unwrap();
         assert_eq!(output.status.code(), Some(2));

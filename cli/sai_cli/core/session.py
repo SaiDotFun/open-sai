@@ -5,42 +5,100 @@ from __future__ import annotations
 import base64
 import json
 import shlex
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from . import log, storage
+from . import keeper, log, storage
 from .errors import Code, SessionError
 
 EXPIRY_WARNING = timedelta(days=3)
+INVALID_RENEWAL_ADDRESS = "Stored session address is invalid. Sign in again."
+
+
+def _redact_field(result: dict[str, str], value: str) -> str:
+    secrets = (result.get("token"), *log.known_tokens())
+    return (
+        log.REDACTED if any(secret and secret in value for secret in secrets) else value
+    )
+
+
+def _display_origin(result: dict[str, str], endpoint: str) -> str:
+    # Compare the stored value before parsing, which can change its spelling.
+    if _redact_field(result, endpoint) == log.REDACTED:
+        return log.REDACTED
+    return _redact_field(result, log.origin(endpoint))
 
 
 def expiry_time(result: dict[str, str]) -> datetime:
-    expiry = datetime.fromisoformat(result["expiresAt"])
-    if expiry.tzinfo is None:
-        raise ValueError("Stored session is invalid: expiry has no time zone")
+    try:
+        expiry = datetime.fromisoformat(result["expiresAt"])
+        if expiry.tzinfo is None:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise SessionError(storage.INVALID_EXPIRY) from None
     return expiry
 
 
-def renewal_command(result: dict[str, str]) -> str:
-    """Return recovery instructions scoped to the session's Keeper."""
-    endpoint = result.get("endpoint")
+def validate_issued_session(result: dict[str, str]) -> None:
+    """Reject a Keeper reply that the session store or expiry reader cannot use."""
+    try:
+        expiry_time(storage.check_session_fields(result))
+    except SessionError:
+        raise keeper.KeeperError("Keeper returned an invalid session expiry") from None
+    except ValueError:
+        raise keeper.KeeperError("Keeper returned invalid session data") from None
 
-    def command(*args: str) -> str:
-        if endpoint:
-            return storage.keeper_command_hint(endpoint, "auth", *args)
-        return shlex.join(["sai", "auth", *args])
 
-    origin = log.origin(endpoint) if endpoint else None
-    suffix = ""
-    if not endpoint or endpoint != origin:
-        where = f" at {origin}" if origin not in (None, log.REDACTED_URL) else ""
-        suffix = f" (reuse the Keeper endpoint{where} configured when this session was stored)"
+def renewal_fields(result: dict[str, str]) -> dict[str, str]:
+    """Return a shell command and any guidance needed to renew the session."""
+    addr = result["evmAddress"]
+    if not keeper.is_address(addr):
+        return {"renewalGuidance": INVALID_RENEWAL_ADDRESS}
     if result.get("keyName"):
-        return command("renew", result["evmAddress"]) + suffix
-    browser = command("import")
-    if result.get("source") == "imported":
-        return browser + suffix
-    return f"{command('login', 'NAME')} or {browser}{suffix}"
+        args = ("auth", "renew", addr)
+    else:
+        args = ("auth", "import", "--addr", addr)
+    endpoint = result.get("endpoint") or ""
+    origin = _display_origin(result, endpoint)
+    show_origin = origin not in (log.REDACTED, log.REDACTED_URL)
+    public_default = endpoint == keeper.MAINNET_HTTP and show_origin
+    command = (
+        shlex.join(("sai", "--endpoint", endpoint, *args))
+        if public_default
+        else storage.keeper_command_hint(
+            log.REDACTED if origin == log.REDACTED else endpoint, *args
+        )
+    )
+    guidance = []
+    if not public_default and (endpoint != origin or not show_origin):
+        where = f" at {origin}" if show_origin else ""
+        guidance.append(f"Reuse the Keeper endpoint{where} used to sign in.")
+    if not result.get("keyName") and result.get("source") != "imported":
+        guidance.append("You can also sign in again with your Foundry keystore.")
+    fields = {"renewalCommand": command}
+    if guidance:
+        fields["renewalGuidance"] = " ".join(guidance)
+    return {name: _redact_field(result, value) for name, value in fields.items()}
+
+
+def expiry_notice_text(fields: Mapping[str, str]) -> str:
+    command = fields.get("renewalCommand")
+    parts = (
+        fields["expiryWarning"],
+        fields.get("renewalGuidance"),
+        f"Run {command}" if command else None,
+    )
+    return " ".join(part for part in parts if part)
+
+
+def escape_warning_text(value: str) -> str:
+    return "".join(
+        ascii(c)[1:-1]
+        if ord(c) < 32 or 0x7F <= ord(c) <= 0x9F or c in "\u2028\u2029"
+        else c
+        for c in value
+    )
 
 
 def expiry_warning(result: dict[str, str], now: datetime) -> str | None:
@@ -55,7 +113,8 @@ def expiry_warning(result: dict[str, str], now: datetime) -> str | None:
         if minutes < 120
         else f"{minutes // 60} h"
     )
-    return f"Sai session for {result['evmAddress']} expires in {when}."
+    addr = escape_warning_text(_redact_field(result, result["evmAddress"]))
+    return _redact_field(result, f"Sai session for {addr} expires in {when}.")
 
 
 def load_active_session(endpoint: str, addr: str | None = None) -> dict[str, str]:
@@ -81,12 +140,7 @@ def check_active(result: dict[str, str], endpoint: str) -> dict[str, str]:
     """Return RESULT if it belongs to ENDPOINT and has not expired."""
     if result.get("endpoint") != endpoint:
         raise SessionError("Stored session belongs to another Keeper endpoint")
-    try:
-        expiry = expiry_time(result)
-    except (KeyError, ValueError) as exc:
-        raise SessionError(
-            f"Stored session has an invalid expiry; {storage.SIGN_IN_AGAIN}"
-        ) from exc
+    expiry = expiry_time(result)
     if expiry <= datetime.now(UTC):
         log.event(
             "session.expired",
@@ -95,15 +149,21 @@ def check_active(result: dict[str, str], endpoint: str) -> dict[str, str]:
             addr=result.get("evmAddress"),
             expiresAt=result["expiresAt"],
         )
-        raise SessionError(
-            "Trading session expired; sign in again",
-            Code.SESSION_EXPIRED,
-            hint=renewal_command(result)
-            if result.get("keyName") or result.get("source") == "imported"
-            else storage.keeper_command_hint(
+        if not keeper.is_address(result["evmAddress"]):
+            error = SessionError(INVALID_RENEWAL_ADDRESS, Code.SESSION_EXPIRED)
+            error.hint = None
+            raise error
+        message = "Trading session expired; sign in again"
+        if result.get("keyName") or result.get("source") == "imported":
+            fields = renewal_fields(result)
+            if guidance := fields.get("renewalGuidance"):
+                message += f". {guidance}"
+            hint = fields["renewalCommand"]
+        else:
+            hint = storage.keeper_command_hint(
                 endpoint, "auth", "login", "NAME", "--addr", result["evmAddress"]
-            ),
-        )
+            )
+        raise SessionError(message, Code.SESSION_EXPIRED, hint=hint)
     return result
 
 
@@ -142,13 +202,33 @@ def import_session(token: str, endpoint: str) -> dict[str, str]:
     }
 
 
-def summary(result: dict[str, str]) -> dict[str, str | None]:
+def session_address(result: dict[str, str], account_key: str) -> str:
+    addr = result["evmAddress"]
+    if not keeper.is_address(addr) or addr.lower() != account_key:
+        raise SessionError(
+            f"Stored session has an invalid address; {storage.SIGN_IN_AGAIN}"
+        )
+    return addr
+
+
+def summary(
+    result: dict[str, str], *, account_key: str | None = None
+) -> dict[str, str | None]:
     """Return the address, expiry, and Keeper origin for display."""
     endpoint = result.get("endpoint")
+    if endpoint is not None and not isinstance(endpoint, str):
+        raise SessionError(
+            f"Stored session has an invalid endpoint; {storage.SIGN_IN_AGAIN}"
+        )
+    addr = (
+        result["evmAddress"]
+        if account_key is None
+        else session_address(result, account_key)
+    )
     return {
-        "addr": result["evmAddress"],
-        "expiresAt": result["expiresAt"],
-        "endpoint": log.origin(endpoint) if endpoint is not None else None,
+        "addr": _redact_field(result, addr),
+        "expiresAt": _redact_field(result, result["expiresAt"]),
+        "endpoint": _display_origin(result, endpoint) if endpoint is not None else None,
     }
 
 
@@ -159,4 +239,4 @@ def expiry_fields(
     warning = expiry_warning(result, now or datetime.now(UTC))
     if warning is None:
         return {}
-    return {"expiryWarning": warning, "renewalCommand": renewal_command(result)}
+    return {"expiryWarning": warning, **renewal_fields(result)}

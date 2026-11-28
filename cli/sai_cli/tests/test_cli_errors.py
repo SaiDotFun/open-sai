@@ -61,6 +61,65 @@ def test_command_failures_use_one_json_envelope(args, exit_code, code):
     assert result.stderr == ""
 
 
+@pytest.mark.parametrize(
+    ("command", "defaults", "field"),
+    [
+        *(
+            (
+                "open",
+                {
+                    "--market": "3",
+                    "--side": "long",
+                    "--type": "limit",
+                    "--amount": "20",
+                    "--leverage": "2",
+                    "--slippage": "1",
+                    "--price": "100",
+                },
+                field,
+            )
+            for field in (
+                "--market",
+                "--amount",
+                "--leverage",
+                "--slippage",
+                "--price",
+                "--take-profit",
+                "--stop-loss",
+            )
+        ),
+        ("close", {"trade_id": "7"}, "trade_id"),
+        ("tpsl", {"trade_id": "7", "--take-profit": "110"}, "trade_id"),
+        ("tpsl", {"trade_id": "7"}, "--take-profit"),
+        ("tpsl", {"trade_id": "7"}, "--stop-loss"),
+        ("leverage", {"trade_id": "7", "--leverage": "5"}, "trade_id"),
+        ("leverage", {"trade_id": "7"}, "--leverage"),
+        (
+            "margin",
+            {"trade_id": "7", "--direction": "add", "--amount": "1"},
+            "trade_id",
+        ),
+        ("margin", {"trade_id": "7", "--direction": "add"}, "--amount"),
+        ("partial-close", {"trade_id": "7", "--percent": "50"}, "trade_id"),
+        ("partial-close", {"trade_id": "7"}, "--percent"),
+    ],
+)
+@pytest.mark.parametrize("malformed", ["3٣", "bad", "3_0", " 7 ", "+7"])
+def test_trade_rejects_malformed_numbers_as_usage_errors(
+    command, defaults, field, malformed
+):
+    if field == "--market" and malformed == "bad":
+        # Alphabetic market symbols now resolve through Keeper.
+        malformed = "?"
+    args = ["--json", "trade", command, "--dry-run"]
+    for key, value in {**defaults, field: malformed}.items():
+        args.extend([key, value] if key.startswith("--") else [value])
+    result = CliRunner().invoke(main, args)
+    error = assert_error(result, 2, "INVALID_REQUEST")
+    assert field in error["message"].lower()
+    assert result.stderr == ""
+
+
 def test_root_json_flag_is_detected_when_earlier_option_fails():
     result = CliRunner().invoke(main, ["--bad-option", "--json", "market", "list"])
     assert_error(result, 2, "INVALID_REQUEST")
@@ -120,9 +179,7 @@ def test_success_and_sign_in_exit_codes():
     args = ["--json", "--endpoint", keeper.MAINNET_HTTP]
     signed_out = runner.invoke(main, [*args, "trade", "close", "7"])
     hint = assert_error(signed_out, 6, "SIGNED_OUT")["hint"]
-    assert hint.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
-    assert hint.endswith("auth login NAME")
-    assert keeper.MAINNET_HTTP not in signed_out.output
+    assert hint == f"sai --endpoint {keeper.MAINNET_HTTP} auth login NAME"
     listed = runner.invoke(main, [*args, "auth", "list"])
     assert listed.exit_code == 0 and json.loads(listed.stdout) == {"accounts": []}
     storage.save_session(

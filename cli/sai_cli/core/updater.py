@@ -1,17 +1,17 @@
 """Install a sai-cli release over this install, verify it, and roll back.
 
 `sai update` downloads the release wheel and its SHA256SUMS, checks the hash,
-installs the wheel with `uv tool install --force`, and then runs the new
-`sai --version` and imports the package. A failure at any step leaves or
+installs the wheel inside the existing uv tool environment, and then runs
+the new `sai --version` and imports the package. A failure at any step leaves or
 restores the previous version. Only an official uv tool install is changed.
 
 Interactive commands call `tick`, which prints at most one notice per state
 change and starts a detached `sai update --background` at most once a day.
 
-Two locks keep this safe. The tool lock sits beside the uv tool environment
-and covers a whole install, verify, and rollback, so every SAI_HOME that
-shares the tool takes the same one. The state lock is `$SAI_HOME/update.lock`
-and covers each read-modify-write of that profile's `update.json`.
+The tool lock covers installation and rollback for one uv environment.
+The public install lock sits beside the launcher and coordinates all Sai
+installers using that path. The state lock covers each read-modify-write of
+a profile's `update.json`.
 
 What this protects against is a bad release, a failed network, two commands
 racing, and mistakes such as uv pointed at another directory. It does not
@@ -26,17 +26,24 @@ may be imported after the install starts.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
+import ipaddress
 import json
 import os
+import re
+import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import tomllib
+import zipfile
+import zlib
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -45,7 +52,7 @@ from typing import Any
 import httpx
 
 from .. import mcp_install
-from . import log, paths, update
+from . import log, native_bridge, paths, update
 from .errors import ExitCode
 
 EXIT_OK = ExitCode.OK
@@ -54,7 +61,13 @@ EXIT_FAILED = ExitCode.ERROR
 EXIT_UNSUPPORTED = ExitCode.UNSUPPORTED
 
 MAX_WHEEL = 64 << 20
+MAX_PYTHON_BUNDLE = 128 << 20
 MAX_SUMS = 1 << 16
+DOWNLOAD_HOSTS = {
+    "github.com",
+    "release-assets.githubusercontent.com",
+    "objects.githubusercontent.com",
+}
 DOWNLOAD_TIMEOUT = 120.0
 UV_TIMEOUT = 600.0
 VERIFY_TIMEOUT = 60.0
@@ -68,6 +81,10 @@ CHECK_INTERVAL = 24 * 60 * 60
 # this long instead of a day later.
 RETRY_INTERVAL = 15 * 60
 TOOL_LOCK_NAME = ".sai-cli-update.lock"
+INSTALL_LOCK_NAME = ".sai-update.lock"
+NATIVE_PENDING = ".sai-cli-native-pending.json"
+NATIVE_WHEELS = ".sai-cli-native-wheels"
+NATIVE_RECOVERY = ".sai-cli-recover"
 # A copy of the tool's environment, kept beside it while an update that has
 # no verified wheel to go back to replaces it.
 SNAPSHOT_PREFIX = ".sai-cli-rollback-"
@@ -95,6 +112,10 @@ Runner = Callable[[Sequence[str], float], tuple[int, str]]
 
 class UpdateFailed(Exception):
     """A step of the update failed; the message says which."""
+
+
+class WindowsShim(UpdateFailed):
+    """The release only supplied a native shim for this Windows download."""
 
 
 # State and locks
@@ -177,13 +198,26 @@ def _try_lock(fd: int) -> bool:
 
 
 @contextlib.contextmanager
-def locked(path: Path | None = None, wait: float = 0.0) -> Generator[bool]:
+def locked(
+    path: Path | None = None, wait: float = 0.0, *, private_file: bool = False
+) -> Generator[bool]:
     """Hold the lock file at PATH (default: the state lock). Yields False
     when another process still holds it after WAIT seconds."""
     path = path or state_lock_path()
     update.prepare_parent(path)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    flags = os.O_RDWR | os.O_CREAT
+    if private_file and os.name != "nt":
+        flags |= os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = os.open(path, flags, 0o600)
     try:
+        if private_file and os.name != "nt":
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_mode & 0o077
+            ):
+                raise PermissionError(f"{path} must be a private lock file")
         deadline = time.monotonic() + wait
         held = _try_lock(fd)
         while not held and time.monotonic() < deadline:
@@ -198,39 +232,88 @@ def locked(path: Path | None = None, wait: float = 0.0) -> Generator[bool]:
 # Download and verify
 
 
+def _loopback(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
+
+
+def _release_host(url: httpx.URL) -> bool:
+    return (
+        url.scheme == "https"
+        and url.host in DOWNLOAD_HOSTS
+        and url.port in (None, 443)
+        and not url.userinfo
+    )
+
+
 def _download(
     client: httpx.Client, url: str, target: Path, limit: int, deadline: float
 ) -> None:
-    name = url.rsplit("/", 1)[-1]
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise UpdateFailed(f"timed out downloading {name}")
-    timeout = httpx.Timeout(min(remaining, 30.0))
-    size = 0
-    with client.stream("GET", url, timeout=timeout) as response:
-        if response.status_code == 404:
-            raise UpdateFailed(f"the release has no file {name}")
-        if response.status_code != 200:
-            raise UpdateFailed(
-                f"downloading {name} answered HTTP {response.status_code}"
-            )
-        with target.open("wb") as handle:
-            for chunk in response.iter_bytes():
-                size += len(chunk)
-                if size > limit:
-                    raise UpdateFailed(f"{name} is larger than expected")
-                if time.monotonic() > deadline:
-                    raise UpdateFailed(f"timed out downloading {name}")
-                handle.write(chunk)
+    origin = address = httpx.URL(url)
+    name = target.name
+    official = origin.host == "github.com" and _release_host(origin)
+    if not official and (
+        origin.scheme not in ("http", "https")
+        or origin.userinfo
+        or not _loopback(origin.host)
+    ):
+        raise UpdateFailed("release downloads require official or loopback URLs")
+    for _ in range(5):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise UpdateFailed(f"timed out downloading {name}")
+        timeout = httpx.Timeout(min(remaining, 30.0))
+        with client.stream("GET", address, timeout=timeout) as response:
+            if response.has_redirect_location:
+                address = address.join(response.headers["location"])
+                valid = (
+                    _release_host(address)
+                    if official
+                    else (
+                        address.scheme == origin.scheme
+                        and address.netloc == origin.netloc
+                        and not address.userinfo
+                    )
+                )
+                if not valid:
+                    raise UpdateFailed(
+                        "the release redirected outside its download hosts"
+                    )
+                continue
+            if response.status_code == 404:
+                raise UpdateFailed(f"the release has no file {name}")
+            if response.status_code != 200:
+                raise UpdateFailed(
+                    f"downloading {name} answered HTTP {response.status_code}"
+                )
+            size = 0
+            with target.open("wb") as handle:
+                for chunk in response.iter_bytes():
+                    size += len(chunk)
+                    if size > limit:
+                        raise UpdateFailed(f"{name} is larger than expected")
+                    if time.monotonic() > deadline:
+                        raise UpdateFailed(f"timed out downloading {name}")
+                    handle.write(chunk)
+            return
+    raise UpdateFailed("the release redirected too many times")
 
 
 def expected_hash(sums: str, name: str) -> str | None:
     """Return the SHA-256 that SHA256SUMS text lists for file NAME."""
-    for line in sums.splitlines():
-        digest, _, listed = line.strip().partition(" ")
-        if listed.strip().removeprefix("*") == name and len(digest) == 64:
-            return digest.lower()
-    return None
+    matches = [
+        fields[0].lower()
+        for line in sums.splitlines()
+        if len(fields := line.split(maxsplit=1)) == 2
+        and fields[1].removeprefix("*") == name
+    ]
+    return (
+        matches[0]
+        if len(matches) == 1 and re.fullmatch(r"[0-9a-f]{64}", matches[0])
+        else None
+    )
 
 
 def sha256(path: Path) -> str:
@@ -242,10 +325,15 @@ def sha256(path: Path) -> str:
 
 
 def fetch_wheel(
-    release: update.Release, directory: Path, timeout: float = DOWNLOAD_TIMEOUT
+    release: update.Release,
+    directory: Path,
+    timeout: float = DOWNLOAD_TIMEOUT,
+    *,
+    recorded_digest: str | None = None,
 ) -> tuple[Path, str]:
     """Download RELEASE's wheel and SHA256SUMS into DIRECTORY and return the
     wheel and its SHA-256, or raise UpdateFailed when the hash differs.
+    A rollback with a release record requires the original wheel digest.
 
     TIMEOUT is wall-clock time for both transfers, with their redirects and
     response headers. HTTPX timeouts apply per network operation, so the
@@ -254,15 +342,37 @@ def fetch_wheel(
     """
     name = update.wheel_name(release.version)
     wheel, sums = directory / name, directory / "SHA256SUMS"
+    bundle = directory / update.full_python_bundle_name(release.version)
+    asset = wheel
     deadline = time.monotonic() + timeout
     outcome: dict[str, Exception] = {}
 
     def work() -> None:
+        nonlocal asset
         try:
             headers = {"User-Agent": "sai-cli"}
-            with httpx.Client(headers=headers, follow_redirects=True) as client:
+            with httpx.Client(headers=headers) as client:
                 _download(client, release.sums_url, sums, MAX_SUMS, deadline)
-                _download(client, release.wheel_url, wheel, MAX_WHEEL, deadline)
+                manifest = sums.read_text(errors="replace")
+                if recorded_digest is None:
+                    prefer_bundle = os.name == "nt"
+                else:
+                    prefer_bundle = expected_hash(manifest, name) != recorded_digest
+                if prefer_bundle and expected_hash(manifest, bundle.name) is not None:
+                    asset = bundle
+                    _download(
+                        client,
+                        release.full_python_url,
+                        bundle,
+                        MAX_PYTHON_BUNDLE,
+                        deadline,
+                    )
+                else:
+                    if prefer_bundle and recorded_digest is not None:
+                        raise UpdateFailed(
+                            f"{name} has no matching recorded rollback wheel"
+                        )
+                    _download(client, release.wheel_url, wheel, MAX_WHEEL, deadline)
         except Exception as exc:  # noqa: BLE001 - re-raised in the caller
             outcome["error"] = exc
 
@@ -278,13 +388,46 @@ def fetch_wheel(
         raise UpdateFailed(f"download failed: {type(error).__name__}") from error
     if error is not None:
         raise error
-    expected = expected_hash(sums.read_text(errors="replace"), name)
+    expected = expected_hash(sums.read_text(errors="replace"), asset.name)
     if expected is None:
-        raise UpdateFailed(f"SHA256SUMS does not list {name}")
-    actual = sha256(wheel)
+        raise UpdateFailed(f"SHA256SUMS does not list {asset.name}")
+    actual = sha256(asset)
     if actual != expected:
-        raise UpdateFailed(f"{name} does not match its SHA256SUMS entry")
+        raise UpdateFailed(f"{asset.name} does not match its SHA256SUMS entry")
+    if asset == bundle:
+        unpack_python_wheel(bundle, wheel)
+        actual = sha256(wheel)
+    if recorded_digest is not None and actual != recorded_digest:
+        raise UpdateFailed(f"{name} does not match the recorded rollback wheel")
+    if os.name == "nt":
+        try:
+            if native_bridge.is_shim(wheel):
+                raise WindowsShim(
+                    f"Sai {release.version} has no full Python wheel for Windows"
+                )
+        except zipfile.BadZipFile:
+            # Preserve uv's trial-install diagnostic for a malformed wheel.
+            pass
     return wheel, actual
+
+
+def unpack_python_wheel(bundle: Path, wheel: Path) -> None:
+    # Keep in step with the standalone installer. Copy only the fixed wheel entry.
+    try:
+        with zipfile.ZipFile(bundle) as archive:
+            members = [
+                entry for entry in archive.infolist() if entry.filename == wheel.name
+            ]
+            if len(members) != 1 or members[0].file_size > MAX_WHEEL:
+                raise UpdateFailed(
+                    f"{bundle.name} must contain one bounded {wheel.name}"
+                )
+            with archive.open(members[0]) as source, wheel.open("xb") as output:
+                shutil.copyfileobj(source, output)
+    except (zipfile.BadZipFile, EOFError, RuntimeError, zlib.error) as error:
+        raise UpdateFailed(
+            f"could not read the full Python wheel from {bundle.name}"
+        ) from error
 
 
 # Install, verify, roll back
@@ -359,29 +502,26 @@ def _same(left: Path, right: Path) -> bool:
 
 
 def launcher_owner_error(prefix: Path, launcher: Path) -> str | None:
-    """Return why LAUNCHER does not run the install at PREFIX, or None.
-
-    uv links the executable directory's `sai` to the one inside the tool's
-    environment. Two tool directories can share an executable directory, and
-    then the last install owns `sai` while the other's receipt still names
-    it. Updating that other install would take the launcher over.
-    """
+    """Check uv's POSIX link or Windows copy against its tool executable."""
     inside = _executables(prefix)[0]
+    target = launcher
     try:
-        if launcher.is_symlink() or os.name != "nt":
+        info = launcher.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            target = launcher.parent / launcher.readlink()
             if launcher.resolve(strict=True) == inside.resolve(strict=True):
                 return None
-            # Not a link to this environment: a copied script names the
-            # environment's interpreter in its first line.
-            with launcher.open("rb") as handle:
-                head = handle.read(4096)
-            if os.fsencode(str(prefix.resolve())) in head:
-                return None
-            return f"{launcher} runs another install, not the one at {prefix}"
-    except OSError:
-        return f"{launcher} is missing or unreadable"
-    # Windows copies a launcher executable; its owner cannot be read here.
-    return None
+        # uv copies the executable on Windows. Require the same bytes.
+        elif (
+            os.name == "nt"
+            and stat.S_ISREG(info.st_mode)
+            and info.st_size == inside.stat().st_size
+            and launcher.read_bytes() == inside.read_bytes()
+        ):
+            return None
+    except (OSError, RuntimeError):
+        return f"{launcher} is missing or unreadable. Expected the uv executable at {inside}"
+    return f"{launcher} runs another install at {target}. Expected the uv executable at {inside}"
 
 
 def destination_error(
@@ -412,21 +552,47 @@ def destination_error(
 
 
 def check_runs(
-    sai: Path, python: Path, version: str, imports: Sequence[str], runner: Runner
+    sai: Path,
+    python: Path,
+    version: str,
+    imports: Sequence[str],
+    runner: Runner,
+    *,
+    native: bool = False,
 ) -> str | None:
     """Return why SAI does not print VERSION or PYTHON cannot import the
     package, or None. Python runs isolated (`-I`), so it imports from its own
     environment and never from a working directory or PYTHONPATH."""
-    code, output = runner([str(sai), "--version"], VERIFY_TIMEOUT)
-    if code != 0:
-        return f"`sai --version` failed: {_last_line(output)}"
-    if not output.strip().endswith(f" {version}"):
-        return f"`sai --version` printed {_last_line(output)!r}, not {version}"
+    if native:
+        with tempfile.TemporaryDirectory(prefix="sai-bridge-profile-") as home:
+            problem = native_bridge.smoke(sai, version, Path(home), VERIFY_TIMEOUT)
+        if problem is not None:
+            return problem
+    else:
+        code, output = runner([str(sai), "--version"], VERIFY_TIMEOUT)
+        if code != 0:
+            return f"`sai --version` failed: {_last_line(output)}"
+        if not output.strip().endswith(f" {version}"):
+            return f"`sai --version` printed {_last_line(output)!r}, not {version}"
     statement = "import " + ", ".join(imports)
     code, output = runner([str(python), "-I", "-c", statement], VERIFY_TIMEOUT)
     if code != 0:
         return f"the package does not import: {_last_line(output)}"
     return None
+
+
+def launcher_change_error(
+    prefix: Path, launcher: Path, expected: os.stat_result
+) -> str | None:
+    try:
+        if os.path.samestat(launcher.lstat(), expected):
+            return launcher_owner_error(prefix, launcher)
+        actual = (
+            launcher.parent / launcher.readlink() if launcher.is_symlink() else launcher
+        )
+    except OSError:
+        actual = launcher
+    return f"the launcher changed at {launcher}; found {actual}, expected {_executables(prefix)[0]}"
 
 
 def verify(
@@ -435,20 +601,36 @@ def verify(
     version: str,
     imports: Sequence[str],
     runner: Runner,
+    *,
+    native: bool = False,
 ) -> str | None:
-    """Return why the install at PREFIX is not a working VERSION, or None.
-
-    It runs LAUNCHER, the registered `sai` that clients use, after checking
-    that it still runs this install.
-    """
+    """Check ownership, run the executable inside PREFIX, and recheck identity."""
     owner = launcher_owner_error(prefix, launcher)
     if owner is not None:
         return owner
-    return check_runs(launcher, _executables(prefix)[1], version, imports, runner)
+    binary, python = _executables(prefix)
+    try:
+        entry = launcher.lstat()
+        executable = binary.stat()
+        error = check_runs(binary, python, version, imports, runner, native=native)
+        if error is not None:
+            return error
+        if not os.path.samestat(binary.stat(), executable):
+            return f"the executable changed at {binary}"
+        return launcher_change_error(prefix, launcher, entry)
+    except OSError as error:
+        return f"could not verify the launcher at {launcher}: {type(error).__name__}"
 
 
 def preverify(
-    spec: str, version: str, prefix: Path, uv: str, options: Options
+    spec: str,
+    version: str,
+    prefix: Path,
+    uv: str,
+    options: Options,
+    *,
+    native: bool = False,
+    offline: bool = False,
 ) -> str | None:
     """Install SPEC into a throwaway environment and return why it is not a
     working VERSION, or None.
@@ -462,21 +644,44 @@ def preverify(
         environment = Path(os.path.abspath(temp)) / "venv"
         sai, python = _executables(environment)
         base = str(_executables(prefix)[1])
+        install = [uv, "pip", "install"]
+        if offline:
+            install.append("--offline")
         steps = (
             [uv, "venv", "--python", base, str(environment)],
-            [uv, "pip", "install", "--python", str(python), spec],
+            [*install, "--python", str(python), spec],
         )
         for step in steps:
             code, output = runner(step, UV_TIMEOUT)
             if code != 0:
                 return f"uv {step[1]} failed: {_last_line(output)}"
-        return check_runs(sai, python, version, options.imports, runner)
+        failure = check_runs(
+            sai, python, version, options.imports, runner, native=native
+        )
+        if failure is None and native:
+            # The new shim must be able to launch the recovery command if uv
+            # is interrupted before we can start the installed-path probes.
+            failure = native_bridge.keep_recovery(
+                python,
+                version,
+                update.sai_home(),
+                prefix.parent / NATIVE_RECOVERY,
+                VERIFY_TIMEOUT,
+            )
+        return failure
 
 
-def install_spec(uv: str, spec: str, runner: Runner) -> str | None:
-    """Run `uv tool install --force SPEC`; return the error, or None."""
-    code, output = runner([uv, "tool", "install", "--force", spec], UV_TIMEOUT)
-    return None if code == 0 else f"uv tool install failed: {_last_line(output)}"
+def install_spec(
+    uv: str, spec: str, prefix: Path, runner: Runner, *, offline: bool = False
+) -> str | None:
+    """Update the tool environment while uv's public entry stays in place."""
+    args = [uv, "pip", "install", "--reinstall-package", "sai-cli"]
+    if offline:
+        args.append("--offline")
+    code, output = runner(
+        [*args, "--python", str(_executables(prefix)[1]), spec], UV_TIMEOUT
+    )
+    return None if code == 0 else f"uv pip install failed: {_last_line(output)}"
 
 
 def write_record(prefix: Path, tag: str, digest: str, wheel: Path) -> None:
@@ -573,6 +778,7 @@ class Outcome:
                 "status": check.status,
                 "changes": list(check.changes),
                 **({"pinned": True} if check.pinned else {}),
+                **({"disabled": True} if check.disabled else {}),
                 **(
                     {
                         "manualRepairs": [
@@ -580,6 +786,41 @@ class Outcome:
                                 "scope": repair.scope,
                                 "name": repair.name,
                                 **({"resetArgs": True} if repair.reset_args else {}),
+                                **(
+                                    {"replaceEntry": True}
+                                    if repair.replace_entry
+                                    else {}
+                                ),
+                                **(
+                                    {"saiHome": repair.sai_home}
+                                    if repair.sai_home is not None
+                                    else {}
+                                ),
+                                **(
+                                    {"configPath": str(repair.config_path)}
+                                    if repair.config_path is not None
+                                    else {}
+                                ),
+                                **(
+                                    {"fields": list(repair.fields)}
+                                    if repair.fields
+                                    else {}
+                                ),
+                                **(
+                                    {"launcher": repair.launcher}
+                                    if repair.launcher is not None
+                                    else {}
+                                ),
+                                **(
+                                    {"serverArgs": list(repair.server_args)}
+                                    if repair.server_args is not None
+                                    else {}
+                                ),
+                                **(
+                                    {"extraEnv": repair.extra_env}
+                                    if repair.extra_env
+                                    else {}
+                                ),
                             }
                             for repair in check.manual_repairs
                         ],
@@ -656,7 +897,7 @@ def _resolve(options: Options) -> update.Release | None:
     no release yet."""
     if options.to is not None:
         if update.parse_version(options.to) is None:
-            raise UpdateFailed(f"{options.to!r} is not a version like 0.2.0")
+            raise UpdateFailed(f"{options.to!r} is not a version like X.Y.Z")
         return update.release_for(update.tag_for(options.to), options.web_base)
     try:
         release = update.fetch_latest(
@@ -703,14 +944,22 @@ class Rollback:
 
 
 def _download_to_cache(
-    release: update.Release, options: Options
+    release: update.Release,
+    options: Options,
+    *,
+    recorded_digest: str | None = None,
 ) -> tuple[Path, str, bool]:
     """Download and verify RELEASE's wheel in a private directory, then keep
     it in the wheel cache. Return its absolute path, its SHA-256, and
     whether the cache had no such file before."""
     cache = private_cache()
     with tempfile.TemporaryDirectory(dir=cache, prefix=".download-") as temp:
-        wheel, digest = fetch_wheel(release, Path(temp), options.download_timeout)
+        wheel, digest = fetch_wheel(
+            release,
+            Path(temp),
+            options.download_timeout,
+            recorded_digest=recorded_digest,
+        )
         kept = cache / wheel.name
         created = not kept.exists()
         os.replace(wheel, kept)
@@ -740,36 +989,65 @@ def snapshot_environment(prefix: Path) -> Path | None:
     return target
 
 
+def rollback_launcher_error(prefix: Path, launcher: Path) -> str | None:
+    """Recovery can publish in a vacant slot or keep uv's existing link."""
+    if not os.path.lexists(launcher):
+        return None
+    if os.name == "nt":
+        return launcher_owner_error(prefix, launcher)
+    inside = _executables(prefix)[0]
+    try:
+        target = launcher.parent / launcher.readlink()
+    except OSError:
+        return f"{launcher} is occupied. Expected a uv launcher for {inside}"
+    # uv may have removed its environment. Check the link even when dangling.
+    if not _same(target, inside):
+        return f"{launcher} points to {target}. Expected the uv executable at {inside}"
+    return None
+
+
 def swap_back(prefix: Path, snapshot: Path, launcher: Path) -> str | None:
     """Put the copied environment SNAPSHOT back at PREFIX and make LAUNCHER
     run it again. Return the error, or None."""
     broken = prefix.parent / f"{BROKEN_PREFIX}{os.getpid()}"
     try:
+        if error := rollback_launcher_error(prefix, launcher):
+            return error
         shutil.rmtree(broken, ignore_errors=True)
         if prefix.exists():
             os.rename(prefix, broken)
         os.rename(snapshot, prefix)
         shutil.rmtree(broken, ignore_errors=True)
-        if os.name != "nt" and launcher_owner_error(prefix, launcher) is not None:
-            launcher.unlink(missing_ok=True)
-            launcher.symlink_to(_executables(prefix)[0])
+        if os.name != "nt" and not os.path.lexists(launcher):
+            try:
+                launcher.symlink_to(_executables(prefix)[0])
+            except FileExistsError:
+                return rollback_launcher_error(prefix, launcher)
+        return rollback_launcher_error(prefix, launcher)
     except OSError as exc:
         return f"could not put the previous environment back: {type(exc).__name__}"
-    return None
+
+
+def bridge_wheel_path(tools: Path, version: str, digest: str) -> Path:
+    return tools / NATIVE_WHEELS / digest / update.wheel_name(version)
 
 
 def rollback_wheel(current: Current, options: Options) -> tuple[str, str, Path] | None:
-    """A verified wheel of CURRENT's version for a release install, or None:
-    the kept one, while it lies in the private cache and its bytes still
-    hash to what the release record says, or else the current release
-    downloaded and checked against its SHA256SUMS now."""
+    """Use the verified wheel kept by the updater or offline recovery.
+    Download the current release's wheel if neither cache has it."""
     record, install = current.record, current.install
     if record is not None and record.wheel:
         kept = Path(record.wheel)
         try:
+            recovery_wheel = bridge_wheel_path(
+                current.prefix.parent.resolve(), record.version, record.sha256
+            )
+            if kept == recovery_wheel:
+                in_cache = kept.resolve(strict=True) == kept
+            else:
+                in_cache = kept.is_absolute() and kept.parent == private_cache()
             intact = (
-                kept.is_absolute()
-                and kept.parent == private_cache()
+                in_cache
                 and kept.is_file()
                 and not kept.is_symlink()
                 and sha256(kept) == record.sha256
@@ -783,7 +1061,11 @@ def rollback_wheel(current: Current, options: Options) -> tuple[str, str, Path] 
     tag = update.tag_for(current.version)
     try:
         release = update.release_for(tag, options.web_base)
-        wheel, digest, _ = _download_to_cache(release, options)
+        wheel, digest, _ = _download_to_cache(
+            release,
+            options,
+            recorded_digest=record.sha256 if record is not None else None,
+        )
     except (UpdateFailed, OSError):
         return None
     return tag, digest, wheel
@@ -806,12 +1088,127 @@ def prepare_rollback(current: Current, options: Options) -> Rollback | None:
     return Rollback(snapshot, wheel)
 
 
+def sync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    except OSError as error:
+        if sys.platform != "darwin" or error.errno != errno.EINVAL:
+            raise
+    finally:
+        os.close(fd)
+
+
+def publish_bridge_wheel(
+    tools: Path, wheel: tuple[str, str, Path]
+) -> tuple[Path, dict[str, str]]:
+    tag, digest, source = wheel
+    version = update.tag_version(tag)
+    cache = tools / NATIVE_WHEELS
+    destination = bridge_wheel_path(tools, version, digest)
+    for directory in (cache, destination.parent):
+        paths.private_directory(directory)
+        if directory.resolve() != directory:
+            raise UpdateFailed("the native recovery wheel directory changed")
+        sync_directory(directory.parent)
+    fd, tmp = tempfile.mkstemp(dir=destination.parent)
+    try:
+        with os.fdopen(fd, "wb") as output, source.open("rb") as input_file:
+            shutil.copyfileobj(input_file, output)
+            output.flush()
+            os.fsync(output.fileno())
+        if sha256(Path(tmp)) != digest:
+            raise UpdateFailed("the bridge wheel changed after verification")
+        with contextlib.suppress(FileExistsError):
+            os.link(tmp, destination)
+        if (
+            destination.resolve(strict=True) != destination
+            or sha256(destination) != digest
+        ):
+            raise UpdateFailed("the native recovery wheel does not match its digest")
+        sync_directory(destination.parent)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+    return destination, {"version": version, "digest": digest}
+
+
+def record_bridge(
+    current: Current, previous: tuple[str, str, Path], candidate: tuple[str, str, Path]
+) -> tuple[Path, Path]:
+    """Write the same tool-local rollback record used by the Rust updater."""
+    tools = current.prefix.parent.resolve(strict=True)
+    python = _executables(current.prefix)[1].resolve(strict=True)
+    if python.is_relative_to(current.prefix.resolve()):
+        raise UpdateFailed(
+            "uv's base Python interpreter must be outside the tool environment"
+        )
+    original = update.installed_files_hash(current.prefix)
+    if original is None:
+        raise UpdateFailed("could not identify the current Python installation")
+    recovery = tools / NATIVE_RECOVERY
+    if recovery.resolve(strict=True) != recovery or not recovery.is_file():
+        raise UpdateFailed("the offline recovery binary is missing or changed")
+    rollback, old = publish_bridge_wheel(tools, previous)
+    path, new = publish_bridge_wheel(tools, candidate)
+    pending = tools / NATIVE_PENDING
+    update.write_json(
+        pending,
+        {
+            **old,
+            "next": new,
+            "launcher": str(current.launcher),
+            "python": str(python),
+            "original_record": original,
+            "recovery": str(recovery),
+        },
+    )
+    with pending.open("rb") as handle:
+        os.fsync(handle.fileno())
+    sync_directory(tools)
+    return rollback, path
+
+
+def clear_bridge_record(prefix: Path) -> None:
+    pending = prefix.parent / NATIVE_PENDING
+    pending.unlink()
+    (pending.parent / NATIVE_RECOVERY).unlink(missing_ok=True)
+    sync_directory(pending.parent)
+
+
+def finish_previous_bridge(current: Current) -> None:
+    """Clear an interrupted transaction only when Python is already restored."""
+    pending = current.prefix.parent / NATIVE_PENDING
+    try:
+        with pending.open("rb") as handle:
+            record = json.loads(handle.read(MAX_SUMS))
+    except FileNotFoundError:
+        return
+    except ValueError as error:
+        raise UpdateFailed("could not read the pending uv install record") from error
+    if not isinstance(record, dict) or (
+        record.get("version") != current.version
+        or record.get("launcher") != str(current.launcher)
+        or (
+            record.get("original_record") != update.installed_files_hash(current.prefix)
+            and (
+                current.record is None or current.record.sha256 != record.get("digest")
+            )
+        )
+    ):
+        raise UpdateFailed("an interrupted uv bridge requires `sai update --recover`")
+    clear_bridge_record(current.prefix)
+
+
 def restore(
-    current: Current, rollback: Rollback, options: Options, uv: str
+    current: Current,
+    rollback: Rollback,
+    options: Options,
+    uv: str,
+    *,
+    native: bool = False,
 ) -> str | None:
-    """Put CURRENT's version back from ROLLBACK and verify it. Return None
-    when it runs again, or the last error. The environment copy comes
-    first; the wheel is reinstalled only if that fails."""
+    """Restore and verify CURRENT. A shim handoff tries uv's offline wheel
+    reinstall first. Full Python updates prefer the environment copy."""
 
     def runs() -> str | None:
         return verify(
@@ -822,21 +1219,32 @@ def restore(
             options.runner,
         )
 
+    def reinstall(wheel: tuple[str, str, Path]) -> str | None:
+        error = (
+            wheel_error(wheel)
+            or rollback_launcher_error(current.prefix, current.launcher)
+            or install_spec(
+                uv, str(wheel[2]), current.prefix, options.runner, offline=native
+            )
+            or runs()
+        )
+        if error is None:
+            with contextlib.suppress(OSError):
+                write_record(current.prefix, *wheel)
+        return error
+
     error: str | None = "nothing to roll back to"
+    if native and rollback.wheel is not None:
+        error = reinstall(rollback.wheel)
+        if error is None:
+            return None
     if rollback.snapshot is not None:
         swapped = swap_back(current.prefix, rollback.snapshot, current.launcher)
         error = swapped or runs()
         if error is None:
             return None
-    if rollback.wheel is not None:
-        error = (
-            wheel_error(rollback.wheel)
-            or install_spec(uv, str(rollback.wheel[2]), options.runner)
-            or runs()
-        )
-        if error is None:
-            with contextlib.suppress(OSError):
-                write_record(current.prefix, *rollback.wheel)
+    if not native and rollback.wheel is not None:
+        error = reinstall(rollback.wheel)
     return error
 
 
@@ -870,12 +1278,16 @@ def _install(
     runner, imports = options.runner, options.imports
     wheel: tuple[str, str, Path] | None = None
     created = False
+    native = False
 
     def discard() -> None:
         """Remove the wheel this run downloaded and did not install."""
         if wheel is not None and created and target != installed:
             with contextlib.suppress(OSError):
                 wheel[2].unlink(missing_ok=True)
+        if native and not (prefix.parent / NATIVE_PENDING).exists():
+            with contextlib.suppress(OSError):
+                (prefix.parent / NATIVE_RECOVERY).unlink(missing_ok=True)
 
     def unchanged(reason: str) -> tuple[Outcome, bool]:
         discard()
@@ -884,19 +1296,60 @@ def _install(
         )
         return Outcome(FAILED, message, installed, target), False
 
+    def available() -> tuple[Outcome, bool]:
+        discard()
+        message = f"sai {target} is available. Run `sai update` to install it."
+        return Outcome(AVAILABLE, message, installed, target), False
+
+    def unsupported_shim() -> tuple[Outcome, bool]:
+        discard()
+        message = (
+            f"Sai {target} requires a native binary for a supported platform. "
+            f"Keep your full Python release `sai-cli=={installed}`."
+        )
+        return Outcome(UNSUPPORTED, message, installed, target), False
+
+    try:
+        expected_launcher = current.launcher.lstat()
+    except OSError as error:
+        return unchanged(
+            f"could not inspect {current.launcher}: {type(error).__name__}"
+        )
     if options.source:
         # The full ref: a branch named like the tag must not shadow it.
         spec = f"git+{options.git_url}@refs/tags/{release.tag}"
     else:
         try:
             kept, digest, created = _download_to_cache(release, options)
+        except WindowsShim:
+            return unsupported_shim()
         except (UpdateFailed, OSError) as exc:
             return unchanged(
                 str(exc) if isinstance(exc, UpdateFailed) else type(exc).__name__
             )
         spec, wheel = str(kept), (release.tag, digest, kept)
+        try:
+            native = native_bridge.is_shim(kept)
+        except zipfile.BadZipFile:
+            # Keep uv's existing trial-install diagnostic for invalid wheels.
+            pass
+        except OSError as error:
+            return unchanged(
+                f"could not inspect the release wheel: {type(error).__name__}"
+            )
+        if native and not native_bridge.supported():
+            return unsupported_shim()
+        if native and current.install.kind == update.UV_TOOL_GIT:
+            return unchanged(
+                "this uv Git install needs a verified full-Python bridge wheel first."
+                " Run `uv tool uninstall sai-cli`, then"
+                f" `{update.INSTALL_COMMAND} --version VERSION` with the published"
+                " full-Python bridge version. Then run `sai update`"
+            )
 
-    trial = wheel_error(wheel) or preverify(spec, target, prefix, uv, options)
+    trial = wheel_error(wheel) or preverify(
+        spec, target, prefix, uv, options, native=native
+    )
     if trial is not None:
         return unchanged(f"the release failed its trial install: {trial}")
     rollback = prepare_rollback(current, options)
@@ -905,34 +1358,94 @@ def _install(
             f"nothing to roll back to could be prepared: no copy of the"
             f" environment and no verified wheel of {installed}"
         )
+    retain_snapshot = False
+    pending_written = False
     try:
         if options.allowed is not None and not options.allowed():
             # Turned off while this run downloaded and tested the release.
-            discard()
-            message = f"sai {target} is available. Run `sai update` to install it."
-            return Outcome(AVAILABLE, message, installed, target), False
+            return available()
 
-        def failed(reason: str) -> Outcome:
+        def failed(reason: str) -> tuple[Outcome, bool]:
             """Report REASON after making sure the previous version runs."""
-            if verify(prefix, current.launcher, installed, imports, runner) is None:
+            was_replaced = native and update.installed_version(prefix) != installed
+            if (
+                not was_replaced
+                and verify(prefix, current.launcher, installed, imports, runner) is None
+            ):
                 message = f"{reason}. sai {installed} is unchanged."
-                return Outcome(FAILED, message, installed, target)
-            error = restore(current, rollback, options, uv)
+                return Outcome(FAILED, message, installed, target), True
+            error = restore(current, rollback, options, uv, native=native)
             if error is None:
                 message = f"{reason}. Rolled back to sai {installed}."
-                return Outcome(FAILED, message, installed, target, rolled_back=True)
+                return Outcome(
+                    FAILED, message, installed, target, rolled_back=True
+                ), True
             message = (
                 f"{reason}. Rolling back to sai {installed} also failed: {error}."
                 f" Reinstall with: {update.INSTALL_COMMAND}"
             )
-            return Outcome(FAILED, message, installed, target)
+            return Outcome(FAILED, message, installed, target), False
 
         interrupted = False
         try:
             # The wheel is hashed once more right before uv opens it.
-            error = wheel_error(wheel) or install_spec(uv, spec, runner)
+            error = wheel_error(wheel)
+            if error is None and native:
+                assert wheel is not None
+                if rollback.wheel is None:
+                    return unchanged(
+                        "the bridge requires a verified previous Python wheel"
+                    )
+                trial = preverify(
+                    str(rollback.wheel[2]), installed, prefix, uv, options, offline=True
+                )
+                if trial is not None:
+                    return unchanged(
+                        f"the rollback wheel failed its offline trial install: {trial}"
+                    )
+                previous, kept = record_bridge(current, rollback.wheel, wheel)
+                pending_written = True
+                if options.allowed is not None and not options.allowed():
+                    clear_bridge_record(prefix)
+                    return available()
+                rollback = replace(
+                    rollback, wheel=(rollback.wheel[0], rollback.wheel[1], previous)
+                )
+                spec, wheel = str(kept), (release.tag, wheel[1], kept)
+                # The tool-local wheel is the durable recovery source.
+                created = False
             if error is None:
-                error = verify(prefix, current.launcher, target, imports, runner)
+                error = launcher_change_error(
+                    prefix, current.launcher, expected_launcher
+                )
+            if error is None:
+                if native and not options.background:
+                    recovery = shlex.join(
+                        [str(prefix.parent / NATIVE_RECOVERY), "update", "--recover"]
+                    )
+                    print(
+                        f"If the uv switch is interrupted, run {recovery}.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                error = install_spec(uv, spec, prefix, runner)
+            if error is None:
+                error = verify(
+                    prefix, current.launcher, target, imports, runner, native=native
+                )
+            if error is None and native:
+                # The isolated probes leave the invoking profile's cache cold.
+                error = native_bridge.smoke(
+                    _executables(prefix)[0],
+                    target,
+                    update.sai_home(),
+                    VERIFY_TIMEOUT,
+                    version_only=True,
+                )
+            if error is None:
+                error = launcher_change_error(
+                    prefix, current.launcher, expected_launcher
+                )
             if error is None and wheel is not None:
                 try:
                     write_record(prefix, *wheel)
@@ -941,10 +1454,17 @@ def _install(
         except KeyboardInterrupt:
             interrupted = True
             error = "interrupted"
+        except (OSError, UpdateFailed) as exc:
+            error = str(exc)
         if error is not None:
             with _uninterrupted():
-                outcome = failed(f"Could not update to {target}: {error}")
-                discard()
+                outcome, recovered = failed(f"Could not update to {target}: {error}")
+                retain_snapshot = native and not recovered
+                if recovered and pending_written:
+                    with contextlib.suppress(OSError):
+                        clear_bridge_record(prefix)
+                if not retain_snapshot:
+                    discard()
             return outcome, interrupted
         if wheel is None:
             # A Git install has no release record; drop a stale one.
@@ -952,13 +1472,23 @@ def _install(
                 update.release_record_path(prefix).unlink(missing_ok=True)
         # Only now, verified: keep the new wheel and the one to go back to.
         prune_wheels((installed, target))
+        retain_snapshot = native
+        if pending_written:
+            try:
+                clear_bridge_record(prefix)
+            except OSError as exc:
+                return Outcome(
+                    FAILED, f"Could not finish the uv bridge: {exc}", target, target
+                ), False
+        if error := launcher_change_error(prefix, current.launcher, expected_launcher):
+            return Outcome(FAILED, error, installed, target), False
         message = (
             f"Updated sai from {installed} to {target}. Restart agent clients and"
             " any open `sai` shell so they load it."
         )
         return Outcome(UPDATED, message, target, target), False
     finally:
-        if rollback.snapshot is not None:
+        if rollback.snapshot is not None and not retain_snapshot:
             shutil.rmtree(rollback.snapshot, ignore_errors=True)
 
 
@@ -979,8 +1509,8 @@ def update_now(options: Options | None = None) -> Outcome:
         return _unsupported(install)
     prefix = Path(os.path.abspath(install.prefix))
     wait = 0.0 if options.background else LOCK_WAIT
-    with locked(tool_lock_path(prefix), wait) as held:
-        if not held:
+    with contextlib.ExitStack() as locks:
+        if not locks.enter_context(locked(tool_lock_path(prefix), wait)):
             message = "Another sai update is still running; try again shortly."
             status = BUSY if options.background else FAILED
             return Outcome(status, message, update.installed_version(prefix))
@@ -1036,11 +1566,25 @@ def update_now(options: Options | None = None) -> Outcome:
             return outcome
         uv = os.path.abspath(found)
         launcher = registered_launcher(prefix)
-        mismatch = (
-            "this install's uv receipt names no `sai` executable"
-            if launcher is None
-            else destination_error(prefix, launcher, uv, options.runner)
-        )
+        if launcher is None:
+            mismatch = "this install's uv receipt names no `sai` executable"
+        else:
+            try:
+                lock = launcher.parent.resolve() / INSTALL_LOCK_NAME
+                held = locks.enter_context(locked(lock, wait, private_file=True))
+            except OSError as error:
+                return Outcome(
+                    FAILED, f"Could not lock {launcher}: {error}", installed, target
+                )
+            if not held:
+                status = BUSY if options.background else FAILED
+                return Outcome(
+                    status,
+                    f"Another Sai install or update is using {launcher}.",
+                    installed,
+                    target,
+                )
+            mismatch = destination_error(prefix, launcher, uv, options.runner)
         if mismatch is not None or launcher is None:
             message = (
                 f"`sai update` stopped before changing anything: {mismatch}."
@@ -1049,9 +1593,13 @@ def update_now(options: Options | None = None) -> Outcome:
             return Outcome(UNSUPPORTED, message, installed, target)
         record = update.read_release_record(prefix)
         current = Current(install, installed, launcher, record)
+        try:
+            finish_previous_bridge(current)
+        except (OSError, UpdateFailed) as error:
+            return Outcome(FAILED, str(error), installed, target)
         clear_snapshots(prefix)
-        # The cache lock comes second, always after the tool lock, and is
-        # held until the install is verified or rolled back.
+        # Acquire the cache lock after the tool and launcher locks. Keep it
+        # until the install is verified or rolled back.
         # Capture the absolute state path while a relative SAI_HOME can
         # still be resolved, even if the working directory goes away.
         state_path = update.cache_path()
@@ -1095,7 +1643,11 @@ def repair_after_update(outcome: Outcome, launcher: Path, background: bool) -> O
             notes.append("cwd-missing")
     checks: list[mcp_install.RegistrationCheck] = []
     try:
-        target = mcp_install.launcher_target(str(launcher), {})
+        try:
+            target = mcp_install.launcher_target(str(launcher), os.environ)
+        except FileNotFoundError:
+            # A relative SAI_HOME cannot be resolved after the cwd disappears.
+            target = mcp_install.launcher_target(str(launcher), {})
         checks = mcp_install.check_registrations(target, fix=True, cwd=cwd)
     except Exception:  # noqa: BLE001 - the installation has already succeeded
         notes.append("failed")
@@ -1104,7 +1656,11 @@ def repair_after_update(outcome: Outcome, launcher: Path, background: bool) -> O
         mcp=tuple(
             check
             for check in checks
-            if check.status in ("fixed", "fail") or check.pinned or check.legacy_name
+            if check.status in ("fixed", "fail")
+            or check.pinned
+            or check.legacy_name
+            or check.manual_repairs
+            or check.disabled
         ),
         mcp_notes=tuple(notes),
     )
@@ -1133,6 +1689,7 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
     repaired, failed, pinned, legacy = [], [], [], []
     claude_manual: list[mcp_install.ClaudeRepair] = []
     old_claude_notice = False
+    claude_disabled = False
     for entry in results if isinstance(results, list) else []:
         if (
             not isinstance(entry, dict)
@@ -1147,14 +1704,40 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
         if entry["client"] == "claude" and isinstance(manual, list):
             claude_manual.extend(
                 mcp_install.ClaudeRepair(
-                    repair["scope"], repair["name"], repair.get("resetArgs") is True
+                    repair["scope"],
+                    repair["name"],
+                    repair.get("resetArgs") is True,
+                    replace_entry=repair.get("replaceEntry") is True,
+                    sai_home=repair["saiHome"]
+                    if isinstance(repair.get("saiHome"), str)
+                    else None,
+                    config_path=Path(repair["configPath"])
+                    if isinstance(repair.get("configPath"), str)
+                    else None,
+                    fields=tuple(
+                        value for value in repair["fields"] if isinstance(value, str)
+                    )
+                    if isinstance(repair.get("fields"), list)
+                    else (),
+                    launcher=repair["launcher"]
+                    if isinstance(repair.get("launcher"), str)
+                    else None,
+                    server_args=tuple(repair["serverArgs"])
+                    if isinstance(repair.get("serverArgs"), list)
+                    and all(isinstance(arg, str) for arg in repair["serverArgs"])
+                    else None,
+                    extra_env=repair["extraEnv"]
+                    if isinstance(repair.get("extraEnv"), int)
+                    else 0,
                 )
                 for repair in manual
                 if isinstance(repair, dict)
                 and repair.get("scope") in mcp_install.UNINSTALL_SCOPES
                 and repair.get("name") in mcp_install.SERVER_NAMES
             )
-        if entry.get("status") == "fail" and not manual:
+        disabled = entry["client"] == "claude" and entry.get("disabled") is True
+        claude_disabled |= disabled
+        if entry.get("status") == "fail" and not manual and not disabled:
             failed.append(entry["client"])
         keeps_name = entry.get("legacyName") == mcp_install.RETIRED_NAME
         if keeps_name:
@@ -1165,7 +1748,11 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
         old_claude_notice |= old_blocked
         # Older update records used warn exclusively for a pinned launcher.
         if entry.get("pinned") is True or (
-            entry.get("status") == "warn" and not keeps_name and not old_blocked
+            entry.get("status") == "warn"
+            and not keeps_name
+            and not old_blocked
+            and not manual
+            and not disabled
         ):
             pinned.append(entry["client"])
     messages = []
@@ -1178,6 +1765,10 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
         )
     if pinned:
         messages.append(f"Sai MCP uses a pinned launcher for {', '.join(pinned)}.")
+    if claude_disabled:
+        messages.append(
+            "Claude Code has disabled a Sai MCP registration. Review MCP approvals and settings in Claude Code."
+        )
     if claude_manual:
         messages.append(
             "Claude Code MCP registrations need manual repair. "

@@ -1,0 +1,42 @@
+name: Installer Rehearsal (Windows)
+
+on:
+  pull_request:
+    paths:
+      - 'cli/sai_cli/core/**'
+      - 'pyproject.toml'
+      - 'scripts/check_release.py'
+      - 'scripts/install.py'
+      - 'scripts/build-bridge.py'
+      - 'scripts/build-installer-fixtures.py'
+      - 'shim/**'
+      - 'tests/parity/test_installer_bridge.py'
+      - '.github/workflows/installer-windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pre-bridge:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.11"
+      - name: Fetch pinned fixture sources
+        run: git fetch --no-tags origin 8557a7e13dceab0accc369191182c8e01423c91b 4bd968eb956c154f0a0ab53ccc288ceb78dd8713
+      - name: Build the three local replay wheels
+        run: uv run --locked python scripts/build-installer-fixtures.py "$env:RUNNER_TEMP/sai-installer" --wheels-only
+      - name: Rehearse Windows installation and updates
+        env:
+          SAI_C10B_REQUIRED: "1"
+          SAI_C10B_PRE_BRIDGE: ${{ runner.temp }}/sai-installer/pre-bridge
+          SAI_C10B_BRIDGE: ${{ runner.temp }}/sai-installer/bridge
+          SAI_C10B_SHIM: ${{ runner.temp }}/sai-installer/shim
+        run: uv run --locked pytest tests/parity/test_installer_bridge.py -k 'windows or managed_full_python'

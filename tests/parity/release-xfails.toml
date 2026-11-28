@@ -1,0 +1,18 @@
+# Signatures of normalized differences reproduced against sai-cli/v0.1.2.
+# Run without --release-xfails to inspect the difference paths.
+
+[issue."49"]
+# All 12 cases still differ from Python main at a48e7775 in their log error
+# fields. Rust redacts free-form messages to keep untrusted text out of logs.
+"test_intent_status.py::test_history[service-unavailable]" = "dfcd2f372d6cb0e6dbb103bb6dff7c6e0bac722d0fa639661798142f7aaba789"
+"test_intent_status.py::test_history[body-timeout]" = "dfcd2f372d6cb0e6dbb103bb6dff7c6e0bac722d0fa639661798142f7aaba789"
+"test_intent_status.py::test_request_and_data_failures[redirect]" = "9771c7385b3f16f09e6c45498fcc114742588582ab005b85a08652ca17ede96c"
+"test_intent_status.py::test_request_and_data_failures[unauthorized]" = "9771c7385b3f16f09e6c45498fcc114742588582ab005b85a08652ca17ede96c"
+"test_intent_status.py::test_request_and_data_failures[server-error]" = "9771c7385b3f16f09e6c45498fcc114742588582ab005b85a08652ca17ede96c"
+"test_intent_status.py::test_request_and_data_failures[disconnect]" = "9771c7385b3f16f09e6c45498fcc114742588582ab005b85a08652ca17ede96c"
+"test_intent_status.py::test_request_and_data_failures[invalid-json]" = "9771c7385b3f16f09e6c45498fcc114742588582ab005b85a08652ca17ede96c"
+"test_intent_status.py::test_request_and_data_failures[non-object-response]" = "b4ce7d1ddff075e846c56b853ea21552ed7dcfa833ce13cf8f4ac15ef3b6dca3"
+"test_intent_status.py::test_request_and_data_failures[null-data]" = "c71c13b0009446bc47bb94f63880b3e2fc3b82e2e7d219272e5a531aa5f539da"
+"test_intent_status.py::test_connection_refused" = "5e2486f403f9664e63c5933bb91104685f00e5d2af68da382d064cce0bddb4b0"
+"test_intent_status.py::test_expired_auth_status[/query]" = "c77a85284ecea311e116de430c5f6dbeece060e4a316cd44026555bc5778c853"
+"test_intent_status.py::test_expired_auth_status[/private/query]" = "c77a85284ecea311e116de430c5f6dbeece060e4a316cd44026555bc5778c853"

@@ -17,11 +17,18 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 import pytest
+import uvicorn
 from click.testing import CliRunner
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import TextContent
 from sai_cli.core import keeper, overview, reconcile, settings, storage, stream
 from sai_cli.mcp_server.server import create_server
 from sai_cli.sai_cli import main
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse, RedirectResponse
+from starlette.routing import Route, WebSocketRoute
+from starlette.websockets import WebSocket
 from websockets.sync.server import serve
 from websockets.typing import Subprotocol
 
@@ -66,6 +73,7 @@ def replay():
         "contractMarkets": {},
         "expiration": 300,
         "lcdDisconnected": threading.Event(),
+        "queuedRequestHash": "A" * 64,
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -114,6 +122,9 @@ def replay():
                 message = json.loads(base64.b64decode(unquote(path.rsplit("/", 1)[-1])))
                 assert self.headers["x-cosmos-block-height"] == str(RISK_BLOCK)
                 state["calls"].append(("contract", message))
+                if state.get("failedLcdQuery") in message:
+                    self.answer({"message": "not found"}, status=404)
+                    return
                 if state.get("dripQuery") in message:
                     self.drip()
                     return
@@ -179,10 +190,9 @@ def replay():
         connection.send(json.dumps({"type": "connection_ack"}))
         request = json.loads(connection.recv())
         assert request["type"] == "subscribe"
-        assert request["payload"]["query"] == stream.BALANCES_WITH_BLOCK
-        state["calls"].append(
-            (stream.BALANCES_WITH_BLOCK, request["payload"]["variables"])
-        )
+        query = request["payload"]["query"]
+        assert query in (stream.BALANCES, stream.BALANCES_WITH_BLOCK)
+        state["calls"].append((query, request["payload"]["variables"]))
         connection.send(json.dumps({"id": "1", "type": "next", "payload": state["ws"]}))
 
     http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -241,13 +251,59 @@ def decode_mcp(result: Any) -> dict[str, Any]:
     return json.loads(block.text)
 
 
-def save_session(replay: dict[str, Any], addr: str = ADDR):
+def test_market_prices_reports_missing_block_times_as_null(replay):
+    prices = replay["http"][keeper.PRICES]["data"]
+    rows = prices["oracle"]["tokenPricesUsd"][:11]
+    prices["oracle"]["tokenPricesUsd"] = rows
+    del rows[0]["lastUpdatedBlock"]["block_ts"]
+    for row, stamp in zip(
+        rows[1:],
+        (
+            0,
+            None,
+            "0",
+            "1970-01-01T00:00:00Z",
+            "1970-01-01t00:00:00z",
+            "1970-01-01 01:00:00.0000000000+01:00",
+            "1969-12-31T23:00:00−01:00",
+            BLOCK_TIME,
+            "1970-01-01T00:00:00.000000001Z",
+            "1970-01-01t00:00:00.0000000001z",
+        ),
+        strict=True,
+    ):
+        row["lastUpdatedBlock"]["block_ts"] = stamp
+    heights = [row["lastUpdatedBlock"]["block"] for row in rows]
+
+    result = cli(replay, "--json", "market", "prices")
+    assert result.exit_code == 0, result.output
+    decoded = json.loads(result.stdout)
+    blocks = [row["lastUpdatedBlock"] for row in decoded["oracle"]["tokenPricesUsd"]]
+    assert [block["block"] for block in blocks] == heights
+    assert [block["block_ts"] for block in blocks] == [
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        BLOCK_TIME,
+        "1970-01-01T00:00:00.000000001Z",
+        "1970-01-01t00:00:00.0000000001z",
+    ]
+    server = create_server(replay["config"])
+    assert decode_mcp(asyncio.run(server.call_tool("market_prices", {}))) == decoded
+
+
+def save_session(replay: dict[str, Any], addr: str = ADDR, *, token: str | None = None):
     now = datetime.now(UTC)
     issued = (now - timedelta(days=28)).timestamp()
     part = base64.urlsafe_b64encode(json.dumps({"iat": issued}).encode()).decode()
     storage.save_session(
         {
-            "token": f"test.{part}.signature",
+            "token": token if token is not None else f"test.{part}.signature",
             "evmAddress": addr,
             "expiresAt": (now + timedelta(hours=48)).isoformat(),
             "keyName": "fixture",
@@ -263,7 +319,15 @@ def static_fields(value: Any) -> Any:
         return {
             key: static_fields(item)
             for key, item in value.items()
-            if key not in {"fetchedAt", "sourceAgeSeconds"}
+            if key not in {"fetchedAt", "sourceAgeSeconds", "stale"}
+            and not (
+                key == "sourceAt"
+                and item is not None
+                and (
+                    item == value.get("fetchedAt")
+                    or value.get("sourceAtBasis") == "fetchedAt"
+                )
+            )
         }
     return value
 
@@ -279,9 +343,12 @@ def test_replays_mainnet_and_preserves_freshness_on_both_surfaces(replay):
     assert data["balance"]["usd"] == 150.813685
     assert data["credits"]["usd"] == 22.091064
     # The test WebSocket is served from a separate port with no proven chain.
-    assert data["balance"]["sourceAt"] is None
+    assert data["balance"]["sourceAt"] == decoded["balances"]["fetchedAt"]
+    assert data["balance"]["sourceAtBasis"] == "fetchedAt"
     assert data["balance"]["sourceAgeSeconds"] is None
+    assert data["balance"]["stale"] is None
     assert data["balance"]["sourceBlock"] == 49819589
+    assert data["unsettled"]["sourceAt"] is None
     assert datetime.fromisoformat(decoded["balances"]["fetchedAt"]).tzinfo == UTC
     assert decoded["positions"]["data"] == {
         "items": [],
@@ -303,7 +370,34 @@ def test_replays_mainnet_and_preserves_freshness_on_both_surfaces(replay):
     assert session["sourceAgeSeconds"] == pytest.approx(28 * 86400, abs=5)
     assert [args for query, args in replay["calls"] if query == "lcd"] == ["latest"]
     assert keeper.PRICES not in {query for query, _ in replay["calls"]}
-    assert static_fields(decoded) == static_fields(mcp(replay))
+    tool_output = mcp(replay)
+    assert static_fields(decoded) == static_fields(tool_output)
+    for output in (decoded, tool_output):
+        for key in (
+            "balances",
+            "positions",
+            "pendingOrders",
+            "queuedMarketOrders",
+            "blockingIntents",
+            "session",
+        ):
+            assert output[key]["sourceAt"] == output[key]["fetchedAt"]
+            assert datetime.fromisoformat(output[key]["sourceAt"]).tzinfo == UTC
+        assert (
+            output["balances"]["data"]["balance"]["sourceAt"]
+            == output["balances"]["sourceAt"]
+        )
+        assert output["prices"] == {
+            "fetchedAt": None,
+            "data": [],
+            "status": "skipped",
+            "skipReason": "No positions or pending orders were available to price.",
+        }
+    human = cli(replay, "account", "overview")
+    assert (
+        "Skipped. No positions or pending orders were available to price."
+        in human.stdout
+    )
     assert not (storage.home() / "intents.sqlite3").exists()
 
 
@@ -400,7 +494,10 @@ def populate_trades(replay: dict[str, Any]):
                         "collateralAmount": 5_000_000,
                         "orderReqBlock": 41148706,
                         "orderReqBlockTs": BLOCK_TIME,
-                        "orderReqTxHash": "SYNTHETIC_COSMOS_REQUEST",
+                        # Release parity reuses this helper with the original hash.
+                        "orderReqTxHash": replay.get(
+                            "queuedRequestHash", "SYNTHETIC_COSMOS_REQUEST"
+                        ),
                         "orderReqEvmTxHash": None,
                     },
                 ]
@@ -430,6 +527,7 @@ def test_open_positions_limits_stops_and_next_oracle_orders(replay):
     assert result.exit_code == 0, result.output
     decoded = json.loads(result.stdout)
     assert decoded["addrSource"] == "argument"
+    assert decoded["prices"]["sourceAt"] == decoded["prices"]["fetchedAt"]
     positions = decoded["positions"]["data"]
     long, short = positions["items"]
     assert long["collateralUsd"] == 12
@@ -481,7 +579,7 @@ def test_open_positions_limits_stops_and_next_oracle_orders(replay):
         "Open Positions",
         "Pending Limit and Stop Orders",
         "Queued Market Orders",
-        "SYNTHETIC_COSMOS_REQUEST",
+        "A" * 64,
         "BTC",
         "ARB",
         "12.5%",
@@ -507,8 +605,14 @@ def test_a_failed_read_preserves_other_sections(replay, failure):
     if failure == keeper.OVERVIEW_TRADES:
         assert result["positions"]["error"]["code"] == "KEEPER_ERROR"
         assert result["pendingOrders"]["error"] == result["positions"]["error"]
+        assert result["prices"]["status"] == "skipped"
+        assert (
+            result["prices"]["skipReason"]
+            == "Positions and pending orders could not be loaded."
+        )
     if failure == keeper.PRICES:
         assert result["prices"]["error"]["code"] == "KEEPER_ERROR"
+        assert "status" not in result["prices"]
         position = result["positions"]["data"]["items"][0]
         assert position["unrealizedPnlUsd"] == 12
         assert position["liquidationPriceUsd"] == 50
@@ -519,8 +623,74 @@ def test_a_failed_read_preserves_other_sections(replay, failure):
     else:
         balance = result["balances"]["data"]["balance"]
         assert balance["sourceBlock"] == 49819589
-        assert balance["sourceAt"] is balance["sourceAgeSeconds"] is None
+        assert balance["sourceAt"] == result["balances"]["fetchedAt"]
+        assert balance["sourceAtBasis"] == "fetchedAt"
+        assert balance["sourceAgeSeconds"] is None
     assert result["queuedMarketOrders"]["data"][0]["sequence"] == 400
+
+
+@pytest.mark.parametrize("paginated", [False, True])
+def test_queued_orders_keep_valid_actions_beside_invalid_rows(replay, paginated):
+    populate_trades(replay)
+    order = replay["http"][keeper.PENDING_MARKET_ORDERS]["data"]["perp"][
+        "marketOrders"
+    ][0]
+    actions = ["open", "close", "increase", "decrease", "update_leverage"]
+    valid = [
+        {
+            **order,
+            "sequence": index,
+            "side": action,
+            "collateralAmount": order["collateralAmount"]
+            if action in {"open", "increase"}
+            else None,
+        }
+        for index, action in enumerate(actions)
+    ]
+    rows = [*valid[:2], {"sequence": "invalid"}, *valid[2:]]
+    if paginated:
+        rows = rows[:3] + [None] * 97 + rows[3:]
+
+    def orders(variables):
+        offset = variables["offset"]
+        return {
+            "data": {
+                "perp": {"marketOrders": rows[offset : offset + variables["limit"]]}
+            }
+        }
+
+    replay["http"][keeper.PENDING_MARKET_ORDERS] = orders
+    queued = mcp(replay, addr=ADDR)["queuedMarketOrders"]
+
+    assert [row["action"] for row in queued["data"]] == actions
+    assert [row["collateralBaseUnits"] for row in queued["data"]] == [
+        row["collateralAmount"] for row in valid
+    ]
+    assert queued["error"]["code"] == "INCOMPLETE_DATA"
+    assert "Invalid rows were omitted" in queued["error"]["message"]
+    assert "paginated list could not be confirmed" not in queued["error"]["message"]
+    assert [
+        variables["offset"]
+        for query, variables in replay["calls"]
+        if query == keeper.PENDING_MARKET_ORDERS
+    ] == ([0, 100, 0, 100] if paginated else [0])
+
+
+def test_overview_keeps_positions_with_null_token_symbols(replay):
+    long, short = populate_trades(replay)
+    long["perpBorrowing"]["baseToken"]["symbol"] = None
+    short["perpBorrowing"]["collateralToken"]["symbol"] = None
+
+    positions = mcp(replay, addr=ADDR)["positions"]
+    long_row, short_row = positions["data"]["items"]
+    assert long_row["market"] is None
+    assert long_row["marketId"] == long["perpBorrowing"]["marketId"]
+    assert long_row["riskStatus"] == "verified"
+    assert short_row["collateralToken"] is None
+    assert short_row["collateralBaseUnits"] == short["collateralAmount"]
+    assert short_row["collateralUsd"] is None
+    assert short_row["riskStatus"] == "partial"
+    assert positions["data"]["unrealizedPnlUsd"] is None
 
 
 def test_no_default_account_gives_an_address_hint(replay):
@@ -528,6 +698,195 @@ def test_no_default_account_gives_an_address_hint(replay):
     assert result.exit_code != 0 and "--as ADDR" in result.output
     assert mcp(replay)["code"] == "SESSION_UNAVAILABLE"
     assert replay["calls"] == []
+
+
+@pytest.mark.parametrize("source", ["argument", "global", "empty", "session"])
+def test_overview_rejects_invalid_addresses_before_reading(replay, source):
+    invalid = "https://overview-fixture.invalid/address"
+    if source == "session":
+        save_session(replay, addr=invalid)
+        args, mcp_args = [], {}
+    elif source == "global":
+        args, mcp_args = ["--as", invalid], {"addr": invalid}
+    else:
+        addr = "" if source == "empty" else invalid
+        args, mcp_args = [], {"addr": addr}
+
+    command = [*args, "account", "overview"]
+    if source in {"argument", "empty"}:
+        command += ["--as", mcp_args["addr"]]
+    code = "SESSION_UNAVAILABLE" if source == "session" else "INVALID_REQUEST"
+    result = cli(replay, "--json", *command)
+    response = mcp(replay, **mcp_args)
+
+    assert replay["calls"] == []
+    assert result.exit_code != 0
+    assert json.loads(result.output)["error"]["code"] == code
+    assert response["code"] == code
+    assert invalid not in result.output
+    assert invalid not in json.dumps(response)
+    server = create_server(replay["config"])
+    assert server.loggable("account_overview", mcp_args) == ({}, 0)
+
+
+def test_explicit_overview_ignores_session_for_a_different_address(replay):
+    save_session(replay, addr=OTHER)
+    accounts = storage.load_accounts()
+    accounts["sessions"][ADDR] = accounts["sessions"].pop(OTHER)
+    accounts["active"] = ADDR
+    storage._save_accounts(accounts)
+
+    result = cli(replay, "account", "overview", "--json", "--as", ADDR)
+    assert result.exit_code == 0, result.output
+    for report in (json.loads(result.stdout), mcp(replay, addr=ADDR)):
+        assert report["addr"] == ADDR
+        assert report["balances"]["data"]["balance"]["usd"] == 150.813685
+        assert report["session"]["error"]["code"] == "INCOMPLETE_DATA"
+        assert "data" not in report["session"]
+        assert OTHER not in json.dumps(report)
+    assert [
+        args["user"]
+        for query, args in replay["calls"]
+        if query == stream.BALANCES_WITH_BLOCK
+    ] == [ADDR, ADDR]
+
+
+def test_mcp_overview_rejects_a_non_string_address_before_reading(replay):
+    invalid = {"value": "synthetic-overview-address"}
+    server = create_server(replay["config"])
+    with pytest.raises(ToolError) as caught:
+        asyncio.run(server.call_tool("account_overview", {"addr": invalid}))
+
+    assert replay["calls"] == []
+    assert invalid["value"] not in str(caught.value)
+    assert str(caught.value) == "Argument 'addr' must be a string or null."
+    assert server.loggable("account_overview", {"addr": invalid}) == ({}, 0)
+
+
+def test_overview_validates_keeper_fields_and_cleans_display_text(replay):
+    long, short = populate_trades(replay)
+    url = "https://overview-fixture.invalid/private"
+    relative_url = "//overview-fixture.invalid/relative"
+    token = "synthetic-overview-session-marker"
+    hex_text = "D" * 64
+    save_session(replay, token=token)
+    replay["ws"]["data"]["userBalances"][-1]["lastUpdatedBlock"] = {"url": url}
+    queued = replay["http"][keeper.PENDING_MARKET_ORDERS]["data"]["perp"][
+        "marketOrders"
+    ]
+    queued[0]["orderReqTxHash"] = url
+    long["perpBorrowing"]["baseToken"]["symbol"] = token
+    long["perpBorrowing"]["quoteToken"].update(symbol=None, name=hex_text)
+    short["perpBorrowing"]["baseToken"]["symbol"] = relative_url
+
+    result = cli(replay, "--json", "account", "overview")
+    assert result.exit_code == 0, result.output
+    for report in (json.loads(result.stdout), mcp(replay)):
+        assert report["balances"]["error"]["code"] == "INCOMPLETE_DATA"
+        assert report["queuedMarketOrders"]["error"]["code"] == "INCOMPLETE_DATA"
+        positions = report["positions"]["data"]["items"]
+        assert len(positions) == 2
+        assert positions[0]["market"] is None
+        assert positions[0]["quoteToken"] is None
+        assert positions[1]["market"] is None
+        assert all(
+            text not in json.dumps(report)
+            for text in (url, relative_url, token, hex_text)
+        )
+
+
+def test_testnet_overview_prices_usdc_without_a_keeper_oracle_quote(replay):
+    long, short = populate_trades(replay)
+    chain = "nibiru-testnet-2"
+    replay["lcdChain"] = chain
+    replay["http"][keeper.ROUTE]["data"]["oneClickTrading"]["chainId"] = chain
+    replay["http"][keeper.PRICES]["data"]["oracle"]["tokenPricesUsd"] = []
+    long["perpBorrowing"]["baseToken"]["id"] = 4
+    for trade, mark, liquidation in ((long, 100, 50), (short, 10, 15)):
+        trade["perpBorrowing"]["collateralToken"] = {"id": 3, "symbol": "USDC"}
+        install_contract_trade(replay, trade, mark=mark, liquidation=liquidation)
+
+    report = mcp(replay, addr=ADDR)
+    positions = report["positions"]["data"]
+    assert positions["unrealizedPnlUsd"] == 7
+    assert [row["collateralUsd"] for row in positions["items"]] == [12, 10]
+    assert [row["collateralUsd"] for row in report["pendingOrders"]["data"]] == [12, 10]
+    assert report["prices"]["data"] == []
+    assert "error" not in report["prices"]
+
+
+@pytest.mark.parametrize(
+    ("symbol", "token_id", "market_id"),
+    [("HYPE", 44, 43), ("XAU", 77, 1018), ("ABC-1/USD", 99, 99)],
+)
+def test_overview_displays_keeper_market_symbols(replay, symbol, token_id, market_id):
+    long, _ = populate_trades(replay)
+    market = long["perpBorrowing"]
+    market.update(marketId=market_id, baseToken={"id": token_id, "symbol": symbol})
+    install_contract_trade(replay, long, mark=100, liquidation=50)
+
+    report = mcp(replay, addr=ADDR)
+    row = report["positions"]["data"]["items"][0]
+    assert row["market"] == symbol
+    assert row["marketId"] == market_id
+    result = cli(replay, "account", "overview", "--as", ADDR)
+    assert result.exit_code == 0, result.output
+    assert symbol in result.stdout
+
+
+def test_overview_uses_ids_for_invalid_keeper_labels(replay):
+    long, _ = populate_trades(replay)
+    market = long["perpBorrowing"]
+    marker = "SyntheticFixtureLabel"
+    market["baseToken"]["symbol"] = marker
+    market["quoteToken"].update(symbol=None, name=f"Fixture label {marker}")
+    market["collateralToken"] = {"id": 2, "symbol": marker}
+    rows = replay["http"][keeper.PRICES]["data"]["oracle"]["tokenPricesUsd"]
+    next(row for row in rows if row["token"]["id"] == 2)["token"]["symbol"] = marker
+    install_contract_trade(replay, long, mark=100, liquidation=50)
+
+    result = cli(replay, "account", "overview", "--json", "--as", ADDR)
+    assert result.exit_code == 0, result.output
+    for report in (json.loads(result.stdout), mcp(replay, addr=ADDR)):
+        first, second = report["positions"]["data"]["items"]
+        assert marker not in json.dumps(report)
+        assert (
+            first["market"] is first["collateralToken"] is first["quoteToken"] is None
+        )
+        assert (
+            first["marketId"],
+            first["collateralTokenId"],
+            first["quoteTokenId"],
+        ) == (0, 2, 0)
+        assert second["market"] == "ARB"
+        assert [(row["tokenId"], row["token"]) for row in report["prices"]["data"]] == [
+            (2, None)
+        ]
+
+
+@pytest.mark.parametrize("invalid_field", ["trade_side", "price_block", "lcd_stamp"])
+def test_overview_checks_field_types_before_use(replay, invalid_field):
+    long, _ = populate_trades(replay)
+    if invalid_field == "trade_side":
+        long["isLong"] = "false"
+    elif invalid_field == "price_block":
+        row = replay["http"][keeper.PRICES]["data"]["oracle"]["tokenPricesUsd"][0]
+        row["lastUpdatedBlock"]["block"] = True
+    else:
+        base = long["perpBorrowing"]["baseToken"]["id"]
+        rate = replay["oracleRates"][base, 0]
+        rate["base"]["price_block"] = True
+
+    report = mcp(replay, addr=ADDR)
+    if invalid_field == "trade_side":
+        assert report["positions"]["error"]["code"] == "INCOMPLETE_DATA"
+        assert "data" not in report["positions"]
+    elif invalid_field == "price_block":
+        assert report["prices"]["error"]["code"] == "INCOMPLETE_DATA"
+    else:
+        position = report["positions"]["data"]["items"][0]
+        assert position["markSource"]["sourceBlock"] is None
+        assert position["riskStatus"] == "verified"
 
 
 def test_contract_threshold_reports_crossing_even_when_keeper_estimate_does_not(replay):
@@ -628,7 +987,7 @@ def test_overview_includes_unsettled_teller_funds(replay):
             "userBalances": [
                 {
                     "amount": "100000000",
-                    "usd_value": 100,
+                    "usd_value": 99,
                     "lastUpdatedBlock": 49819589,
                     "token_info": {"type": "sai", "name": "USDC Unsettled on Sai"},
                 }
@@ -660,7 +1019,8 @@ def test_lcd_must_match_keeper_before_assigning_block_times(replay, lcd):
     result = mcp(replay, addr=ADDR)
     balances = result["balances"]
     assert balances["data"]["balance"]["sourceBlock"] == 49819589
-    assert balances["data"]["balance"]["sourceAt"] is None
+    assert balances["data"]["balance"]["sourceAt"] == balances["fetchedAt"]
+    assert balances["data"]["balance"]["sourceAgeSeconds"] is None
     assert result["positions"]["data"]["items"][0]["riskStatus"] == "unavailable"
     calls = [args for query, args in replay["calls"] if query == "lcd"]
     assert calls == ([] if lcd == "default" else ["latest"])
@@ -672,6 +1032,22 @@ def test_verified_lcd_only_assigns_times_for_its_own_chain(replay):
     assert chain.block_time(49819589) == datetime.fromisoformat(BLOCK_TIME)
     replay["lcdChain"] = "another-chain"
     assert chain.block_time(49819589) is None
+
+
+def test_future_lcd_block_time_has_zero_source_age(replay):
+    fetched = datetime.now(UTC)
+    future = (fetched + timedelta(minutes=5)).isoformat()
+    replay["riskTime"] = future
+    chain = overview._chain_read(replay["config"])
+    assert chain is not None
+    assert overview._block_source(
+        {"block": RISK_BLOCK}, fetched.isoformat(), chain.block_time
+    ) == {"sourceBlock": RISK_BLOCK, "sourceAt": future, "sourceAgeSeconds": 0.0}
+
+    membership = mcp(replay, addr=ADDR)["positions"]["membership"]
+    assert membership["status"] == "stale"
+    assert membership["sourceAt"] == future
+    assert membership["sourceAgeSeconds"] == 0.0
 
 
 @pytest.mark.parametrize("settles", [True, False])
@@ -829,6 +1205,23 @@ def test_legacy_collateral_uses_the_pinned_oracle_price_for_pnl(replay):
     assert row["collateralPriceSource"]["queryBlock"] == RISK_BLOCK
 
 
+def test_overview_requires_collateral_price_publish_time(replay):
+    long, _ = populate_trades(replay)
+    long["perpBorrowing"]["collateralToken"] = {"id": 2, "symbol": "stNIBI"}
+    install_contract_trade(replay, long, mark=100, liquidation=50)
+    install_oracle_quote(replay, 2, 0, mark="0.04")
+    replay["oracleRates"][2, 0]["rate"]["base_last_update_time"] = None
+
+    positions = mcp(replay, addr=ADDR)["positions"]
+    row = positions["data"]["items"][0]
+    assert positions["membership"]["status"] == "verified"
+    assert row["riskStatus"] == "partial"
+    assert row["riskReason"] == "Collateral oracle publish time is unknown"
+    assert row["markPriceUsd"] == 100
+    assert row["unrealizedPnlUsd"] is None
+    assert positions["data"]["unrealizedPnlUsd"] is None
+
+
 @pytest.mark.parametrize("gap", ["keeper", "contract", "index_seeding"])
 def test_unconfirmed_empty_position_list_has_no_total(replay, gap):
     if gap == "keeper":
@@ -853,6 +1246,73 @@ def test_unconfirmed_empty_position_list_has_no_total(replay, gap):
     assert snapshot["data"]["items"] == []
     assert snapshot["data"]["unrealizedPnlUsd"] is None
     assert snapshot["error"]["code"] == "INCOMPLETE_DATA"
+
+
+@pytest.mark.parametrize(
+    ("fill_check", "lcd_trade"),
+    [
+        ("error", None),
+        ("malformed", None),
+        (None, "missing"),
+        (None, "malformed"),
+        ("error", "missing"),
+    ],
+)
+def test_overview_reports_failed_fill_and_lcd_position_checks(
+    replay, fill_check, lcd_trade
+):
+    if fill_check == "error":
+        replay["http"][keeper.INTENTS] = {"errors": [{"message": "fill check failed"}]}
+    elif fill_check == "malformed":
+        replay["http"][keeper.INTENTS] = {"data": {"userIntents": [{}]}}
+    if lcd_trade is not None:
+        populate_trades(replay)
+        replay["liveTradeIds"] = [0, 1]
+        if lcd_trade == "missing":
+            del replay["contractTrades"][0]
+        else:
+            replay["contractTrades"][0] = {"trade": {}}
+
+    positions = mcp(replay, addr=ADDR)["positions"]
+    assert positions["membership"]["status"] == "verified"
+    assert positions["data"]["unrealizedPnlUsd"] is None
+    items = positions["data"]["items"]
+    if lcd_trade is None:
+        assert items == []
+    else:
+        assert [row["riskStatus"] for row in items] == ["unavailable", "verified"]
+    error = positions["error"]
+    assert error["code"] == "INCOMPLETE_DATA"
+    assert ("Keeper fill check failed" in error["message"]) == (fill_check is not None)
+    assert ("LCD position read failed" in error["message"]) == (lcd_trade is not None)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "get_market",
+        "get_oracle_address",
+        "get_exchange_rate_stamped",
+        "get_group",
+        "collateral",
+    ],
+)
+def test_overview_reports_downstream_lcd_risk_failures(replay, query):
+    long, _ = populate_trades(replay)
+    if query == "collateral":
+        long["perpBorrowing"]["collateralToken"] = {"id": 2, "symbol": "stNIBI"}
+        install_contract_trade(replay, long, mark=100, liquidation=50)
+    else:
+        replay["failedLcdQuery"] = query
+
+    positions = mcp(replay, addr=ADDR)["positions"]
+    assert positions["membership"]["status"] == "verified"
+    row = positions["data"]["items"][0]
+    assert row["riskStatus"] == "partial"
+    assert row["liquidationPriceQuote"] == 50
+    assert positions["data"]["unrealizedPnlUsd"] is None
+    assert positions["error"]["code"] == "INCOMPLETE_DATA"
+    assert "LCD position read failed" in positions["error"]["message"]
 
 
 @pytest.mark.parametrize("has_positions", [False, True])
@@ -1042,3 +1502,215 @@ def test_next_oracle_pending_intent_remains_a_local_trade_blocker(replay):
     assert [(row["status"], row["scope"]) for row in result["data"]] == [
         ("pending", "allTrades")
     ]
+
+
+@pytest.mark.parametrize("redirected", [False, True], ids=["direct", "redirected"])
+def test_balance_commands_report_source_block_age(replay, redirected):
+    balance_endpoint = replay["config"].ws_endpoint
+
+    async def query(request: Request) -> JSONResponse:
+        body = await request.json()
+        return JSONResponse(replay["http"][body["query"]])
+
+    async def balances(ws: WebSocket) -> None:
+        if redirected:
+            await ws.send_denial_response(RedirectResponse(balance_endpoint))
+            return
+        await ws.accept(subprotocol="graphql-transport-ws")
+        assert await ws.receive_json() == {"type": "connection_init"}
+        await ws.send_json({"type": "connection_ack"})
+        request = await ws.receive_json()
+        assert request["payload"]["query"] == stream.BALANCES_WITH_BLOCK
+        await ws.send_json({"id": "1", "type": "next", "payload": replay["ws"]})
+        await ws.close()
+
+    app = Starlette(
+        routes=[
+            Route("/query", query, methods=["POST"]),
+            WebSocketRoute("/query", balances),
+        ]
+    )
+    rows = replay["ws"]["data"]["userBalances"]
+    by_name = {row["token_info"]["name"]: row for row in rows}
+    by_name["USDC on Sai"]["lastUpdatedBlock"] = RISK_BLOCK
+    by_name["USDC Credits on Sai"]["lastUpdatedBlock"] = MARK_BLOCK
+    with socket.create_server(("127.0.0.1", 0)) as listener:
+        origin = f"127.0.0.1:{listener.getsockname()[1]}"
+        config = uvicorn.Config(app, log_level="error", ws="websockets-sansio")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, kwargs={"sockets": [listener]})
+        thread.start()
+        replay["config"] = replace(
+            replay["config"],
+            endpoint=f"http://{origin}/query",
+            ws_endpoint=f"ws://{origin}/query",
+        )
+        try:
+            for command in (("overview", "--as", ADDR), ("balances", ADDR)):
+                human = cli(replay, "account", *command)
+                assert human.exit_code == 0, human.output
+                assert f"block {RISK_BLOCK}" in human.stdout
+                stale_row = next(
+                    line
+                    for line in human.stdout.splitlines()
+                    if f"block {MARK_BLOCK}" in line
+                )
+                if redirected:
+                    assert f"block {RISK_BLOCK} (age unknown)" in human.stdout
+                    assert "age unknown" in stale_row
+                else:
+                    assert "old" in stale_row and "stale" in stale_row
+
+                machine = cli(replay, "--json", "account", *command)
+                assert machine.exit_code == 0, machine.output
+                response = json.loads(machine.stdout)
+                if command[0] == "overview":
+                    if redirected:
+                        assert response["balances"]["source"] == {
+                            "endpoint": balance_endpoint.removesuffix("/query"),
+                            "matchesKeeper": False,
+                        }
+                    result = response["balances"]["data"]
+                    fresh, stale = result["balance"], result["credits"]
+                else:
+                    result = {
+                        row["sourceBlock"]: row
+                        for row in response["data"]["userBalances"]
+                    }
+                    fresh, stale = result[RISK_BLOCK], result[MARK_BLOCK]
+                assert fresh["sourceBlock"] == RISK_BLOCK
+                assert stale["sourceBlock"] == MARK_BLOCK
+                if redirected:
+                    for row in (fresh, stale):
+                        assert row["stale"] is None
+                        assert row["sourceAgeSeconds"] is None
+                else:
+                    assert fresh["stale"] is False
+                    assert (
+                        0 <= fresh["sourceAgeSeconds"] < overview.BALANCE_STALE_SECONDS
+                    )
+                    assert stale["stale"] is True
+                    assert stale["sourceAgeSeconds"] > overview.BALANCE_STALE_SECONDS
+        finally:
+            server.should_exit = True
+            thread.join(timeout=10)
+
+
+def test_balance_subcommand_ws_flag_overrides_invalid_environment(replay, monkeypatch):
+    config = replay["config"]
+    monkeypatch.setenv("SAI_WS_ENDPOINT", "not-a-websocket-url")
+    result = CliRunner().invoke(
+        main,
+        [
+            "--json",
+            "--endpoint",
+            config.endpoint,
+            "account",
+            "balances",
+            ADDR,
+            "--ws-endpoint",
+            config.ws_endpoint,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    response = json.loads(result.stdout)
+    assert response["data"]["userBalances"]
+    assert (stream.BALANCES_WITH_BLOCK, {"user": ADDR}) in replay["calls"]
+
+
+def test_explicit_balance_websocket_works_without_valid_lcd(replay, monkeypatch):
+    config = replay["config"]
+    monkeypatch.setenv("SAI_LCD_ENDPOINT", "not-an-lcd-url")
+    row = replay["ws"]["data"]["userBalances"][0]
+    row["lastUpdatedBlock"] = RISK_BLOCK
+    args = ["--json", "--endpoint", config.endpoint, "account", "balances", ADDR]
+    cli = CliRunner()
+
+    result = cli.invoke(main, [*args, "--ws-endpoint", config.ws_endpoint])
+    assert result.exit_code == 0, result.output
+    response = json.loads(result.stdout)
+    balance = response["data"]["userBalances"][0]
+    assert balance["amount"] == row["amount"]
+    assert balance["sourceBlock"] == RISK_BLOCK
+    assert balance["sourceAgeSeconds"] is None
+    assert balance["stale"] is None
+    assert replay["calls"] == [(stream.BALANCES_WITH_BLOCK, {"user": ADDR})]
+
+    derived = cli.invoke(main, args)
+    assert derived.exit_code == 2, derived.output
+    assert json.loads(derived.stdout)["error"]["code"] == "INVALID_REQUEST"
+
+
+def test_text_balances_show_unpriced_token_quantities(replay):
+    replay["ws"] = {
+        "data": {
+            "userBalances": [
+                {
+                    "amount": "123456789012345678901234567891",
+                    "usd_value": 0,
+                    "lastUpdatedBlock": RISK_BLOCK,
+                    "token_info": {
+                        "name": "Unpriced token",
+                        "symbol": "UP",
+                        "decimals": 18,
+                        "type": "erc20",
+                    },
+                }
+            ]
+        }
+    }
+    result = cli(replay, "account", "balances", ADDR)
+    assert result.exit_code == 0, result.output
+    assert "Quantity" in result.stdout
+    assert "123456789012.345678901234567891 UP" in result.stdout
+    assert f"block {RISK_BLOCK}" in result.stdout
+
+
+def test_cli_and_mcp_use_usdc_base_units_for_balances(replay):
+    rows = replay["ws"]["data"]["userBalances"]
+    by_name = {row["token_info"]["name"]: row for row in rows}
+    balance = by_name["USDC on Sai"]
+    balance.update(amount="12345678", usd_value=99)
+    credits = by_name["USDC Credits on Sai"]
+    credits.update(amount="1", usd_value=None)
+    by_name["USDC (Sai Teller)"].update(amount="0", usd_value=99)
+
+    machine = cli(replay, "--json", "account", "balances", ADDR)
+    assert machine.exit_code == 0, machine.output
+    cli_rows = json.loads(machine.stdout)["data"]["userBalances"]
+
+    server = create_server(replay["config"])
+    mcp_rows = decode_mcp(
+        asyncio.run(server.call_tool("account_balances", {"addr": ADDR}))
+    )["data"]["userBalances"]
+    for output_rows in (cli_rows, mcp_rows):
+        assert [row["usd_value"] for row in output_rows] == [
+            by_name["Nibiru"]["usd_value"],
+            0,
+            0.000001,
+            12.345678,
+        ]
+        assert output_rows[-1]["amount"] == "12345678"
+
+    mcp_overview = mcp(replay, addr=ADDR)["balances"]["data"]
+    assert mcp_overview["balance"]["usd"] == 12.345678
+    assert mcp_overview["credits"]["usd"] == 0.000001
+
+    for command in (("balances", ADDR), ("overview", "--as", ADDR)):
+        human = cli(replay, "account", *command)
+        assert human.exit_code == 0, human.output
+        assert "12.345678" in human.stdout
+        assert "12.345678 USDC" not in human.stdout
+
+
+def test_usdc_balance_without_base_units_is_unknown(replay):
+    rows = replay["ws"]["data"]["userBalances"]
+    balance = next(row for row in rows if row["token_info"]["name"] == "USDC on Sai")
+    del balance["amount"]
+
+    result = cli(replay, "--json", "account", "balances", ADDR)
+    assert result.exit_code == 0, result.output
+    rows = json.loads(result.stdout)["data"]["userBalances"]
+    actual = next(row for row in rows if row["token_info"]["name"] == "USDC on Sai")
+    assert actual["usd_value"] is None
+    assert mcp(replay, addr=ADDR)["balances"]["data"]["balance"]["usd"] is None

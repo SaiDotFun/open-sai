@@ -16,13 +16,13 @@ import re
 import sys
 import tempfile
 import tomllib
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Collection, Generator, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import httpx
 import tomlkit
@@ -58,11 +58,8 @@ class ConfigError(SettingsError):
         self.diagnostic = diagnostic
 
 
-class InvalidEndpoint(ConfigError):
-    """An endpoint setting contains a malformed URL."""
-
-    def __init__(self, diagnostic: str, detail: str | None = None) -> None:
-        super().__init__(diagnostic, diagnostic if detail is None else detail)
+class InvalidSetting(SettingsError):
+    """A known setting or section has an invalid value."""
 
 
 @dataclass(frozen=True)
@@ -201,45 +198,46 @@ def setting(key: str) -> Setting:
         ) from None
 
 
-def parse_value(key: str, raw: str) -> str | bool | int:
+def parse_value(key: str, raw: str, *, source: str | None = None) -> str | bool | int:
     """Parse RAW, as typed in a flag, variable, or `sai config set`."""
     spec = setting(key)
     text = raw.strip()
+    value: str | bool | int = raw
     if spec.kind == "bool":
         if text.lower() in _TRUE:
-            return True
-        if text.lower() in _FALSE:
-            return False
-        raise SettingsError(f"Invalid value {raw!r} for {key}: expected true or false")
-    if spec.kind == "int":
-        if not text.isascii() or not text.isdigit():
-            raise SettingsError(
-                f"Invalid value {raw!r} for {key}: expected a whole number, 1 or more"
-            )
-        return check_value(key, int(text))
-    return check_value(key, raw)
+            value = True
+        elif text.lower() in _FALSE:
+            value = False
+    elif spec.kind == "int" and text.isascii() and text.isdigit():
+        try:
+            value = int(text)
+        except ValueError:
+            # Python limits integer string conversion. Reject it like other bad values.
+            pass
+    return check_value(key, value, source=source)
 
 
-def check_value(key: str, value: Any) -> str | bool | int:
+def check_value(key: str, value: Any, *, source: str | None = None) -> str | bool | int:
     """Return VALUE when it has the right type and form for KEY."""
     spec = setting(key)
+    message = f"Invalid value for {key}"
+    if source is not None:
+        message = f"{source}: {message}"
     if spec.kind == "bool":
         if not isinstance(value, bool):
-            raise SettingsError(f"Invalid value for {key}: expected true or false")
+            raise InvalidSetting(f"{message}: expected true or false")
         return value
     if spec.kind == "int":
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise SettingsError(
-                f"Invalid value for {key}: expected a whole number, 1 or more"
-            )
+            raise InvalidSetting(f"{message}: expected a whole number, 1 or more")
         return value
     if not isinstance(value, str):
-        raise InvalidEndpoint(f"Invalid value for {key}: expected a URL string")
+        raise InvalidSetting(f"{message}: expected a URL string")
     if spec.section == "keeper" and "#" in value:
-        raise InvalidEndpoint(f"Invalid value for {key}: remove the URL fragment")
+        raise InvalidSetting(f"{message}: remove the URL fragment")
     if _URL_WHITESPACE_OR_CONTROL.search(value):
-        raise InvalidEndpoint(
-            f"Invalid value for {key}: URL contains whitespace or control characters"
+        raise InvalidSetting(
+            f"{message}: URL contains whitespace or control characters"
         )
     try:
         parts = urlsplit(value)
@@ -271,9 +269,8 @@ def check_value(key: str, value: Any) -> str | bool | int:
                 return value
     except (ValueError, httpx.InvalidURL, InvalidURI):
         pass
-    raise InvalidEndpoint(
-        f"Invalid value for {key}: expected a URL starting with"
-        f" {' or '.join(s + '://' for s in spec.schemes)}"
+    raise InvalidSetting(
+        f"{message}: expected a URL starting with {' or '.join(s + '://' for s in spec.schemes)}"
     )
 
 
@@ -286,13 +283,16 @@ def config_path(env: Mapping[str, str]) -> Path:
     return sai_home(env) / FILE_NAME
 
 
-def parse_file(text: str, path: Path | str) -> tuple[dict[str, Any], list[str]]:
+def parse_file(
+    text: str, path: Path | str, *, overridden: Collection[str] = ()
+) -> tuple[dict[str, Any], list[str]]:
     """Return the known keys set in config TEXT and warnings for unknown ones.
 
     A file that is not TOML, or a known key with a bad value, is an error
     naming PATH. Unknown keys are only warned about, so an older sai keeps
     working with a file a newer one wrote. A bad `logs.*` value is a warning
     too: it comes back as `Invalid`, and `resolve` turns logging off.
+    Skip value validation for keys superseded by flags or environment variables.
     """
     try:
         data = tomllib.loads(text)
@@ -304,19 +304,25 @@ def parse_file(text: str, path: Path | str) -> tuple[dict[str, Any], list[str]]:
     warnings: list[str] = []
     for section, table in data.items():
         if not isinstance(table, dict):
+            active_keys = [
+                spec.key
+                for spec in SETTINGS
+                if spec.section == section and spec.key not in overridden
+            ]
+            if section in SECTIONS and not active_keys:
+                continue
             if section in LENIENT_SECTIONS:
                 # Not worth stopping a trade for: the feature goes off.
                 message = f"{section!r} must be a table, such as [{section}]"
-                for spec in SETTINGS:
-                    if spec.section == section:
-                        values[spec.key] = Invalid(message)
+                for key in active_keys:
+                    values[key] = Invalid(message)
                 warnings.append(f"{path}: {message}; logging is off until it is fixed")
                 continue
             if section in SECTIONS:
                 # A known section that is not a table would otherwise fall back
                 # to the default and quietly select another Keeper.
                 message = f"{section!r} must be a table, such as [{section}]"
-                raise ConfigError(message, f"{path}: {message}")
+                raise InvalidSetting(f"{path}: {message}")
             warnings.append(f"{path}: ignoring unknown setting {section!r}")
             continue
         for name, value in table.items():
@@ -324,19 +330,21 @@ def parse_file(text: str, path: Path | str) -> tuple[dict[str, Any], list[str]]:
             if key not in BY_KEY:
                 warnings.append(f"{path}: ignoring unknown setting {key!r}")
                 continue
+            if key in overridden:
+                continue
             try:
                 values[key] = check_value(key, value)
-            except InvalidEndpoint as exc:
-                raise InvalidEndpoint(exc.diagnostic, f"{path}: {exc}") from None
-            except SettingsError as exc:
+            except InvalidSetting as exc:
                 if section not in LENIENT_SECTIONS:
-                    raise ConfigError(str(exc), f"{path}: {exc}") from None
+                    raise InvalidSetting(f"{path}: {exc}") from None
                 values[key] = Invalid(str(exc))
                 warnings.append(f"{path}: {exc}; logging is off until it is fixed")
     return values, warnings
 
 
-def read_file(path: Path) -> tuple[dict[str, Any], list[str]]:
+def read_file(
+    path: Path, *, overridden: Collection[str] = ()
+) -> tuple[dict[str, Any], list[str]]:
     """Read the config file at PATH; a missing file sets nothing."""
     try:
         text = path.read_text(encoding="utf-8")
@@ -349,7 +357,39 @@ def read_file(path: Path) -> tuple[dict[str, Any], list[str]]:
         raise ConfigError(
             "Could not read config.toml", f"Cannot read {path}: {exc.strerror}"
         ) from None
-    return parse_file(text, path)
+    return parse_file(text, path, overridden=overridden)
+
+
+def _override(
+    spec: Setting, flags: Mapping[str, str | None], env: Mapping[str, str]
+) -> tuple[str, str] | None:
+    raw_flag = flags.get(spec.key)
+    if raw_flag is not None:
+        return raw_flag, "flag"
+    raw_env = env.get(spec.env, "")
+    if raw_env.strip():
+        return raw_env, "env"
+    return None
+
+
+def shadowed_file_keys(
+    flag_keys: Iterable[str], env: Mapping[str, str]
+) -> frozenset[str]:
+    """Config file keys superseded by higher layers."""
+    overridden = set(flag_keys)
+    overridden.update(spec.key for spec in SETTINGS if env.get(spec.env, "").strip())
+    if "keeper.endpoint" in overridden:
+        # Even with no explicit WebSocket override, derive it from the HTTP URL.
+        overridden.add("keeper.ws_endpoint")
+    return frozenset(overridden)
+
+
+def read_effective_file(
+    path: Path, flags: Mapping[str, str | None], env: Mapping[str, str]
+) -> tuple[dict[str, Any], list[str]]:
+    """Read the config file, skipping values that cannot affect resolution."""
+    flag_keys = (key for key, value in flags.items() if value is not None)
+    return read_file(path, overridden=shadowed_file_keys(flag_keys, env))
 
 
 def resolve(
@@ -367,53 +407,41 @@ def resolve(
 
     A bad `logs.*` value never fails: its source becomes `invalid` and
     logging resolves to off, so a typo in a logging setting cannot stop a
-    command or the MCP server from starting. With logging already turned
-    off, `logs.keep_days` is not validated at all.
+    command or the MCP server from starting. Invalid retention is reported
+    even when logging is already off.
     """
     values: dict[str, str | bool | int | None] = {}
     sources: dict[str, str] = {}
+    http_key, ws_key = "keeper.endpoint", "keeper.ws_endpoint"
     for spec in SETTINGS:
-        raw_flag = flags.get(spec.key)
-        raw_env = env.get(spec.env, "")
+        override = _override(spec, flags, env)
+        source = override[1] if override else "file" if spec.key in file else "default"
+        # SETTINGS lists the HTTP endpoint before its dependent WebSocket.
+        if spec.key == ws_key and (
+            source == "default" or _RANK[source] > _RANK[sources[http_key]]
+        ):
+            values[ws_key] = stream.derive_ws(str(values[http_key]))
+            sources[ws_key] = "derived"
+            continue
         try:
-            if raw_flag is not None:
-                values[spec.key], sources[spec.key] = (
-                    parse_value(spec.key, raw_flag),
-                    "flag",
-                )
-            elif raw_env.strip():
-                values[spec.key], sources[spec.key] = (
-                    parse_value(spec.key, raw_env),
-                    "env",
-                )
-            elif spec.key in file:
+            if override is not None:
+                origin = (spec.flag or spec.key) if source == "flag" else spec.env
+                values[spec.key] = parse_value(spec.key, override[0], source=origin)
+            elif source == "file":
                 if isinstance(file[spec.key], Invalid):
-                    raise SettingsError(file[spec.key].message)
-                values[spec.key], sources[spec.key] = (
-                    check_value(spec.key, file[spec.key]),
-                    "file",
+                    raise InvalidSetting(file[spec.key].message)
+                values[spec.key] = check_value(
+                    spec.key, file[spec.key], source=FILE_NAME
                 )
             else:
-                values[spec.key], sources[spec.key] = spec.default, "default"
-        except SettingsError as exc:
-            if spec.section in LENIENT_SECTIONS:
-                # With logging turned off by a valid setting, the other
-                # logs values are not validated: they change nothing.
-                off = values.get("logs.enabled") is False
-                layer = "env" if raw_env.strip() else "file"
                 values[spec.key] = spec.default
-                sources[spec.key] = layer if off else "invalid"
-                continue
-            origin = spec.flag or spec.key if raw_flag is not None else spec.env
-            if isinstance(exc, InvalidEndpoint):
-                raise InvalidEndpoint(exc.diagnostic, f"{origin}: {exc}") from None
-            raise SettingsError(f"{origin}: {exc}") from None
+        except InvalidSetting:
+            if spec.section not in LENIENT_SECTIONS:
+                raise
+            values[spec.key] = spec.default
+            source = "invalid"
+        sources[spec.key] = source
     logs_valid = "invalid" not in (sources["logs.enabled"], sources["logs.keep_days"])
-    ws_key, http_key = "keeper.ws_endpoint", "keeper.endpoint"
-    ws_rank = _RANK[sources[ws_key]]
-    if values[ws_key] is None or ws_rank > _RANK[sources[http_key]]:
-        values[ws_key] = stream.derive_ws(str(values[http_key]))
-        sources[ws_key] = "derived"
     return Settings(
         endpoint=str(values[http_key]),
         ws_endpoint=str(values[ws_key]),
@@ -432,8 +460,9 @@ def load(
 ) -> Settings:
     """Read the config file named by ENV (default: os.environ) and resolve."""
     values = os.environ if env is None else env
-    file, warnings = read_file(config_path(values))
-    resolved = resolve(flags or {}, values, file)
+    overrides = flags or {}
+    file, warnings = read_effective_file(config_path(values), overrides, values)
+    resolved = resolve(overrides, values, file)
     for spec in SETTINGS:
         from_env = values.get(spec.env, "").strip()
         if resolved.sources[spec.key] == "invalid" and from_env:
@@ -450,39 +479,24 @@ def load(
 # Redacted output
 
 
-def public_url(url: str | None) -> str | None:
-    """Return URL without user info, query, or fragment, which can hold
-    credentials such as API keys."""
-    if url is None:
-        return None
-    parts = urlsplit(url)
-    host = parts.hostname or ""
-    if ":" in host:
-        host = f"[{host}]"
-    try:
-        port = parts.port
-    except ValueError:
-        port = None
-    netloc = host if port is None else f"{host}:{port}"
-    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+def public_value(
+    spec: Setting, value: str | bool | int | None
+) -> str | bool | int | None:
+    """Show only the origin for an endpoint setting."""
+    if spec.kind == "url" and isinstance(value, str):
+        return log.origin(value)
+    return value
 
 
 def public(settings: Settings) -> dict[str, dict[str, Any]]:
     """Every key with its display value, source, variable, and default."""
 
-    def shown(spec: Setting, value: Any) -> Any:
-        if spec.kind != "url" or value is None:
-            return value
-        if spec.section == "keeper":
-            return log.origin(value)
-        return public_url(value)
-
     return {
         spec.key: {
-            "value": shown(spec, settings.value(spec.key)),
+            "value": public_value(spec, settings.value(spec.key)),
             "source": settings.sources[spec.key],
             "env": spec.env,
-            "default": shown(spec, spec.default),
+            "default": public_value(spec, spec.default),
         }
         for spec in SETTINGS
     }
@@ -580,7 +594,7 @@ def _table(
     if _is_standard(doc, spec.section, item):
         return item
     if not isinstance(getattr(item, "unwrap", lambda: None)(), dict):
-        raise SettingsError(
+        raise InvalidSetting(
             f"{path}: {spec.section!r} must be a table, such as [{spec.section}]"
         )
     raise UneditableSection(

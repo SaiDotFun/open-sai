@@ -63,7 +63,7 @@ def test_set_get_unset(tmp_path):
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout) == {
         "key": "keeper.endpoint",
-        "value": SECRET_URL,
+        "value": "https://k.example",
         "path": str(path),
     }
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
@@ -104,10 +104,12 @@ def test_bool_setting_text_output():
     assert "update.auto = false  # file, SAI_UPDATE_AUTO" in text
 
 
-def test_list_shows_only_keeper_origins():
+def test_list_shows_only_endpoint_origins():
     path_key, query_key = "fixture-path-key", "fixture-query-key"
     endpoint = f"https://[::1]:9443/{path_key}/query?key={query_key}"
     assert sai("config", "set", "keeper.endpoint", endpoint).exit_code == 0
+    lcd = f"https://lcd.example:8443/{path_key}?key={query_key}"
+    assert sai("config", "set", "lcd.endpoint", lcd).exit_code == 0
 
     text = sai("config", "list")
     structured = sai("--json", "config", "list")
@@ -117,10 +119,29 @@ def test_list_shows_only_keeper_origins():
 
     assert 'keeper.endpoint = "https://[::1]:9443"' in text.stdout
     assert 'keeper.ws_endpoint = "wss://[::1]:9443"' in text.stdout
+    assert 'lcd.endpoint = "https://lcd.example:8443"' in text.stdout
     shown = json.loads(structured.stdout)["settings"]
     assert shown["keeper.endpoint"]["value"] == "https://[::1]:9443"
     assert shown["keeper.ws_endpoint"]["value"] == "wss://[::1]:9443"
     assert shown["keeper.ws_endpoint"]["source"] == "derived"
+    assert shown["lcd.endpoint"]["value"] == "https://lcd.example:8443"
+    assert sai("config", "get", "lcd.endpoint").stdout == lcd + "\n"
+
+
+@pytest.mark.parametrize(
+    ("host", "ascii_host"),
+    [
+        ("bücher.example", "xn--bcher-kva.example"),
+        ("faß.example", "xn--fa-hia.example"),
+    ],
+)
+def test_config_list_shows_idna_origin_for_internationalized_lcd(host, ascii_host):
+    endpoint = f"https://{host}:8443/fixture-private-path?key=fixture-private-query"
+    assert sai("config", "set", "lcd.endpoint", endpoint).exit_code == 0
+    expected = f"https://{ascii_host}:8443"
+    assert listed()["settings"]["lcd.endpoint"]["value"] == expected
+    assert f'lcd.endpoint = "{expected}"' in sai("config", "list").stdout
+    assert sai("config", "get", "lcd.endpoint").stdout == endpoint + "\n"
 
 
 @pytest.mark.parametrize(
@@ -138,6 +159,38 @@ def test_unknown_key_or_bad_value_exits_2_listing_keys(args, tmp_path):
     assert result.exit_code == 2
     assert "Valid keys: keeper.endpoint, keeper.ws_endpoint" in result.stderr
     assert not (tmp_path / "config.toml").exists()
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        ("update.auto", "true or false"),
+        ("logs.keep_days", "a whole number, 1 or more"),
+    ],
+)
+def test_config_set_reports_invalid_values_without_echoing_them(
+    tmp_path, key, expected, json_output
+):
+    args = ["--json"] if json_output else []
+    value = "fixture-private-setting-value"
+    result = sai(*args, "config", "set", key, value)
+
+    assert result.exit_code == 2
+    message = f"Invalid value for {key}: expected {expected}"
+    if json_output:
+        assert json.loads(result.stdout)["error"] == {
+            "code": "INVALID_REQUEST",
+            "message": f"{message}. Valid keys: {', '.join(settings.KEYS)}",
+            "retryable": False,
+        }
+        assert result.stderr == ""
+    else:
+        assert result.stdout == ""
+        assert message in result.stderr
+    assert value not in result.output
+    assert not (tmp_path / "config.toml").exists()
+    assert not (tmp_path / ".config.lock").exists()
 
 
 @pytest.mark.parametrize("authority", ["[::1]suffix", "prefix[::1]", "[::1"])
@@ -166,7 +219,27 @@ def test_config_set_accepts_ipv6_with_port():
     endpoint = "https://[::1]:8443/path"
     result = sai("--json", "config", "set", "keeper.endpoint", endpoint)
     assert result.exit_code == 0
-    assert json.loads(result.stdout)["value"] == endpoint
+    assert json.loads(result.stdout)["value"] == "https://[::1]:8443"
+    assert sai("config", "get", "keeper.endpoint").stdout == endpoint + "\n"
+
+
+@pytest.mark.parametrize(
+    ("key", "scheme"),
+    [
+        ("lcd.endpoint", "https"),
+        ("keeper.endpoint", "https"),
+        ("keeper.ws_endpoint", "wss"),
+    ],
+)
+def test_config_set_acknowledges_only_the_endpoint_origin(key, scheme):
+    origin = f"{scheme}://provider.example:8443"
+    path_key, query_key = "fixture-private-path", "fixture-private-query"
+    endpoint = f"{origin}/{path_key}?key={query_key}"
+    result = sai("--json", "config", "set", key, endpoint)
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["value"] == origin
+    assert path_key not in result.output and query_key not in result.output
+    assert sai("config", "get", key).stdout == endpoint + "\n"
 
 
 @pytest.mark.parametrize(
@@ -235,7 +308,8 @@ def test_config_set_accepts_percent_encoded_websocket_request_target():
     endpoint = "wss://keeper.example/graphql%20stream?name=one%20two"
     result = sai("--json", "config", "set", "keeper.ws_endpoint", endpoint)
     assert result.exit_code == 0
-    assert json.loads(result.stdout)["value"] == endpoint
+    assert json.loads(result.stdout)["value"] == "wss://keeper.example"
+    assert sai("config", "get", "keeper.ws_endpoint").stdout == endpoint + "\n"
 
 
 @pytest.mark.parametrize(
@@ -334,6 +408,31 @@ def test_flag_and_env_override_the_file(monkeypatch):
     assert "SAI_ENDPOINT is set and overrides keeper.endpoint" in result.stderr
 
 
+@pytest.mark.parametrize("source", ["env", "file"])
+def test_only_the_effective_websocket_setting_is_validated(
+    tmp_path, monkeypatch, source
+):
+    value = "fixture-malformed-websocket"
+    if source == "env":
+        origin = "SAI_WS_ENDPOINT"
+        monkeypatch.setenv(origin, value)
+    else:
+        path = tmp_path / "config.toml"
+        path.write_text(f'[keeper]\nws_endpoint = "{value}"\n')
+        origin = str(path)
+
+    entry = listed("--endpoint", "https://keeper.invalid/query")["settings"][
+        "keeper.ws_endpoint"
+    ]
+    assert (entry["value"], entry["source"]) == ("wss://keeper.invalid", "derived")
+
+    result = sai("--json", "config", "list")
+    assert result.exit_code == 2
+    message = json.loads(result.stdout)["error"]["message"]
+    assert f"{origin}: Invalid value for keeper.ws_endpoint" in message
+    assert value not in result.output
+
+
 @pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
 @pytest.mark.parametrize("source", ["flag", "env", "file"])
 @pytest.mark.parametrize(
@@ -372,13 +471,96 @@ def test_malformed_endpoint_during_resolution_is_a_usage_error(
         assert "Traceback" not in result.stderr
 
 
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("source", ["env", "file"])
+@pytest.mark.parametrize("command", [("config", "list"), ("mcp", "serve")])
+def test_invalid_update_override_exits_2(
+    tmp_path, monkeypatch, json_output, source, command
+):
+    value = "fixture-private-update-value"
+    if source == "env":
+        origin = "SAI_UPDATE_AUTO"
+        monkeypatch.setenv(origin, value)
+    else:
+        path = tmp_path / "config.toml"
+        path.write_text(f'[update]\nauto = "{value}"\n')
+        origin = str(path)
+    args = ["--json"] if json_output else []
+    result = sai(*args, *command)
+
+    assert result.exit_code == 2
+    message = f"{origin}: Invalid value for update.auto: expected true or false"
+    if command == ("mcp", "serve"):
+        message = f"sai mcp serve: {message}"
+    if json_output:
+        assert json.loads(result.stdout) == {
+            "error": {"code": "INVALID_REQUEST", "message": message, "retryable": False}
+        }
+        assert result.stderr == ""
+    else:
+        assert result.stdout == ""
+        assert message in result.stderr
+    assert value not in result.output
+
+
+@pytest.mark.parametrize("source", ["env", "file"])
+def test_config_list_reports_invalid_retention_when_logging_is_off(
+    tmp_path, monkeypatch, source
+):
+    monkeypatch.setenv("SAI_LOG", "false")
+    value = "fixture-invalid-retention"
+    if source == "env":
+        origin = "SAI_LOG_KEEP_DAYS"
+        monkeypatch.setenv(origin, value)
+    else:
+        path = tmp_path / "config.toml"
+        path.write_text(f'[logs]\nkeep_days = "{value}"\n')
+        origin = str(path)
+
+    result = sai("--json", "config", "list")
+
+    assert result.exit_code == 0
+    shown = json.loads(result.stdout)["settings"]
+    assert shown["logs.enabled"]["value"] is False
+    assert shown["logs.keep_days"]["source"] == "invalid"
+    assert shown["logs.keep_days"]["value"] == 14
+    assert origin in result.stderr and "logs.keep_days" in result.stderr
+    assert value not in result.output
+
+
 @pytest.mark.parametrize(
-    ("args", "key"),
+    "args",
+    [("--json", "account", "overview"), ("account", "overview", "--json")],
+    ids=["root", "subcommand"],
+)
+def test_account_overview_reports_settings_errors_in_json(monkeypatch, args):
+    monkeypatch.setenv("SAI_UPDATE_AUTO", "fixture-invalid-boolean")
+
+    result = sai(*args)
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "error": {
+            "code": "INVALID_REQUEST",
+            "message": "SAI_UPDATE_AUTO: Invalid value for update.auto: expected true or false",
+            "retryable": False,
+        }
+    }
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    ("args", "key", "flag"),
     [
-        (("mcp", "serve", "--endpoint", "https://[::1]:oops/path"), "keeper.endpoint"),
+        (
+            ("mcp", "serve", "--endpoint", "https://[::1]:oops/path"),
+            "keeper.endpoint",
+            "--endpoint",
+        ),
         (
             ("watch", "price", "1", "--ws-endpoint", "wss://[::1]:oops/path"),
             "keeper.ws_endpoint",
+            "--ws-endpoint",
         ),
         (
             (
@@ -390,15 +572,16 @@ def test_malformed_endpoint_during_resolution_is_a_usage_error(
                 "--offline",
             ),
             "keeper.endpoint",
+            "--endpoint",
         ),
     ],
 )
-def test_malformed_command_endpoint_is_a_usage_error(args, key):
+def test_malformed_command_endpoint_is_a_usage_error(args, key, flag):
     result = sai("--json", *args)
     assert result.exit_code == 2
     error = json.loads(result.stdout)["error"]
     assert error["code"] == "INVALID_REQUEST"
-    assert key in error["message"]
+    assert f"{flag}: Invalid value for {key}" in error["message"]
     assert result.stderr == ""
 
 
@@ -450,7 +633,7 @@ def test_malformed_file_fails_commands_but_can_be_fixed(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text('[update]\nauto = "sometimes"  # oops\n')
     result = sai("market", "prices")
-    assert result.exit_code == 1
+    assert result.exit_code == 2
     assert f"{path}: Invalid value for update.auto" in result.stderr
     assert sai("config", "unset", "update.auto").exit_code == 0
     assert listed()["settings"]["update.auto"]["source"] == "default"

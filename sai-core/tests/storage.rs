@@ -53,14 +53,13 @@ fn sessions_are_private_and_reads_do_not_create_files() {
         fs::metadata(&trader).unwrap().permissions().mode() & 0o777,
         0o700
     );
-    for name in ["sessions.json", "sessions.lock"] {
-        let path = trader.join(name);
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert!(!fs::read_to_string(path).unwrap().contains(fixture));
-    }
+    let path = trader.join("sessions.json");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!fs::read_to_string(path).unwrap().contains(fixture));
+    assert_eq!(fs::metadata(trader.join("sessions.lock")).unwrap().len(), 0);
     let storage = Storage::new(home.path());
     let loaded = storage
         .load_active_session(ENDPOINT, Some("0xabcd"))
@@ -207,16 +206,21 @@ fn reservation_subprocess() {
         return;
     };
     let home = std::env::var_os("SAI_HOME").unwrap();
+    let endpoint = std::env::var("SAI_TEST_RESERVE_ENDPOINT").unwrap_or_else(|_| ENDPOINT.into());
+    let account = std::env::var("SAI_TEST_RESERVE_ACCOUNT").unwrap_or_else(|_| ADDR.into());
     let mut input = io::stdin().lock();
     input.read_exact(&mut [0]).unwrap();
-    match Storage::new(home).pending(&key, ENDPOINT, ADDR, KIND, "7") {
+    match Storage::new(home).pending(&key, &endpoint, &account, KIND, "7") {
         Ok(()) => {
             io::stderr().write_all(b"reserved\n").unwrap();
             if std::env::var_os("SAI_TEST_RESERVE_WAIT").is_some() {
                 let _ = input.read_exact(&mut [0]);
             }
         }
-        Err(StorageError::UncertainIntent(_)) => process::exit(4),
+        Err(StorageError::UncertainIntent(key)) => {
+            writeln!(io::stderr(), "blocked by {key}").unwrap();
+            process::exit(4);
+        }
         Err(error) => panic!("Reserve failed: {error}"),
     }
 }
@@ -227,6 +231,8 @@ fn child(home: &std::path::Path, key: &str, wait: bool) -> Child {
         .args(["--exact", "reservation_subprocess", "--nocapture"])
         .env("SAI_HOME", home)
         .env("SAI_TEST_RESERVE_KEY", key)
+        .env_remove("SAI_TEST_RESERVE_ENDPOINT")
+        .env_remove("SAI_TEST_RESERVE_ACCOUNT")
         .env_remove("SAI_TEST_RESERVE_WAIT")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -453,4 +459,42 @@ fn migrates_old_v1_and_distinguishes_legacy_from_verified_terminal() {
         )
         .unwrap();
     assert_eq!(marker, "terminal");
+}
+#[test]
+fn accepted_open_blocks_until_terminal_unless_explicitly_overridden() {
+    let home = tempdir().unwrap();
+    let storage = Storage::new(home.path());
+    let opening = "OPEN_TRADE";
+    storage
+        .pending("open", ENDPOINT, ADDR, opening, "")
+        .unwrap();
+    storage
+        .set_status("open", ENDPOINT, ADDR, IntentStatus::Accepted)
+        .unwrap();
+
+    assert!(matches!(
+        storage.pending("blocked", ENDPOINT, ADDR, opening, ""),
+        Err(StorageError::RecentOpenPending { key, .. }) if key == "open"
+    ));
+    storage
+        .reserve("override", ENDPOINT, ADDR, opening, "", true)
+        .unwrap();
+    storage
+        .reserve("third", ENDPOINT, ADDR, opening, "", true)
+        .unwrap();
+    storage
+        .set_status("override", ENDPOINT, ADDR, IntentStatus::Pending)
+        .unwrap();
+    assert!(matches!(
+        storage.reserve("blocked", ENDPOINT, ADDR, opening, "", true),
+        Err(StorageError::RecentOpenPending { key, .. }) if key == "override"
+    ));
+    for key in ["open", "override", "third"] {
+        storage
+            .set_status(key, ENDPOINT, ADDR, IntentStatus::Terminal)
+            .unwrap();
+    }
+    storage
+        .pending("next", ENDPOINT, ADDR, opening, "")
+        .unwrap();
 }

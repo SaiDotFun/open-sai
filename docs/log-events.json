@@ -112,6 +112,21 @@
         "endpointId": "string"
       }
     },
+    "intent.open_blocked": {
+      "emitter": "core.storage._check_open_pending",
+      "levels": [
+        "warn"
+      ],
+      "required": {
+        "intentKey": "string",
+        "addr": "string",
+        "endpoint": "string",
+        "code": "string"
+      },
+      "optional": {
+        "endpointId": "string"
+      }
+    },
     "intent.status": {
       "emitter": "core.storage._log_status",
       "levels": [
@@ -165,7 +180,7 @@
       }
     },
     "intent.wait.start": {
-      "emitter": "core intent wait (lane A4)",
+      "emitter": "core.wait.for_intent_async",
       "levels": [
         "info"
       ],
@@ -180,7 +195,7 @@
       }
     },
     "intent.wait.end": {
-      "emitter": "core intent wait (lane A4)",
+      "emitter": "core.wait.for_intent_async",
       "levels": [
         "info",
         "warn",

@@ -2,12 +2,36 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import threading
 from collections.abc import Generator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import unquote, urlsplit
+
+POSITION_ROUTE = {
+    "oneClickTrading": {
+        "enabled": True,
+        "chainId": "fixture-1",
+        "contractAddress": "nibi1fixture",
+    }
+}
+
+
+def position_data(variables: dict[str, Any]) -> dict[str, Any]:
+    """Return the selected account's synthetic position in a Keeper response."""
+    return {
+        "perp": {
+            "trade": {
+                "id": variables["id"],
+                "trader": variables["trader"],
+                "isOpen": True,
+                "tradeType": "trade",
+            }
+        }
+    }
 
 
 class KeeperHandler(BaseHTTPRequestHandler):
@@ -26,6 +50,32 @@ class KeeperHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: Any) -> None:
         pass
+
+
+class PositionKeeperHandler(KeeperHandler):
+    """Serve an LCD trade target for tests concerned with intent admission."""
+
+    def do_GET(self) -> None:
+        path = urlsplit(self.path).path
+        if path == "/cosmos/base/tendermint/v1beta1/node_info":
+            self.reply({"default_node_info": {"network": "fixture-1"}})
+            return
+        prefix = "/cosmwasm/wasm/v1/contract/nibi1fixture/smart/"
+        assert path.startswith(prefix)
+        request = json.loads(base64.b64decode(unquote(path[len(prefix) :])))
+        if "get_trade_raw" not in request:
+            self.send_error(400, "unsupported contract query")
+            return
+        trade = request["get_trade_raw"]
+        self.reply(
+            {
+                "data": {
+                    "user": trade["trader"],
+                    "user_trade_index": f"UserTradeIndex({trade['index']})",
+                    "collateral_amount": "4000000",
+                }
+            }
+        )
 
 
 @contextmanager

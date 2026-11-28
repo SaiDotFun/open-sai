@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
+from ..core.overview import is_usdc_balance
+from ..core.session import expiry_notice_text
 from .repl_skin import ReplSkin
 
 UNKNOWN = "unknown"
@@ -14,17 +17,69 @@ def _value(value: Any, suffix: str = "") -> str:
 
 
 def _source(row: dict[str, Any]) -> str:
-    if row.get("sourceAt") is not None:
+    if row.get("sourceAt") is not None and row.get("sourceAtBasis") != "fetchedAt":
         return f"{row['sourceAt']} ({_value(row['sourceAgeSeconds'], ' s')})"
     if row.get("sourceBlock") is not None:
         return f"block {row['sourceBlock']} (time unknown)"
     return UNKNOWN
 
 
+def _balance_source(row: dict[str, Any]) -> str:
+    height = row["sourceBlock"]
+    source = f"block {height}" if height is not None else "block unknown"
+    age = row["sourceAgeSeconds"]
+    if age is None:
+        return f"{source} (age unknown)"
+    minutes, seconds = divmod(int(age), 60)
+    hours, minutes = divmod(minutes, 60)
+    elapsed = f"{hours}h {minutes}m" if hours else f"{minutes}m {seconds}s"
+    return f"{source} ({elapsed} old{' · stale' if row['stale'] else ''})"
+
+
+def _token_quantity(row: dict[str, Any]) -> str:
+    token = row["token_info"]
+    amount = str(row.get("amount"))
+    decimals = token.get("decimals")
+    symbol = token.get("symbol")
+    if not (
+        amount.isascii()
+        and amount.isdecimal()
+        and type(decimals) is int
+        and 0 <= decimals <= 255
+        and isinstance(symbol, str)
+        and symbol
+    ):
+        return UNKNOWN
+    quantity = format(Decimal(f"{amount}e-{decimals}"), "f")
+    if "." in quantity:
+        quantity = quantity.rstrip("0").rstrip(".")
+    return f"{quantity} {symbol}"
+
+
+def show_balances(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        print("No balance rows returned.")
+        return
+    ReplSkin("sai").table(
+        ["Balance", "Quantity", "USD", "Source (Age)"],
+        [
+            [
+                row["token_info"]["name"],
+                "-" if is_usdc_balance(row) else _token_quantity(row),
+                _value(row.get("usd_value")),
+                _balance_source(row),
+            ]
+            for row in rows
+        ],
+        max_col_width=72,
+    )
+
+
 def _collateral(row: dict[str, Any]) -> str:
     if row["collateralUsd"] is not None:
         return _value(row["collateralUsd"])
-    return f"{row['collateralBaseUnits']} {row['collateralToken']} base units"
+    token = row["collateralToken"] or row["collateralTokenId"]
+    return f"{row['collateralBaseUnits']} {token} base units"
 
 
 def _trigger(row: dict[str, Any], prefix: str) -> str:
@@ -60,6 +115,9 @@ def show(result: dict[str, Any]) -> None:
                 )
         if error := snapshot.get("error"):
             print(f"  {error['message']} ({error['code']})")
+        if snapshot.get("status") == "skipped":
+            print(f"  Skipped. {snapshot['skipReason']}")
+            return None
         return snapshot.get("data")
 
     def table(headers: list[str], rows: list[list[str]]) -> None:
@@ -76,7 +134,7 @@ def show(result: dict[str, Any]) -> None:
                 [
                     "Unsettled Teller" if key == "unsettled" else key.title(),
                     _value(row["usd"]),
-                    _source(row),
+                    _balance_source(row),
                 ]
                 for key, row in balances.items()
             ],
@@ -141,7 +199,7 @@ def show(result: dict[str, Any]) -> None:
                     if row["liquidationPriceUsd"] is None:
                         price = _value(row["liquidationPriceQuote"])
                         print(
-                            f"    Contract liquidation price {price} {row['quoteToken']}"
+                            f"    Contract liquidation price {price} {row['quoteToken'] or row['quoteTokenId']}"
                         )
                 if mark := row.get("markSource"):
                     block = (
@@ -168,7 +226,7 @@ def show(result: dict[str, Any]) -> None:
                     if "keeperLiquidationEstimatePriceQuote" in row:
                         estimate = _value(row["keeperLiquidationEstimatePriceQuote"])
                         print(
-                            f"    Keeper liquidation estimate {estimate} {row['quoteToken']}. Source time unknown."
+                            f"    Keeper liquidation estimate {estimate} {row['quoteToken'] or row['quoteTokenId']}. Source time unknown."
                         )
             print(
                 f"  Total gross unrealized PnL before fees {_value(positions['unrealizedPnlUsd'], ' USD')}"
@@ -245,7 +303,10 @@ def show(result: dict[str, Any]) -> None:
     if prices is not None:
         table(
             ["Token", "USD", "Source (Age)"],
-            [[row["token"], _value(row["usd"]), _source(row)] for row in prices],
+            [
+                [str(row["token"] or row["tokenId"]), _value(row["usd"]), _source(row)]
+                for row in prices
+            ],
         )
 
     intents = section("blockingIntents", "Local Intents Blocking Trades")
@@ -277,7 +338,7 @@ def show(result: dict[str, Any]) -> None:
             )
             print(f"  {state.capitalize()} until {session['expiresAt']}")
             print(f"  Issued at {_source(session)}")
-            if warning := session.get("expiryWarning"):
-                print(f"  {warning} Run {session['renewalCommand']}.")
+            if session.get("expiryWarning"):
+                print(f"  {expiry_notice_text(session)}")
         else:
             print("  No local session for this account")

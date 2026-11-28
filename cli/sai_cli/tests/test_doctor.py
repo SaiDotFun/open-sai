@@ -17,11 +17,12 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from click.testing import CliRunner
 from sai_cli import doctor
-from sai_cli.core import keeper, margin, settings, storage, stream, update, updater
+from sai_cli.core import keeper, log, margin, settings, storage, stream, update, updater
 from sai_cli.sai_cli import main
 from websockets.http11 import Request, Response
 from websockets.sync.server import ServerConnection, serve
@@ -47,8 +48,8 @@ TOKEN = f"{HEADER}.{PAYLOAD}.{SIGNATURE}"
 def isolated_home(tmp_path, monkeypatch) -> Path:
     monkeypatch.setenv("SAI_HOME", str(tmp_path))
     monkeypatch.setenv("PATH", "")
-    for name in ("SAI_ENDPOINT", "SAI_WS_ENDPOINT", "SAI_LCD_ENDPOINT"):
-        monkeypatch.delenv(name, raising=False)
+    for spec in settings.SETTINGS:
+        monkeypatch.delenv(spec.env, raising=False)
     return tmp_path
 
 
@@ -128,8 +129,8 @@ def run_cli(*args: str) -> tuple[int, str]:
             2,
             "keeper.endpoint",
         ),
-        (b"[update]\nauto = 'private_value'\n", "fail", 1, "update.auto"),
-        (b"[logs]\nenabled = false\nkeep_days = 0\n", "fail", 1, "logs.keep_days"),
+        (b"[update]\nauto = 'private_value'\n", "fail", 2, "update.auto"),
+        (b"[logs]\nenabled = false\nkeep_days = 0\n", "fail", 2, "logs.keep_days"),
         (b"\xff", "fail", 1, "UTF-8"),
         pytest.param(
             b"[logs]\nkeep_days = " + b"9" * 5000,
@@ -141,12 +142,10 @@ def run_cli(*args: str) -> tuple[int, str]:
     ],
 )
 def test_config_check_reports_file_errors_without_echoing_values(
-    isolated_home, monkeypatch, content, expected, exit_code, summary
+    isolated_home, content, expected, exit_code, summary
 ):
     path = isolated_home / "config.toml"
     path.write_bytes(content)
-    # File validation still applies to keys shadowed by an environment value.
-    monkeypatch.setenv("SAI_UPDATE_AUTO", "false")
     code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
     report = json.loads(output)
     if expected == "fail":
@@ -155,10 +154,50 @@ def test_config_check_reports_file_errors_without_echoing_values(
     checks = {check["id"]: check for check in report["checks"]}
     assert checks["config"]["status"] == expected
     assert summary in checks["config"]["summary"]
+    if exit_code == 2:
+        assert str(path) in checks["config"]["summary"]
     assert "home" in checks
     assert code == exit_code
     assert "private_setting" not in output and "private_value" not in output
     assert path.read_bytes() == content
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_config_check_names_invalid_environment_override(monkeypatch, json_output):
+    value = "fixture-private-update-value"
+    monkeypatch.setenv("SAI_UPDATE_AUTO", value)
+    args = ["--json"] if json_output else []
+    result = CliRunner().invoke(main, [*args, "doctor", "--offline", "--no-fix"])
+
+    assert result.exit_code == 2
+    message = "SAI_UPDATE_AUTO: Invalid value for update.auto: expected true or false"
+    if json_output:
+        error = json.loads(result.stdout)["error"]
+        assert error["code"] == "INVALID_REQUEST"
+        assert error["retryable"] is False
+        assert message in error["message"]
+        config = next(
+            check for check in error["details"]["checks"] if check["id"] == "config"
+        )
+        assert config["summary"] == message
+        assert result.stderr == ""
+    else:
+        assert result.stdout == ""
+        assert message in result.stderr
+    assert value not in result.output
+
+
+def test_config_check_ignores_an_invalid_file_value_overridden_by_env(
+    isolated_home, monkeypatch
+):
+    (isolated_home / "config.toml").write_text('[update]\nauto = "fixture-invalid"\n')
+    monkeypatch.setenv("SAI_UPDATE_AUTO", "false")
+
+    code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
+
+    assert code == 0
+    config = next(c for c in json.loads(output)["checks"] if c["id"] == "config")
+    assert config["status"] == "pass"
 
 
 def test_unusable_config_skips_checks_that_need_resolved_settings(isolated_home):
@@ -182,6 +221,19 @@ def test_config_warns_about_invalid_logging_override(monkeypatch):
     assert "SAI_LOG" in checks["config"]["summary"]
     assert "logs.enabled" in checks["config"]["summary"]
     assert "private-invalid-boolean" not in output
+
+
+def test_config_warns_about_invalid_retention_when_logging_is_off(monkeypatch):
+    monkeypatch.setenv("SAI_LOG", "false")
+    monkeypatch.setenv("SAI_LOG_KEEP_DAYS", "fixture-invalid-retention")
+
+    code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
+
+    assert code == 0
+    config = next(c for c in json.loads(output)["checks"] if c["id"] == "config")
+    assert config["status"] == "warn"
+    assert "SAI_LOG_KEEP_DAYS (logs.keep_days)" in config["summary"]
+    assert "fixture-invalid-retention" not in output
 
 
 # Session
@@ -226,11 +278,8 @@ def test_expired_session_fails():
     check = one(doctor.check_session, ctx())
     assert check.status == "fail"
     assert "expired" in check.summary
-    assert check.fix and check.fix.startswith(
-        'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?'
-    )
-    assert "auth login NAME" in check.fix
-    assert ENDPOINT not in check.fix
+    assert check.fix == f"sai --endpoint {ENDPOINT} auth import --addr {ADDR}"
+    assert "Foundry keystore" in check.summary
 
 
 def test_session_for_other_endpoint_fails():
@@ -320,34 +369,242 @@ def test_no_fix_reports_loose_modes_without_changing_them(isolated_home):
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
 @pytest.mark.parametrize("default_home", [False, True])
+@pytest.mark.parametrize("trader_mode", [0o700, 0o775])
+@pytest.mark.parametrize("evidence", ["sessions", "ledger"])
 def test_doctor_repairs_a_dedicated_existing_sai_home(
-    isolated_home, default_home, monkeypatch
+    isolated_home, default_home, trader_mode, evidence, monkeypatch
 ):
     if default_home:
         monkeypatch.setenv("HOME", str(isolated_home))
         isolated_home = isolated_home / ".sai"
         monkeypatch.delenv("SAI_HOME")
-    save()
-    storage.db().close()
+    if evidence == "sessions":
+        save()
+    else:
+        storage.db().close()
     wheels = updater.private_cache()
     (wheels / update.wheel_name("0.1.0")).touch()
     isolated_home.chmod(0o755)
+    trader = isolated_home / "trader"
+    trader.chmod(trader_mode)
+    expected_modes = [{"path": str(isolated_home), "mode": "755"}]
+    expected_fix = f"chmod go-rwx {isolated_home}"
+    expected_changes = [f"chmod {isolated_home} 755 -> 700"]
+    if trader_mode != 0o700:
+        expected_modes.append({"path": str(trader), "mode": f"{trader_mode:o}"})
+        expected_fix += f"; chmod go-rwx {trader}"
+        expected_changes.insert(0, f"chmod {trader} {trader_mode:o} -> 700")
 
     code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
     assert code == 0
     check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
     assert check["status"] == "warn"
-    assert check["details"]["looseModes"] == [
-        {"path": str(isolated_home), "mode": "755"}
-    ]
+    assert check["details"]["looseModes"] == expected_modes
+    assert check["fix"] == expected_fix
     assert isolated_home.stat().st_mode & 0o777 == 0o755
+    assert trader.stat().st_mode & 0o777 == trader_mode
 
     code, output = run_cli("--json", "doctor", "--offline")
     assert code == 0
     check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
     assert check["status"] == "fixed"
-    assert check["changes"] == [f"chmod {isolated_home} 755 -> 700"]
+    assert check["changes"] == expected_changes
     assert isolated_home.stat().st_mode & 0o777 == 0o700
+    assert trader.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+def test_doctor_leaves_a_home_with_only_foreign_config_at_0755(isolated_home):
+    config = isolated_home / "config.toml"
+    config.write_text("[foreign]\nsetting = true\n")
+    isolated_home.chmod(0o755)
+
+    # A second fix run sees the first run's empty trader directory and logs.
+    for flags in [("--no-fix",), (), ()]:
+        code, output = run_cli("--json", "doctor", "--offline", *flags)
+        assert code == 0
+        check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
+        assert check["status"] == "warn"
+        assert "moving the profile to a dedicated directory" in check["fix"]
+        assert isolated_home.stat().st_mode & 0o777 == 0o755
+        assert config.read_text() == "[foreign]\nsetting = true\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        ("sessions.lock", b""),
+        ("sessions.lock", b"\0"),
+        ("sessions.json", b""),
+        ("sessions.json", b'{"saved_filters":[]}'),
+        ("sessions.json", b'{"version":3,"nonce":"x","ciphertext":"x"}'),
+        ("session.json", b""),
+        ("intents.sqlite3", b""),
+        ("intents.sqlite3", b"not a database"),
+        ("history", b"config list\n"),
+    ],
+)
+def test_doctor_needs_more_than_trader_artifacts(
+    isolated_home, monkeypatch, filename, content
+):
+    (isolated_home / "config.toml").write_text("[foreign]\nsetting = true\n")
+    isolated_home.chmod(0o755)
+    monkeypatch.setenv("SAI_LOG", "0")
+    trader = isolated_home / "trader"
+
+    code, output = run_cli("--json", "auth", "logout")
+    assert code == 0 and json.loads(output)["removed"] is False
+    assert not trader.exists()
+
+    trader.mkdir(mode=0o700)
+    artifact = trader / filename
+    artifact.write_bytes(content)
+    artifact.chmod(0o600)
+    for fix in (False, True):
+        check = one(doctor.check_home, ctx(fix=fix))
+        assert check.status == "warn"
+        assert check.fix == doctor.SAI_HOME_MODE_FIX
+        assert check.changes == []
+        assert isolated_home.stat().st_mode & 0o777 == 0o755
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+@pytest.mark.parametrize(
+    "schema",
+    [
+        "CREATE TABLE saved_filters (name TEXT)",
+        (
+            "CREATE TABLE intents (id INTEGER, endpoint TEXT NOT NULL,"
+            " account TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,"
+            " entity TEXT NOT NULL)"
+        ),
+    ],
+)
+def test_doctor_leaves_a_foreign_sqlite_ledger_unmodified(isolated_home, schema):
+    (isolated_home / "config.toml").write_text("[foreign]\nsetting = true\n")
+    isolated_home.chmod(0o755)
+    trader = isolated_home / "trader"
+    trader.mkdir(mode=0o700)
+    path = trader / "intents.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(schema)
+    connection.close()
+    path.chmod(0o600)
+    before = path.read_bytes()
+
+    for flags in [("--no-fix",), (), ()]:
+        code, output = run_cli("--json", "doctor", "--offline", *flags)
+        assert code == 1
+        checks = {c["id"]: c for c in json.loads(output)["error"]["details"]["checks"]}
+        assert checks["home"]["status"] == "warn"
+        assert checks["home"]["fix"] == doctor.SAI_HOME_MODE_FIX
+        assert checks["home"]["changes"] == []
+        assert checks["intents"]["status"] == "fail"
+        assert isolated_home.stat().st_mode & 0o777 == 0o755
+        assert path.read_bytes() == before
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+@pytest.mark.parametrize("log_enabled", ["0", "1"])
+@pytest.mark.parametrize(
+    ("directory", "filename", "content", "exit_code", "check_id", "sai_ledger"),
+    [
+        ("trader", "sessions.json", '{"saved_filters":[]}', 1, "home", False),
+        ("logs", "application.log", "application startup\n", 0, "logs", False),
+        ("logs", None, '{"other_application":"request"}\n', 0, "logs", True),
+    ],
+)
+def test_doctor_reports_foreign_subdirectories_without_tightening(
+    isolated_home,
+    monkeypatch,
+    log_enabled,
+    directory,
+    filename,
+    content,
+    exit_code,
+    check_id,
+    sai_ledger,
+):
+    monkeypatch.setenv("SAI_LOG", log_enabled)
+    if sai_ledger:
+        storage.db().close()
+    if filename is None:
+        filename = log.file_name("cli", datetime.now(UTC).date())
+    (isolated_home / "config.toml").write_text("[foreign]\nsetting = true\n")
+    isolated_home.chmod(0o755)
+    child = isolated_home / directory
+    child.mkdir(mode=0o755)
+    artifact = child / filename
+    artifact.write_text(content)
+    artifact.chmod(0o644)
+
+    for flags in [("--no-fix",), ()]:
+        code, output = run_cli("--json", "doctor", "--offline", *flags)
+        assert code == exit_code
+        assert log.flush()
+        report = json.loads(output)
+        if exit_code:
+            report = report["error"]["details"]
+        check = next(c for c in report["checks"] if c["id"] == check_id)
+        assert check["status"] == "warn"
+        assert check["fix"] == doctor.SAI_HOME_MODE_FIX
+        assert check["changes"] == []
+        assert isolated_home.stat().st_mode & 0o777 == 0o755
+        assert child.stat().st_mode & 0o777 == 0o755
+        assert artifact.stat().st_mode & 0o777 == 0o644
+        assert artifact.read_text() == content
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+def test_doctor_logging_leaves_a_foreign_archive_alone(isolated_home, monkeypatch):
+    monkeypatch.setenv("SAI_LOG", "1")
+    root = isolated_home / "logs"
+    root.mkdir(mode=0o700)
+    archive = root / "cli-2020-01-01.jsonl"
+    contents = '{"other_application":"archived request"}\n'
+    archive.write_text(contents)
+    archive.chmod(0o600)
+
+    assert run_cli("doctor", "--offline")[0] == 0
+    assert log.flush()
+    assert archive.read_text() == contents
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+@pytest.mark.parametrize(
+    ("key", "expected_code"), [("keeper.endpoint", 0), ("bogus", 2)]
+)
+def test_doctor_preserves_a_foreign_home_with_sai_logs(
+    isolated_home, key, expected_code
+):
+    (isolated_home / "config.toml").write_text("[foreign]\nsetting = true\n")
+    isolated_home.chmod(0o755)
+    code, _ = run_cli("--json", "config", "get", key)
+    assert code == expected_code and log.flush()
+    assert log.log_files()
+    assert not (isolated_home / "trader").exists()
+
+    for flags in [("--no-fix",), (), ()]:
+        code, output = run_cli("--json", "doctor", "--offline", *flags)
+        assert code == 0
+        check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
+        assert check["status"] == "warn"
+        assert check["fix"] == doctor.SAI_HOME_MODE_FIX
+        assert isolated_home.stat().st_mode & 0o777 == 0o755
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+def test_doctor_preserves_a_home_with_only_a_cached_sai_wheel(isolated_home):
+    wheels = updater.private_cache()
+    (wheels / update.wheel_name("0.1.0")).touch()
+    isolated_home.chmod(0o755)
+
+    code, output = run_cli("--json", "doctor", "--offline")
+    assert code == 0
+    check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
+    assert check["status"] == "warn"
+    assert isolated_home.stat().st_mode & 0o777 == 0o755
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
@@ -400,8 +657,11 @@ def test_doctor_reports_and_preserves_an_existing_shared_or_ambiguous_root(
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
 def test_doctor_gives_shared_root_guidance_in_both_modes(isolated_home):
-    storage.db().close()
-    history = isolated_home / "trader" / "history"
+    ledger_path = old_ledger(isolated_home)
+    ledger_path.chmod(0o640)
+    trader = ledger_path.parent
+    trader.chmod(0o755)
+    history = trader / "history"
     history.touch()
     history.chmod(0o644)
     isolated_home.chmod(0o2770)
@@ -416,7 +676,7 @@ def test_doctor_gives_shared_root_guidance_in_both_modes(isolated_home):
     assert code == 0
     check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
     assert check["status"] == "warn"
-    assert check["fix"] == f"{root_advice} chmod go-rwx {history}"
+    assert check["fix"] == root_advice
     assert history.stat().st_mode & 0o777 == 0o644
     assert isolated_home.stat().st_mode & 0o7777 == 0o2770
 
@@ -425,7 +685,11 @@ def test_doctor_gives_shared_root_guidance_in_both_modes(isolated_home):
     check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
     assert check["status"] == "warn"
     assert check["fix"] == root_advice
-    assert history.stat().st_mode & 0o777 == 0o600
+    assert check["changes"] == []
+    assert user_version(ledger_path) == storage.SCHEMA_VERSION
+    assert ledger_path.stat().st_mode & 0o777 == 0o640
+    assert trader.stat().st_mode & 0o777 == 0o755
+    assert history.stat().st_mode & 0o777 == 0o644
     assert isolated_home.stat().st_mode & 0o7777 == 0o2770
 
 
@@ -448,19 +712,26 @@ def test_fix_makes_the_directory_and_files_private(isolated_home):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
-def test_fix_keeps_owner_bits_and_skips_files_sai_does_not_manage(isolated_home):
+@pytest.mark.parametrize("mixed", [False, True])
+def test_fix_keeps_owner_bits_and_preserves_a_mixed_trader(isolated_home, mixed):
+    storage.db().close()
     root = isolated_home / "trader"
-    root.mkdir(mode=0o700)
     history = root / "history"
     history.write_text("")
     history.chmod(0o754)
     tool = root / "notes.sh"
-    tool.write_text("#!/bin/sh\n")
-    tool.chmod(0o755)
+    if mixed:
+        tool.write_text("#!/bin/sh\n")
+        tool.chmod(0o755)
     check = one(doctor.check_home, ctx(fix=True))
-    assert check.changes == [f"chmod {history} 754 -> 700"]
-    assert history.stat().st_mode & 0o777 == 0o700
-    assert tool.stat().st_mode & 0o777 == 0o755
+    if mixed:
+        assert check.fix == doctor.SAI_HOME_MODE_FIX
+        assert check.changes == []
+        assert history.stat().st_mode & 0o777 == 0o754
+        assert tool.stat().st_mode & 0o777 == 0o755
+    else:
+        assert check.changes == [f"chmod {history} 754 -> 700"]
+        assert history.stat().st_mode & 0o777 == 0o700
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
@@ -531,29 +802,46 @@ def test_tighten_refuses_a_path_swapped_for_a_symlink(isolated_home, tmp_path_fa
     root = isolated_home / "trader"
     root.mkdir(mode=0o700)
     (root / "session.json").symlink_to(target)
-    changes, failed = doctor.tighten(root, doctor.MANAGED)
+    changes, failed, eligible = doctor.tighten(root, doctor.MANAGED)
     assert changes == []
-    assert failed == [f"chmod go-rwx {root / 'session.json'}"]
+    assert not eligible
+    assert failed == [
+        f"Could not open {root / 'session.json'} safely; inspect it by hand"
+    ]
     assert target.stat().st_mode & 0o777 == 0o644
     linked = isolated_home / "linked"
     linked.symlink_to(outside)
     outside.chmod(0o755)
-    assert doctor.tighten(linked, doctor.MANAGED) == ([], [f"chmod go-rwx {linked}"])
+    assert doctor.tighten(linked, doctor.MANAGED) == (
+        [],
+        [f"Could not open {linked} safely; inspect it by hand"],
+        False,
+    )
     assert outside.stat().st_mode & 0o777 == 0o755
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX hard links")
-def test_hard_linked_history_is_not_chmodded(isolated_home, tmp_path_factory):
+@pytest.mark.parametrize("root_mode", [0o700, 0o755])
+def test_hard_linked_history_is_refused_in_both_modes(
+    isolated_home, tmp_path_factory, root_mode
+):
     outside = tmp_path_factory.mktemp("outside") / "shared"
     outside.write_text("x")
     outside.chmod(0o644)
     root = isolated_home / "trader"
     root.mkdir(mode=0o700)
     os.link(outside, root / "history")
-    check = one(doctor.check_home, ctx(fix=True))
-    assert check.status == "fail"
-    assert check.fix == f"{root / 'history'} has other hard links; fix by hand"
-    assert outside.stat().st_mode & 0o777 == 0o644
+    isolated_home.chmod(root_mode)
+    advice = f"{root / 'history'} has other hard links; fix by hand"
+    if root_mode == 0o755:
+        advice = f"{doctor.SAI_HOME_MODE_FIX} {advice}"
+    for fix in (False, True):
+        check = one(doctor.check_home, ctx(fix=fix))
+        assert check.status == "fail"
+        assert check.fix == advice
+        assert check.changes == []
+        assert outside.stat().st_mode & 0o777 == 0o644
+        assert isolated_home.stat().st_mode & 0o777 == root_mode
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX hard links")
@@ -629,9 +917,9 @@ def test_unknown_intent_for_signed_in_account_fails():
     check = one(doctor.check_intents, ctx())
     assert check.status == "fail"
     assert check.summary == "1 unknown intent blocks trading for 0x4803…"
-    assert check.fix is not None
-    assert check.fix.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
-    assert check.fix.endswith(f"intent status {ADDR} --key 20261118T000000000000-a")
+    assert check.fix == (
+        f"sai --endpoint {ENDPOINT} intent status {ADDR} --key 20261118T000000000000-a"
+    )
     assert check.details["otherAccounts"] == {"unknown": 1, "accounts": 1}
 
 
@@ -775,7 +1063,7 @@ def add_unknown(key: str, account: str = ADDR, endpoint: str = ENDPOINT) -> None
 def test_snapshot_retries_when_the_ledger_changes_during_the_copy(monkeypatch):
     save()
     path = ledger([])
-    copy = doctor.shutil.copyfile
+    copy = doctor.shutil.copyfileobj
     writes = iter(["k-late"])
 
     def copy_then_write(source, target):
@@ -786,7 +1074,7 @@ def test_snapshot_retries_when_the_ledger_changes_during_the_copy(monkeypatch):
             add_unknown(key)
         return result
 
-    monkeypatch.setattr(doctor.shutil, "copyfile", copy_then_write)
+    monkeypatch.setattr(doctor.shutil, "copyfileobj", copy_then_write)
     check = one(doctor.check_intents, ctx())
     assert check.details["blocking"] == ["k-late"]
     assert path.is_file()
@@ -794,7 +1082,7 @@ def test_snapshot_retries_when_the_ledger_changes_during_the_copy(monkeypatch):
 
 def test_ledger_that_keeps_changing_warns(monkeypatch):
     ledger([])
-    copy = doctor.shutil.copyfile
+    copy = doctor.shutil.copyfileobj
     count = iter(range(100))
 
     def copy_then_write(source, target):
@@ -803,7 +1091,7 @@ def test_ledger_that_keeps_changing_warns(monkeypatch):
         add_unknown(f"k{next(count)}", account=OTHER)
         return result
 
-    monkeypatch.setattr(doctor.shutil, "copyfile", copy_then_write)
+    monkeypatch.setattr(doctor.shutil, "copyfileobj", copy_then_write)
     check = one(doctor.check_intents, ctx())
     assert check.status == "warn"
     assert "changed while reading" in check.summary
@@ -953,6 +1241,8 @@ class Stub:
         self.on_intents: Any = None
         self.queries: list[str] = []
         self.paths: list[str] = []
+        self.lcd_paths: list[str] = []
+        self.reflect_lcd_network: Callable[[str], str] | None = None
 
 
 @pytest.fixture
@@ -1006,8 +1296,14 @@ def http_stub() -> Iterator[tuple[str, Stub]]:
             self.reply({"data": {"oneClickTrading": route}})
 
         def do_GET(self):
-            assert self.path.endswith("/cosmos/base/tendermint/v1beta1/node_info")
-            info = {} if state.network is None else {"network": state.network}
+            state.lcd_paths.append(self.path)
+            assert urlsplit(self.path).path.endswith(margin.NODE_INFO_PATH)
+            network = (
+                state.reflect_lcd_network(self.path)
+                if state.reflect_lcd_network is not None
+                else state.network
+            )
+            info = {} if network is None else {"network": network}
             self.reply({"default_node_info": info})
 
         def log_message(self, format, *args):
@@ -1066,11 +1362,15 @@ def free_port() -> int:
 
 
 def test_network_checks_pass_against_stubs(http_stub):
-    base, _state = http_stub
+    base, state = http_stub
     ws, stop = ws_stub(ack=True)
     try:
         checks = doctor.run_checks(
-            ctx(f"{base}/query", ws_override=ws, lcd_endpoint=base)
+            ctx(
+                f"{base}/query",
+                ws_override=ws,
+                lcd_endpoint=f"{base}/fixture-lcd-path/?key=fixture-lcd-query",
+            )
         )
     finally:
         stop()
@@ -1089,15 +1389,94 @@ def test_network_checks_pass_against_stubs(http_stub):
     assert by_id["keeper"].status == "pass"
     assert by_id["websocket"].status == "pass"
     assert by_id["lcd"].status == "pass"
-    assert by_id["lcd"].details["network"] == "cataclysm-1"
+    assert by_id["lcd"].details == {"endpoint": base, "matchesKeeperChain": True}
+    assert "matches Keeper chain cataclysm-1" in by_id["lcd"].summary
+    assert state.lcd_paths == [
+        f"/fixture-lcd-path{margin.NODE_INFO_PATH}?key=fixture-lcd-query"
+    ]
 
 
-def test_lcd_without_a_network_fails(http_stub):
+@pytest.mark.parametrize("network", [None, "a" * 51, "cataclysm-1\n"])
+def test_lcd_with_an_invalid_network_fails(http_stub, network):
     base, state = http_stub
-    state.network = None
+    state.network = network
     check = one(doctor.check_lcd, ctx(lcd_endpoint=base))
     assert check.status == "fail"
-    assert "network" in check.summary
+    assert "invalid chain ID" in check.summary
+    assert check.details == {"endpoint": base}
+
+
+@pytest.mark.parametrize(
+    ("reflect", "status", "summary"),
+    [
+        pytest.param(lambda target: target, "fail", "invalid chain ID", id="target"),
+        pytest.param(
+            lambda target: urlsplit(target).path.split("/")[1],
+            "warn",
+            "LCD network differs from Keeper chain cataclysm-1",
+            id="path-segment",
+        ),
+        pytest.param(
+            lambda target: parse_qs(urlsplit(target).query)["key"][0],
+            "warn",
+            "LCD network differs from Keeper chain cataclysm-1",
+            id="query-key",
+        ),
+    ],
+)
+def test_doctor_does_not_echo_a_reflected_lcd_network(
+    http_stub, isolated_home, reflect, status, summary
+):
+    base, state = http_stub
+    state.reflect_lcd_network = reflect
+    path_key, query_key = "fixture-private-lcd-path", "fixture-private-lcd-query"
+    target = f"/{path_key}{margin.NODE_INFO_PATH}?key={query_key}"
+    ws, stop = ws_stub(ack=True)
+    try:
+        for flags in ((), ("--json",)):
+            code, output = run_cli(
+                *flags,
+                "--endpoint",
+                base + "/query",
+                "doctor",
+                "--ws-endpoint",
+                ws,
+                "--lcd-endpoint",
+                f"{base}/{path_key}?key={query_key}",
+            )
+            assert code == (1 if status == "fail" else 0)
+            assert summary in output
+            assert path_key not in output and query_key not in output
+            if flags:
+                report = json.loads(output)
+                if status == "fail":
+                    report = report["error"]["details"]
+                lcd = next(check for check in report["checks"] if check["id"] == "lcd")
+                assert lcd["status"] == status
+                details = {"endpoint": base}
+                if status == "warn":
+                    details["matchesKeeperChain"] = False
+                assert lcd["details"] == details
+    finally:
+        stop()
+    assert state.lcd_paths == [target, target]
+    assert log.flush(5)
+    logs = "".join(
+        path.read_text() for path in (isolated_home / "logs").glob("*.jsonl")
+    )
+    assert path_key not in logs and query_key not in logs
+    results = [json.loads(line) for line in logs.splitlines()]
+    lcd_results = [
+        check
+        for result in results
+        if result["event"] == "doctor.result"
+        for check in result["checks"]
+        if check["id"] == "lcd"
+    ]
+    assert len(lcd_results) == 2
+    assert all(
+        row["status"] == status and summary in row["summary"] for row in lcd_results
+    )
 
 
 @pytest.fixture
@@ -1224,7 +1603,8 @@ def test_lcd_on_another_chain_warns(http_stub):
         stop()
     lcd = next(check for check in checks if check.id == "lcd")
     assert lcd.status == "warn"
-    assert "Keeper trades on cataclysm-1" in lcd.summary
+    assert "LCD network differs from Keeper chain cataclysm-1" in lcd.summary
+    assert lcd.details == {"endpoint": base, "matchesKeeperChain": False}
 
 
 def test_silent_websocket_fails_within_the_timeout():
@@ -1365,11 +1745,12 @@ def blocked_on(endpoint: str) -> None:
 @pytest.mark.parametrize(
     "matches", [False, True], ids=["same-origin-mismatch", "match"]
 )
-def test_doctor_shows_only_keeper_origins_in_reports_and_hints(
+def test_doctor_shows_only_endpoint_origins_in_reports_and_hints(
     http_stub, matches, request
 ):
     base, state = http_stub
     path_key, query_key = "fixture-keeper-path", "fixture-keeper-query"
+    lcd_path_key, lcd_query_key = "fixture-lcd-path", "fixture-lcd-query"
     stored_path_key = "fixture-stored-path"
     route = f"/{path_key}/query?key={query_key}"
     endpoint = base + route
@@ -1390,12 +1771,18 @@ def test_doctor_shows_only_keeper_origins_in_reports_and_hints(
             "--ws-endpoint",
             ws_origin + route,
             "--lcd-endpoint",
-            base,
+            f"{base}/{lcd_path_key}?key={lcd_query_key}",
         )
         assert code == 1
         assert ws_origin in output
-        assert path_key not in output and query_key not in output
-        assert stored_path_key not in output
+        for secret in (
+            path_key,
+            query_key,
+            stored_path_key,
+            lcd_path_key,
+            lcd_query_key,
+        ):
+            assert secret not in output
         assert "${SAI_RECONCILE_ENDPOINT:?" in output
         if flags:
             checks = {
@@ -1407,6 +1794,8 @@ def test_doctor_shows_only_keeper_origins_in_reports_and_hints(
             assert session["endpoint"] == base and session["endpointMatches"] is matches
             assert checks["websocket"]["status"] == "pass"
             assert checks["websocket"]["details"]["endpoint"] == ws_origin
+            assert checks["lcd"]["status"] == "pass"
+            assert checks["lcd"]["details"]["endpoint"] == base
             fix = checks["intents" if matches else "session"]["fix"]
             command = (
                 f"intent status {ADDR} --key {KEY}" if matches else "auth login NAME"
@@ -1563,15 +1952,13 @@ def test_json_report_shape_and_exit_code():
     error = json.loads(output)["error"]
     assert error["code"] == "INTERNAL_ERROR" and error["retryable"] is False
     assert "expired" in error["message"]
-    assert "auth login NAME" in error["message"]
+    assert "Foundry keystore" in error["message"]
     details = error["details"]
     assert details["schemaVersion"] == 1 and details["overall"] == "fail"
     checks = {check["id"]: check for check in details["checks"]}
     assert checks["session"]["status"] == "fail"
     recovery = checks["session"]["fix"]
-    assert recovery.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
-    assert "auth login NAME" in recovery
-    assert ENDPOINT not in recovery
+    assert recovery == f"sai --endpoint {ENDPOINT} auth import --addr {ADDR}"
     assert checks["keeper"]["status"] == "skipped"
 
 

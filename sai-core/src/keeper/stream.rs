@@ -1,6 +1,6 @@
 //! Keeper snapshots over graphql-transport-ws.
 
-mod upgrade;
+pub(super) mod upgrade;
 
 use std::{env, io, pin::Pin, time::Duration};
 
@@ -32,11 +32,13 @@ const SUBPROTOCOL: &str = "graphql-transport-ws";
 pub const CONNECTED: &str = "Connected; waiting for current snapshot";
 
 const BALANCES: &str = "subscription($user:String!) { userBalances(where:{user:$user}) { amount usd_value token_info { name symbol decimals type } } }";
+const BALANCES_WITH_BLOCK: &str = "subscription($user:String!) { userBalances(where:{user:$user}) { amount usd_value lastUpdatedBlock token_info { name symbol decimals type } } }";
 const POSITIONS: &str = "subscription($user:String!) { perpTrades(where:{trader:$user}) { id trader isOpen isLong tradeType leverage openPrice tp sl } }";
 const PRICE: &str = "subscription($id:Int!) { tokenPricesUsd(where:{tokenId:$id}) { priceUsd token { id symbol } lastUpdatedBlock { block block_ts } } }";
 
 pub enum Subscription {
     Balances(String),
+    BalancesWithBlock(String),
     Positions(String),
     Price(Number),
 }
@@ -45,6 +47,9 @@ impl Subscription {
     fn parameters(&self) -> (&'static str, &'static str, Value) {
         match self {
             Self::Balances(addr) => (BALANCES, "userBalances", json!({"user": addr})),
+            Self::BalancesWithBlock(addr) => {
+                (BALANCES_WITH_BLOCK, "userBalances", json!({"user": addr}))
+            }
             Self::Positions(addr) => (POSITIONS, "perpTrades", json!({"user": addr})),
             Self::Price(id) => (PRICE, "tokenPricesUsd", json!({"id": id})),
         }
@@ -119,11 +124,28 @@ pub async fn snapshot(
     notify: impl Fn(),
     interrupt: impl Future<Output = SaiError>,
 ) -> Result<Value, SaiError> {
-    check_endpoint(endpoint)?;
-    tokio::pin!(interrupt);
-    let mut connection = Connection::open(endpoint, subscribe, interrupt.as_mut())
+    snapshot_with_endpoint(endpoint, subscribe, notify, interrupt)
         .await
-        .map_err(balance_error)?;
+        .map(|(payload, _)| payload)
+}
+
+/// Return the endpoint that delivered the snapshot, including any redirects.
+pub(crate) async fn snapshot_with_endpoint(
+    endpoint: &str,
+    subscribe: &Subscription,
+    notify: impl Fn(),
+    interrupt: impl Future<Output = SaiError>,
+) -> Result<(Value, Url), SaiError> {
+    check_endpoint(endpoint)?;
+    let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
+    tokio::pin!(interrupt);
+    let mut connection = time::timeout_at(
+        deadline,
+        Connection::open(endpoint, subscribe, interrupt.as_mut()),
+    )
+    .await
+    .unwrap_or(Err(Failure::Disconnected("TimeoutError")))
+    .map_err(balance_error)?;
     notify();
     let result = tokio::select! {
         biased;
@@ -131,17 +153,21 @@ pub async fn snapshot(
             connection.close().await;
             return Err(error);
         }
-        result = connection.next(Some(SNAPSHOT_TIMEOUT)) => result.map_err(balance_error),
+        result = time::timeout_at(deadline, connection.next_payload()) => {
+            result.unwrap_or(Err(Failure::Disconnected("TimeoutError"))).map_err(balance_error)
+        }
     };
-    tokio::select! {
+    let payload = tokio::select! {
         biased;
         () = connection.close() => result,
         error = &mut interrupt => Err(error),
-    }
+    }?;
+    Ok((payload, connection.endpoint))
 }
 
 pub struct Connection {
     socket: WebSocketStream<transport::SocketBox>,
+    endpoint: Url,
     field: &'static str,
     heartbeat: Instant,
     ping: Option<[u8; 8]>,
@@ -197,7 +223,7 @@ impl Connection {
 
     async fn acknowledge(&mut self) -> Result<(), Failure> {
         self.send(json!({"type": "connection_init"})).await?;
-        let message = self.receive(None).await?;
+        let message = self.receive().await?;
         if message["type"] != "connection_ack" {
             return Err(protocol("Keeper did not acknowledge WebSocket connection"));
         }
@@ -238,13 +264,15 @@ impl Connection {
                             Some(config),
                         )
                         .await,
+                        endpoint: url,
                         field,
                         heartbeat: Instant::now() + PING_INTERVAL,
                         ping: None,
                         ping_count: 0,
                     });
                 }
-                Upgrade::Redirect(location) => url = redirect_target(&url, &location)?,
+                Upgrade::Redirect { location, .. } => url = redirect_target(&url, &location)?,
+                Upgrade::Rejected(_) => return Err(Failure::Disconnected("InvalidStatus")),
             }
         }
         Err(Failure::Disconnected("SecurityError"))
@@ -252,8 +280,17 @@ impl Connection {
 
     /// Return each complete subscription payload in arrival order.
     pub async fn next(&mut self, timeout: Option<Duration>) -> Result<Value, Failure> {
+        match timeout {
+            Some(timeout) => time::timeout(timeout, self.next_payload())
+                .await
+                .unwrap_or(Err(Failure::Disconnected("TimeoutError"))),
+            None => self.next_payload().await,
+        }
+    }
+
+    async fn next_payload(&mut self) -> Result<Value, Failure> {
         loop {
-            let mut message = self.receive(timeout).await?;
+            let mut message = self.receive().await?;
             match message["type"].as_str() {
                 Some("ping") => self.send(json!({"type": "pong"})).await?,
                 Some("next") => {
@@ -266,7 +303,9 @@ impl Connection {
                     }
                     return Ok(payload);
                 }
-                Some("error" | "complete") => return Err(protocol("Keeper subscription ended")),
+                Some("error" | "complete") => {
+                    return Err(protocol("Keeper subscription ended"));
+                }
                 _ => {}
             }
         }
@@ -277,14 +316,9 @@ impl Connection {
         Ok(())
     }
 
-    async fn receive(&mut self, timeout: Option<Duration>) -> Result<Value, Failure> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    async fn receive(&mut self) -> Result<Value, Failure> {
         loop {
-            let wake = deadline.map_or(self.heartbeat, |deadline| deadline.min(self.heartbeat));
-            match time::timeout_at(wake, self.socket.next()).await {
-                Err(_) if deadline.is_some_and(|deadline| Instant::now() >= deadline) => {
-                    return Err(Failure::Disconnected("TimeoutError"));
-                }
+            match time::timeout_at(self.heartbeat, self.socket.next()).await {
                 Err(_) if self.ping.is_some() => {
                     return Err(Failure::Disconnected("ConnectionClosedError"));
                 }
@@ -303,7 +337,9 @@ impl Connection {
                     }
                 }
                 Ok(Some(Ok(Message::Ping(_)))) => self.socket.flush().await?,
-                Ok(Some(Ok(Message::Text(text)))) => return decode(text.as_bytes()),
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    return decode(text.as_bytes());
+                }
                 Ok(Some(Ok(Message::Binary(bytes)))) => return decode(&bytes),
                 Ok(Some(Ok(Message::Close(frame)))) => {
                     let normal = frame.is_none_or(|frame| {
@@ -318,7 +354,9 @@ impl Connection {
                     return Err(Failure::Disconnected(name));
                 }
                 Ok(Some(Err(error))) => return Err(error.into()),
-                Ok(None) => return Err(Failure::Disconnected("ConnectionClosedError")),
+                Ok(None) => {
+                    return Err(Failure::Disconnected("ConnectionClosedError"));
+                }
                 Ok(Some(Ok(Message::Frame(_)))) => {}
             }
         }

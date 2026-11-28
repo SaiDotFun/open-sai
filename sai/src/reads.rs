@@ -1,4 +1,5 @@
-mod output;
+pub(crate) mod output;
+mod overview;
 
 use std::{
     fmt::Write as _,
@@ -12,9 +13,10 @@ use sai_core::{
     keeper::{
         self, Keeper,
         stream::{self, Connection, Failure, Subscription},
+        usdc_markets,
     },
     log::{EventContext, Field, Level},
-    settings::{Environment, Flags, repr},
+    settings::{Environment, Flags, Key},
 };
 use serde_json::{Map, Number, Value, json};
 
@@ -34,7 +36,10 @@ pub(crate) fn help(command: &str) -> Option<String> {
     let description = entry.get_about()?;
     // Clap strips the final period from each doc comment's short help.
     let mut text = format!("{}\n\n  {description}.\n\nOptions:\n", usage(command));
-    let help_column = if let Some(arg) = entry
+    let help_column = if command == "account overview" {
+        text.push_str("  --as ADDR  Read this EVM account.\n  --json     Print compact JSON.\n");
+        9
+    } else if let Some(arg) = entry
         .get_arguments()
         .find(|arg| arg.get_long() == Some("ws-endpoint"))
     {
@@ -62,7 +67,11 @@ pub(crate) fn help(command: &str) -> Option<String> {
                 text,
                 "\n  {:<width$}  {}.",
                 child.get_name(),
-                child.get_about()?,
+                if child.get_name() == "overview" {
+                    "Show Sai funds, positions, orders, local blockers, and..".into()
+                } else {
+                    child.get_about()?.to_string()
+                },
             )
             .ok()?;
         }
@@ -96,6 +105,15 @@ impl MarketCommand {
 
 #[derive(Subcommand)]
 pub(crate) enum AccountCommand {
+    /// Show Sai funds, positions, orders, local blockers, and session expiry.
+    Overview {
+        /// Read this EVM account.
+        #[arg(long = "as", value_name = "ADDR")]
+        addr: Option<String>,
+        /// Print compact JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// List positions and pending orders for ADDR.
     Positions { addr: String },
     /// Read trade history for ADDR.
@@ -112,23 +130,80 @@ pub(crate) enum AccountCommand {
 impl AccountCommand {
     pub(crate) fn run(
         self,
+        account: Option<&str>,
         flags: &Flags,
         env: &Environment,
         json: bool,
         events: EventContext<'_>,
     ) -> Result<(), SaiError> {
         let (query, addr) = match self {
+            Self::Overview {
+                addr,
+                json: overview_json,
+            } => {
+                let addr = addr.as_deref().filter(|addr| !addr.is_empty()).or(account);
+                let settings = load_settings(flags, env)?;
+                let runtime = runtime()?;
+                let value = runtime.block_on(sai_core::overview::read(
+                    &settings,
+                    &env.home,
+                    addr,
+                    events,
+                    interrupted(),
+                ));
+                // A cancelled system DNS job can outlive the overview's deadline.
+                // Let the CLI report its result without waiting for that blocking job.
+                runtime.shutdown_background();
+                let mut value = value.map_err(|mut error| {
+                    if error.code == Code::SessionUnavailable {
+                        error.message.push_str(". Pass --as ADDR explicitly.");
+                    }
+                    error
+                })?;
+                overview::add_balance_freshness(&mut value);
+                return if json || overview_json {
+                    output::read(&value, true)
+                } else {
+                    overview::show(&value)
+                };
+            }
             Self::Positions { addr } => (keeper::POSITIONS, addr),
             Self::History { addr } => (keeper::HISTORY, addr),
             Self::Balances { addr, ws_endpoint } => {
-                let endpoint = stream_endpoint(ws_endpoint, flags, env)?;
-                let payload = runtime()?.block_on(stream::snapshot(
-                    &endpoint,
-                    &Subscription::Balances(addr),
+                let flags = Flags {
+                    endpoint: flags.endpoint.clone(),
+                    ws_endpoint: ws_endpoint.or_else(|| flags.ws_endpoint.clone()),
+                    lcd_endpoint: flags.lcd_endpoint.clone(),
+                };
+                if let Some(endpoint) = &flags.ws_endpoint {
+                    Key::KeeperWsEndpoint.parse_value(endpoint)?;
+                }
+                let settings = match load_settings(&flags, env) {
+                    Ok(settings) => Some(settings),
+                    Err(_) if flags.ws_endpoint.is_some() => None,
+                    Err(error) => return Err(error.into()),
+                };
+                let endpoint = settings
+                    .as_ref()
+                    .map(sai_core::settings::Settings::ws_endpoint)
+                    .or(flags.ws_endpoint.as_deref())
+                    .ok_or_else(SaiError::internal)?;
+                let runtime = runtime()?;
+                let payload = runtime.block_on(sai_core::overview::read_balance_snapshot(
+                    settings.as_ref(),
+                    endpoint,
+                    addr,
+                    events,
                     || eprintln!("{}", stream::CONNECTED),
                     interrupted(),
-                ))?;
-                return output::read(&payload, json);
+                ));
+                runtime.shutdown_background();
+                let payload = payload?;
+                return if json {
+                    output::read(&payload, true)
+                } else {
+                    overview::show_balances(&payload)
+                };
             }
         };
         read(
@@ -152,13 +227,42 @@ fn read(
 ) -> Result<(), SaiError> {
     let settings = load_settings(flags, env)?;
     let keeper = Keeper::new(settings.endpoint(), events);
-    let data =
+    let mut data =
         runtime()?.block_on(keeper.read_until(query, variables, keeper::TIMEOUT, interrupted()))?;
+    if query == keeper::PRICES {
+        keeper::normalize_market_price_timestamps(&mut data);
+    }
     if query == keeper::HISTORY {
         output::read(&keeper::public_account_history(&env.home, &data), json)
+    } else if query == keeper::MARKETS && !json {
+        market_table(&data)
     } else {
         output::read(&data, json)
     }
+}
+
+fn market_table(data: &Map<String, Value>) -> Result<(), SaiError> {
+    let rows = usdc_markets(data)?
+        .map(|row| {
+            let price = &row["price"];
+            Ok(vec![
+                row["baseToken"]["symbol"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .into(),
+                row["marketId"].to_string(),
+                "USDC".into(),
+                if price.is_null() {
+                    "-".into()
+                } else if let Some(price) = price.as_str() {
+                    price.into()
+                } else {
+                    output::line(price)?
+                },
+            ])
+        })
+        .collect::<Result<Vec<_>, SaiError>>()?;
+    overview::show_table(&["Symbol", "ID", "Collateral", "Price"], rows, 40)
 }
 
 #[derive(Subcommand)]
@@ -205,12 +309,7 @@ impl WatchCommand {
 }
 
 fn parse_token_id(input: &str) -> Result<Number, SaiError> {
-    let invalid = || {
-        SaiError::usage(format!(
-            "Invalid value for 'TOKEN_ID': {} is not a valid integer.",
-            repr(input)
-        ))
-    };
+    let invalid = || SaiError::usage("Invalid value for 'TOKEN_ID': expected an integer.");
     let input = input.trim();
     let digits = input.strip_prefix(['+', '-']).unwrap_or(input);
     if digits.is_empty()
@@ -237,7 +336,8 @@ fn stream_endpoint(
     flags: &Flags,
     env: &Environment,
 ) -> Result<String, SaiError> {
-    if let Some(endpoint) = override_endpoint.filter(|endpoint| !endpoint.is_empty()) {
+    if let Some(endpoint) = override_endpoint {
+        Key::KeeperWsEndpoint.parse_value(&endpoint)?;
         return Ok(endpoint);
     }
     Ok(load_settings(flags, env)?.ws_endpoint().to_owned())
@@ -250,7 +350,7 @@ fn runtime() -> Result<tokio::runtime::Runtime, SaiError> {
         .map_err(|_| SaiError::internal())
 }
 
-async fn interrupted() -> SaiError {
+pub(super) async fn interrupted() -> SaiError {
     match tokio::signal::ctrl_c().await {
         Ok(()) => SaiError::new(Code::InvalidRequest, "Aborted"),
         Err(_) => SaiError::internal(),

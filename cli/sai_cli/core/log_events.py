@@ -98,6 +98,17 @@ EVENTS = {
         },
         {"tradeId": "string", "endpointId": "string"},
     ),
+    "intent.open_blocked": Event(
+        "core.storage._check_open_pending",
+        ("warn",),
+        {
+            "intentKey": "string",
+            "addr": "string",
+            "endpoint": "string",
+            "code": "string",
+        },
+        {"endpointId": "string"},
+    ),
     "intent.status": Event(
         "core.storage._log_status",
         ("info",),
@@ -136,7 +147,7 @@ EVENTS = {
         {"endpointId": "string"},
     ),
     "intent.wait.start": Event(
-        "core intent wait (lane A4)",
+        "core.wait.for_intent_async",
         ("info",),
         {"intentKey": "string"},
         {
@@ -147,7 +158,7 @@ EVENTS = {
         },
     ),
     "intent.wait.end": Event(
-        "core intent wait (lane A4)",
+        "core.wait.for_intent_async",
         ("info", "warn", "error"),
         {"intentKey": "string", "status": "string", "durationMs": "integer"},
         {
@@ -364,7 +375,14 @@ def render_markdown() -> str:
         "A malformed request hash is omitted and sets `txHashInvalid`.",
         "The field `txHash` on `intent.submitted` is the request transaction hash when",
         "Keeper includes it in the admission response. It may appear first on `intent.keeper`.",
-        "The wait entries reserve fields for the intent wait implementation.",
+        "The `intent.wait.start` event records the intent key and timeout.",
+        "A wait can return a locally recorded `not_sent` or `rejected` outcome",
+        "without querying Keeper.",
+        "The `intent.wait.end` event records the outcome in `status`, the elapsed",
+        "milliseconds in `durationMs`, and a Sai `code` when assigned.",
+        "In v0.1.2 the wait writer does not populate `txHash`, `txHashInvalid`,",
+        "`fillBlock`, or `error` on that event. Read the wait receipt for",
+        "transaction and fill details.",
         "",
         "| Event | Emitter | Levels | Required | Optional |",
         "| --- | --- | --- | --- | --- |",

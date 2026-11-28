@@ -1,0 +1,251 @@
+use std::sync::LazyLock;
+
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use chrono::DateTime;
+use hyper::{HeaderMap, StatusCode, header::HeaderValue};
+use regex::Regex;
+use serde_json::{Value, json};
+use url::form_urlencoded::byte_serialize;
+use uuid::Uuid;
+
+use crate::{
+    errors::{Code, SaiError},
+    keeper::{self, TIMEOUT},
+};
+
+use super::{ROUTE_MISMATCH, invalid, malformed};
+use crate::trade::cancel::lcd_url;
+
+const HEIGHT: &str = "x-cosmos-block-height";
+const SERVED_HEIGHT: &str = "grpc-metadata-x-cosmos-block-height";
+
+pub(in crate::trade) struct Lcd<'a>(pub &'a str);
+
+#[derive(Clone, Copy)]
+pub(in crate::trade) enum Read<'a> {
+    Snapshot,
+    Fresh,
+    At(&'a str),
+}
+
+impl Lcd<'_> {
+    pub(in crate::trade) async fn network(&self) -> Result<String, SaiError> {
+        let (response, _) = self
+            .get(
+                "/cosmos/base/tendermint/v1beta1/node_info",
+                Read::Snapshot,
+                false,
+            )
+            .await?;
+        response["default_node_info"]["network"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| invalid(ROUTE_MISMATCH))
+    }
+
+    pub(in crate::trade) async fn smart(
+        &self,
+        contract: &str,
+        message: Value,
+        read: Read<'_>,
+    ) -> Result<(Value, Option<String>), SaiError> {
+        let path = smart_path(contract, &message);
+        let missing_cap = message.get("get_pair_custom_max_leverage").is_some();
+        self.get(&path, read, missing_cap)
+            .await
+            .map(|(mut response, height)| (response["data"].take(), height))
+    }
+
+    pub(in crate::trade) async fn market_oracle_price(
+        &self,
+        contract: &str,
+        pair: &Value,
+        height: &str,
+    ) -> Result<Value, SaiError> {
+        let token_index = |side| {
+            let digits = pair
+                .get(side)
+                .and_then(Value::as_str)?
+                .strip_prefix("TokenIndex(")?
+                .strip_suffix(')')?;
+            if digits.len() > 5 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            digits.parse::<u16>().ok()
+        };
+        let base = token_index("base").ok_or_else(malformed)?;
+        let quote = token_index("quote").ok_or_else(malformed)?;
+        let (oracle, _) = self
+            .smart(
+                contract,
+                json!({"get_oracle_address": {}}),
+                Read::At(height),
+            )
+            .await?;
+        let oracle = oracle
+            .as_str()
+            .filter(|address| {
+                address.strip_prefix("nibi1").is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                })
+            })
+            .ok_or_else(malformed)?;
+        let (rate, _) = self
+            .smart(
+                oracle,
+                json!({"get_exchange_rate": {"base": base, "quote": quote}}),
+                Read::At(height),
+            )
+            .await?;
+        if !rate.is_object() {
+            return Err(malformed());
+        }
+        Ok(rate)
+    }
+
+    pub(in crate::trade) async fn leverage_quote_liquidates(
+        &self,
+        contract: &str,
+        message: Value,
+        height: &str,
+    ) -> bool {
+        static LIQUIDATION: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"\bliquidation price reached\. Liq price \d+(?:\.\d+)?, current price \d+(?:\.\d+)?\b")
+                .expect("valid liquidation pattern")
+        });
+        let Ok((status, headers, bytes)) = self
+            .request(&smart_path(contract, &message), Read::At(height))
+            .await
+        else {
+            return false;
+        };
+        if status.is_success()
+            || [HEIGHT, SERVED_HEIGHT].iter().any(|key| {
+                headers
+                    .get(*key)
+                    .is_some_and(|value| value.as_bytes() != height.as_bytes())
+            })
+        {
+            return false;
+        }
+        serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|value| {
+                value["message"]
+                    .as_str()
+                    .map(|message| LIQUIDATION.is_match(message))
+            })
+            .unwrap_or(false)
+    }
+
+    pub(in crate::trade) async fn position(
+        &self,
+        contract: &str,
+        trader: &str,
+        trade_id: &Value,
+        read: Read<'_>,
+    ) -> Result<(Value, Option<String>), SaiError> {
+        let query = json!({"get_trade_raw": {"trader": trader, "index": trade_id}});
+        self.smart(contract, query, read).await
+    }
+
+    pub(in crate::trade) async fn block_timestamp(&self, height: &str) -> Result<i64, SaiError> {
+        let path = format!("/cosmos/base/tendermint/v1beta1/blocks/{height}");
+        let (block, _) = self.get(&path, Read::Snapshot, false).await?;
+        let header = if keeper::truthy(&block["sdk_block"]) {
+            &block["sdk_block"]["header"]
+        } else {
+            &block["block"]["header"]
+        };
+        if header["height"] != height {
+            return Err(invalid(
+                "Cannot verify the timestamp of the quoted LCD block",
+            ));
+        }
+        DateTime::parse_from_rfc3339(header["time"].as_str().ok_or_else(malformed)?)
+            .map(|time| time.timestamp())
+            .map_err(|_| malformed())
+    }
+
+    async fn get(
+        &self,
+        path: &str,
+        read: Read<'_>,
+        missing_cap_is_zero: bool,
+    ) -> Result<(Value, Option<String>), SaiError> {
+        static ABSENT_CAP: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"type: cosmwasm_std::math::decimal::Decimal; key: \[[^\]]*\] not found")
+                .expect("valid missing-cap pattern")
+        });
+        let (status, headers, bytes) = self.request(path, read).await?;
+        let height = headers
+            .get(SERVED_HEIGHT)
+            .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
+        if !status.is_success() {
+            // Python treats Perp's missing storage key as no pair override,
+            // even when the error response reports a different height.
+            if missing_cap_is_zero && ABSENT_CAP.is_match(&String::from_utf8_lossy(&bytes)) {
+                return Ok((json!({"data": "0"}), height));
+            }
+            return Err(read.failure());
+        }
+        if let Read::At(requested) = read
+            && height.as_deref() != Some(requested)
+        {
+            return Err(height_error(
+                "LCD did not serve the requested contract query height.",
+            ));
+        }
+        let data: Value = serde_json::from_slice(&bytes).map_err(|_| read.failure())?;
+        if !data.is_object() {
+            return Err(read.failure());
+        }
+        Ok((data, height))
+    }
+
+    async fn request(
+        &self,
+        path: &str,
+        read: Read<'_>,
+    ) -> Result<(StatusCode, HeaderMap, Vec<u8>), SaiError> {
+        let mut url = lcd_url(self.0, path)?;
+        if !matches!(read, Read::Snapshot) {
+            url.query_pairs_mut()
+                .append_pair("_sai_query", &Uuid::new_v4().simple().to_string());
+        }
+        let mut headers = HeaderMap::new();
+        if let Read::At(height) = read {
+            headers.insert(
+                HEIGHT,
+                HeaderValue::from_str(height).map_err(|_| read.failure())?,
+            );
+        }
+        keeper::lcd_get(url.as_str(), headers, TIMEOUT)
+            .await
+            .map_err(|_| read.failure())
+    }
+}
+
+fn smart_path(contract: &str, message: &Value) -> String {
+    let encoded = STANDARD.encode(message.to_string());
+    let query: String = byte_serialize(encoded.as_bytes()).collect();
+    let contract: String = byte_serialize(contract.as_bytes()).collect();
+    format!("/cosmwasm/wasm/v1/contract/{contract}/smart/{query}")
+}
+
+impl Read<'_> {
+    fn failure(&self) -> SaiError {
+        match self {
+            Self::Snapshot => invalid("Unable to read contract state"),
+            _ => height_error("Unable to verify contract state during confirmation."),
+        }
+    }
+}
+
+pub(in crate::trade) fn height_error(message: &str) -> SaiError {
+    SaiError::new(
+        Code::PreviewMismatch,
+        format!("{message} Retry the preview and confirmation."),
+    )
+}

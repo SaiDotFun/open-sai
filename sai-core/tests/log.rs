@@ -41,7 +41,7 @@ fn keeper_identity_reuses_the_python_log_key_and_omits_private_url_parts() {
     let bytes: Vec<u8> = (0..32).collect();
     fs::write(&key, &bytes).unwrap();
     fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
-    let logger = writer(home.path()).with_v2_command();
+    let logger = LogWriter::start_command(Environment::new(home.path().into(), |_| None)).unwrap();
     for url in [
         "https://EXAMPLE.com:443/query?route=first#fragment",
         "https://example.com:443/query?route=first",
@@ -54,6 +54,7 @@ fn keeper_identity_reuses_the_python_log_key_and_omits_private_url_parts() {
             [
                 ("endpoint", Field::Endpoint(url.into())),
                 ("endpointId", Field::endpoint_identity(url)),
+                ("command", Field::Text("market list".into())),
             ],
         );
     }
@@ -122,14 +123,8 @@ fn redaction_applies_to_nested_text_url_origins_arguments_and_untrusted_errors()
         })
     );
     assert_eq!(events[0]["url"], "https://example.com:443");
-    assert_eq!(
-        events[0]["argv"],
-        json!(["--endpoint=https://example.com:443"])
-    );
-    assert_eq!(
-        events[0]["error"],
-        "Bad [redacted hex] https://example.com [cut]"
-    );
+    assert_eq!(events[0]["argv"], json!(["--endpoint=[redacted]"]));
+    assert_eq!(events[0]["error"], "[redacted]");
     assert_eq!(events[0]["surface"], "mcp");
     assert_eq!(events[0]["level"], "info");
     assert_eq!(events[0]["pid"], std::process::id());

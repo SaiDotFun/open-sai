@@ -37,7 +37,9 @@ fn uv(home: &Path) -> Command {
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join(".."));
     let mut command = Command::new("uv");
-    command.args(["--quiet", "run", "--project"]).arg(root);
+    command
+        .args(["--quiet", "run", "--offline", "--no-sync", "--project"])
+        .arg(root);
     clean_env(&mut command, home);
     command
 }
@@ -97,9 +99,55 @@ fn missing_home_status_and_list_have_no_side_effects() {
 }
 
 #[test]
+fn signed_out_trade_hides_keeper_query_path_in_hint() {
+    let home = tempdir().unwrap();
+    let endpoint = format!("{ENDPOINT}/query");
+    let output = rust(home.path())
+        .args(["--json", "--endpoint", &endpoint, "trade", "close", "7"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(6));
+    assert!(output.stderr.is_empty());
+    let error = &serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"];
+    assert_eq!(error["code"], "SIGNED_OUT");
+    assert_eq!(
+        error["hint"],
+        r#"sai --endpoint "${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}" auth login NAME"#
+    );
+}
+
+#[test]
+fn signed_out_auth_hint_shows_only_the_keeper_origin() {
+    let home = tempdir().unwrap();
+    let endpoint = format!("{ENDPOINT}/query");
+    let output = rust(home.path())
+        .args(["--json", "--endpoint", &endpoint, "auth", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(6));
+    let error = &serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"];
+    assert_eq!(
+        error["hint"],
+        format!(
+            r#"sai --endpoint "${{SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL at {ENDPOINT}}}" auth login NAME"#
+        )
+    );
+    let output = rust(home.path())
+        .args(["--json", "--endpoint", ENDPOINT, "auth", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(6));
+    let error = &serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"];
+    assert_eq!(
+        error["hint"],
+        format!("sai --endpoint {ENDPOINT} auth login NAME")
+    );
+}
+
+#[test]
 fn auth_output_shows_only_the_origin_but_checks_the_full_endpoint() {
     let home = tempdir().unwrap();
-    let endpoint = "http://fixture-user:fixture-password@[::1]:9345/private?key=fixture#secret";
+    let endpoint = "http://fixture-user:fixture-password@[::1]:9345/private?key=fixture";
     Storage::new(home.path())
         .save_session(Session::new(
             String::from("synthetic-session").into(),
@@ -157,7 +205,7 @@ fn local_commands_reject_an_invalid_lcd_setting_before_accessing_storage() {
         &["intent", "local", ADDR][..],
     ] {
         let output = rust(home.path()).args(args).output().unwrap();
-        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
         assert_eq!(output.stderr, expected.as_bytes());
     }
@@ -177,7 +225,7 @@ fn url_validation_rejects_malformed_authorities_without_echoing_them() {
             .args(["auth", "list"])
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
         assert!(output.stderr == b"Error: SAI_LCD_ENDPOINT: Invalid value for lcd.endpoint: expected a URL starting with https:// or http://\n");
     }
@@ -188,10 +236,10 @@ fn invalid_settings_diagnostics_omit_supplied_values() {
     let home = tempdir().unwrap();
     let marker = "synthetic-secret-setting-value";
     for (variable, key, code) in [
-        ("SAI_UPDATE_AUTO", "update.auto", 1),
-        ("SAI_ENDPOINT", "keeper.endpoint", 1),
-        ("SAI_WS_ENDPOINT", "keeper.ws_endpoint", 1),
-        ("SAI_LCD_ENDPOINT", "lcd.endpoint", 1),
+        ("SAI_UPDATE_AUTO", "update.auto", 2),
+        ("SAI_ENDPOINT", "keeper.endpoint", 2),
+        ("SAI_WS_ENDPOINT", "keeper.ws_endpoint", 2),
+        ("SAI_LCD_ENDPOINT", "lcd.endpoint", 2),
         ("SAI_LOG", "logs.enabled", 0),
         ("SAI_LOG_KEEP_DAYS", "logs.keep_days", 0),
     ] {
@@ -213,7 +261,7 @@ fn invalid_settings_diagnostics_omit_supplied_values() {
         assert!(!diagnostic.contains(marker), "{variable} echoed its value");
         assert!(diagnostic.contains(variable) && diagnostic.contains(key));
         if variable == "SAI_UPDATE_AUTO" {
-            assert!(diagnostic.contains("expected true, false, yes, no, on, off, 1, or 0"));
+            assert!(diagnostic.contains("expected true or false"));
         }
     }
 
@@ -229,23 +277,23 @@ fn invalid_settings_diagnostics_omit_supplied_values() {
 }
 
 #[test]
-#[ignore = "requires uv and a Python reference checkout"]
+#[ignore = "requires uv and the Python v0.1.2 reference checkout"]
 fn invalid_settings_match_python_for_local_commands() {
     let home = tempdir().unwrap();
     let config = home.path().join("config.toml");
-    for invalid in [
-        "[lcd]\nendpoint = false\n",
-        "[update]\nauto = 'off'\n",
-        "[keeper]\nws_endpoint = 'http://localhost'\n",
+    for (invalid, code) in [
+        ("[lcd]\nendpoint = false\n", 2),
+        ("[update]\nauto = 'off'\n", 1),
+        ("[keeper]\nws_endpoint = 'http://localhost'\n", 2),
     ] {
         fs::write(&config, invalid).unwrap();
-        parity(home.path(), &["--json", "auth", "list"], 1);
-        parity(home.path(), &["--json", "auth", "status"], 1);
-        parity(home.path(), &["--json", "intent", "local", ADDR], 1);
+        parity(home.path(), &["--json", "auth", "list"], code);
+        parity(home.path(), &["--json", "auth", "status"], code);
+        parity(home.path(), &["--json", "intent", "local", ADDR], code);
     }
     fs::remove_file(config).unwrap();
     for flag in ["--ws-endpoint", "--lcd-endpoint"] {
-        parity(home.path(), &["--json", flag, "invalid", "auth", "list"], 1);
+        parity(home.path(), &["--json", flag, "invalid", "auth", "list"], 2);
     }
     assert!(!home.path().join("trader").exists());
 
@@ -379,13 +427,63 @@ fn rust_saved_session_round_trips_in_python() {
             ENDPOINT.into(),
         ))
         .unwrap();
-    let status = parity(
-        home.path(),
-        &["--json", "--endpoint", ENDPOINT, "auth", "status"],
-        6,
+    let read_session = r#"
+import sys
+from sai_cli.core.storage import load_session
+
+session = load_session()
+assert session["token"] == "synthetic-legacy-session"
+assert session["evmAddress"] == sys.argv[1]
+assert session["endpoint"] == sys.argv[2]
+assert session["expiresAt"] == "2000-01-01T00:00:00+00:00"
+"#;
+    write_cli_fixture(home.path(), read_session, &[ADDR, ENDPOINT]);
+    let damaged_home = tempdir().unwrap();
+    let damaged_trader = damaged_home.path().join("trader");
+    fs::create_dir(&damaged_trader).unwrap();
+    fs::copy(
+        home.path().join("trader/sessions.json"),
+        damaged_trader.join("sessions.json"),
+    )
+    .unwrap();
+    write_cli_fixture(
+        damaged_home.path(),
+        r#"
+import base64
+import json
+from cryptography.exceptions import InvalidTag
+from sai_cli.core.storage import SIGN_IN_AGAIN, directory, load_session
+
+path = directory() / "sessions.json"
+envelope = json.loads(path.read_text())
+ciphertext = bytearray(base64.b64decode(envelope["ciphertext"], validate=True))
+ciphertext[-1] ^= 1
+envelope["ciphertext"] = base64.b64encode(ciphertext).decode()
+path.write_text(json.dumps(envelope))
+
+try:
+    load_session()
+except ValueError as exc:
+    assert str(exc) == f"Cannot unlock session; {SIGN_IN_AGAIN}"
+    assert isinstance(exc.__cause__, InvalidTag)
+else:
+    raise AssertionError("Python accepted a damaged session")
+"#,
+        &[],
     );
-    let error: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(error["error"]["code"], "SESSION_EXPIRED");
+    let mut python = uv(home.path());
+    python.arg("sai");
+    // The releases use different human-facing hints for the same expired session.
+    for mut command in [rust(home.path()), python] {
+        let status = command
+            .args(["--json", "--endpoint", ENDPOINT, "auth", "status"])
+            .output()
+            .unwrap();
+        assert_eq!(status.status.code(), Some(6));
+        assert!(status.stderr.is_empty());
+        let error: Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(error["error"]["code"], "SESSION_EXPIRED");
+    }
     let output = parity(
         home.path(),
         &["--json", "--endpoint", ENDPOINT, "auth", "list"],
@@ -547,9 +645,12 @@ sys.stdout.flush()
 sys.stdin.buffer.read(1)
 try:
     storage.pending("python", endpoint, addr, "OPEN_TRADE", "")
-except ValueError as error:
-    if "Reconcile uncertain intent rust " not in str(error):
-        raise
+except storage.UnresolvedIntent as error:
+    if hasattr(storage, "RecentOpenPending"):
+        assert isinstance(error, storage.RecentOpenPending)
+        assert error.intent_key == "rust"
+    else:
+        assert "Reconcile uncertain intent rust " in str(error)
     sys.exit(4)
 "#,
             ENDPOINT,
@@ -575,7 +676,7 @@ except ValueError as error:
     let python_status = python.wait().unwrap().code();
     match reserved {
         Ok(()) => assert_eq!(python_status, Some(4)),
-        Err(StorageError::UncertainIntent(key)) => {
+        Err(StorageError::RecentOpenPending { key, .. }) => {
             assert_eq!(key, "python");
             assert_eq!(python_status, Some(0));
         }
@@ -641,8 +742,12 @@ from sai_cli.core import storage
 endpoint, addr = sys.argv[1:]
 try:
     storage.pending("python", endpoint, addr, "OPEN_TRADE", "")
-except ValueError as error:
-    assert "Reconcile uncertain intent rust " in str(error)
+except storage.UnresolvedIntent as error:
+    if hasattr(storage, "RecentOpenPending"):
+        assert isinstance(error, storage.RecentOpenPending)
+        assert error.intent_key == "rust"
+    else:
+        assert "Reconcile uncertain intent rust " in str(error)
 else:
     raise AssertionError("Python reserved a second intent")
 "#,

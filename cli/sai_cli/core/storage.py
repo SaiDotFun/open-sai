@@ -7,13 +7,14 @@ import base64
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import shlex
 import sqlite3
 import sys
 import tempfile
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -23,7 +24,7 @@ from typing import Any
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from . import log, paths
+from . import keeper, log, paths
 from .errors import Code, SaiError, SessionError, describe
 
 
@@ -61,6 +62,12 @@ class UnresolvedIntent(SaiError, ValueError):
 
     code = Code.INVALID_REQUEST
 
+    def __init__(
+        self, message: str, *, intent_key: str, hint: str, account: str
+    ) -> None:
+        super().__init__(message, intent_key=intent_key, hint=hint)
+        self.account = account
+
 
 class RecentOpenPending(UnresolvedIntent):
     """An earlier open on the same account may still execute."""
@@ -75,6 +82,7 @@ class RecentOpenPending(UnresolvedIntent):
             f" Check its status with `{hint}` before retrying.",
             intent_key=key,
             hint=hint,
+            account=account,
         )
         self.keys = keys
 
@@ -101,8 +109,9 @@ _AAD = b"sai-sessions-v3"
 _V2_AAD = b"sai-session-v2-test"
 
 SIGN_IN_AGAIN = "run `sai auth import` or `sai auth login NAME` again"
+INVALID_EXPIRY = f"Stored session has an invalid expiry; {SIGN_IN_AGAIN}"
 NO_SESSION = "No Sai session; run `sai auth import` or `sai auth login NAME`"
-SESSION_FIELDS = ("token", "evmAddress", "expiresAt")
+SESSION_FIELDS = ("token", "evmAddress")
 # What delete_session reports after deleting a store it could not read.
 UNREADABLE_REMOVED = "unreadable session file"
 
@@ -123,11 +132,14 @@ def _decrypt(fields: dict[str, Any], aad: bytes) -> Any:
     return json.loads(AESGCM(_SESSION_KEY).decrypt(nonce, ciphertext, aad))
 
 
-def _check_session(session: Any) -> dict[str, str]:
+def check_session_fields(session: Any) -> dict[str, str]:
+    """Check the fields required to read a session from the store."""
     if not isinstance(session, dict) or not all(
         isinstance(session.get(k), str) for k in SESSION_FIELDS
     ):
         raise ValueError("Invalid session")
+    if not isinstance(session.get("expiresAt"), str):
+        raise SessionError(INVALID_EXPIRY)
     return session
 
 
@@ -139,6 +151,26 @@ def _read_envelope(path: Path) -> dict[str, Any] | None:
     except (OSError, ValueError) as exc:
         raise ValueError(f"Stored session is unreadable; {SIGN_IN_AGAIN}") from exc
     return envelope if isinstance(envelope, dict) else {}
+
+
+def is_session_envelope(name: str, value: object) -> bool:
+    """Recognize a supported session format without unlocking any tokens."""
+    if not isinstance(value, dict):
+        return False
+    version = value.get("version")
+    if type(version) is not int:
+        return False
+    if name == "session.json":
+        if version != 2 or value.get("backend") != "test":
+            return False
+    elif version != _VERSION:
+        return False
+    try:
+        nonce = base64.b64decode(value["nonce"], validate=True)
+        ciphertext = base64.b64decode(value["ciphertext"], validate=True)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return len(nonce) == 12 and len(ciphertext) > 16
 
 
 def _load_v2(fields: dict[str, Any]) -> dict[str, Any]:
@@ -157,8 +189,10 @@ def _load_v2(fields: dict[str, Any]) -> dict[str, Any]:
     if fields.get("version") != 2 or fields.get("backend") != "test":
         raise ValueError(f"Unsupported session version; {SIGN_IN_AGAIN}")
     try:
-        session = _check_session(_decrypt(fields, _V2_AAD))
+        session = check_session_fields(_decrypt(fields, _V2_AAD))
         log.remember([session["token"]])
+    except SessionError:
+        raise
     except (ValueError, KeyError, TypeError, InvalidTag) as exc:
         raise ValueError(f"Cannot unlock session; {SIGN_IN_AGAIN}") from exc
     addr = session["evmAddress"].lower()
@@ -188,11 +222,13 @@ def load_accounts() -> dict[str, Any]:
         stored = accounts["sessions"]
         if not isinstance(stored, dict):
             raise TypeError("Invalid session set")
-        sessions = {k: _check_session(v) for k, v in stored.items()}
+        sessions = {k: check_session_fields(v) for k, v in stored.items()}
         log.remember(session["token"] for session in sessions.values())
         active = accounts.get("active")
         if active is not None and active not in sessions:
             active = None
+    except SessionError:
+        raise
     except (ValueError, KeyError, TypeError, InvalidTag) as exc:
         raise ValueError(f"Cannot unlock session; {SIGN_IN_AGAIN}") from exc
     return {"active": active, "sessions": sessions}
@@ -218,7 +254,12 @@ def _save_accounts(accounts: dict[str, Any]) -> None:
         os.replace(temp, root / "sessions.json")
     finally:
         Path(temp).unlink(missing_ok=True)
-    _v2_path().unlink(missing_ok=True)
+    try:
+        _v2_path().unlink(missing_ok=True)
+    except OSError:
+        logging.getLogger(__name__).warning(
+            "Could not remove legacy session file trader/session.json after saving accounts."
+        )
 
 
 @contextlib.contextmanager
@@ -251,11 +292,12 @@ def _remove_files() -> None:
     _v2_path().unlink(missing_ok=True)
 
 
-def _find(accounts: dict[str, Any], addr: str) -> str:
+def _find(accounts: dict[str, Any], addr: str, *, include_addr: bool = True) -> str:
     key = addr.lower()
     if key not in accounts["sessions"]:
         raise ValueError(
-            f"{addr} is not connected; run `sai auth list` to see connected"
+            f"{addr if include_addr else 'Requested account'} is not connected;"
+            " run `sai auth list` to see connected"
             " accounts, or sign in with `sai auth login NAME` or `sai auth import`"
         )
     return key
@@ -323,20 +365,34 @@ def load_session(addr: str | None = None) -> dict[str, str]:
     return accounts["sessions"][accounts["active"]]
 
 
-def use_session(addr: str) -> dict[str, str]:
-    """Make the connected ADDR the active account and return its session."""
+def use_session(
+    addr: str, prepare: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    """Select ADDR, preparing its response from the candidate state before saving."""
+    from .session import expiry_time, session_address
+
     with _locked():
         accounts = load_accounts()
-        key = _find(accounts, addr)
+        key = _find(accounts, addr, include_addr=False)
+        session = accounts["sessions"][key]
+        address = session_address(session, key)
+        expiry_time(session)
         accounts["active"] = key
+        response = session if prepare is None else prepare(accounts)
         _save_accounts(accounts)
-        log.event("session.active", addr=accounts["sessions"][key]["evmAddress"])
-        return accounts["sessions"][key]
+        log.event("session.active", addr=address)
+        return response
 
 
 def session_exists() -> bool:
     """Report whether any session file is stored, without reading it."""
-    return (home() / "sessions.json").is_file() or _v2_path().is_file()
+    # Sign-in writes the new file before unlinking the legacy file.
+    return _v2_path().is_file() or _sessions_path().is_file()
+
+
+def _logout_key(accounts: dict[str, Any], addr: str | None) -> str | None:
+    key = accounts["active"] if addr is None else addr.lower()
+    return key if key in accounts["sessions"] else None
 
 
 def delete_session(addr: str | None = None) -> str | None:
@@ -346,6 +402,17 @@ def delete_session(addr: str | None = None) -> str | None:
     Removing the active account leaves no account active. Without ADDR, a
     store that cannot be read is deleted and reported as removed.
     """
+    if not session_exists():
+        return None
+    if not (home() / "sessions.lock").exists():
+        # A legacy or copied store may have no lock yet. Leave it alone if
+        # this logout is a no-op, and re-read under the lock before writing.
+        try:
+            if _logout_key(load_accounts(), addr) is None:
+                return None
+        except ValueError:
+            if addr is not None:
+                raise
     with _locked():
         # Checked under the lock: a sign-in may be migrating the old file.
         if not session_exists():
@@ -363,14 +430,9 @@ def delete_session(addr: str | None = None) -> str | None:
                 reason="unreadable session file",
             )
             return UNREADABLE_REMOVED
-        if addr is None:
-            key = accounts["active"]
-            if key is None:
-                return None
-        else:
-            key = addr.lower()
-            if key not in accounts["sessions"]:
-                return None
+        key = _logout_key(accounts, addr)
+        if key is None:
+            return None
         removed = accounts["sessions"].pop(key)["evmAddress"]
         if accounts["active"] == key:
             accounts["active"] = None
@@ -421,6 +483,7 @@ def _migrate(connection: sqlite3.Connection) -> None:
 # Seconds a ledger write waits for another process's SQLite lock. A caller
 # with a deadline, such as `sai doctor`, lowers it with `busy_timeout`.
 _BUSY_TIMEOUT: ContextVar[float] = ContextVar("busy_timeout", default=10)
+_KEEP_MODES: ContextVar[bool] = ContextVar("keep_modes", default=False)
 
 
 @contextmanager
@@ -434,13 +497,26 @@ def busy_timeout(seconds: float) -> Generator[None]:
         _BUSY_TIMEOUT.reset(token)
 
 
+@contextmanager
+def keep_ledger_modes() -> Generator[None]:
+    """Use the existing ledger without changing its or its directory's mode."""
+    token = _KEEP_MODES.set(True)
+    try:
+        yield
+    finally:
+        _KEEP_MODES.reset(token)
+
+
 def db() -> sqlite3.Connection:
-    path = directory() / "intents.sqlite3"
-    connection = sqlite3.connect(path, timeout=_BUSY_TIMEOUT.get())
+    keep_modes = _KEEP_MODES.get()
+    path = (home() if keep_modes else directory()) / "intents.sqlite3"
+    target = f"{path.absolute().as_uri()}?mode=rw" if keep_modes else str(path)
+    connection = sqlite3.connect(target, uri=keep_modes, timeout=_BUSY_TIMEOUT.get())
     try:
         # Closing a separate file descriptor would release any POSIX locks
         # that another connection in this process holds on the ledger.
-        path.chmod(0o600)
+        if not keep_modes:
+            path.chmod(0o600)
         _migrate(connection)
     except BaseException:
         connection.close()
@@ -454,7 +530,11 @@ def keeper_command_hint(endpoint: str, *args: str) -> str:
     Ask the caller to supply the original URL when the origin is insufficient.
     """
     origin = log.origin(endpoint)
-    if origin != log.REDACTED_URL and origin == endpoint == log.redact(endpoint):
+    if (
+        origin != log.REDACTED_URL
+        and endpoint in (origin, keeper.MAINNET_HTTP)
+        and endpoint == log.redact(endpoint)
+    ):
         flag = shlex.quote(endpoint)
     else:
         flag = (
@@ -483,7 +563,18 @@ def _check_open_pending(
         (endpoint, account.lower(), allow_concurrent_open),
     ).fetchall()
     if opens:
-        raise RecentOpenPending([row[0] for row in opens], endpoint, account)
+        keys = [row[0] for row in opens]
+        for key in keys:
+            log.event(
+                "intent.open_blocked",
+                "warn",
+                intentKey=key,
+                addr=account,
+                endpoint=log.endpoint(endpoint),
+                endpointId=log.endpoint_identity(endpoint),
+                code=Code.RECENT_OPEN_PENDING,
+            )
+        raise RecentOpenPending(keys, endpoint, account)
 
 
 @contextmanager
@@ -536,6 +627,7 @@ def pending(
                 f"Reconcile uncertain intent {blocked_key} before submitting another trade",
                 intent_key=blocked_key,
                 hint=intent_status_hint(endpoint, account, blocked_key),
+                account=account,
             )
         connection.execute(
             "INSERT INTO intents (id, endpoint, account, kind, status, entity, created_at) VALUES (?, ?, ?, ?, 'unknown', ?, ?)",

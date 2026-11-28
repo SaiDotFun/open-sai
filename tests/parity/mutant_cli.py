@@ -155,7 +155,13 @@ elif MUTATION.startswith("network-"):
 
 
 def run() -> None:
-    if MUTATION not in {"stdout-key-order", "stderr-duplicate"}:
+    if MUTATION not in {
+        "stdout-key-order",
+        "stderr-duplicate",
+        "stale-index-code",
+        "auth-import-stderr-echo",
+        "auth-import-stderr-drift",
+    }:
         main()
         return
     output, diagnostics = io.StringIO(), io.StringIO()
@@ -166,7 +172,15 @@ def run() -> None:
         stdout = output.getvalue()
         if MUTATION == "stdout-key-order":
             stdout = json.dumps(json.loads(stdout), sort_keys=True) + "\n"
+        elif MUTATION == "stale-index-code":
+            envelope = json.loads(stdout)
+            envelope["error"]["code"] = "KEEPER_ERROR"
+            stdout = json.dumps(envelope) + "\n"
         stderr = diagnostics.getvalue()
+        if MUTATION == "auth-import-stderr-echo":
+            stderr = stderr.replace("Error:", f"Error: {sys.argv[-1]}", 1)
+        elif MUTATION == "auth-import-stderr-drift":
+            stderr = stderr.replace("Error:", "Error: Wrong diagnostic.", 1)
         sys.stdout.write(stdout)
         sys.stderr.write(stderr * (2 if MUTATION == "stderr-duplicate" else 1))
 
@@ -180,3 +194,5 @@ finally:
         change_config()
     elif MUTATION == "stale-log":
         stamp_logs_in_past()
+    elif MUTATION == "doctor-create-trader":
+        (SAI_HOME / "trader").mkdir(mode=0o700, exist_ok=True)

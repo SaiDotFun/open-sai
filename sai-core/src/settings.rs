@@ -2,23 +2,25 @@
 
 mod edit;
 mod home;
+mod hostname;
 mod toml;
 
 use std::{
     env,
     ffi::{OsStr, OsString},
-    fmt, fs, io,
+    fmt,
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 
 use serde_json::{Value, json};
 use toml_edit::{Item, TomlError};
 
-use crate::endpoint::Endpoint;
+use crate::{endpoint::Endpoint, files::open_regular, log};
 use toml::ParsedDocument;
 
 pub const FILE_NAME: &str = "config.toml";
-const MAINNET_HTTP: &str = "https://sai-keeper.nibiru.fi/query";
+pub(crate) const MAINNET_HTTP: &str = "https://sai-keeper.nibiru.fi/query";
 const MAINNET_WS: &str = "wss://sai-keeper.nibiru.fi/query";
 const MAINNET_LCD: &str = "https://lcd.nibiru.fi";
 const DEFAULT_KEEP_DAYS: u64 = 14;
@@ -105,8 +107,7 @@ impl Key {
     pub fn parse(name: &str) -> Result<Self, SettingsError> {
         find_key(name).ok_or_else(|| {
             SettingsError::invalid(format!(
-                "Unknown setting {}. Valid keys: {}",
-                repr(name),
+                "Invalid value for 'KEY': unknown setting. Valid keys: {}",
                 valid_keys()
             ))
         })
@@ -116,19 +117,17 @@ impl Key {
         let text = raw.trim();
         let name = self.spec().name;
         match self.spec().kind {
-            Kind::Url(_) => self.check_url(text),
+            Kind::Url(_) => self.check_url(raw),
             Kind::Bool => match parse_bool(text) {
                 Some(value) => Ok(Value::Bool(value)),
                 None => Err(SettingsError::invalid(format!(
-                    "Invalid value {} for {name}: expected true or false",
-                    repr(raw)
+                    "Invalid value for {name}: expected true or false"
                 ))),
             },
             Kind::Days => {
                 if text.is_empty() || !text.bytes().all(|c| c.is_ascii_digit()) {
                     return Err(SettingsError::invalid(format!(
-                        "Invalid value {} for {name}: expected a whole number, 1 or more",
-                        repr(raw)
+                        "Invalid value for {name}: expected a whole number, 1 or more"
                     )));
                 }
                 let digits = text.trim_start_matches('0');
@@ -151,18 +150,8 @@ impl Key {
     }
 
     pub fn public_value(self, value: &Value) -> Value {
-        if let (Kind::Url(_), Some(endpoint)) = (self.spec().kind, value.as_str())
-            && let Some(endpoint) = Endpoint::split(endpoint)
-        {
-            let (host, port) = endpoint.host_port();
-            let authority = match port {
-                Ok(Some(port)) => format!("{host}:{port}"),
-                _ => host,
-            };
-            return json!(format!(
-                "{}://{authority}{}",
-                endpoint.scheme, endpoint.path
-            ));
+        if let (Kind::Url(_), Some(endpoint)) = (self.spec().kind, value.as_str()) {
+            return json!(log::origin(endpoint));
         }
         value.clone()
     }
@@ -179,10 +168,12 @@ impl Key {
     }
 
     fn expected(self, expected: &str) -> SettingsError {
-        SettingsError::invalid(format!(
+        let mut error = SettingsError::invalid(format!(
             "Invalid value for {}: expected {expected}",
             self.spec().name
-        ))
+        ));
+        error.invalid_endpoint = matches!(self.spec().kind, Kind::Url(_));
+        error
     }
 
     fn invalid_env_value(self) -> SettingsError {
@@ -190,6 +181,7 @@ impl Key {
             Kind::Url([secure, plain]) => {
                 self.expected(&format!("a URL starting with {secure}:// or {plain}://"))
             }
+            Kind::Bool if self == Self::UpdateAuto => self.expected("true or false"),
             Kind::Bool => self.expected("true, false, yes, no, on, off, 1, or 0"),
             Kind::Days => self.expected("a whole number, 1 or more"),
         }
@@ -199,7 +191,29 @@ impl Key {
         let Kind::Url(schemes) = self.spec().kind else {
             unreachable!()
         };
-        if Endpoint::split(value).is_some_and(|url| schemes.contains(&url.scheme.as_str())) {
+        let invalid = |reason| {
+            SettingsError::endpoint(format!("Invalid value for {}: {reason}", self.spec().name))
+        };
+        if self != Self::LcdEndpoint && value.contains('#') {
+            return Err(invalid("remove the URL fragment"));
+        }
+        if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return Err(invalid("URL contains whitespace or control characters"));
+        }
+        if Endpoint::split(value).is_some_and(|url| {
+            let (host, port) = url.host_port();
+            let authority = url.authority.rsplit('@').next().unwrap_or_default();
+            schemes.contains(&url.scheme.as_str())
+                && !host.is_empty()
+                && port.is_ok()
+                && !url.authority.contains('\\')
+                && (schemes[0] != "https" || hostname::valid_http_host(authority, &host))
+                && (self != Self::KeeperWsEndpoint
+                    || url
+                        .authority
+                        .rsplit_once('@')
+                        .is_none_or(|(userinfo, _)| userinfo.contains(':')))
+        }) {
             return Ok(json!(value));
         }
         Err(self.expected(&format!(
@@ -208,10 +222,20 @@ impl Key {
         )))
     }
 
+    /// Validate server endpoints for diagnostics and registration repair.
+    pub fn check_diagnostic_url(self, value: &str) -> Result<(), SettingsError> {
+        if matches!(self.spec().kind, Kind::Url(_)) {
+            self.check_url(value)?;
+        }
+        Ok(())
+    }
+
     fn read_value(self, item: &Item, document: &ParsedDocument) -> Result<Value, SettingsError> {
         match self.spec().kind {
             Kind::Url(_) => {
-                self.check_url(item.as_str().ok_or_else(|| self.expected("a URL string"))?)
+                self.check_url(item.as_str().ok_or_else(|| {
+                    SettingsError::endpoint(self.expected("a URL string").message)
+                })?)
             }
             Kind::Bool => item
                 .as_bool()
@@ -286,6 +310,9 @@ fn parse_bool(raw: &str) -> Option<bool> {
 pub struct SettingsError {
     message: String,
     uneditable: bool,
+    invalid_endpoint: bool,
+    invalid_override: bool,
+    malformed_toml: bool,
 }
 
 impl SettingsError {
@@ -293,11 +320,38 @@ impl SettingsError {
         Self {
             message,
             uneditable: false,
+            invalid_endpoint: false,
+            invalid_override: false,
+            malformed_toml: false,
+        }
+    }
+
+    fn endpoint(message: String) -> Self {
+        Self {
+            invalid_endpoint: true,
+            ..Self::invalid(message)
         }
     }
 
     pub fn is_uneditable(&self) -> bool {
         self.uneditable
+    }
+
+    pub fn is_invalid_endpoint(&self) -> bool {
+        self.invalid_endpoint
+    }
+
+    pub fn is_invalid_setting(&self) -> bool {
+        self.invalid_endpoint || self.invalid_override
+    }
+
+    pub fn is_malformed_toml(&self) -> bool {
+        self.malformed_toml
+    }
+
+    fn with_context(mut self, origin: &str) -> Self {
+        self.message = format!("{origin}: {}", self.message);
+        self
     }
 }
 
@@ -313,6 +367,11 @@ impl From<SettingsError> for crate::errors::SaiError {
     fn from(error: SettingsError) -> Self {
         if error.is_uneditable() {
             Self::usage(error.to_string())
+        } else if error.is_invalid_setting() {
+            Self {
+                show_usage: false,
+                ..Self::usage(error.to_string())
+            }
         } else {
             Self::new(crate::errors::Code::InvalidRequest, error.to_string())
         }
@@ -408,8 +467,54 @@ pub struct Settings {
 
 impl Settings {
     pub fn load(flags: &Flags, env: &Environment) -> Result<Self, SettingsError> {
-        let path = env.path();
-        let file = FileSettings::read(&path)?;
+        let file = FileSettings::read(&env.path(), env.raw(Key::UpdateAuto).is_some())?;
+        Self::resolve(flags, env, file)
+    }
+
+    /// Inspect the file even when flags or environment settings override it.
+    pub fn for_doctor(
+        flags: &Flags,
+        env: &Environment,
+    ) -> Result<(Result<Self, SettingsError>, Vec<&'static str>), SettingsError> {
+        let invalid_update_override = matches!(
+            pick(Key::UpdateAuto, flags, env, None),
+            (Err(_), Source::Env)
+        );
+        let file = FileSettings::read_for_diagnostics(&env.path(), invalid_update_override)?;
+        let invalid = KEYS
+            .into_iter()
+            .filter(|key| {
+                file.entries[*key as usize]
+                    .as_ref()
+                    .is_some_and(Result::is_err)
+            })
+            .map(|key| key.spec().name)
+            .collect();
+        let resolved = (|| {
+            for key in KEYS {
+                let selection = flags
+                    .value(key)
+                    .map(|value| (key.spec().flag.unwrap_or(key.spec().name), value))
+                    .or_else(|| {
+                        env.raw(key)
+                            .and_then(|value| value.to_str())
+                            .map(|value| (key.spec().env, value))
+                    });
+                if let Some((source, value)) = selection {
+                    key.check_diagnostic_url(value)
+                        .map_err(|error| error.with_context(source))?;
+                }
+            }
+            Self::resolve(flags, env, file)
+        })();
+        Ok((resolved, invalid))
+    }
+
+    fn resolve(
+        flags: &Flags,
+        env: &Environment,
+        file: FileSettings,
+    ) -> Result<Self, SettingsError> {
         let mut resolved = Self {
             entries: KEYS.map(|key| (key.default_value(), Source::Default)),
             warnings: file.warnings,
@@ -422,21 +527,29 @@ impl Settings {
                 Err(error) if key.is_log() => {
                     let already_off = resolved.value(Key::LogsEnabled).as_bool() == Some(false);
                     let source = if already_off { source } else { Source::Invalid };
-                    if source == Source::Invalid && env.is_set(key) {
+                    if source == Source::Invalid
+                        && let Some(raw) = env.raw(key)
+                    {
+                        let detail = if raw.to_str().is_none() {
+                            format!("invalid value for {}", key.spec().name)
+                        } else {
+                            error.to_string()
+                        };
                         resolved.warnings.push(format!(
-                            "{}: {error}; logging is off until it is fixed",
+                            "{}: {detail}; logging is off until it is fixed",
                             key.spec().env
                         ));
                     }
                     (key.default_value(), source)
                 }
-                Err(error) => {
+                Err(mut error) => {
                     let origin = if source == Source::Flag {
                         key.spec().flag.unwrap_or(key.spec().name)
                     } else {
                         key.spec().env
                     };
-                    return Err(SettingsError::invalid(format!("{origin}: {error}")));
+                    error.invalid_override = matches!(source, Source::Flag | Source::Env);
+                    return Err(error.with_context(origin));
                 }
             };
         }
@@ -480,6 +593,27 @@ impl Settings {
     }
 }
 
+/// Effective logging settings, including the default when config cannot load.
+pub fn doctor_log_settings(env: &Environment) -> (bool, Value) {
+    let flags = Flags::default();
+    let selected = FileSettings::read_for_diagnostics(&env.path(), false)
+        .ok()
+        .and_then(|file| {
+            let value = |key: Key| {
+                pick(key, &flags, env, file.entries[key as usize].as_ref())
+                    .0
+                    .ok()
+            };
+            (value(Key::LogsEnabled)?.as_bool() == Some(true))
+                .then(|| value(Key::LogsKeepDays))
+                .flatten()
+        });
+    selected.map_or_else(
+        || (false, Key::LogsKeepDays.default_value()),
+        |keep| (true, keep),
+    )
+}
+
 type Entry = Result<Value, SettingsError>;
 
 #[derive(Default)]
@@ -489,7 +623,20 @@ struct FileSettings {
 }
 
 impl FileSettings {
-    fn read(path: &Path) -> Result<Self, SettingsError> {
+    fn read_for_diagnostics(path: &Path, update_overridden: bool) -> Result<Self, SettingsError> {
+        let file = Self::read(path, update_overridden)?;
+        for key in KEYS {
+            if let Some(Ok(value)) = &file.entries[key as usize]
+                && let Some(url) = value.as_str()
+            {
+                key.check_diagnostic_url(url)
+                    .map_err(|error| error.with_context(&path.display().to_string()))?;
+            }
+        }
+        Ok(file)
+    }
+
+    fn read(path: &Path, update_overridden: bool) -> Result<Self, SettingsError> {
         let Some(text) = read_text(path)? else {
             return Ok(Self::default());
         };
@@ -506,10 +653,13 @@ impl FileSettings {
                             .push(format!("{path}: ignoring unknown setting {}", repr(&name)));
                         continue;
                     };
+                    if key == Key::UpdateAuto && update_overridden {
+                        continue;
+                    }
                     let entry = key.read_value(item, &parsed);
                     if let Err(ref error) = entry {
                         if !key.is_log() {
-                            return Err(SettingsError::invalid(format!("{path}: {error}")));
+                            return Err(error.clone().with_context(&path.to_string()));
                         }
                         file.warnings
                             .push(format!("{path}: {error}; logging is off until it is fixed"));
@@ -524,6 +674,8 @@ impl FileSettings {
                 file.warnings.push(format!(
                     "{path}: {message}; logging is off until it is fixed"
                 ));
+            } else if section == "update" && update_overridden {
+                continue;
             } else if KEYS.iter().any(|key| key.section_and_name().0 == section) {
                 return Err(SettingsError::invalid(format!(
                     "{path}: {}",
@@ -548,10 +700,18 @@ fn pick(key: Key, flags: &Flags, env: &Environment, file: Option<&Entry>) -> (En
     if let Some(raw) = flags.value(key) {
         (key.parse_value(raw), Source::Flag)
     } else if let Some(raw) = env.raw(key) {
-        let value = raw
-            .to_str()
-            .and_then(|raw| key.parse_value(raw).ok())
-            .ok_or_else(|| key.invalid_env_value());
+        let value = raw.to_str().map_or_else(
+            || Err(key.invalid_env_value()),
+            |raw| {
+                key.parse_value(raw).map_err(|error| {
+                    if error.invalid_endpoint {
+                        error
+                    } else {
+                        key.invalid_env_value()
+                    }
+                })
+            },
+        );
         (value, Source::Env)
     } else if let Some(value) = file {
         (value.clone(), Source::File)
@@ -562,7 +722,11 @@ fn pick(key: Key, flags: &Flags, env: &Environment, file: Option<&Entry>) -> (En
 
 /// The writer uses file and environment settings independently of CLI flags.
 pub(crate) fn log_keep_days(env: &Environment) -> Option<u64> {
-    let file = FileSettings::read(&env.path()).ok()?;
+    Some(log_keep_value(env)?.as_u64().unwrap_or(u64::MAX))
+}
+
+pub(crate) fn log_keep_value(env: &Environment) -> Option<Value> {
+    let file = FileSettings::read(&env.path(), false).ok()?;
     let flags = Flags::default();
     let value = |key: Key| {
         pick(key, &flags, env, file.entries[key as usize].as_ref())
@@ -570,7 +734,7 @@ pub(crate) fn log_keep_days(env: &Environment) -> Option<u64> {
             .ok()
     };
     if value(Key::LogsEnabled)?.as_bool()? {
-        Some(value(Key::LogsKeepDays)?.as_u64().unwrap_or(u64::MAX))
+        value(Key::LogsKeepDays)
     } else {
         None
     }
@@ -592,8 +756,9 @@ fn read_text(path: &Path) -> Result<Option<String>, SettingsError> {
 }
 
 fn read_raw_text(path: &Path) -> Result<Option<String>, SettingsError> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
+    let mut text = String::new();
+    match open_regular(path).and_then(|mut file| file.read_to_string(&mut text)) {
+        Ok(_) => Ok(Some(text)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(SettingsError::invalid(format!(
             "Cannot read {}: {}",
@@ -678,7 +843,9 @@ fn parse_error(path: &Path, input: &str, error: &TomlError, editing: bool) -> Se
         };
         format!("{description} ({location})")
     };
-    SettingsError::invalid(format!("Cannot parse {}: {detail}", path.display()))
+    let mut error = SettingsError::invalid(format!("Cannot parse {}: {detail}", path.display()));
+    error.malformed_toml = true;
+    error
 }
 
-pub use edit::{set, unset};
+pub use edit::{edit_setting, set, unset};

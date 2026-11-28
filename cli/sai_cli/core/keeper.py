@@ -10,7 +10,7 @@ import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -66,6 +66,14 @@ INTENT_HISTORY = """query($trader:String!, $limit:Int!, $offset:Int!) {
         leverage openPrice closePrice tp sl openBlock { block } closeBlock { block }
         perpBorrowing { marketId collateralToken { symbol } }
       }
+    }
+  }
+}"""
+FILL_POSITION = """query($trader:String!, $id:Int!) {
+  perp {
+    trade(trader:$trader,id:$id) {
+      id trader isOpen tradeType collateralAmount leverage openPrice
+      openBlock { block } lastUpdatedBlock { block }
     }
   }
 }"""
@@ -203,6 +211,39 @@ def _block_time(value: object) -> str | None:
     return None
 
 
+def _zero_price_timestamp(value: object) -> bool:
+    if type(value) in (int, float):
+        return value == 0
+    if not isinstance(value, str):
+        return False
+    if value == "0":
+        return True
+    # Match Chrono's separators. Drop all-zero fractions before parsing so a
+    # nonzero digit below datetime's resolution cannot turn into the epoch.
+    timestamp = value.upper().replace(" ", "T", 1).replace("−", "-")
+    timestamp = re.sub(r"\.0+(?=[Z+-])", "", timestamp)
+    if "." in timestamp or not BLOCK_TIMESTAMP.fullmatch(timestamp):
+        return False
+    try:
+        return datetime.fromisoformat(timestamp) == datetime(1970, 1, 1, tzinfo=UTC)
+    except ValueError:
+        return False
+
+
+def market_prices(endpoint: str) -> dict[str, Any]:
+    data = request(endpoint, PRICES)
+    oracle = data.get("oracle")
+    rows = oracle.get("tokenPricesUsd") if isinstance(oracle, dict) else None
+    if isinstance(rows, list):
+        for row in rows:
+            block = row.get("lastUpdatedBlock") if isinstance(row, dict) else None
+            if isinstance(block, dict):
+                timestamp = block.get("block_ts")
+                if timestamp is None or _zero_price_timestamp(timestamp):
+                    block["block_ts"] = None
+    return data
+
+
 def _row_id(value: object) -> str | int | None:
     if type(value) is int and 0 <= value < 2**63:
         return value
@@ -323,6 +364,7 @@ OPERATIONS = {
     ROUTE: "route",
     HISTORY: "history",
     INTENT_HISTORY: "history",
+    FILL_POSITION: "position",
     INTENTS: "intents",
     WAIT_INTENTS: "intents",
     CHALLENGE: "challenge",
@@ -335,6 +377,7 @@ class KeeperError(SaiError):
     """Keeper rejected a query or transport failed."""
 
     code = Code.KEEPER_ERROR
+    recovery_account: str | None = None
 
 
 class UdUnavailable(KeeperError):
@@ -354,15 +397,16 @@ class AdmissionRejected(KeeperError):
 class OutcomeUnknown(KeeperError):
     """The server may have accepted the request.
 
-    INTENT_KEY names the intent to reconcile, when one was reserved.
+    INTENT_KEY names the intent to reconcile for ACCOUNT.
     """
 
     code = Code.OUTCOME_UNKNOWN
 
     def __init__(
-        self, message: str, intent_key: str | None = None, *, hint: str | None = None
+        self, message: str, intent_key: str, *, account: str, hint: str | None = None
     ) -> None:
         super().__init__(message, intent_key=intent_key, hint=hint)
+        self.account = account
 
 
 class NotSent(KeeperError):
@@ -754,6 +798,12 @@ def canonical_account(value: object) -> str | None:
     for symbol in symbols[:-6]:
         payload = (payload << 5) | symbol
     return "0x" + payload.to_bytes(20, "big").hex()
+
+
+def same_account(first: object, second: object) -> bool:
+    """Compare two valid EVM or Nibiru addresses by account identity."""
+    account = canonical_account(first)
+    return account is not None and account == canonical_account(second)
 
 
 @dataclass(frozen=True)

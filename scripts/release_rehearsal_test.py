@@ -1,5 +1,6 @@
 """Run with python3 scripts/release-rehearsal.py --self-test."""
 
+import ast
 import fcntl
 import json
 import os
@@ -12,7 +13,9 @@ import tempfile
 import time
 import unittest
 import urllib.request
-from contextlib import suppress
+from contextlib import redirect_stdout, suppress
+from http.client import RemoteDisconnected
+from io import StringIO
 from pathlib import Path
 from threading import Event
 from typing import Any
@@ -741,9 +744,7 @@ class KeeperReplayTest(unittest.TestCase):
         self.key = "20261124T080000000Z_ABCDEFGHJKMNPQRS"
         self.replay.submitted.append(self.key)
 
-    def query(
-        self, base: str, text: str, **variables: str | int | None
-    ) -> dict[str, Any]:
+    def query(self, base: str, text: str, **variables: object) -> dict[str, Any]:
         request = urllib.request.Request(
             f"{base}/query",
             data=json.dumps({"query": text, "variables": variables}).encode(),
@@ -755,7 +756,7 @@ class KeeperReplayTest(unittest.TestCase):
     def test_projects_nested_and_aliased_fields(self) -> None:
         fields = REHEARSAL["selection_set"](
             "query TradeStatus($key: String) {\n"
-            " rows: userIntents(where:{intentKey:$key}) { intentKey # errorCode\n"
+            ' rows: userIntents(where:{user:"fixture", intentKey:$key}) { intentKey # errorCode\n'
             " trade { owner: trader } } }"
         )
         payload = {
@@ -771,6 +772,163 @@ class KeeperReplayTest(unittest.TestCase):
             REHEARSAL["project_fields"](payload, fields),
             {"rows": [{"intentKey": "the-key", "trade": {"owner": "trader-address"}}]},
         )
+
+    def test_intent_wait_projects_body_only_when_requested(self) -> None:
+        # Load the CLI's query without importing third-party CLI dependencies.
+        keeper = SCRIPT.parent.parent / "cli" / "sai_cli" / "core" / "keeper.py"
+        query = next(
+            ast.literal_eval(node.value)
+            for node in ast.parse(keeper.read_text()).body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(name, ast.Name) and name.id == "WAIT_INTENTS"
+                for name in node.targets
+            )
+        )
+        self.replay.lifecycle = "limit_placement_exec_pass"
+        variables = {"user": self.replay.addr, "key": self.key}
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            for override in ({}, {"includeAction": False}, {"includeAction": True}):
+                with self.subTest(variables=override):
+                    [row] = self.query(base, query, **variables, **override)[
+                        "userIntents"
+                    ]
+                    self.assertEqual(row["intentKey"], self.key)
+                    self.assertEqual(row["lifecycleStep"], "exec_pass")
+                    if override.get("includeAction"):
+                        self.assertEqual(row["body"], {"orderType": "limit"})
+                    else:
+                        self.assertNotIn("body", row)
+
+    def test_skip_directive_uses_its_boolean_binding(self) -> None:
+        query = (
+            "query($skip:Boolean!, $user:String!, $key:String) {"
+            " rows: userIntents(where:{user:$user, intentKey:$key}) @skip(if:$skip) { intentKey } }"
+        )
+        variables = {"user": self.replay.addr, "key": self.key}
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            self.assertEqual(
+                self.query(base, query, skip=False, **variables),
+                {"rows": [{"intentKey": self.key}]},
+            )
+            self.assertEqual(self.query(base, query, skip=True, **variables), {})
+            with self.assertRaises(HTTPError) as error:
+                self.query(base, query, skip="false", **variables)
+            with error.exception as response:
+                self.assertEqual(response.code, 400)
+
+    def test_selected_objects_with_all_children_skipped_keep_their_aliases(
+        self,
+    ) -> None:
+        query = """
+query($user:String!, $key:String) {
+  p: perp { tradeHistory @skip(if:true) { id } }
+  route: oneClickTrading { enabled @include(if:false) }
+  matched: userIntents(where:{user:$user, intentKey:$key}) { intentKey }
+}
+"""
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            data = self.query(base, query, user=self.replay.addr, key=self.key)
+        self.assertEqual(
+            data, {"p": {}, "route": {}, "matched": [{"intentKey": self.key}]}
+        )
+
+    def test_rejects_conflicting_root_alias_with_skipped_children(self) -> None:
+        query = """
+query($user:String!, $key:String) {
+  shared: perp { tradeHistory @skip(if:true) { id } }
+  shared: userIntents(where:{user:$user, intentKey:$key}) { intentKey }
+}
+"""
+        with (
+            REHEARSAL["keeper_server"](self.replay.handler()) as base,
+            self.assertRaises(HTTPError) as error,
+        ):
+            self.query(base, query, user=self.replay.addr, key=self.key)
+        with error.exception as response:
+            self.assertEqual(response.code, 400)
+
+    def test_empty_selection_does_not_replace_an_active_alias(self) -> None:
+        self.replay.history = [{"id": 1, "trade": {"trader": self.replay.addr}}]
+        query = """
+query($trader:String!) {
+  p: perp { tradeHistory(where:{trader:$trader}) @skip(if:true) { id } }
+  p: perp { tradeHistory(where:{trader:$trader}) { id } }
+}
+"""
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            data = self.query(base, query, trader=self.replay.addr)
+        self.assertEqual(data, {"p": {"tradeHistory": [{"id": 1}]}})
+
+    def submit_open(self, base: str, key: str) -> dict[str, Any]:
+        query = (
+            "mutation($payload:RecordUserIntentInput!) {"
+            " submitted: recordUserIntent(input:$payload) { intentKey } }"
+        )
+        token = REHEARSAL["SYNTHETIC_TOKEN"]
+        request = urllib.request.Request(
+            f"{base}/query",
+            data=json.dumps(
+                {
+                    "query": query,
+                    "variables": {
+                        "payload": {
+                            "intentKey": key,
+                            "intent": {"kind": "OPEN_TRADE"},
+                        }
+                    },
+                }
+            ).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=2) as response:
+            return json.load(response)["data"]
+
+    def test_mutation_uses_the_bound_input_argument(self) -> None:
+        key = "20261124T080000000Z_ABCDEFGHJKMNPQRT"
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            self.assertEqual(
+                self.submit_open(base, key), {"submitted": {"intentKey": key}}
+            )
+        self.assertEqual(self.replay.submitted, [self.key, key])
+
+    def test_native_rehearsal_fails_if_reconciliation_submits_another_open(
+        self,
+    ) -> None:
+        self.replay.submitted.clear()
+        self.replay.lifecycle = "pending_exec"
+        second = "20261124T080000000Z_ABCDEFGHJKMNPQRT"
+        status = (
+            "query($user:String!, $key:String) {"
+            " userIntents(where:{user:$user,intentKey:$key}) { intentKey lifecycleStep } }"
+        )
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            with self.assertRaises(RemoteDisconnected):
+                self.submit_open(base, self.key)
+            with redirect_stdout(StringIO()):
+                self.assertEqual(
+                    REHEARSAL["native_cutover_result"](self.replay, self.key, 0), 0
+                )
+
+            # A broken reconciliation sends a new open but still returns the
+            # pending status of the original intent.
+            self.assertEqual(
+                self.submit_open(base, second), {"submitted": {"intentKey": second}}
+            )
+            result = self.query(base, status, user=self.replay.addr, key=self.key)
+            self.assertEqual(
+                result["userIntents"],
+                [{"intentKey": self.key, "lifecycleStep": "pending_exec"}],
+            )
+
+        with redirect_stdout(StringIO()) as output:
+            self.assertEqual(
+                REHEARSAL["native_cutover_result"](self.replay, self.key, 0), 1
+            )
+        self.assertIn("recorded 2 submissions", output.getvalue())
 
     def test_projects_trade_history_with_variable_pagination_and_legacy_limit(
         self,
@@ -933,6 +1091,89 @@ query($user: String!, $key: String, $other: DECLARATION) {
                     with error.exception as response:
                         self.assertEqual(response.code, 400)
 
+    def test_checks_declared_intent_and_history_filter_object_types(self) -> None:
+        self.replay.history = [{"id": 1, "trade": {"trader": self.replay.addr}}]
+        cases = (
+            (
+                "UserIntentsFilter!",
+                "{ matched: userIntents(where: $filter) { intentKey } }",
+                {"user": self.replay.addr, "intentKey": self.key},
+                {"matched": [{"intentKey": self.key}]},
+            ),
+            (
+                "PerpTradeHistoryFilter",
+                "{ perp { matched: tradeHistory(where: $filter) { id } } }",
+                {"trader": self.replay.addr},
+                {"perp": {"matched": [{"id": 1}]}},
+            ),
+        )
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            for declaration, selection, filters, expected in cases:
+                with self.subTest(declaration=declaration):
+                    query = f"query($filter: {declaration}) {selection}"
+                    self.assertEqual(self.query(base, query, filter=filters), expected)
+                    for invalid_query, invalid_filters in (
+                        (f"query($filter: Int) {selection}", filters),
+                        (f"query($filter: Int) {selection}", 1),
+                        (query, {}),
+                    ):
+                        with self.assertRaises(HTTPError) as error:
+                            self.query(base, invalid_query, filter=invalid_filters)
+                        with error.exception as response:
+                            self.assertEqual(response.code, 400)
+
+    def test_invalid_inline_filters_reject_all_aliases(self) -> None:
+        self.replay.history = [{"id": 1, "trade": {"trader": self.replay.addr}}]
+        cases = (
+            (
+                """query($trader:String!, $key:String) { perp {
+                  matching: tradeHistory(where:{trader:$trader}) { id }
+                  other: tradeHistory(where:FILTER) { id }
+                } }""",
+                ("{trader:$trader, intentKey:$key}", "{}", "{trader:null}", "[]"),
+            ),
+            (
+                """query($trader:String!, $key:String) {
+                  matching: userIntents(where:{user:$trader, intentKey:$key}) { intentKey }
+                  other: userIntents(where:FILTER) { intentKey }
+                }""",
+                ("{user:$trader, intentKey:ENUM}", "{}", "null"),
+            ),
+        )
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            for query, filters in cases:
+                for filter_text in filters:
+                    with self.subTest(filter=filter_text):
+                        with self.assertRaises(HTTPError) as error:
+                            self.query(
+                                base,
+                                query.replace("FILTER", filter_text),
+                                trader=self.replay.addr,
+                                key=self.key,
+                            )
+                        with error.exception as response:
+                            self.assertEqual(response.code, 400)
+
+    def test_invalid_required_variable_rejects_all_aliases(self) -> None:
+        query = """
+query($user: String!, $goodKey: String!, $key: String!) {
+  matched: userIntents(where: {user: $user, intentKey: $goodKey}) { intentKey }
+  other: userIntents(where: {user: $user, intentKey: $key}) { intentKey }
+}
+"""
+        variables = {"user": self.replay.addr, "goodKey": self.key}
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            self.assertEqual(
+                self.query(base, query, **variables, key="another-key"),
+                {"matched": [{"intentKey": self.key}], "other": []},
+            )
+            for invalid in ({}, {"key": None}, {"key": 123}):
+                with self.subTest(variables=invalid):
+                    with self.assertRaises(HTTPError) as error:
+                        self.query(base, query, **variables, **invalid)
+                    with error.exception as response:
+                        self.assertEqual(response.code, 400)
+
     def test_user_filter_requires_a_non_null_declaration_or_default(self) -> None:
         query = """
 query($account: DECLARATION, $key: String) {
@@ -957,6 +1198,10 @@ query($account: DECLARATION, $key: String) {
                 self.query(base, defaulted, key=self.key),
                 {"matched": [{"intentKey": self.key}]},
             )
+            with self.assertRaises(HTTPError) as error:
+                self.query(base, defaulted, account=None, key=self.key)
+            with error.exception as response:
+                self.assertEqual(response.code, 400)
 
     def test_uses_intent_filter_defaults_only_for_omitted_variables(self) -> None:
         query = (

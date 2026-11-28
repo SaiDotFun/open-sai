@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -39,7 +40,8 @@ from test_mcp_install import (
 )
 from test_update import API_PATH, Stub, listing, make_prefix
 
-REAL_UV = os.environ.get("UV") or shutil.which("uv")
+_uv_executable = shutil.which(os.environ.get("UV") or "uv")
+REAL_UV = os.path.abspath(_uv_executable) if _uv_executable else None
 needs_uv = pytest.mark.skipif(REAL_UV is None, reason="uv is not on PATH")
 
 
@@ -101,12 +103,23 @@ def sai_home(tmp_path, monkeypatch) -> Path:
     return home
 
 
+@pytest.fixture(autouse=True)
+def private_updater_path(tmp_path, monkeypatch) -> None:
+    """Keep installed MCP clients out of post-update discovery."""
+    executables = tmp_path / "path"
+    executables.mkdir()
+    if REAL_UV is not None:
+        (executables / "uv").symlink_to(REAL_UV)
+    monkeypatch.setenv("PATH", str(executables))
+
+
 @pytest.fixture
 def uv_dirs(tmp_path, monkeypatch, sai_home) -> Path:
     """Point uv at temporary tool, bin, and cache directories."""
     monkeypatch.setenv("UV_TOOL_DIR", str(tmp_path / "tools"))
     monkeypatch.setenv("UV_TOOL_BIN_DIR", str(tmp_path / "bin"))
     monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv-cache"))
+    monkeypatch.setenv("UV_PYTHON", str(Path(sys.executable).resolve()))
     monkeypatch.setenv("UV_PYTHON_DOWNLOADS", "never")
     monkeypatch.setenv("UV_NO_CONFIG", "1")
     monkeypatch.delenv("UV", raising=False)
@@ -280,11 +293,33 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
         claude = repair[0]["clients"][0]
         assert claude["client"] == "claude"
         assert claude["status"] == "fail" and claude["changes"] == []
-        assert claude["manualRepairs"] == [{"scope": scope, "name": name}]
-        command = (
-            f"sai mcp install --client claude --scope {scope} --repair-existing {name}"
-        )
-        assert command in claude["fix"]
+        repair_entry = {"scope": scope, "name": name}
+        if legacy:
+            commands = [
+                f"sai mcp install --client claude --scope {scope} --repair-existing {name}"
+            ]
+        else:
+            repair_entry["replaceEntry"] = True
+            repair_entry["launcher"] = str(tool.sai)
+            repair_entry["configPath"] = str(config)
+            repair_entry["fields"] = ["command", "args", "env"]
+            repair_entry["saiHome"] = str(uv_dirs / "sai-home")
+            repair_entry["serverArgs"] = [
+                "mcp",
+                "serve",
+                "--endpoint",
+                "<original-argument>",
+            ]
+            repair_entry["extraEnv"] = 1
+            commands = [
+                (
+                    f"claude mcp add --scope {scope} {name}"
+                    f" --env=SAI_HOME={uv_dirs / 'sai-home'} '--env=<NAME>=<value>'"
+                    f" -- {tool.sai} mcp serve --endpoint '<original-argument>'"
+                ),
+            ]
+        assert claude["manualRepairs"] == [repair_entry]
+        assert all(command in claude["fix"] for command in commands)
         assert state["result"]["mcp"] == repair[0]["clients"]
         if legacy:
             clients = {client["client"]: client for client in repair[0]["clients"]}
@@ -301,18 +336,18 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
             updater.tick(notices.append, prefix=tool.prefix)
             assert len(notices) == 1 and message in notices[0]
             assert "sai doctor" in notices[0]
-            assert command in notices[0]
+            assert all(command in notices[0] for command in commands)
             assert "project registrations" in notices[0]
             assert state["result"]["mcpNotes"] == ["background"]
         elif mode == "deleted-cwd":
             assert "The working directory is gone." in result.stdout
-            assert command in result.stdout
+            assert all(command in result.stdout for command in commands)
             assert state["result"]["mcpNotes"] == ["cwd-missing"]
         elif mode == "json":
             assert json.loads(result.stdout)["mcp"] == state["result"]["mcp"]
         else:
             assert message in result.stdout
-            assert command in result.stdout
+            assert all(command in result.stdout for command in commands)
         assert "Repaired Sai MCP registrations for claude" not in result.stdout
         if not background:
             assert updater.notice(state, "0.2.0") is None
@@ -561,7 +596,9 @@ def test_rollback_needs_no_package_source_for_the_old_dependencies(
     )
     assert done.returncode == 0, done.stderr
     # uv replaced the install once and was not asked to put it back.
-    installs = [line for line in log.read_text().splitlines() if "tool install" in line]
+    installs = [
+        line for line in log.read_text().splitlines() if "--reinstall-package" in line
+    ]
     assert len(installs) == 1
 
 
@@ -589,6 +626,37 @@ def test_the_spare_wheel_restores_when_the_copy_cannot_be_swapped_back(
     assert record is not None
     assert record.sha256 == hashlib.sha256(wheels["0.1.0"]).hexdigest()
     assert tool.kind() == update.UV_TOOL_RELEASE
+
+
+@pytest.mark.skipif(os.name == "nt", reason="uv launches through POSIX symlinks")
+@pytest.mark.parametrize("foreign", [False, True])
+def test_snapshot_rollback_only_publishes_to_a_vacant_launcher(
+    tmp_path: Path, foreign: bool
+) -> None:
+    prefix = tmp_path / "tools" / "sai-cli"
+    snapshot = prefix.with_name("snapshot")
+    for environment, contents in ((prefix, "candidate"), (snapshot, "previous")):
+        sai = environment / "bin" / "sai"
+        sai.parent.mkdir(parents=True)
+        sai.write_text(contents)
+    public = tmp_path / "sai"
+    competitor = tmp_path / "external-sai"
+    competitor.write_text("another installer")
+    if foreign:
+        public.symlink_to(competitor)
+        entry = public.lstat()
+
+    error = updater.swap_back(prefix, snapshot, public)
+    if foreign:
+        assert error and str(public) in error and str(competitor) in error
+        assert os.path.samestat(public.lstat(), entry)
+        assert public.read_text() == "another installer"
+        assert (prefix / "bin" / "sai").read_text() == "candidate"
+        assert snapshot.is_dir()
+    else:
+        assert error is None
+        assert public.read_text() == "previous"
+        assert not snapshot.exists()
 
 
 @pytest.mark.slow
@@ -624,6 +692,72 @@ def test_with_no_previous_wheel_the_environment_copy_restores_the_install(uv_dir
         "sai-cli",
     ]
     assert list(update.wheel_cache().glob("*.whl")) == []
+
+
+@needs_uv
+def test_uv_update_obeys_the_standalone_install_lock(uv_dirs):
+    wheels = {"0.1.0": build_wheel("0.1.0"), "0.2.0": build_wheel("0.2.0")}
+    with Stub(release_routes(wheels)) as stub:
+        tool = Tool(uv_dirs, stub.url)
+        tool.install_release("0.1.0")
+        public = tool.sai.lstat()
+        with updater.locked(tool.sai.parent / ".sai-update.lock") as held:
+            assert held
+            outcome = tool.update(background=True)
+        assert outcome.status == updater.BUSY
+        assert str(tool.sai) in outcome.message
+        assert tool.version() == "0.1.0"
+        assert os.path.samestat(tool.sai.lstat(), public)
+        assert tool.update().status == updater.UPDATED
+        assert tool.version() == "0.2.0"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="test uses a foreign POSIX script")
+@needs_uv
+def test_a_foreign_script_mentioning_the_tool_prefix_is_not_its_launcher(uv_dirs):
+    wheels = {"0.1.0": build_wheel("0.1.0"), "0.2.0": build_wheel("0.2.0")}
+    with Stub(release_routes(wheels)) as stub:
+        tool = Tool(uv_dirs, stub.url)
+        tool.install_release("0.1.0")
+        contents = f"#!/bin/sh\n# {tool.prefix}\nexit 19\n"
+        tool.sai.unlink()
+        tool.sai.write_text(contents)
+        outcome = tool.update()
+
+    assert outcome.status == updater.UNSUPPORTED
+    assert str(tool.sai) in outcome.message and str(tool.prefix) in outcome.message
+    assert tool.sai.read_text() == contents
+    assert update.installed_version(tool.prefix) == "0.1.0"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="test replaces a public POSIX symlink")
+@needs_uv
+def test_updating_the_uv_environment_does_not_replace_a_late_competitor(uv_dirs):
+    wheels = {"0.1.0": build_wheel("0.1.0"), "0.2.0": build_wheel("0.2.0")}
+    with Stub(release_routes(wheels)) as stub:
+        tool = Tool(uv_dirs, stub.url)
+        tool.install_release("0.1.0")
+        target = uv_dirs / "other-sai"
+        target.write_text("another install")
+        competitor = uv_dirs / "competitor"
+        competitor.symlink_to(target)
+        entry = competitor.lstat()
+
+        def takeover(command: Sequence[str], timeout: float) -> tuple[int, str]:
+            installed = (
+                command[1:3] == ["tool", "install"] or "--reinstall-package" in command
+            )
+            if installed and competitor.is_symlink():
+                competitor.replace(tool.sai)
+            return updater.run(command, timeout)
+
+        outcome = tool.update(runner=takeover)
+
+    assert outcome.status == updater.FAILED
+    assert str(tool.sai) in outcome.message
+    assert str(target) in outcome.message
+    assert os.path.samestat(tool.sai.lstat(), entry)
+    assert tool.sai.read_text() == "another install"
 
 
 @pytest.mark.slow
@@ -827,7 +961,9 @@ def test_two_workers_install_once(uv_dirs, monkeypatch):
         updater.CURRENT,
         updater.UPDATED,
     ]
-    installs = [line for line in log.read_text().splitlines() if "tool install" in line]
+    installs = [
+        line for line in log.read_text().splitlines() if "--reinstall-package" in line
+    ]
     assert len(installs) == 1
     assert tool.version() == "0.2.0"
 
@@ -877,7 +1013,7 @@ class Script:
     and the installed sai.
 
     COMMITS maps a Git commit to the version it installs. FAIL_TRIAL fails
-    the trial `uv pip install`; FAIL_INSTALL fails `uv tool install`. A
+    the trial `uv pip install`; FAIL_INSTALL fails the in-place `uv pip install`. A
     version in BROKEN fails `sai --version` everywhere; one in
     BROKEN_INSTALLED only as the installed tool. INTERRUPT raises Ctrl-C
     from the first installed `sai --version` after an install.
@@ -927,20 +1063,20 @@ class Script:
             return 0, f"{self.root / name}\n"
         if command[1:2] == ["venv"]:
             return 0, ""
-        if command[1:3] == ["pip", "install"]:
-            if self.fail_trial:
-                return 2, "error: no such revision"
-            self.staged = self.named(command[-1])
-            return 0, "Installed 1 package"
-        if command[1:3] == ["tool", "install"]:
+        if command[1:4] == ["pip", "install", "--reinstall-package"]:
             if self.fail_install:
                 return 2, "error: disk full"
             dist = next(self.prefix.glob("lib/*/site-packages/sai_cli-*.dist-info"))
             version = self.named(command[-1])
             (dist / "METADATA").write_text(f"Name: sai-cli\nVersion: {version}\n")
             return 0, "Installed 1 executable: sai"
+        if command[1:3] == ["pip", "install"]:
+            if self.fail_trial:
+                return 2, "error: no such revision"
+            self.staged = self.named(command[-1])
+            return 0, "Installed 1 package"
         if command[-1] == "--version":
-            installed = command[0] == self.launcher
+            installed = command[0] == str(self.prefix / "bin/sai")
             version = self.version if installed else self.staged
             if installed and self.interrupt:
                 self.interrupt = False
@@ -954,11 +1090,19 @@ class Script:
 
     @property
     def installs(self) -> list[str]:
-        return [c[-1] for c in self.commands if c[1:3] == ["tool", "install"]]
+        return [
+            c[-1]
+            for c in self.commands
+            if c[1:4] == ["pip", "install", "--reinstall-package"]
+        ]
 
     @property
     def trials(self) -> list[str]:
-        return [c[-1] for c in self.commands if c[1:3] == ["pip", "install"]]
+        return [
+            c[-1]
+            for c in self.commands
+            if c[1:3] == ["pip", "install"] and "--reinstall-package" not in c
+        ]
 
 
 def scripted(tmp_path: Path, stub: Stub, script: Script, **changes) -> updater.Options:
@@ -991,12 +1135,11 @@ def test_source_builds_the_exact_release_tag_from_git(tmp_path, sai_home):
         "tool dir",
         "venv --python",
         "pip install",
-        "tool install",
+        "pip install",
     ]
     assert script.trials == [spec]
-    # The check after the install runs the registered launcher, the one on
-    # PATH, and imports with an isolated interpreter.
-    assert [str(tmp_path / "bin" / "sai"), "--version"] in script.commands
+    # The check runs the tool executable after checking the registered link.
+    assert [str(tmp_path / "tools/sai-cli/bin/sai"), "--version"] in script.commands
     last = script.commands[-1]
     assert last[1:] == ["-I", "-c", "import sai_cli.sai_cli, sai_cli.mcp_server.server"]
     assert last[0] == str(tmp_path / "tools" / "sai-cli" / "bin" / "python")
@@ -1093,7 +1236,17 @@ def test_the_wheel_cache_must_be_private_and_ours(tmp_path, sai_home, monkeypatc
     assert wheels.stat().st_mode & 0o777 == 0o700
 
     other = os.getuid() + 1
-    monkeypatch.setattr(updater.os, "getuid", lambda: other)
+    lstat = Path.lstat
+
+    def cache_owner(path: Path) -> os.stat_result:
+        info = lstat(path)
+        if path == sai_home:
+            fields = list(info)
+            fields[stat.ST_UID] = other
+            return os.stat_result(fields)
+        return info
+
+    monkeypatch.setattr(Path, "lstat", cache_owner)
     with pytest.raises(updater.UpdateFailed, match="belongs to another user"):
         updater.private_cache()
     script = Script(tmp_path, "0.1.0")
@@ -1226,7 +1379,7 @@ def test_no_release_and_bad_versions_install_nothing(tmp_path, sai_home):
     assert none.status == updater.NO_RELEASE
     assert none.exit_code == 0
     assert bad.status == updater.FAILED
-    assert "is not a version like 0.2.0" in bad.message
+    assert "is not a version like X.Y.Z" in bad.message
     assert script.commands == []
     assert updater.read_state()["latest"] is None
 

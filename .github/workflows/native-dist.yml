@@ -1,0 +1,155 @@
+name: Native Distribution
+
+on:
+  pull_request:
+    paths: &distribution-paths
+      - '.github/workflows/native-dist.yml'
+      - '.cargo/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'rust-toolchain.toml'
+      - 'sai/**'
+      - 'sai-core/**'
+      - 'shim/**'
+      - 'scripts/native-dist.py'
+      - 'scripts/release-rehearsal.py'
+      - 'tests/parity/test_native_distribution.py'
+      - 'tests/parity/native_release_source.py'
+      - 'cli/sai_cli/tests/fixtures/intent_outcomes.json'
+      - 'cli/sai_cli/tests/loopback_keeper.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+  push:
+    branches: [main]
+    paths: *distribution-paths
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-dist-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  shim:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: '3.11'
+      - run: uv build shim --out-dir dist/native-shim --no-create-gitignore
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-part-shim
+          path: dist/native-shim/
+          if-no-files-found: error
+          compression-level: 0
+
+  archive:
+    needs: shim
+    name: Archive and smoke (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04 builds and smokes with glibc 2.35.
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bridge: true
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-part-shim
+          path: dist/native-shim
+      - name: Build and package native Sai
+        env:
+          TARGET: ${{ matrix.target }}
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: |
+          cargo build --locked --release --bin sai --target "$TARGET"
+          uv run --no-project python scripts/native-dist.py archive \
+            "target/$TARGET/release/sai" dist/native --target "$TARGET"
+      - name: Check out the published Python installer
+        if: matrix.bridge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 9ee5a356fd41a22697483e467652d367035909bd # sai-cli/v0.1.1
+          path: .native-python-reference
+          persist-credentials: false
+      - name: Download the Python release fixtures
+        if: matrix.bridge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          baseline_dir="$RUNNER_TEMP/sai-baseline"
+          mkdir -p "$baseline_dir"
+          gh release download sai-cli/v0.1.1 --repo SaiDotFun/open-sai \
+            --dir "$baseline_dir" --pattern 'sai_cli-0.1.1-py3-none-any.whl' --pattern SHA256SUMS
+          cp .native-python-reference/scripts/install.py "$baseline_dir/install.py"
+          git -C .native-python-reference rev-parse HEAD > "$baseline_dir/commit"
+      # The populated 0.1.3 profile uses real MCP clients. Run the manual
+      # native cutover and rollback rehearsal documented in README.md.
+      - name: Smoke the archive through uv and loopback release assets
+        env:
+          SAI_NATIVE_BASELINE: ${{ matrix.bridge && format('{0}/sai-baseline', runner.temp) || '' }}
+        run: |
+          uv run --no-project python scripts/native-dist.py rehearsal-wheel dist/rehearsal-shim
+          archives=(dist/native/sai-*.tar.gz)
+          wheels=(dist/rehearsal-shim/sai_cli-*.whl)
+          release_wheels=(dist/native-shim/sai_cli-*.whl)
+          UV="$(command -v uv)" SAI_NATIVE_ARCHIVE="${archives[0]}" SAI_NATIVE_WHEEL="${wheels[0]}" \
+            SAI_NATIVE_RELEASE_WHEEL="${release_wheels[0]}" \
+            uv run --locked pytest -ra tests/parity/test_native_distribution.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-part-${{ matrix.target }}
+          path: dist/native/sai-*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  bundle:
+    needs: archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: native-part-*
+          merge-multiple: true
+          path: dist/native
+      - run: uv run --no-project python scripts/native-dist.py manifest dist/native
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sai-native-ci
+          path: dist/native/
+          if-no-files-found: error
+          compression-level: 0

@@ -19,12 +19,16 @@ use url::Url;
 
 use super::{Failure, SUBPROTOCOL, transport::SocketBox};
 
-pub(super) enum Upgrade {
+pub(in crate::keeper) enum Upgrade {
     Connected(SocketBox),
-    Redirect(String),
+    Redirect {
+        status: StatusCode,
+        location: String,
+    },
+    Rejected(StatusCode),
 }
 
-pub(super) async fn connect(url: &Url, socket: SocketBox) -> Result<Upgrade, Failure> {
+pub(in crate::keeper) async fn connect(url: &Url, socket: SocketBox) -> Result<Upgrade, Failure> {
     let mut request = url.as_str().into_client_request()?;
     let path = request
         .uri()
@@ -53,11 +57,14 @@ pub(super) async fn connect(url: &Url, socket: SocketBox) -> Result<Upgrade, Fai
         {
             return location
                 .to_str()
-                .map(|value| Upgrade::Redirect(value.into()))
+                .map(|value| Upgrade::Redirect {
+                    status: reply.status(),
+                    location: value.into(),
+                })
                 .map_err(|_| Failure::Disconnected("InvalidURI"));
         }
         if reply.status() != StatusCode::SWITCHING_PROTOCOLS {
-            return Err(Failure::Disconnected("InvalidStatus"));
+            return Ok(Upgrade::Rejected(reply.status()));
         }
 
         validate_headers(reply.headers(), &accept)?;
@@ -102,12 +109,15 @@ fn validate_headers(headers: &HeaderMap, accept: &str) -> Result<(), Failure> {
         return Err(Failure::Disconnected("InvalidHeaderValue"));
     }
 
-    if headers.contains_key(SEC_WEBSOCKET_EXTENSIONS)
-        || single(headers, SEC_WEBSOCKET_PROTOCOL)?.is_some_and(|value| value != SUBPROTOCOL)
-    {
+    if headers.contains_key(SEC_WEBSOCKET_EXTENSIONS) {
         return Err(Failure::Disconnected("NegotiationError"));
     }
-    Ok(())
+    match header_tokens(headers, SEC_WEBSOCKET_PROTOCOL)?.as_slice() {
+        [] => Ok(()),
+        [protocol] if *protocol == SUBPROTOCOL => Ok(()),
+        [_] => Err(Failure::Disconnected("NegotiationError")),
+        _ => Err(Failure::Disconnected("InvalidHeader")),
+    }
 }
 
 fn header_tokens(headers: &HeaderMap, name: HeaderName) -> Result<Vec<&str>, Failure> {
@@ -146,19 +156,4 @@ fn is_http_token(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
-}
-
-fn single(headers: &HeaderMap, name: HeaderName) -> Result<Option<&str>, Failure> {
-    let mut values = headers.get_all(name).iter();
-    let value = values.next();
-    if values.next().is_some() {
-        return Err(Failure::Disconnected("InvalidHeaderValue"));
-    }
-    value
-        .map(|header| {
-            header
-                .to_str()
-                .map_err(|_| Failure::Disconnected("InvalidHeaderValue"))
-        })
-        .transpose()
 }

@@ -1,21 +1,43 @@
 use std::{
-    fs::{self, DirBuilder, File, OpenOptions},
-    io,
+    fs, io,
     net::Ipv6Addr,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use thiserror::Error;
 
-use crate::errors::{Code, SaiError};
+use crate::{
+    errors::{Code, SaiError},
+    paths,
+    settings::MAINNET_HTTP,
+};
 
 mod ledger;
 mod sessions;
 
 pub use ledger::{IntentRow, IntentStatus, StatusUpdateOptions};
-pub use sessions::{Accounts, RemovedSession, Session, SessionSummary};
+pub use sessions::{Accounts, RemovedSession, Session, SessionSummary, is_session_envelope};
+
+const TRADE_LEDGER_LOCKED: &str =
+    "Could not reserve the trade intent. database is locked. Nothing was sent.";
+const TRADE_LEDGER_NOT_DATABASE: &str =
+    "Could not reserve the trade intent. file is not a database. Nothing was sent.";
+const TRADE_LEDGER_CORRUPT: &str =
+    "Could not reserve the trade intent. database disk image is malformed. Nothing was sent.";
+const TRADE_LEDGER_UNAVAILABLE: &str =
+    "Could not reserve the trade intent. The intent ledger is unavailable. Nothing was sent.";
+
+/// Check for reservation diagnostics that are safe to disclose over MCP.
+pub fn is_trade_reservation_diagnostic(message: &str) -> bool {
+    matches!(
+        message,
+        TRADE_LEDGER_LOCKED
+            | TRADE_LEDGER_NOT_DATABASE
+            | TRADE_LEDGER_CORRUPT
+            | TRADE_LEDGER_UNAVAILABLE
+    )
+}
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -27,13 +49,64 @@ pub enum StorageError {
     NewerLedger,
     #[error("Reconcile uncertain intent {0} before submitting another trade")]
     UncertainIntent(String),
+    #[error(
+        "Earlier open intent {key} may still execute. Check its status with `{hint}` before retrying."
+    )]
+    RecentOpenPending {
+        key: String,
+        hint: String,
+        keys: Vec<String>,
+    },
     #[error("{0}")]
     Session(#[from] SessionError),
+    #[error("{0}")]
+    SessionData(#[source] SessionError),
+    #[error("{}", crate::session::INVALID_EXPIRY)]
+    InvalidSessionExpiry,
 }
 
 #[derive(Debug, Error)]
 #[error("{0}")]
 pub struct SessionError(pub SaiError);
+
+impl StorageError {
+    pub(crate) fn mcp_trade_error(self) -> SaiError {
+        let diagnostic = match &self {
+            Self::Sqlite(rusqlite::Error::SqliteFailure(error, _)) => {
+                use rusqlite::ErrorCode;
+                Some(match error.code {
+                    ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => TRADE_LEDGER_LOCKED,
+                    ErrorCode::NotADatabase => TRADE_LEDGER_NOT_DATABASE,
+                    ErrorCode::DatabaseCorrupt => TRADE_LEDGER_CORRUPT,
+                    _ => TRADE_LEDGER_UNAVAILABLE,
+                })
+            }
+            Self::Sqlite(_) | Self::Io(_) => Some(TRADE_LEDGER_UNAVAILABLE),
+            Self::NewerLedger => {
+                return SaiError::new(
+                    Code::InvalidRequest,
+                    format!("Could not reserve the trade intent. {self}. Nothing was sent."),
+                );
+            }
+            _ => None,
+        };
+        if let Some(message) = diagnostic {
+            return SaiError::new(Code::InternalError, message);
+        }
+        let keys = match &self {
+            Self::RecentOpenPending { keys, .. } => Some(serde_json::json!(keys)),
+            _ => None,
+        };
+        let mut error = SaiError::from(self);
+        if let Some(keys) = keys {
+            error.details = Some(Box::new(serde_json::Map::from_iter([(
+                "intentKeys".into(),
+                keys,
+            )])));
+        }
+        error
+    }
+}
 
 impl SessionError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
@@ -50,7 +123,17 @@ impl From<SessionError> for SaiError {
 impl From<StorageError> for SaiError {
     fn from(error: StorageError) -> Self {
         match error {
-            StorageError::Session(error) => error.into(),
+            StorageError::Session(error) | StorageError::SessionData(error) => error.into(),
+            StorageError::InvalidSessionExpiry => {
+                Self::new(Code::SessionUnavailable, crate::session::INVALID_EXPIRY)
+            }
+            StorageError::RecentOpenPending {
+                ref key, ref hint, ..
+            } => SaiError {
+                intent_key: Some(key.clone()),
+                hint: Some(hint.clone()),
+                ..Self::new(Code::RecentOpenPending, error.to_string())
+            },
             StorageError::NewerLedger | StorageError::UncertainIntent(_) => {
                 Self::new(Code::InvalidRequest, error.to_string())
             }
@@ -60,14 +143,17 @@ impl From<StorageError> for SaiError {
 }
 
 /// Persisted account sessions and trade reservations under a single Sai home.
+#[derive(Clone)]
 pub struct Storage<'a> {
     pub(crate) trader: PathBuf,
     busy_timeout: Duration,
+    ledger_deadline: Option<Instant>,
+    preserve_ledger_modes: bool,
     events: Option<&'a (dyn Fn(StorageEvent<'_>) + Sync)>,
 }
 
-/// State changes to pass to the shared log writer. The event sink runs only
-/// after the operation has committed. Endpoints contain only the URL origin.
+/// Storage events for the shared log writer. State changes are emitted after
+/// commit. Endpoints contain only the URL origin.
 pub enum StorageEvent<'a> {
     SessionSaved {
         addr: &'a str,
@@ -94,6 +180,11 @@ pub enum StorageEvent<'a> {
         entity: &'a str,
         endpoint: &'a str,
     },
+    OpenBlocked {
+        key: &'a str,
+        addr: &'a str,
+        endpoint: &'a str,
+    },
     IntentStatus {
         key: &'a str,
         kind: &'a str,
@@ -105,7 +196,7 @@ pub enum StorageEvent<'a> {
 }
 
 /// Project a stored endpoint onto the same fields as Python's log.origin.
-fn endpoint_origin(endpoint: &str) -> String {
+pub(crate) fn endpoint_origin(endpoint: &str) -> String {
     fn origin(endpoint: &str) -> Option<String> {
         let normalized = endpoint.trim().replace(['\t', '\n', '\r'], "");
         let (scheme, rest) = normalized.split_once("://")?;
@@ -161,6 +252,8 @@ impl<'a> Storage<'a> {
         Self {
             trader: sai_home.as_ref().join("trader"),
             busy_timeout: Duration::from_secs(10),
+            ledger_deadline: None,
+            preserve_ledger_modes: false,
             events: None,
         }
     }
@@ -171,9 +264,64 @@ impl<'a> Storage<'a> {
         self
     }
 
+    /// Bound ledger writes during one doctor reconciliation run.
+    pub fn with_ledger_deadline(mut self, deadline: Instant) -> Self {
+        self.ledger_deadline = Some(deadline);
+        self
+    }
+
+    /// Open only an existing ledger without changing its mode or its directory's mode.
+    pub fn with_preserved_ledger_modes(mut self) -> Self {
+        self.preserve_ledger_modes = true;
+        self
+    }
+
+    fn remaining_busy_timeout(&self) -> io::Result<Duration> {
+        match self.ledger_deadline {
+            Some(end) => end
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .map(|remaining| self.busy_timeout.min(remaining))
+                .ok_or_else(|| io::ErrorKind::TimedOut.into()),
+            None => Ok(self.busy_timeout),
+        }
+    }
+
     pub fn with_event_sink(mut self, sink: &'a (dyn Fn(StorageEvent<'_>) + Sync)) -> Self {
         self.events = Some(sink);
         self
+    }
+
+    pub fn intent_status_hint(&self, endpoint: &str, account: &str, key: &str) -> String {
+        self.trade_command_hint(endpoint, &["intent", "status", account, "--key", key])
+    }
+
+    pub fn trade_command_hint(&self, endpoint: &str, args: &[&str]) -> String {
+        use crate::session::shell_quote;
+
+        let flag = self.keeper_hint_flag(endpoint);
+        let args = args
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("sai --endpoint {flag} {args}")
+    }
+
+    pub(crate) fn keeper_hint_flag(&self, endpoint: &str) -> String {
+        if self.keeper_hint_uses_url(endpoint, Some(&endpoint_origin(endpoint))) {
+            crate::session::shell_quote(endpoint)
+        } else {
+            crate::session::ORIGINAL_KEEPER_HINT.into()
+        }
+    }
+
+    pub(crate) fn keeper_hint_uses_url(&self, endpoint: &str, origin: Option<&str>) -> bool {
+        (endpoint == MAINNET_HTTP || origin == Some(endpoint))
+            && self
+                .trader
+                .parent()
+                .is_some_and(|home| crate::log::redact(home, endpoint) == endpoint)
     }
 
     pub(crate) fn emit(&self, event: StorageEvent<'_>) {
@@ -183,25 +331,10 @@ impl<'a> Storage<'a> {
     }
 
     fn directory(&self) -> io::Result<&Path> {
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&self.trader)?;
-        fs::set_permissions(&self.trader, fs::Permissions::from_mode(0o700))?;
+        paths::profile(self.trader.parent().expect("trader has a profile parent"))?;
+        paths::managed(&self.trader)?;
         Ok(&self.trader)
     }
-}
-
-fn private_file(path: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(path)?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    Ok(file)
 }
 
 fn remove_if_exists(path: &Path) -> io::Result<()> {

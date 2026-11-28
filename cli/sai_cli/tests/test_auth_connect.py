@@ -7,17 +7,22 @@ is touched.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import inspect
 import json
 import os
 import pty
+import secrets
+import shlex
 import subprocess
 import sys
 import termios
 import threading
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,13 +30,15 @@ from typing import Any
 
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from sai_cli.core import keeper
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.types import TextContent
+from sai_cli.core import keeper, log, storage
 
 ADDR = "0x" + "b" * 40
 OTHER = "0x" + "c" * 40
 # Keeper sends the nonce as bare hex and the typed-data challenge with 0x.
 NONCE = "12" * 32
-SIGNATURE = "0x" + "1" * 130
 
 
 def make_token(addr: str = ADDR, hours: int = 720) -> str:
@@ -47,7 +54,9 @@ def make_token(addr: str = ADDR, hours: int = 720) -> str:
 class Env:
     """A temp SAI_HOME, a fake clipboard file, and a PATH of fake tools."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, command: tuple[str, ...] | None = None) -> None:
+        self.command = command or (sys.executable, "-m", "sai_cli")
+        self.extra_env: dict[str, str] = {}
         self.home = root / "sai-home"
         self.bin = root / "bin"
         self.clip = root / "clipboard.txt"
@@ -76,13 +85,14 @@ class Env:
             "SAI_HOME": str(self.home),
             "PATH": str(self.bin),
             "HOME": str(self.home),
+            **self.extra_env,
         }
 
     def run(
         self, *args: str, stdin: str | None = None
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, "-m", "sai_cli", *args],
+            [*self.command, *args],
             input=stdin,
             check=False,
             stdin=None if stdin is not None else subprocess.DEVNULL,
@@ -92,8 +102,29 @@ class Env:
             timeout=30,
         )
 
+    def run_shell(
+        self, command: str, **overrides: str
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["/bin/sh", "-c", command],
+            env={
+                **self.vars(),
+                "PATH": f"{self.bin}{os.pathsep}{Path(sys.executable).parent}",
+                **overrides,
+            },
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+
     def run_tty(
-        self, *args: str, typed: list[str | Callable[[], object]]
+        self,
+        *args: str,
+        typed: list[str | Callable[[], object]],
+        immediate_prompt: bool = False,
+        transcript: bytearray | None = None,
     ) -> tuple[int, str, str]:
         """Run with a pseudo-terminal on stdin and answer each hidden prompt.
 
@@ -102,10 +133,12 @@ class Env:
         previous answer, which `getpass` only does after reading it, and echo
         is off again for the next prompt. A callable entry runs once that
         next prompt is showing, before the line that answers it.
+        To check prompt ordering, send input immediately after seeing the prompt
+        and capture any echo from the PTY master separately from stderr.
         """
         primary, secondary = pty.openpty()
         proc = subprocess.Popen(
-            [sys.executable, "-m", "sai_cli", *args],
+            [*self.command, *args],
             stdin=secondary,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -128,18 +161,27 @@ class Env:
                 deadline = time.monotonic() + 20
                 while proc.poll() is None and time.monotonic() < deadline:
                     echo = termios.tcgetattr(primary)[3] & termios.ECHO
-                    if len(errors) > mark and not echo:
+                    if len(errors) > mark and (immediate_prompt or not echo):
                         break
                     time.sleep(0.01)
                 if callable(line):
                     line()
                     continue
+                if immediate_prompt:
+                    assert errors[mark:].endswith(b": "), "hidden prompt did not appear"
                 os.write(primary, (line + "\n").encode())
+                if immediate_prompt:
+                    assert not echo, "terminal echo was enabled at the prompt"
                 mark = len(errors)
             assert proc.stdout
             stdout = proc.stdout.read()
             proc.wait(timeout=30)
             reader.join(timeout=5)
+            if transcript is not None:
+                os.set_blocking(primary, False)
+                with suppress(BlockingIOError, OSError):
+                    while chunk := os.read(primary, 4096):
+                        transcript.extend(chunk)
         finally:
             proc.kill()
             os.close(primary)
@@ -259,6 +301,75 @@ def test_agent_import_without_clipboard_asks_for_a_terminal(env: Env) -> None:
     error = json.loads(data.stdout)["error"]
     assert error["code"] == "INVALID_REQUEST" and error["hint"] == "sai auth import"
     assert not (env.home / "trader" / "sessions.json").exists()
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+@pytest.mark.parametrize(
+    "form", ["operand", "escaped", "unknown-option", "option-value"]
+)
+def test_import_usage_omits_rejected_operands(env: Env, json_output: bool, form: str):
+    secret = "synthetic-import-credential-marker"
+    operands = {
+        "operand": (secret, make_token()),
+        "escaped": ("--", f"--{secret}"),
+        "unknown-option": (f"--{secret}",),
+        "option-value": (f"--help={secret}",),
+    }[form]
+    flags = ("--json",) if json_output else ()
+    env.clipboard()
+    result = env.run(*flags, "auth", "import", *operands)
+
+    assert result.returncode == 2
+    assert all(
+        operand not in result.stdout + result.stderr
+        for operand in operands
+        if operand != "--"
+    )
+    stored = env.stored_bytes()
+    assert secret.encode() not in stored
+    assert b"command.start" in stored and b"command.end" in stored
+    assert env.log.read_text() == ""
+    assert not (env.home / "trader" / "sessions.json").exists()
+    message = "Unexpected arguments to auth import."
+    if json_output:
+        assert result.stderr == ""
+        assert json.loads(result.stdout)["error"] == {
+            "code": "INVALID_REQUEST",
+            "message": message,
+            "retryable": False,
+        }
+    else:
+        assert result.stdout == ""
+        assert f"Error: {message}" in result.stderr
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+@pytest.mark.parametrize("form", ["root", "group", "root-value", "leaf", "subcommand"])
+def test_auth_usage_and_logs_omit_values(
+    env: Env, json_output: bool, form: str
+) -> None:
+    marker = "synthetic-auth-parser-credential-marker"
+    args = {
+        "root": (f"--{marker}", "auth", "import"),
+        "group": ("auth", f"--{marker}", "import"),
+        "root-value": ("--as", marker, "auth", "import", "extra"),
+        "leaf": ("auth", "login", f"--{marker}"),
+        "subcommand": ("auth", marker),
+    }[form]
+    flags = ("--json",) if json_output else ()
+    result = env.run(*flags, *args)
+
+    assert result.returncode == 2
+    assert marker not in result.stdout + result.stderr
+    records = env.stored_bytes()
+    assert marker.encode() not in records
+    assert b"command.start" in records and b"command.end" in records
+    if json_output:
+        assert result.stderr == ""
+        assert json.loads(result.stdout)["error"]["code"] == "INVALID_REQUEST"
+    else:
+        assert not result.stdout
+        assert "Usage:" in result.stderr and "Error:" in result.stderr
 
 
 def test_invalid_clipboard_is_not_echoed_or_cleared(env: Env) -> None:
@@ -460,6 +571,186 @@ def test_accounts_connect_switch_and_disconnect(env: Env) -> None:
     assert "No active Sai account" in status.stderr
 
 
+@pytest.mark.parametrize("json_output", [False, True])
+def test_auth_use_keeps_unregistered_input_private(env: Env, json_output: bool) -> None:
+    marker = "synthetic-unregistered-account-credential-marker"
+    flags = ("--json",) if json_output else ()
+    result = env.run(*flags, "auth", "use", marker)
+
+    assert result.returncode == 1
+    assert marker not in result.stdout + result.stderr
+    assert "Requested account is not connected" in result.stdout + result.stderr
+    records = env.stored_bytes()
+    assert marker.encode() not in records
+    assert b"command.end" in records and b"session.active" not in records
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+@pytest.mark.parametrize(
+    "expiry", ["synthetic-expiry-credential-marker", "2031-02-03T04:05:06"]
+)
+def test_use_rejects_malformed_expiry_before_switching(
+    env: Env, monkeypatch: pytest.MonkeyPatch, json_output: bool, expiry: str
+) -> None:
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    token = make_token()
+    with log.silenced():
+        storage.save_session({**session_for(token), "expiresAt": expiry})
+        storage.save_session({**session_for(make_token(OTHER)), "evmAddress": OTHER})
+    path = env.home / "trader" / "sessions.json"
+    before = path.read_bytes()
+
+    flags = ("--json",) if json_output else ()
+    result = env.run(*flags, "auth", "use", ADDR)
+
+    assert result.returncode == 1
+    output = result.stdout + result.stderr
+    stored = env.stored_bytes()
+    for secret in (token, expiry):
+        assert secret not in output
+        assert secret.encode() not in stored
+    assert b"command.end" in stored and b"session.active" not in stored
+    assert path.read_bytes() == before
+    assert storage.load_accounts()["active"] == OTHER
+    message = f"Stored session has an invalid expiry; {storage.SIGN_IN_AGAIN}"
+    if json_output:
+        assert result.stderr == ""
+        assert json.loads(result.stdout)["error"] == {
+            "code": "SESSION_UNAVAILABLE",
+            "message": message,
+            "retryable": False,
+        }
+    else:
+        assert result.stdout == ""
+        assert result.stderr == f"Error: {message}\n"
+
+
+def test_use_reports_success_when_legacy_cleanup_fails(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = "synthetic-cli-legacy-cleanup-credential"
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    other = {**session_for(make_token(OTHER)), "evmAddress": OTHER}
+    storage._save_accounts(
+        {"active": OTHER, "sessions": {ADDR: session_for(marker), OTHER: other}}
+    )
+    legacy = env.home / "trader" / "session.json"
+    legacy.mkdir()
+
+    result = env.run("--json", "auth", "use", ADDR)
+
+    assert result.returncode == 0
+    response = json.loads(result.stdout)
+    assert response["addr"] == ADDR and response["active"] is True
+    assert "Could not remove legacy session file trader/session.json" in result.stderr
+    assert marker not in result.stdout + result.stderr
+    assert marker.encode() not in env.stored_bytes()
+    events = [
+        json.loads(line)
+        for _, _, path in log.log_files(env.home / "logs")
+        for line in path.read_text().splitlines()
+    ]
+    assert [
+        event["addr"] for event in events if event["event"] == "session.active"
+    ] == [ADDR]
+    assert storage.load_accounts()["active"] == ADDR
+    assert legacy.is_dir()
+
+
+@pytest.mark.parametrize("same_account", [True, False])
+def test_use_redacts_known_credentials_in_endpoint(
+    env: Env, monkeypatch: pytest.MonkeyPatch, same_account: bool
+) -> None:
+    marker = "Synthetic-Cli-Origin-Credential"
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    selected = session_for(marker if same_account else make_token())
+    selected["endpoint"] = f"https://{marker}.example.invalid/query"
+    other = session_for(make_token(OTHER) if same_account else marker)
+    other["evmAddress"] = OTHER
+    storage._save_accounts(
+        {"active": OTHER, "sessions": {ADDR: selected, OTHER: other}}
+    )
+
+    result = env.run("--json", "auth", "use", ADDR)
+
+    assert result.returncode == 0 and result.stderr == ""
+    assert json.loads(result.stdout)["endpoint"] == log.REDACTED
+    assert marker.lower() not in result.stdout.lower()
+    assert marker.lower().encode() not in env.stored_bytes().lower()
+    assert storage.load_accounts()["active"] == ADDR
+
+
+@pytest.mark.parametrize("corruption", ["endpoint", "address", "address-mismatch"])
+def test_use_refuses_malformed_session_before_switching(
+    env: Env, monkeypatch: pytest.MonkeyPatch, corruption: str
+) -> None:
+    marker = "synthetic-cli-switch-credential-marker"
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    selected: dict[str, Any] = session_for(marker)
+    if corruption == "endpoint":
+        selected["endpoint"] = {"value": marker}
+    else:
+        selected["evmAddress"] = marker if corruption == "address" else OTHER
+    storage._save_accounts(
+        {
+            "active": OTHER,
+            "sessions": {
+                ADDR: selected,
+                OTHER: {**session_for(make_token(OTHER)), "evmAddress": OTHER},
+            },
+        }
+    )
+    path = env.home / "trader" / "sessions.json"
+    before = path.read_bytes()
+
+    result = env.run("--json", "auth", "use", ADDR)
+
+    assert result.returncode == 1
+    assert marker not in result.stdout + result.stderr
+    assert json.loads(result.stdout)["error"]["code"] == "SESSION_UNAVAILABLE"
+    assert f"invalid {corruption.split('-')[0]}" in result.stdout
+    assert marker.encode() not in env.stored_bytes()
+    assert b"session.active" not in env.stored_bytes()
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("without_expiry", [False, True])
+@pytest.mark.parametrize("version", [2, 3])
+def test_use_classifies_non_string_or_missing_expiry_as_unavailable(
+    env: Env, monkeypatch: pytest.MonkeyPatch, version: int, without_expiry: bool
+) -> None:
+    marker = "synthetic-expiry-type-credential-marker"
+    numeric_marker = 5427086319284057731
+    selected: dict[str, Any] = session_for(marker)
+    if without_expiry:
+        del selected["expiresAt"]
+    else:
+        selected["expiresAt"] = numeric_marker
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    if version == 2:
+        write_v2_session(env.home, selected)
+        path = env.home / "trader" / "session.json"
+    else:
+        storage._save_accounts({"active": None, "sessions": {ADDR: selected}})
+        path = env.home / "trader" / "sessions.json"
+    before = path.read_bytes()
+
+    result = env.run("--json", "auth", "use", ADDR)
+
+    assert result.returncode == 1
+    stored = env.stored_bytes()
+    assert b"command.end" in stored and b"session.active" not in stored
+    for value in (marker, str(numeric_marker)):
+        assert value not in result.stdout + result.stderr
+        assert value.encode() not in stored
+    assert json.loads(result.stdout)["error"] == {
+        "code": "SESSION_UNAVAILABLE",
+        "message": storage.INVALID_EXPIRY,
+        "retryable": False,
+    }
+    assert path.read_bytes() == before
+
+
 def test_tampered_session_cannot_be_unlocked(env: Env) -> None:
     write_envelope(
         env.home,
@@ -475,13 +766,13 @@ def test_tampered_session_cannot_be_unlocked(env: Env) -> None:
     assert "Cannot unlock session; run `sai auth import`" in result.stderr
 
 
-def typed_data(**overrides) -> dict:
+def typed_data(*, chain_id: int | None = None, **overrides) -> dict:
+    domain: dict[str, str | int] = {"name": "Sai", "version": "1"}
     data: dict[str, Any] = {
         "types": {
             "EIP712Domain": [
                 {"name": "name", "type": "string"},
                 {"name": "version", "type": "string"},
-                {"name": "chainId", "type": "uint256"},
             ],
             "UserTradingSession": [
                 {"name": "account", "type": "address"},
@@ -491,14 +782,17 @@ def typed_data(**overrides) -> dict:
             ],
         },
         "primaryType": "UserTradingSession",
-        "domain": {"name": "Sai", "version": "1", "chainId": 6900},
+        "domain": domain,
         "message": {
             "account": ADDR,
             "challenge": "0x" + NONCE,
             "action": "Enable Sai trading",
-            "expiresAt": "2026-11-17T00:05:00Z",
+            "expiresAt": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
         },
     }
+    if chain_id is not None:
+        data["types"]["EIP712Domain"].append({"name": "chainId", "type": "uint256"})
+        domain["chainId"] = chain_id
     for key, value in overrides.items():
         section, _, field = key.partition("__")
         if field:
@@ -528,38 +822,93 @@ def test_check_session_typed_data_accepts_keeper_challenge() -> None:
     keeper.check_session_typed_data(typed_data(), ADDR.upper(), NONCE.upper())
 
 
+def fixture_signature(data: dict) -> str:
+    """Build a signer-shaped fixture signature bound to the typed challenge."""
+    encoded = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    return "0x" + hashlib.sha512(encoded).hexdigest() + "1b"
+
+
+def fixture_exchange(state: dict) -> dict[str, str]:
+    issued = state["issued"]
+    return {
+        "challenge": issued["nonce"],
+        "signature": fixture_signature(issued["typedData"]),
+    }
+
+
 @pytest.fixture
 def keeper_auth():
-    """Serve Keeper's challenge and session mutations on loopback."""
+    """Serve Keeper's challenge and session mutations on loopback.
+
+    Keeper owns signature verification, expiry, chain agreement, and replay
+    prevention. The client signs only after checking the challenge identity.
+    """
     state: dict[str, Any] = {
         "typed": typed_data(),
+        "challenge_expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+        "challenge_addr": None,
+        "pending": False,
         "token": make_token(),
+        "expires_at": (datetime.now(UTC) + timedelta(days=30)).isoformat(),
+        "requests": [],
+        "paths": [],
         "signatures": [],
     }
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            if "createUserIntentAuthChallenge" in body["query"]:
-                data = {
-                    "createUserIntentAuthChallenge": {
-                        "nonce": NONCE,
-                        "evmAddress": body["variables"]["address"],
-                        "expiresAt": "2026-11-17T00:05:00Z",
-                        "chainId": 6900,
-                        "typedData": state["typed"],
-                    }
+            state["requests"].append(body)
+            state["paths"].append(self.path)
+            query, variables = body["query"], body["variables"]
+            if query == keeper.CHALLENGE:
+                nonce = secrets.token_hex(32)
+                typed = json.loads(json.dumps(state["typed"]))
+                if typed["message"]["challenge"] == "0x" + NONCE:
+                    typed["message"]["challenge"] = "0x" + nonce
+                expiry = state["challenge_expires_at"]
+                typed["message"]["expiresAt"] = expiry
+                issued = {
+                    "nonce": nonce,
+                    "evmAddress": state["challenge_addr"] or variables["address"],
+                    "expiresAt": expiry,
+                    "chainId": "6900",
+                    "typedData": typed,
                 }
+                state.update(issued=issued, pending=True)
+                reply = {"data": {"createUserIntentAuthChallenge": issued}}
+            elif query == keeper.SESSION:
+                state["signatures"].append(variables)
+                live = state["pending"] and (
+                    datetime.fromisoformat(state["issued"]["expiresAt"])
+                    > datetime.now(UTC)
+                )
+                state["pending"] = False
+                issued = state.get("issued")
+                chain_matches = False
+                if issued is not None:
+                    domain = issued["typedData"]["domain"]
+                    chain_matches = (
+                        "chainId" not in domain
+                        or str(domain["chainId"]) == issued["chainId"]
+                    )
+                if live and chain_matches and variables == fixture_exchange(state):
+                    reply = {
+                        "data": {
+                            "createUserIntentSession": {
+                                "token": state["token"],
+                                "evmAddress": ADDR,
+                                "expiresAt": state["expires_at"],
+                            }
+                        }
+                    }
+                else:
+                    reply = {
+                        "errors": [{"message": "Expired or invalid fixture challenge"}]
+                    }
             else:
-                state["signatures"].append(body["variables"])
-                data = {
-                    "createUserIntentSession": {
-                        "token": state["token"],
-                        "evmAddress": ADDR,
-                        "expiresAt": "2026-12-17T00:00:00+00:00",
-                    }
-                }
-            encoded = json.dumps({"data": data}).encode()
+                reply = {"errors": [{"message": "Unsupported fixture operation"}]}
+            encoded = json.dumps(reply).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(encoded)))
@@ -579,17 +928,79 @@ def keeper_auth():
     thread.join()
 
 
-def fake_cast(env: Env) -> None:
+def test_keeper_fixture_uses_expiries_relative_to_now(keeper_auth) -> None:
+    now = datetime.now(UTC)
+    session_expiry = datetime.fromisoformat(keeper_auth["expires_at"])
+    challenge_expiry = datetime.fromisoformat(keeper_auth["challenge_expires_at"])
+    assert now + timedelta(days=29) < session_expiry <= now + timedelta(days=30)
+    assert now < challenge_expiry <= now + timedelta(minutes=5)
+
+
+@pytest.mark.parametrize("fault", ["expired", "signature"])
+def test_keeper_fixture_rejects_expired_or_unbound_signatures(
+    keeper_auth, fault
+) -> None:
+    if fault == "expired":
+        keeper_auth["challenge_expires_at"] = "2000-01-01T00:00:00Z"
+    endpoint = keeper_auth["endpoint"]
+    data = keeper.request(endpoint, keeper.CHALLENGE, {"address": ADDR})
+    issued = data["createUserIntentAuthChallenge"]
+    signature = (
+        fixture_signature(issued["typedData"])
+        if fault == "expired"
+        else "0x" + "1" * 130
+    )
+    with pytest.raises(keeper.KeeperError, match="Keeper rejected the request"):
+        keeper.request(
+            endpoint,
+            keeper.SESSION,
+            {"signature": signature, "challenge": issued["nonce"]},
+        )
+
+
+def test_keeper_fixture_rejects_a_consumed_challenge(keeper_auth) -> None:
+    endpoint = keeper_auth["endpoint"]
+    keeper.request(endpoint, keeper.CHALLENGE, {"address": ADDR})
+    exchange = fixture_exchange(keeper_auth)
+    accepted = keeper.request(endpoint, keeper.SESSION, exchange)
+    assert accepted["createUserIntentSession"]["evmAddress"] == ADDR
+    with pytest.raises(keeper.KeeperError, match="Keeper rejected the request"):
+        keeper.request(endpoint, keeper.SESSION, exchange)
+
+
+def test_keeper_fixture_accepts_challenge_without_signed_chain_id(keeper_auth) -> None:
+    typed = keeper_auth["typed"]
+    typed["domain"].pop("chainId", None)
+    typed["types"]["EIP712Domain"] = [
+        field for field in typed["types"]["EIP712Domain"] if field["name"] != "chainId"
+    ]
+    endpoint = keeper_auth["endpoint"]
+    challenge = keeper.request(endpoint, keeper.CHALLENGE, {"address": ADDR})
+    issued = challenge["createUserIntentAuthChallenge"]
+    assert "chainId" not in issued["typedData"]["domain"]
+    accepted = keeper.request(endpoint, keeper.SESSION, fixture_exchange(keeper_auth))
+    assert accepted["createUserIntentSession"]["evmAddress"] == ADDR
+    assert issued["chainId"] == "6900"
+
+
+def fake_cast(
+    env: Env, *, diagnostics: bool = False, signature: str | None = None
+) -> None:
     env.tool(
         "cast",
-        "import json\n"
-        "args = sys.argv[1:]\n"
+        "import hashlib, json, os, stat\n"
+        + inspect.getsource(fixture_signature)
+        + "args = sys.argv[1:]\n"
         "if args[:2] == ['wallet', 'address']:\n"
+        f"    if {diagnostics!r}: print('Fixture Cast address', file=sys.stderr)\n"
         f"    print({ADDR!r})\n"
         "elif args[:2] == ['wallet', 'sign']:\n"
+        f"    if {diagnostics!r}: print('Fixture Cast sign', file=sys.stderr)\n"
+        "    assert stat.S_IMODE(os.stat(os.path.dirname(args[-1])).st_mode) == 0o700\n"
+        "    assert stat.S_IMODE(os.stat(args[-1]).st_mode) == 0o600\n"
         "    data = json.load(open(args[-1]))\n"
         "    assert data['primaryType'] == 'UserTradingSession'\n"
-        f"    print({SIGNATURE!r})\n"
+        f"    print(fixture_signature(data) if {signature is None!r} else {signature!r})\n"
         "else:\n"
         "    sys.exit(2)\n",
     )
@@ -623,7 +1034,7 @@ def test_cast_login_derives_addr_and_signs(env: Env, keeper_auth) -> None:
     calls = env.log.read_text().splitlines()
     assert calls[0].endswith("cast wallet address --account dev")
     assert " wallet sign --account dev --data --from-file " in calls[1]
-    assert keeper_auth["signatures"] == [{"signature": SIGNATURE, "challenge": NONCE}]
+    assert keeper_auth["signatures"] == [fixture_exchange(keeper_auth)]
     status = env.run("--json", "--endpoint", keeper_auth["endpoint"], "auth", "status")
     assert status.returncode == 0, status.stderr
 
@@ -736,8 +1147,9 @@ def fake_ud(
     }
     env.tool(
         "ud",
-        "import json\n"
-        "args = sys.argv[1:]\n"
+        "import hashlib, json\n"
+        + inspect.getsource(fixture_signature)
+        + "args = sys.argv[1:]\n"
         f"if args[:3] == ['evm', 'wallet', 'show'] and {down!r}:\n"
         "    sys.exit('Error: gpg: decryption failed: No secret key')\n"
         f"elif args[:3] == ['evm', 'wallet', 'show'] and args[3] == {known!r}:\n"
@@ -756,7 +1168,7 @@ def fake_ud(
         "    assert args[7:9] == ['--data', '--from-file']\n"
         "    data = json.load(open(args[-1]))\n"
         "    assert data['primaryType'] == 'UserTradingSession'\n"
-        f"    print({SIGNATURE!r})\n"
+        "    print(fixture_signature(data))\n"
         "elif args[:3] == ['evm', 'wallet', 'show']:\n"
         "    sys.exit(f'Error: wallet {args[3]} is not in pass entry evm/wallets')\n"
         "else:\n"
@@ -801,6 +1213,45 @@ def test_renew_uses_saved_name_and_preserves_active_account(env: Env, keeper_aut
     assert len(keeper_auth["signatures"]) == 2
 
 
+@pytest.mark.parametrize("command", [("login", "dev"), ("renew", ADDR)])
+@pytest.mark.parametrize("numeric_expiry", [True, False])
+def test_auth_refuses_malformed_issued_expiry_before_saving(
+    env: Env,
+    keeper_auth: dict[str, Any],
+    command: tuple[str, str],
+    numeric_expiry: bool,
+) -> None:
+    fake_cast(env)
+    keystore(env, addr=ADDR)
+    args = ("--json", "--endpoint", keeper_auth["endpoint"], "auth")
+    assert env.run(*args, "login", "dev").returncode == 0
+    env.clipboard()
+    env.clip.write_text(make_token(OTHER))
+    assert env.run(*args, "import").returncode == 0
+    path = env.home / "trader" / "sessions.json"
+    before = path.read_bytes()
+
+    marker = "synthetic-issued-session-credential-marker"
+    expiry = 6754981276043819275 if numeric_expiry else marker
+    keeper_auth.update(token=marker, expires_at=expiry)
+    result = env.run(*args, *command)
+
+    assert result.returncode == 1 and result.stderr == ""
+    assert json.loads(result.stdout)["error"] == {
+        "code": "KEEPER_ERROR",
+        "message": "Keeper returned an invalid session expiry",
+        "retryable": False,
+    }
+    for value in (marker, str(expiry)):
+        assert value not in result.stdout
+        assert value.encode() not in env.stored_bytes()
+    assert len(keeper_auth["signatures"]) == 2
+    assert path.read_bytes() == before
+    status = env.run(*args, "status")
+    assert status.returncode == 0
+    assert json.loads(status.stdout)["addr"] == OTHER
+
+
 def test_renew_refuses_a_key_that_changed_address(env: Env, keeper_auth):
     fake_cast(env)
     keystore(env, addr=ADDR)
@@ -821,10 +1272,133 @@ def test_cli_status_and_list_report_expiry_warnings(env: Env):
     row = json.loads(result.stdout)["accounts"][0]
     assert row["expiryWarning"] == json.loads(status.stdout)["expiryWarning"]
     renewal = row["renewalCommand"]
-    assert renewal.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
-    assert "auth import" in renewal
-    assert keeper.MAINNET_HTTP not in renewal
+    assert renewal == f"sai --endpoint {keeper.MAINNET_HTTP} auth import --addr {ADDR}"
     assert status.stderr == result.stderr == ""
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_paste_renewal_command_with_the_configured_keeper(
+    env: Env, keeper_auth, configured: bool
+):
+    endpoint = keeper.MAINNET_HTTP
+    shell = {"SAI_ENDPOINT": keeper_auth["endpoint"]}
+    if configured:
+        endpoint = f"{keeper_auth['endpoint']}/private-path"
+        assert env.run("config", "set", "keeper.endpoint", endpoint).returncode == 0
+        shell["SAI_RECONCILE_ENDPOINT"] = endpoint
+    env.clipboard()
+    env.clip.write_text(make_token(hours=48))
+    assert env.run("auth", "import").returncode == 0
+    report = json.loads(env.run("--json", "auth", "status").stdout)
+    command = report["renewalCommand"]
+    if configured:
+        assert "SAI_RECONCILE_ENDPOINT" in command
+        assert endpoint not in command
+    else:
+        assert command == f"sai --endpoint {endpoint} auth import --addr {ADDR}"
+
+    env.clip.write_text(make_token())
+    renewed = env.run_shell(command, **shell)
+    assert renewed.returncode == 0, renewed.stderr
+    assert json.loads(renewed.stdout)["expiresAt"] > report["expiresAt"]
+    assert env.run("--json", "auth", "status").returncode == 0
+
+
+@pytest.mark.parametrize("path", ["", "/private-recovery-path/query"])
+def test_mcp_renewal_routes_to_keeper_from_server_environment(
+    env: Env, keeper_auth, path: str
+):
+    origin = keeper_auth["endpoint"].removesuffix("/query")
+    endpoint = origin + path
+    args = ("--json", "--endpoint", endpoint, "auth")
+    env.clipboard()
+    env.clip.write_text(make_token(hours=48))
+    assert env.run(*args, "import").returncode == 0
+
+    async def report_session() -> dict[str, Any]:
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "sai_cli", "mcp", "serve"],
+            env={**env.vars(), "SAI_ENDPOINT": endpoint},
+        )
+        async with (
+            stdio_client(params) as (read, write),
+            ClientSession(read, write) as client,
+        ):
+            await client.initialize()
+            result = await client.call_tool("mcp_info", {})
+        [content] = result.content
+        assert isinstance(content, TextContent)
+        return json.loads(content.text)["session"]
+
+    report = asyncio.run(report_session())
+    assert report["usable"] is True
+    command = report["renewalCommand"]
+    env.clip.write_text(make_token())
+    if path:
+        assert path not in json.dumps(report)
+        refused = env.run_shell(command)
+        assert refused.returncode != 0
+        assert "Set SAI_RECONCILE_ENDPOINT to the original Keeper URL" in refused.stderr
+        renewed = env.run_shell(command, SAI_RECONCILE_ENDPOINT=endpoint)
+    else:
+        assert shlex.split(command) == [
+            "sai",
+            "--endpoint",
+            origin,
+            "auth",
+            "import",
+            "--addr",
+            ADDR,
+        ]
+        renewed = env.run_shell(command)
+    assert renewed.returncode == 0, renewed.stderr
+    current = env.run(*args, "status")
+    assert current.returncode == 0
+    assert json.loads(current.stdout)["expiresAt"] > report["expiresAt"]
+
+
+@pytest.mark.parametrize("source", [None, "imported"])
+def test_renewal_refuses_another_accounts_clipboard_token(
+    env: Env, monkeypatch: pytest.MonkeyPatch, source: str | None
+):
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    stored = {
+        "evmAddress": ADDR,
+        "token": make_token(hours=48),
+        "expiresAt": (datetime.now(UTC) + timedelta(hours=48)).isoformat(),
+        "endpoint": keeper.MAINNET_HTTP,
+    }
+    if source is not None:
+        stored["source"] = source
+    storage.save_session(stored)
+    env.clipboard()
+    report = json.loads(env.run("--json", "auth", "status").stdout)
+    command = report["renewalCommand"]
+    assert shlex.split(command) == [
+        "sai",
+        "--endpoint",
+        keeper.MAINNET_HTTP,
+        "auth",
+        "import",
+        "--addr",
+        ADDR,
+    ]
+    before = storage.load_accounts()
+
+    wrong_token = make_token(OTHER)
+    env.clip.write_text(wrong_token)
+    refused = env.run_shell(command)
+    assert refused.returncode == 1
+    assert "different account than --addr" in refused.stderr
+    assert storage.load_accounts() == before
+    assert env.clip.read_text() == wrong_token
+
+    env.clip.write_text(make_token("0x" + ADDR[2:].upper()))
+    renewed = env.run_shell(command)
+    assert renewed.returncode == 0, renewed.stderr
+    assert json.loads(renewed.stdout)["expiresAt"] > report["expiresAt"]
+    assert storage.load_accounts()["active"] == ADDR
 
 
 @pytest.mark.parametrize("json_output", [False, True])
@@ -832,19 +1406,28 @@ def test_expiry_notice_uses_stderr_on_a_terminal(env: Env, json_output: bool):
     env.clipboard()
     env.clip.write_text(make_token(hours=48))
     assert env.run("auth", "import").returncode == 0
-    primary, secondary = pty.openpty()
     flags = ["--json"] if json_output else []
+    result, error = run_expiry_notice_on_terminal(
+        env, *flags, "config", "get", "keeper.endpoint"
+    )
+    assert "expires in" not in result.stdout
+    if json_output:
+        assert error == ""
+    else:
+        assert len(error.splitlines()) == 1
+        assert "expires in" in error
+        assert error.splitlines()[0].endswith(
+            f"Run sai --endpoint {keeper.MAINNET_HTTP} auth import --addr {ADDR}"
+        )
+
+
+def run_expiry_notice_on_terminal(
+    env: Env, *args: str
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    primary, secondary = pty.openpty()
     try:
         result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "sai_cli",
-                *flags,
-                "config",
-                "get",
-                "keeper.endpoint",
-            ],
+            [sys.executable, "-m", "sai_cli", *args],
             env={**env.vars(), "CI": "1"},
             stdin=secondary,
             stderr=secondary,
@@ -861,15 +1444,67 @@ def test_expiry_notice_uses_stderr_on_a_terminal(env: Env, json_output: bool):
     finally:
         os.close(primary)
         os.close(secondary)
-    assert "expires in" not in result.stdout
-    if json_output:
-        assert error == ""
-    else:
-        assert len(error.splitlines()) == 1
-        assert "expires in" in error
-        assert 'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?' in error
-        assert "auth import" in error
-        assert keeper.MAINNET_HTTP not in error
+    return result, error
+
+
+@pytest.mark.parametrize("auth", ["status", "list"])
+def test_expiry_notice_with_path_endpoint(env: Env, keeper_auth, auth: str):
+    endpoint = f"{keeper_auth['endpoint']}/private-path"
+    args = ("--endpoint", endpoint, "auth")
+    env.clipboard()
+    env.clip.write_text(make_token(hours=48))
+    assert env.run(*args, "import").returncode == 0
+
+    result, error = run_expiry_notice_on_terminal(env, *args, auth)
+    assert len(error.splitlines()) == 1
+    assert f"{ADDR} expires in" in error
+    assert "private-path" not in result.stdout + error
+    data = json.loads(result.stdout)
+    row = data if auth == "status" else data["accounts"][0]
+    assert row["addr"] == ADDR
+    command = row["renewalCommand"]
+    assert error.splitlines()[0].endswith(f" Run {command}")
+
+    env.clip.write_text(make_token(hours=720))
+    renewed = env.run_shell(command, SAI_RECONCILE_ENDPOINT=endpoint)
+    assert renewed.returncode == 0, renewed.stderr
+    assert json.loads(renewed.stdout)["addr"] == ADDR
+    current = env.run("--json", *args, "status")
+    assert current.returncode == 0
+    assert "expiryWarning" not in json.loads(current.stdout)
+
+
+def test_legacy_expiry_notice_with_invalid_subject_guides_sign_in(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    addr = ADDR[:-4] + "\n\r\x1b\u2028"
+    stored = {
+        "evmAddress": addr,
+        "token": make_token(addr, hours=48),
+        "expiresAt": (datetime.now(UTC) + timedelta(hours=48)).isoformat(),
+        "endpoint": keeper.MAINNET_HTTP,
+    }
+    storage.save_session(stored)
+
+    result, warning = run_expiry_notice_on_terminal(env, "auth", "status")
+    report = json.loads(result.stdout)
+    assert "renewalCommand" not in report
+    assert (
+        report["renewalGuidance"] == "Stored session address is invalid. Sign in again."
+    )
+    assert warning.splitlines() == [
+        f"{report['expiryWarning']} {report['renewalGuidance']}"
+    ]
+    assert rf"{ADDR[:-4]}\n\r\x1b\u2028" in warning
+
+    stored["expiresAt"] = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    storage.save_session(stored)
+    expired = env.run("--json", "auth", "status")
+    assert expired.returncode == 6
+    failure = json.loads(expired.stdout)["error"]
+    assert failure["message"] == report["renewalGuidance"]
+    assert "hint" not in failure
 
 
 @pytest.mark.parametrize(
@@ -888,14 +1523,39 @@ def test_session_hint_preserves_endpoint_context_without_exposing_credentials(
     status = env.run(*args, "status")
     row = json.loads(status.stdout)
     assert row["endpoint"] == origin
-    assert f"reuse the Keeper endpoint at {origin}" in row["renewalCommand"]
+    assert shlex.split(row["renewalCommand"]) == [
+        "sai",
+        "--endpoint",
+        "${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}",
+        "auth",
+        "import",
+        "--addr",
+        ADDR,
+    ]
+    assert f"Reuse the Keeper endpoint at {origin}" in row["renewalGuidance"]
     refused = env.run(*args, "renew")
     assert refused.returncode == 1
-    assert "reuse the Keeper endpoint" in login_error(refused)
+    assert f"Reuse the Keeper endpoint at {origin}" in login_error(refused)
     assert (
         "synthetic-test-credential"
         not in status.stdout + refused.stdout + refused.stderr
     )
+
+    env.clip.write_text(make_token())
+    command = row["renewalCommand"]
+    missing_endpoint = env.run_shell(command)
+    assert missing_endpoint.returncode != 0
+    assert (
+        "Set SAI_RECONCILE_ENDPOINT to the original Keeper URL"
+        in missing_endpoint.stderr
+    )
+
+    renewed = env.run_shell(command, SAI_RECONCILE_ENDPOINT=endpoint)
+    assert renewed.returncode == 0, renewed.stderr
+    assert "synthetic-test-credential" not in renewed.stdout + renewed.stderr
+    current = env.run(*args, "status")
+    assert current.returncode == 0
+    assert json.loads(current.stdout)["expiresAt"] > row["expiresAt"]
 
 
 def test_renew_json_shows_only_the_keeper_origin(env: Env, keeper_auth):
@@ -921,7 +1581,7 @@ def test_wallet_login_reads_addr_from_ud(env: Env, keeper_auth) -> None:
     calls = env.log.read_text().splitlines()
     assert calls[0].endswith("ud evm wallet show dev")
     assert " evm wallet run dev -- wallet sign --data --from-file " in calls[1]
-    assert keeper_auth["signatures"] == [{"signature": SIGNATURE, "challenge": NONCE}]
+    assert keeper_auth["signatures"] == [fixture_exchange(keeper_auth)]
     status = env.run("--json", "--endpoint", keeper_auth["endpoint"], "auth", "status")
     assert status.returncode == 0, status.stderr
 
@@ -1102,7 +1762,7 @@ def test_cast_signs_in_a_terminal_when_ud_cannot_unlock_the_keystore(
     calls = env.log.read_text().splitlines()
     assert " evm wallet run dev -- wallet sign " in calls[1]
     assert " wallet sign --account dev --data --from-file " in calls[2]
-    assert keeper_auth["signatures"] == [{"signature": SIGNATURE, "challenge": NONCE}]
+    assert keeper_auth["signatures"] == [fixture_exchange(keeper_auth)]
 
 
 @pytest.mark.parametrize(
