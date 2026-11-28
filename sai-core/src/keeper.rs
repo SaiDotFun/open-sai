@@ -1,6 +1,8 @@
 //! Keeper GraphQL requests and their transport verdicts.
 
 mod ca_dir;
+mod ca_pem;
+mod ca_store;
 mod diagnostics;
 mod markets;
 mod proxy;

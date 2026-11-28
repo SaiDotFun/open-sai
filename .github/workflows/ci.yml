@@ -136,7 +136,8 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     # The stack runs the combined Rust, shared-state, and update replays.
-    timeout-minutes: 30
+    # Green runs on main already take about 30 minutes.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'

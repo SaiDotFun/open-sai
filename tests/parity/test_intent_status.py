@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import gzip
 import json
 import os
@@ -19,7 +20,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager, suppress
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from functools import cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,6 +29,9 @@ from typing import Any
 
 import pytest
 from compare import Normalize, is_version, read_log, validate_log_endpoint_key
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from release_mismatch import assert_release_equal
 from sai_cli.core import keeper, log, storage
 from sai_cli.tests.loopback import graphql_ws
@@ -1511,6 +1515,17 @@ def test_public_history_preserves_liquidation_label(
             assert row.get("tradeChangeType") == projected
 
 
+def openssl_in(directory: Path, *args: str) -> str:
+    return subprocess.run(
+        ["openssl", *args],
+        cwd=directory,
+        check=True,
+        capture_output=True,
+        timeout=10,
+        text=True,
+    ).stdout
+
+
 @pytest.fixture(scope="module")
 def keeper_certificate(
     tmp_path_factory: pytest.TempPathFactory,
@@ -1518,14 +1533,7 @@ def keeper_certificate(
     certs = tmp_path_factory.mktemp("keeper-ca")
 
     def openssl(*args: str) -> str:
-        return subprocess.run(
-            ["openssl", *args],
-            cwd=certs,
-            check=True,
-            capture_output=True,
-            timeout=10,
-            text=True,
-        ).stdout
+        return openssl_in(certs, *args)
 
     key_args = ("-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes")
     for name in ("keeper-ca", "other-ca"):
@@ -1749,7 +1757,727 @@ def test_keeper_tls_trust_matches_httpx(
         "gap": {"SSL_CERT_DIR": str(certs / "gap")},
         "default": {},
     }[mode]
-    trusted = mode in {"file", "dir"}
+    assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, mode in {"file", "dir"})
+
+
+@pytest.mark.parametrize("store", ["file", "dir"])
+@pytest.mark.parametrize(
+    ("options", "trusted"),
+    [
+        pytest.param(("-addtrust", "serverAuth"), True, id="server-auth"),
+        pytest.param(("-addtrust", "clientAuth"), False, id="client-auth-only"),
+        pytest.param(("-addreject", "serverAuth"), False, id="reject-server-auth"),
+        pytest.param(
+            ("-addtrust", "serverAuth", "-addreject", "serverAuth"),
+            False,
+            id="reject-overrides-trust",
+        ),
+        pytest.param(("-addtrust", "anyExtendedKeyUsage"), True, id="trust-any"),
+        pytest.param(("-addreject", "anyExtendedKeyUsage"), False, id="reject-any"),
+        pytest.param(("-addreject", "clientAuth"), True, id="reject-client-auth"),
+        pytest.param(("-setalias", "Keeper CA"), True, id="alias-only"),
+        pytest.param((), True, id="no-aux"),
+    ],
+)
+def test_trusted_certificate_matches_httpx(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+    store: str,
+    options: tuple[str, ...],
+    trusted: bool,
+) -> None:
+    context, certs = keeper_certificate
+    ca_file = tmp_path / "ca.pem"
+    openssl_in(
+        tmp_path,
+        "x509",
+        "-in",
+        str(certs / "keeper-ca.pem"),
+        "-trustout",
+        *options,
+        "-out",
+        str(ca_file),
+    )
+    assert ca_file.read_bytes().startswith(b"-----BEGIN TRUSTED CERTIFICATE-----\n")
+    if store == "dir":
+        openssl_in(tmp_path, "rehash", str(tmp_path))
+        trust = {"SSL_CERT_DIR": str(tmp_path)}
+    else:
+        trust = {"SSL_CERT_FILE": str(ca_file)}
+    assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, trusted)
+
+
+@pytest.mark.parametrize("store", ["file", "dir"])
+@pytest.mark.parametrize("reject_first", [True, False])
+def test_duplicate_ca_keeps_first_trust_policy(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+    store: str,
+    reject_first: bool,
+) -> None:
+    context, certs = keeper_certificate
+    allowed = certs / "keeper-ca.pem"
+    rejected = tmp_path / "rejected.pem"
+    openssl_in(
+        tmp_path,
+        "x509",
+        "-in",
+        str(allowed),
+        "-addreject",
+        "serverAuth",
+        "-out",
+        str(rejected),
+    )
+    first, second = (rejected, allowed) if reject_first else (allowed, rejected)
+    if store == "dir":
+        subject_hash = openssl_in(
+            tmp_path, "x509", "-in", str(allowed), "-noout", "-subject_hash"
+        ).strip()
+        (tmp_path / f"{subject_hash}.0").symlink_to(first)
+        (tmp_path / f"{subject_hash}.1").symlink_to(second)
+        trust = {"SSL_CERT_DIR": str(tmp_path)}
+    else:
+        bundle = tmp_path / "bundle.pem"
+        bundle.write_bytes(first.read_bytes() + second.read_bytes())
+        trust = {"SSL_CERT_FILE": str(bundle)}
+    assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, not reject_first)
+
+
+@pytest.fixture(scope="module")
+def keeper_cross_signed_ca(
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+) -> tuple[ssl.SSLContext, Path]:
+    _, certs = keeper_certificate
+    openssl_in(
+        certs,
+        "x509",
+        "-x509toreq",
+        "-in",
+        "keeper-ca.pem",
+        "-signkey",
+        "keeper-ca.key",
+        "-out",
+        "cross-signed.csr",
+    )
+    (certs / "cross-signed.ext").write_text(
+        "basicConstraints=critical,CA:TRUE\n"
+        "keyUsage=critical,keyCertSign,cRLSign\n"
+        "subjectKeyIdentifier=hash\n"
+        "authorityKeyIdentifier=keyid\n",
+        encoding="ascii",
+    )
+    openssl_in(
+        certs,
+        "x509",
+        "-req",
+        "-in",
+        "cross-signed.csr",
+        "-CA",
+        "other-ca.pem",
+        "-CAkey",
+        "other-ca.key",
+        "-set_serial",
+        "1",
+        "-days",
+        "2",
+        "-extfile",
+        "cross-signed.ext",
+        "-out",
+        "cross-signed.pem",
+    )
+    server_chain = certs / "server-chain.pem"
+    server_chain.write_bytes(
+        (certs / "server.pem").read_bytes() + (certs / "cross-signed.pem").read_bytes()
+    )
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(server_chain, certs / "server.key")
+    return context, certs
+
+
+@pytest.mark.parametrize("store", ["file", "dir"])
+@pytest.mark.parametrize("reject", [True, False])
+def test_cross_signed_ca_trust_matches_httpx(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_cross_signed_ca: tuple[ssl.SSLContext, Path],
+    store: str,
+    reject: bool,
+) -> None:
+    context, certs = keeper_cross_signed_ca
+    intermediate = tmp_path / "intermediate.pem"
+    openssl_in(
+        tmp_path,
+        "x509",
+        "-in",
+        str(certs / "cross-signed.pem"),
+        "-addreject" if reject else "-addtrust",
+        "serverAuth",
+        "-out",
+        str(intermediate),
+    )
+    if store == "dir":
+        if reject:
+            shutil.copy(certs / "other-ca.pem", tmp_path / "root.pem")
+        openssl_in(tmp_path, "rehash", str(tmp_path))
+        trust = {"SSL_CERT_DIR": str(tmp_path)}
+    else:
+        if reject:
+            intermediate.write_bytes(
+                (certs / "other-ca.pem").read_bytes() + intermediate.read_bytes()
+            )
+        trust = {"SSL_CERT_FILE": str(intermediate)}
+    assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, not reject)
+
+
+def ca_store_overrides(
+    directory: Path, store: str, *certificates: Path
+) -> dict[str, str]:
+    if store == "file":
+        bundle = directory / "bundle.pem"
+        bundle.write_bytes(b"".join(cert.read_bytes() for cert in certificates))
+        return {"SSL_CERT_FILE": str(bundle)}
+
+    hashed = directory / "hashed"
+    hashed.mkdir()
+    for index, certificate in enumerate(certificates):
+        shutil.copyfile(certificate, hashed / f"{index}.pem")
+    openssl_in(hashed, "rehash", ".")
+    return {"SSL_CERT_DIR": str(hashed)}
+
+
+@pytest.mark.parametrize("store", ["file", "dir"])
+def test_local_neutral_intermediate_completes_leaf_only_chain(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+    keeper_cross_signed_ca: tuple[ssl.SSLContext, Path],
+    store: str,
+) -> None:
+    context, _ = keeper_certificate
+    _, certs = keeper_cross_signed_ca
+    openssl_in(
+        tmp_path,
+        "x509",
+        "-in",
+        str(certs / "cross-signed.pem"),
+        "-addreject",
+        "clientAuth",
+        "-out",
+        "neutral.pem",
+    )
+    trust = ca_store_overrides(
+        tmp_path, store, certs / "other-ca.pem", tmp_path / "neutral.pem"
+    )
+    assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, True)
+
+
+@pytest.fixture(scope="module")
+def same_name_intermediates(
+    keeper_cross_signed_ca: tuple[ssl.SSLContext, Path],
+) -> list[bytes]:
+    _, certs = keeper_cross_signed_ca
+    issuer = x509.load_pem_x509_certificate((certs / "cross-signed.pem").read_bytes())
+    root_key = serialization.load_pem_private_key(
+        (certs / "other-ca.key").read_bytes(), None
+    )
+    assert isinstance(root_key, ec.EllipticCurvePrivateKey)
+    decoys = []
+    for serial in range(2, 82):
+        public_key = ec.generate_private_key(ec.SECP256R1()).public_key()
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(issuer.subject)
+            .issuer_name(issuer.issuer)
+            .not_valid_before(issuer.not_valid_before_utc)
+            .not_valid_after(issuer.not_valid_after_utc)
+            .serial_number(serial)
+            .public_key(public_key)
+        )
+        for extension in issuer.extensions:
+            value = extension.value
+            if isinstance(value, x509.SubjectKeyIdentifier):
+                value = x509.SubjectKeyIdentifier.from_public_key(public_key)
+            builder = builder.add_extension(value, extension.critical)
+        decoy = builder.sign(root_key, hashes.SHA256())
+        decoys.append(decoy.public_bytes(serialization.Encoding.PEM))
+    return [*decoys, issuer.public_bytes(serialization.Encoding.PEM)]
+
+
+@pytest.mark.parametrize("store", ["file", "dir"])
+@pytest.mark.parametrize("matching_issuer_first", [True, False])
+def test_matching_local_issuer_works_in_any_order(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+    same_name_intermediates: list[bytes],
+    store: str,
+    matching_issuer_first: bool,
+) -> None:
+    context, certs = keeper_certificate
+    root = certs / "other-ca.pem"
+    candidates = same_name_intermediates
+    if matching_issuer_first:
+        candidates = [candidates[-1], *candidates[:-1]]
+    if store == "file":
+        bundle = tmp_path / "bundle.pem"
+        bundle.write_bytes(root.read_bytes() + b"".join(candidates))
+        trust = {"SSL_CERT_FILE": str(bundle)}
+    else:
+        hashed = tmp_path / "hashed"
+        hashed.mkdir()
+        shutil.copyfile(root, hashed / "root.pem")
+        openssl_in(hashed, "rehash", ".")
+        issuer_hash = openssl_in(
+            certs, "x509", "-in", "cross-signed.pem", "-noout", "-subject_hash"
+        ).strip()
+        for index, certificate in enumerate(candidates):
+            (hashed / f"{issuer_hash}.{index}").write_bytes(certificate)
+        trust = {"SSL_CERT_DIR": str(hashed)}
+    assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, True)
+
+
+@pytest.fixture(scope="module")
+def keeper_three_ca_chain(
+    tmp_path_factory: pytest.TempPathFactory,
+    keeper_cross_signed_ca: tuple[ssl.SSLContext, Path],
+) -> tuple[Path, Path]:
+    _, certs = keeper_cross_signed_ca
+    chain = tmp_path_factory.mktemp("three-ca-chain")
+    openssl_in(
+        chain,
+        "req",
+        "-x509",
+        "-newkey",
+        "ec",
+        "-pkeyopt",
+        "ec_paramgen_curve:P-256",
+        "-nodes",
+        "-subj",
+        "/CN=Chain Root",
+        "-keyout",
+        "root.key",
+        "-out",
+        "root.pem",
+        "-days",
+        "2",
+        "-addext",
+        "basicConstraints=critical,CA:TRUE",
+        "-addext",
+        "keyUsage=critical,keyCertSign,cRLSign",
+    )
+    openssl_in(
+        chain,
+        "x509",
+        "-x509toreq",
+        "-in",
+        str(certs / "other-ca.pem"),
+        "-signkey",
+        str(certs / "other-ca.key"),
+        "-out",
+        "upper.csr",
+    )
+    openssl_in(
+        chain,
+        "x509",
+        "-req",
+        "-in",
+        "upper.csr",
+        "-CA",
+        "root.pem",
+        "-CAkey",
+        "root.key",
+        "-set_serial",
+        "2",
+        "-days",
+        "2",
+        "-extfile",
+        str(certs / "cross-signed.ext"),
+        "-out",
+        "upper.pem",
+    )
+    return certs, chain
+
+
+@pytest.mark.parametrize("store", ["file", "dir"])
+@pytest.mark.parametrize("local_chain", ["root", "missing-upper", "complete"])
+def test_chain_uses_only_local_issuers_after_entering_store(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_three_ca_chain: tuple[Path, Path],
+    store: str,
+    local_chain: str,
+) -> None:
+    certs, chain = keeper_three_ca_chain
+    lower = certs / "cross-signed.pem"
+    upper = chain / "upper.pem"
+    local = [chain / "root.pem"]
+    peer = [certs / "server.pem", upper]
+    if local_chain == "root":
+        peer.insert(1, lower)
+    else:
+        local.append(lower)
+        if local_chain == "complete":
+            local.append(upper)
+
+    certificate_chain = tmp_path / "peer.pem"
+    certificate_chain.write_bytes(b"".join(cert.read_bytes() for cert in peer))
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certificate_chain, certs / "server.key")
+    trust = ca_store_overrides(tmp_path, store, *local)
+    assert_keeper_tls_trust(
+        cli_pair, tmp_path, context, trust, local_chain != "missing-upper"
+    )
+
+
+@pytest.mark.parametrize("store", ["file", "dir"])
+@pytest.mark.parametrize("anchor_kind", ["plain-root", "trusted-intermediate"])
+@pytest.mark.parametrize("path_limit", [0, 2, 256])
+def test_configured_anchor_keeps_path_length_limit(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_three_ca_chain: tuple[Path, Path],
+    store: str,
+    anchor_kind: str,
+    path_limit: int,
+) -> None:
+    certs, chain = keeper_three_ca_chain
+    explicit_trust = anchor_kind == "trusted-intermediate"
+    anchor_name = "upper" if explicit_trust else "root"
+    anchor = x509.load_pem_x509_certificate((chain / f"{anchor_name}.pem").read_bytes())
+    signer = serialization.load_pem_private_key((chain / "root.key").read_bytes(), None)
+    assert isinstance(signer, ec.EllipticCurvePrivateKey)
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(anchor.subject)
+        .issuer_name(anchor.issuer)
+        .public_key(anchor.public_key())
+        .serial_number(anchor.serial_number)
+        .not_valid_before(anchor.not_valid_before_utc)
+        .not_valid_after(anchor.not_valid_after_utc)
+    )
+    for extension in anchor.extensions:
+        value = extension.value
+        if isinstance(value, x509.BasicConstraints):
+            value = x509.BasicConstraints(ca=True, path_length=path_limit)
+        builder = builder.add_extension(value, extension.critical)
+    limited_anchor = tmp_path / "limited.pem"
+    limited_anchor.write_bytes(
+        builder.sign(signer, hashes.SHA256()).public_bytes(serialization.Encoding.PEM)
+    )
+    peer = [certs / "server.pem", certs / "cross-signed.pem"]
+    if explicit_trust:
+        openssl_in(
+            tmp_path,
+            "x509",
+            "-in",
+            "limited.pem",
+            "-addtrust",
+            "serverAuth",
+            "-out",
+            "trusted.pem",
+        )
+        limited_anchor = tmp_path / "trusted.pem"
+    else:
+        peer.append(chain / "upper.pem")
+    certificate_chain = tmp_path / "peer.pem"
+    certificate_chain.write_bytes(b"".join(cert.read_bytes() for cert in peer))
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certificate_chain, certs / "server.key")
+    trust = ca_store_overrides(tmp_path, store, limited_anchor)
+    assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, path_limit > 0)
+
+
+def write_trusted_pem(path: Path, certificate: Path, aux: bytes) -> None:
+    der = ssl.PEM_cert_to_DER_cert(certificate.read_text(encoding="ascii"))
+    path.write_bytes(
+        b"-----BEGIN TRUSTED CERTIFICATE-----\n"
+        + base64.encodebytes(der + aux)
+        + b"-----END TRUSTED CERTIFICATE-----\n"
+    )
+
+
+def test_hashed_store_continues_after_malformed_aux(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+) -> None:
+    context, certs = keeper_certificate
+    root = certs / "keeper-ca.pem"
+    subject_hash = openssl_in(
+        tmp_path, "x509", "-in", str(root), "-noout", "-subject_hash"
+    ).strip()
+    write_trusted_pem(tmp_path / f"{subject_hash}.0", root, b"\x30\x01")
+    openssl_in(
+        tmp_path,
+        "x509",
+        "-in",
+        str(root),
+        "-addtrust",
+        "serverAuth",
+        "-out",
+        f"{subject_hash}.1",
+    )
+    assert_keeper_tls_trust(
+        cli_pair,
+        tmp_path,
+        context,
+        {"SSL_CERT_DIR": str(tmp_path)},
+        True,
+        skip_if_reference_rejects=True,
+    )
+
+
+@pytest.mark.parametrize("store", ["file", "dir"])
+def test_default_trust_compares_canonical_issuer_and_subject_names(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+    keeper_cross_signed_ca: tuple[ssl.SSLContext, Path],
+    store: str,
+) -> None:
+    context, _ = keeper_certificate
+    _, certs = keeper_cross_signed_ca
+    (tmp_path / "printable.cnf").write_text(
+        "[req]\ndistinguished_name = dn\nstring_mask = pkix\n[dn]\n",
+        encoding="ascii",
+    )
+    key = str(certs / "keeper-ca.key")
+    openssl_in(
+        tmp_path,
+        "req",
+        "-x509",
+        "-new",
+        "-key",
+        key,
+        "-config",
+        "printable.cnf",
+        "-days",
+        "2",
+        "-subj",
+        "/CN=keeper-ca   Root/O=Fixture CA",
+        "-addext",
+        "basicConstraints=critical,CA:TRUE",
+        "-addext",
+        "subjectKeyIdentifier=hash",
+        "-out",
+        "issuer.pem",
+    )
+    openssl_in(
+        tmp_path,
+        "x509",
+        "-req",
+        "-in",
+        str(certs / "cross-signed.csr"),
+        "-CA",
+        "issuer.pem",
+        "-CAkey",
+        key,
+        "-set_serial",
+        "1",
+        "-days",
+        "2",
+        "-extfile",
+        str(certs / "cross-signed.ext"),
+        "-out",
+        "different-encoding.pem",
+    )
+    names = openssl_in(
+        tmp_path,
+        "x509",
+        "-in",
+        "different-encoding.pem",
+        "-noout",
+        "-subject",
+        "-issuer",
+        "-nameopt",
+        "show_type,sep_comma_plus",
+    )
+    subject, issuer = names.splitlines()
+    assert "UTF8STRING:" in subject and "PRINTABLESTRING:" in issuer
+    trust = ca_store_overrides(tmp_path, store, tmp_path / "different-encoding.pem")
+    assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, True)
+
+
+@pytest.mark.skipif(
+    bool(ssl.create_default_context().verify_flags & ssl.VERIFY_X509_PARTIAL_CHAIN),
+    reason="Requires the C4 Python reference with full-chain verification",
+)
+@pytest.mark.parametrize("store", ["file", "dir"])
+@pytest.mark.parametrize("kind", ["rollover", "plain"])
+def test_default_trust_requires_an_issuer(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+    keeper_cross_signed_ca: tuple[ssl.SSLContext, Path],
+    store: str,
+    kind: str,
+) -> None:
+    context, _ = keeper_certificate
+    _, certs = keeper_cross_signed_ca
+    intermediate = certs / "cross-signed.pem"
+    if kind == "rollover":
+        openssl_in(
+            tmp_path,
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:P-256",
+            "-nodes",
+            "-days",
+            "2",
+            "-subj",
+            "/CN=keeper-ca   Root/O=Fixture CA",
+            "-keyout",
+            "issuer.key",
+            "-out",
+            "issuer.pem",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "subjectKeyIdentifier=hash",
+        )
+        openssl_in(
+            tmp_path,
+            "x509",
+            "-req",
+            "-in",
+            str(certs / "cross-signed.csr"),
+            "-CA",
+            "issuer.pem",
+            "-CAkey",
+            "issuer.key",
+            "-set_serial",
+            "1",
+            "-days",
+            "2",
+            "-extfile",
+            str(certs / "cross-signed.ext"),
+            "-out",
+            "rollover.pem",
+        )
+        openssl_in(
+            tmp_path,
+            "x509",
+            "-in",
+            "rollover.pem",
+            "-setalias",
+            "Rollover CA",
+            "-out",
+            "alias.pem",
+        )
+        intermediate = tmp_path / "alias.pem"
+
+    trust = ca_store_overrides(tmp_path, store, intermediate)
+    assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, False)
+
+
+@pytest.mark.parametrize("store", ["file", "dir"])
+@pytest.mark.parametrize(
+    "ca_kind", ["plain-root", "trusted-root", "trusted-intermediate"]
+)
+def test_expired_configured_ca_matches_httpx(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+    keeper_cross_signed_ca: tuple[ssl.SSLContext, Path],
+    store: str,
+    ca_kind: str,
+) -> None:
+    context, _ = keeper_certificate
+    _, certs = keeper_cross_signed_ca
+    terminal_intermediate = ca_kind == "trusted-intermediate"
+    ca_name, signer = (
+        ("cross-signed", "other-ca")
+        if terminal_intermediate
+        else ("keeper-ca", "keeper-ca")
+    )
+    ca = x509.load_pem_x509_certificate((certs / f"{ca_name}.pem").read_bytes())
+    key = serialization.load_pem_private_key(
+        (certs / f"{signer}.key").read_bytes(), None
+    )
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(ca.subject)
+        .issuer_name(ca.issuer)
+        .public_key(ca.public_key())
+        .serial_number(ca.serial_number)
+        .not_valid_before(datetime(2020, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime(2021, 1, 1, tzinfo=UTC))
+    )
+    for extension in ca.extensions:
+        builder = builder.add_extension(extension.value, extension.critical)
+    expired = builder.sign(key, hashes.SHA256())
+    configured_ca = tmp_path / "expired.pem"
+    configured_ca.write_bytes(expired.public_bytes(serialization.Encoding.PEM))
+    if ca_kind != "plain-root":
+        openssl_in(
+            tmp_path,
+            "x509",
+            "-in",
+            "expired.pem",
+            "-addtrust",
+            "serverAuth",
+            "-out",
+            "trusted.pem",
+        )
+        configured_ca = tmp_path / "trusted.pem"
+    trust = ca_store_overrides(tmp_path, store, configured_ca)
+    assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, terminal_intermediate)
+
+
+@pytest.mark.parametrize("store", ["file", "dir"])
+@pytest.mark.parametrize(
+    ("aux", "trusted"),
+    [
+        pytest.param(b"\x30\x00\x00", True, id="trailing-padding"),
+        pytest.param(b"\x30\x01", False, id="truncated-aux"),
+        pytest.param(b"\x00", False, id="invalid-aux-tag"),
+    ],
+)
+def test_trusted_pem_reads_one_complete_aux_object(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+    store: str,
+    aux: bytes,
+    trusted: bool,
+) -> None:
+    context, certs = keeper_certificate
+    root = certs / "keeper-ca.pem"
+    if store == "dir":
+        subject_hash = openssl_in(
+            tmp_path, "x509", "-in", str(root), "-noout", "-subject_hash"
+        ).strip()
+        write_trusted_pem(tmp_path / f"{subject_hash}.0", root, aux)
+        trust = {"SSL_CERT_DIR": str(tmp_path)}
+    else:
+        ca_file = tmp_path / "trusted.pem"
+        write_trusted_pem(ca_file, root, aux)
+        trust = {"SSL_CERT_FILE": str(ca_file)}
+    assert_keeper_tls_trust(
+        cli_pair,
+        tmp_path,
+        context,
+        trust,
+        trusted,
+        failure=(1, "INTERNAL_ERROR") if store == "file" else (4, "NOT_SENT"),
+    )
+
+
+def assert_keeper_tls_trust(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    context: ssl.SSLContext,
+    trust: dict[str, str],
+    trusted: bool,
+    *,
+    failure: tuple[int, str] = (4, "NOT_SENT"),
+    skip_if_reference_rejects: bool = False,
+) -> None:
     with replay(context) as (endpoint, replies, requests):
         observed = []
         for index, cli in enumerate(cli_pair):
@@ -1767,14 +2495,23 @@ def test_keeper_tls_trust_matches_httpx(
                 ADDR,
                 overrides=trust,
             )
-            assert result.returncode == (0 if trusted else 4)
+            if (
+                index == 0
+                and skip_if_reference_rejects
+                and result.returncode == 4
+                and not requests
+                and not result.stderr
+                and json.loads(result.stdout)["error"]["code"] == "NOT_SENT"
+            ):
+                pytest.skip("The Python reference stopped at the malformed hash entry")
+            assert result.returncode == (0 if trusted else failure[0]), result.stdout
             assert not result.stderr
             assert not replies
             assert [request.body for request in requests] == (
                 [wire(keeper.INTENTS, user=ADDR, key=None)] if trusted else []
             )
             if not trusted:
-                assert json.loads(result.stdout)["error"]["code"] == "NOT_SENT"
+                assert json.loads(result.stdout)["error"]["code"] == failure[1]
             observed.append((result.stdout, list(requests)))
         assert observed[0] == observed[1]
 

@@ -14,6 +14,7 @@ base64 = "0.22"
 bech32 = "0.11"
 clap = { version = "4.6", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["now", "std"] }
+der = { version = "0.7", features = ["alloc", "derive", "oid"] }
 num-bigint = "0.4"
 openssl-probe = "0.2"
 regex = "1"
@@ -27,6 +28,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "cl
 libc = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 url = "2"
+webpki = { package = "rustls-webpki", version = "0.103" }
 webpki-roots = "1"
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 ring = "0.17"
