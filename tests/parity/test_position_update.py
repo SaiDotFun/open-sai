@@ -67,12 +67,13 @@ def python_main_wire(wire: list[str], mode: str) -> list[str]:
 
     Python main skips the oracle for a queued change (README "Fixed USDC Price").
     """
+    if mode == "queued":
+        oracle = {"get_oracle_address", "get_exchange_rate"}
+        return [label for label in wire if label not in oracle]
     size = len(LEVERAGE_ORACLE_WIRE)
     for start in range(len(wire) - size + 1):
         if wire[start : start + size] == LEVERAGE_ORACLE_WIRE:
-            oracle = (
-                [] if mode == "queued" else ["get_perp_prices", "get_group", "block"]
-            )
+            oracle = ["get_perp_prices", "get_group", "block"]
             return wire[:start] + oracle + wire[start + size :]
     return wire
 
@@ -510,7 +511,11 @@ def dry_run_bytes(cli: CLI, home: Path, endpoints: Endpoints, command: CLI) -> b
         (
             LEVERAGE,
             "queued",
-            LEVERAGE_WIRE + ["get_fees"],
+            # Perp reads no price for a queued change, so no staleness reads.
+            LEVERAGE_MARKET_WIRE
+            + ["get_oracle_address", "get_exchange_rate"]
+            + LEVERAGE_LIMITS_WIRE
+            + ["get_fees"],
             {**estimates(QUOTED_LIQUIDATION), "execution": unavailable(QUEUED)},
         ),
         (

@@ -806,8 +806,6 @@ def loopback(
         contracts["market_order_config"] = {
             "fill_at_next_oracle_price": scenario == "quote-queued"
         }
-    if scenario == "quote-queued":
-        contracts["get_group"]["stale_price_expiration_secs"] = 0
     if market_oracle is not None:
         contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
         contracts["get_group"]["stale_price_expiration_secs"] = 30

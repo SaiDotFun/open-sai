@@ -64,8 +64,8 @@ CLOSE_ESTIMATE_READS = [
     "get_market",
     "get_oracle_address",
     "get_exchange_rate",
+    # These fixtures queue closes, so Perp reads no price and staleness is moot.
     "market_order_config",
-    "get_group",
 ]
 OPEN_ESTIMATE_READS = [
     "oneClickTrading",

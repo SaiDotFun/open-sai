@@ -45,6 +45,7 @@ struct ReplyState {
     target_missing: bool,
     market_close_only: bool,
     stale_oracle: bool,
+    queued: bool,
 }
 
 struct PositionServer {
@@ -75,6 +76,7 @@ impl PositionServer {
             target_missing: false,
             market_close_only: false,
             stale_oracle: false,
+            queued: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let replies = Arc::clone(&state);
@@ -238,9 +240,10 @@ impl ReplyState {
                 }
                 "market_order_config" => (
                     "market_order_config",
-                    json!({"fill_at_next_oracle_price": false}),
+                    json!({"fill_at_next_oracle_price": self.queued}),
                 ),
                 "get_group" => ("group", json!({"stale_price_expiration_secs": 30})),
+                "is_after_hours_market" if self.queued => ("after_hours", json!(false)),
                 _ => ("", Value::Null),
             };
             if !name.is_empty() {
@@ -813,6 +816,54 @@ async fn confirmed_core_leverage_checks_execution_before_reserving() {
     );
     assert!(!server.requests().iter().any(|label| label == "admission"));
     assert!(!home.path().join("trader/intents.sqlite3").exists());
+}
+
+#[tokio::test]
+async fn queued_position_changes_ignore_a_stale_oracle() {
+    // Perp reads no price at request when it queues the order.
+    for preview in [
+        close_preview("7", false).unwrap(),
+        leverage_preview("7", "10").unwrap(),
+    ] {
+        let server = PositionServer::start(ACCOUNT, ACCOUNT);
+        let endpoint = format!("{}/query", server.url);
+        let home = tempfile::tempdir().unwrap();
+        let storage = fixture_storage(&home, &endpoint);
+        let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+        let session = trading.load_session(None).unwrap();
+        let digest = if preview.is_market_close() {
+            trading
+                .confirmed_trade_preview(&session, preview.clone())
+                .await
+                .unwrap()["previewDigest"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        } else {
+            confirmed_digest(&trading, &session, &preview).await
+        };
+        {
+            let mut state = server.state.lock().unwrap();
+            state.close_height_check_index = Some(7);
+            state.stale_oracle = true;
+            state.queued = true;
+        }
+
+        trading
+            .submit(
+                &session,
+                &preview,
+                SubmitOptions {
+                    confirmation: Some(Confirmation::new(&digest, None).unwrap()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let requests = server.requests();
+        assert!(requests.iter().any(|label| label == "market_order_config"));
+        assert!(requests.iter().any(|label| label == "admission"));
+    }
 }
 
 #[tokio::test]

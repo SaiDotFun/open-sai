@@ -194,9 +194,12 @@ def test_market_oracle_failure_refuses_before_reservation(
     kind: str,
     options: dict[str, Any],
 ) -> None:
-    # Python main reads the combined Perp price query instead of the market
-    # oracle (README "Fixed USDC Price"), so only the native CLI runs.
-    for index, cli in [(1, pair[1])]:
+    # Perp reads no price at request when it queues a trade, so both runtimes
+    # accept one on a stale oracle. Otherwise Python main reads
+    # the combined Perp price query instead of the market oracle (README
+    # "Fixed USDC Price"), so only the native CLI runs.
+    accepted = queued and market_oracle == "stale"
+    for index, cli in enumerate(pair) if accepted else [(1, pair[1])]:
         home = tmp_path / f"submit-{index}"
         submit = command
         args = {"trade_id": 7, **options}
@@ -231,6 +234,20 @@ def test_market_oracle_failure_refuses_before_reservation(
             market_oracle=market_oracle,
             queued=queued,
         ) as endpoints:
+            if accepted:
+                if surface == "mcp":
+                    with server(Path(cli[0]), home, endpoints, seed="session") as stdio:
+                        reply = mcp_result(stdio.call(2, f"trade_{action}", **args))
+                else:
+                    seed_home(home, endpoints, "session")
+                    code, reply, stderr = run(
+                        cli, home, endpoints, submit, python=index == 0
+                    )
+                    assert (code, stderr) == (0, ""), reply
+                assert reply["status"] == "accepted", reply
+                assert replay.attempts() == {reply["intentKey"]: 1}
+                assert not endpoints.errors
+                continue
             if surface == "mcp":
                 with server(Path(cli[0]), home, endpoints, seed="session") as stdio:
                     reply = mcp_result(stdio.call(2, f"trade_{action}", **args))
@@ -249,6 +266,7 @@ def test_market_oracle_failure_refuses_before_reservation(
                 )
                 replacement = reply["error"]["details"]["preview"]
             if market_oracle == "stale":
+                assert not queued
                 expected = "OraclePriceStale"
             else:
                 expected = (

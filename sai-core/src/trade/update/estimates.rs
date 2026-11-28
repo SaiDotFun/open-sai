@@ -92,7 +92,9 @@ async fn leverage_execution(
     let Some(published) = oracle_publication_time(&oracle) else {
         return oracle_unavailable();
     };
-    if let Some(published) = published {
+    // Perp reads no price when it queues the change, so a stale oracle
+    // cannot reject the request.
+    if let Some(published) = published.filter(|_| queued != Some(true)) {
         let ttl =
             async { read(group_query()?).await.ok()?["stale_price_expiration_secs"].as_u64() };
         let Some(ttl) = ttl.await else {

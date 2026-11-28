@@ -1974,7 +1974,7 @@ output = { "positionRoute.chainId" = "cataclysm-1", "positionRoute.contractAddre
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
     "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market", "get_oracle_address",
-    "get_exchange_rate", "market_order_config", "get_group",
+    "get_exchange_rate", "market_order_config",
 ]
 
 [[case]]
@@ -2661,8 +2661,8 @@ state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted", "t
 wire = [
     "trade", "oneClickTrading", "node_info", "get_trade_raw", "borrowing",
     "get_exchange_balance", "get_trade_raw", "get_market", "get_oracle_address", "get_exchange_rate",
-    "market_order_config", "get_group", "recordUserIntent", "trade", "oneClickTrading",
-    "node_info", "get_trade_raw", "borrowing", "get_exchange_balance", "get_trade_raw",
-    "get_market", "get_oracle_address", "get_exchange_rate", "market_order_config", "get_group",
+    "market_order_config", "recordUserIntent", "trade", "oneClickTrading", "node_info",
+    "get_trade_raw", "borrowing", "get_exchange_balance", "get_trade_raw", "get_market",
+    "get_oracle_address", "get_exchange_rate", "market_order_config",
 ]
 

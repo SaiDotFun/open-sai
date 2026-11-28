@@ -175,6 +175,15 @@ impl Trading<'_> {
             .await
             .ok()
             .and_then(|config| config["fill_at_next_oracle_price"].as_bool());
+        // Perp reads no price when it queues a close, so a stale oracle
+        // cannot reject the request.
+        if queued? {
+            let queued = unavailable("Queued closes settle on a fresh oracle update.");
+            for value in result.as_object_mut()?.values_mut() {
+                *value = queued.clone();
+            }
+            return Some(());
+        }
         let Some(ttl) = lcd
             .group(&pair, Some(height))
             .await
@@ -196,13 +205,6 @@ impl Trading<'_> {
                 });
                 return Some(());
             }
-        }
-        if queued? {
-            let queued = unavailable("Queued closes settle on a fresh oracle update.");
-            for value in result.as_object_mut()?.values_mut() {
-                *value = queued.clone();
-            }
-            return Some(());
         }
 
         let long = raw["long"].as_bool()?;
