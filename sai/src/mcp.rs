@@ -809,6 +809,39 @@ mod tests {
         assert_eq!(result["code"], "OUTCOME_UNKNOWN");
         assert_eq!(result["intentKey"], "fixture-wait");
         assert_eq!(result["addr"], Value::Null);
+        assert_fits_output_schema("intent_wait", &result);
+    }
+
+    /// Check each top-level field's JSON type against the tool's output schema.
+    fn assert_fits_output_schema(name: &str, value: &Value) {
+        let tool = TOOLS.iter().find(|tool| tool.name == name).unwrap();
+        let schema = tool.output_schema.as_deref().unwrap();
+        for (field, item) in value.as_object().expect("result object") {
+            let Some(types) = schema["properties"][field].get("type") else {
+                continue;
+            };
+            let kind = match item {
+                Value::Null => "null",
+                Value::Bool(_) => "boolean",
+                Value::Number(_) => "number",
+                Value::String(_) => "string",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+            };
+            let allowed = match types {
+                Value::Array(types) => types.iter().any(|allowed| allowed == kind),
+                allowed => allowed == kind,
+            };
+            assert!(allowed, "{name}.{field} is {kind}, schema allows {types}");
+        }
+    }
+
+    #[test]
+    fn unresolved_intent_wait_results_fit_the_output_schema() {
+        // Returned when the ledger is busy before the account resolves.
+        let result = wait_result(Map::new(), wait::unknown_result("fixture-wait"));
+        assert_eq!(result["addr"], Value::Null);
+        assert_fits_output_schema("intent_wait", &result);
     }
 
     #[test]

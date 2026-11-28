@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -126,6 +127,17 @@ def test_native_results_match_their_output_schemas(
 
     with checked(native, next(home), covered, "mcp-wait-final", "ledger") as call:
         assert call("intent_wait", key=INTENT)["outcome"] == "filled"
+
+    locked = next(home)
+    with (
+        checked(native, locked, covered, "normal", "ledger") as call,
+        closing(sqlite3.connect(locked / "sai/trader/intents.sqlite3")) as database,
+    ):
+        # A busy ledger ends the wait before the account resolves.
+        database.execute("BEGIN EXCLUSIVE")
+        unresolved = call("intent_wait", key=INTENT)
+        assert unresolved["code"] == "OUTCOME_UNKNOWN"
+        assert unresolved["addr"] is None
 
     with checked(native, next(home), covered, "mcp-wait-pending", "ledger") as call:
         unknown = call("intent_wait", key=INTENT, addr=ADDRESS, timeout=0.7)

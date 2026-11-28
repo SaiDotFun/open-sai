@@ -30,7 +30,7 @@
     "properties": {
       "addr": {"type": "string", "description": "Connected account address."},
       "expiresAt": {"type": ["string", "null"], "description": "When the session expires."},
-      "endpoint": {"type": "string", "description": "Keeper endpoint the session is for."},
+      "endpoint": {"type": ["string", "null"], "description": "Keeper endpoint the session is for."},
       "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
       "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."}
     },
@@ -296,7 +296,7 @@
     "title": "intent_waitOutput",
     "description": "Intent receipt after waiting for a final outcome.",
     "properties": {
-      "addr": {"type": "string", "description": "Account the tool read, as an EVM address."},
+      "addr": {"type": ["string", "null"], "description": "Account the tool read, as an EVM address. Null when the wait ended before the account was resolved."},
       "addrSource": {"type": "string", "description": "Where addr came from: argument, session, or ledger."},
       "intentKey": {"type": "string", "description": "The intent key."},
       "outcome": {"type": "string", "description": "filled, placed, succeeded, failed, rejected, or another final outcome; unknown when the wait ended first."},
@@ -398,8 +398,8 @@
       "message": {"type": "string", "description": "Keeper's admission message."},
       "addr": {"type": ["string", "null"], "description": "Account the trade acted as."},
       "notices": {"type": "array", "description": "Notices to show the user with the result."},
-      "quote": {"type": "object", "description": "Quote from exact contract state that the trade used."},
-      "warning": {"type": "string", "description": "Warning to show the user about how the margin change executes."},
+      "quote": {"type": ["object", "null"], "description": "Quote from exact contract state that the trade used."},
+      "warning": {"type": ["string", "null"], "description": "Warning to show the user about how the margin change executes."},
       "error": {"type": "string", "description": "Present when the call failed: what went wrong and what to do next."},
       "code": {"type": "string", "description": "Error code such as SIGNED_OUT, KEEPER_ERROR, or OUTCOME_UNKNOWN. Absent on success."},
       "intentKeys": {"type": "array", "description": "Intent keys to check with intent_status before retrying."},
