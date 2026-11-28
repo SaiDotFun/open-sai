@@ -184,17 +184,11 @@ impl Trading<'_> {
             }
             return Some(());
         }
-        let Some(ttl) = lcd
-            .group(&pair, Some(height))
-            .await
-            .and_then(|group| group["stale_price_expiration_secs"].as_u64())
-        else {
-            return unknown_oracle_time(result);
-        };
+        // Without the staleness limit or block time the estimate is
+        // unavailable, and Perp makes the staleness check at execution.
+        let ttl = lcd.group(&pair, Some(height)).await?["stale_price_expiration_secs"].as_u64()?;
         if ttl > 0 {
-            let Some(block_time) = lcd.block_timestamp(height).await else {
-                return unknown_oracle_time(result);
-            };
+            let block_time = lcd.block_timestamp(height).await?;
             if i128::from(block_time) - i128::from(published_at) > i128::from(ttl) {
                 let reason = "Perp rejects the close at the observed stale oracle price.";
                 for value in result.as_object_mut()?.values_mut() {

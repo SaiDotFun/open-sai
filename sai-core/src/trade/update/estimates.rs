@@ -95,15 +95,11 @@ async fn leverage_execution(
     // Perp reads no price when it queues the change, so a stale oracle
     // cannot reject the request.
     if let Some(published) = published.filter(|_| queued != Some(true)) {
-        let ttl =
-            async { read(group_query()?).await.ok()?["stale_price_expiration_secs"].as_u64() };
-        let Some(ttl) = ttl.await else {
-            return oracle_unavailable();
-        };
+        // Without the staleness limit or block time the estimate is
+        // unavailable, and Perp makes the staleness check at execution.
+        let ttl = read(group_query()?).await.ok()?["stale_price_expiration_secs"].as_u64()?;
         if ttl > 0 {
-            let Ok(block_time) = lcd.block_timestamp(height).await else {
-                return oracle_unavailable();
-            };
+            let block_time = lcd.block_timestamp(height).await.ok()?;
             if i128::from(block_time) - i128::from(published) > i128::from(ttl) {
                 return estimated(rejected("OraclePriceStale", STALE));
             }
