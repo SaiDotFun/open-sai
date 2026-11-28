@@ -289,17 +289,41 @@ impl<'a> Evidence<'a> {
             .iter()
             .any(|(_, value)| !value.is_null())
             .then(|| Map::from_iter(fees.map(|(key, value)| (key.into(), value))));
-        project(json!({
-            "requestTxHash": keeper::request_hash(request_hash).0
-                .or_else(|| keeper::request_hash(&order["orderReqTxHash"]).0)
-                .or_else(|| public["txHash"].as_str().map(str::to_owned)),
-            "requestBlock": first_truthy([&number(request_block), &number(&order["orderReqBlock"])]),
-            "action": {"kind": intent["kind"], "orderType": self.order_type},
-            "execution": execution,
-            "fill": fill,
-            "positionNow": position(&self.indexed["trade"], &public["trade"]),
-            "positionFeesUsd": fees,
-        }))
+        let mut receipt = Map::from_iter([
+            (
+                "requestTxHash".into(),
+                json!(
+                    keeper::request_hash(request_hash)
+                        .0
+                        .or_else(|| keeper::request_hash(&order["orderReqTxHash"]).0)
+                        .or_else(|| public["txHash"].as_str().map(str::to_owned))
+                ),
+            ),
+            (
+                "requestBlock".into(),
+                first_truthy([&number(request_block), &number(&order["orderReqBlock"])]),
+            ),
+            (
+                "action".into(),
+                json!({"kind": intent["kind"], "orderType": self.order_type}),
+            ),
+        ]);
+        // `sai trade cancel ID` takes the ID of a placed limit or stop order.
+        if outcome == Outcome::Placed {
+            receipt.insert("orderId".into(), public["trade"]["id"].clone());
+        }
+        receipt.extend(
+            json!({
+                "execution": execution,
+                "fill": fill,
+                "positionNow": position(&self.indexed["trade"], &public["trade"]),
+                "positionFeesUsd": fees,
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        );
+        project(Value::Object(receipt))
     }
 }
 

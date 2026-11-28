@@ -37,11 +37,11 @@ from test_intent_status import (
 
 # Rust adds a dollar field beside each receipt collateral amount in base
 # units. The pinned Python reports base units only (#231). Rust also reports
-# a close's realized PnL (#268).
+# a close's realized PnL (#268) and a placed order's ID (#271).
 RUST_RECEIPT_FIELDS = re.compile(
     rb', "(?:sizeCollateralUsd|escrowedCollateralUsd|collateralUsd|openCollateralUsd)"'
     rb': (?:null|"[0-9.]+")'
-    rb'|, "realizedPnl": null'
+    rb'|, "realizedPnl": null|, "orderId": (?:null|[0-9]+)'
 )
 REQUEST_BLOCK = 50109595
 
@@ -810,6 +810,55 @@ def test_wait_help(
             assert not home.exists()
         outputs.append((result.stdout, result.stderr))
     assert outputs[0] == outputs[1]
+
+
+@pytest.mark.parametrize(
+    ("order_type", "rows", "order_id"),
+    [
+        ("limit", (indexed("limit_order_created"),), 7),
+        ("stop", (indexed("stop_order_created"),), 7),
+        ("limit", (), None),
+        ("market", (indexed(),), "absent"),
+    ],
+    ids=["limit", "stop", "limit-not-indexed", "market-fill"],
+)
+def test_rust_placed_receipt_names_the_order_id(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    order_type: str,
+    rows: tuple[dict[str, Any], ...],
+    order_id: int | str | None,
+) -> None:
+    """`sai trade cancel ID` takes the ID a placed order receipt names (#271)."""
+    with replay() as (endpoint, replies, _):
+        home = tmp_path / "sai"
+        seed(home, endpoint, monkeypatch, "unknown")
+        replies.extend(
+            map(
+                response,
+                (
+                    intent("filled", body={"orderType": order_type}),
+                    history(*rows),
+                    *([history()] if not rows else []),
+                ),
+            )
+        )
+        result = invoke(
+            cli_pair[1], home, "--endpoint", endpoint, "--json", "intent", "wait", KEY
+        )
+        assert result.returncode == 0, result
+        receipt = json.loads(result.stdout)["receipt"]
+        if order_id == "absent":
+            assert "orderId" not in receipt
+        else:
+            assert receipt["orderId"] == order_id
+            assert list(receipt)[:4] == [
+                "requestTxHash",
+                "requestBlock",
+                "action",
+                "orderId",
+            ]
 
 
 def test_wait_account_first_matches_python(
