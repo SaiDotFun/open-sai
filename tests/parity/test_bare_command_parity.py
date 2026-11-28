@@ -74,10 +74,8 @@ def test_bare_leaf_prints_full_help_and_json_usage(
         assert bare.returncode == machine.returncode == 2
         assert bare.stdout == machine.stderr == b""
         help_text = bare.stderr
-        if label == "rust" and args == ("intent", "wait"):
-            # Rust documents the account-first form and the 60 s default (#271).
-            assert WAIT_HELP_RUST in help_text
-            help_text = help_text.replace(WAIT_HELP_RUST, WAIT_HELP_PYTHON)
+        if label == "rust":
+            help_text = documented_rust_help(args, help_text)
         assert help_text == expected.stdout
         error = json.loads(machine.stdout)["error"]
         assert error["code"] == "INVALID_REQUEST"
@@ -88,7 +86,16 @@ def test_bare_leaf_prints_full_help_and_json_usage(
     help_result = invoke(rust, tmp_path / "rust", *args, "--help")
     assert help_result.returncode == 0
     assert help_result.stderr == b""
-    assert help_result.stdout == expected.stdout
+    assert documented_rust_help(args, help_result.stdout) == expected.stdout
+
+
+def documented_rust_help(args: tuple[str, ...], help_text: bytes) -> bytes:
+    """Map the Rust help that intentionally differs back to Python's."""
+    if args == ("intent", "wait"):
+        # Rust documents the account-first form and the 60 s default (#271).
+        assert WAIT_HELP_RUST in help_text
+        return help_text.replace(WAIT_HELP_RUST, WAIT_HELP_PYTHON)
+    return help_text
 
 
 @pytest.mark.parametrize(
