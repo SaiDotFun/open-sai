@@ -180,8 +180,12 @@ reports fees and liquidation as unavailable. Full and partial close previews che
 fees. The execution status `would_liquidate` means Perp would close the
 entire position at the observed oracle price. A price beyond the market
 group's freshness limit produces `would_be_rejected` for immediate
-settlement. Queued closes use a fresh oracle update, so estimates for a
-stale tick stay unavailable. Otherwise a partial close
+settlement. Queued closes and position changes use a fresh oracle update,
+so a stale tick leaves their estimates unavailable and does not block them.
+When Sai cannot verify the market oracle for an immediate change, the
+preview omits the digest and a confirmed submission is refused. A
+submission without a digest still goes through, and Perp checks the price
+at execution. Otherwise a partial close
 can draw on remaining collateral and exceed the leverage cap. Its
 resulting liquidation price stays unavailable until settlement.
 
