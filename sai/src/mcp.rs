@@ -43,10 +43,11 @@ use crate::reads::output;
 
 pub(crate) use install::launcher_path;
 
-// Python's 10-second wait stays the default. A caller can ask for the
-// 60 seconds that CLI `--wait` uses, which covers Keeper's finality lag.
+// Python's 10-second wait stays the default. A caller can ask for up to 55
+// seconds, which covers Keeper's finality lag and still replies before the
+// 60-second default MCP tool timeout in Codex.
 const MCP_WAIT_DEFAULT: Duration = Duration::from_secs(10);
-const MCP_WAIT_LIMIT: Duration = Duration::from_secs(60);
+const MCP_WAIT_LIMIT: Duration = Duration::from_secs(55);
 const INSTRUCTIONS: &str = include_str!("mcp/instructions.txt");
 // Wire metadata captured from Python main at 1c671b231b0fc968a44ec8dd520e67ea28e25b7f.
 // The native server describes a longer intent_wait limit and replaces
@@ -845,7 +846,7 @@ mod tests {
     }
 
     #[test]
-    fn intent_wait_honors_timeouts_up_to_the_cli_wait_limit() {
+    fn intent_wait_honors_timeouts_up_to_its_limit() {
         let home = tempfile::tempdir().unwrap();
         let server = queued_server(home.path());
         // Tokio's paused clock skips ahead, so the waits finish at once.
@@ -857,8 +858,9 @@ mod tests {
         for (timeout, waited) in [
             (None, 10),
             (Some(json!(45)), 45),
-            (Some(json!(60)), 60),
-            (Some(json!(600)), 60),
+            (Some(json!(55)), 55),
+            (Some(json!(60)), 55),
+            (Some(json!(600)), 55),
         ] {
             let mut args = Map::from_iter([("key".into(), json!("fixture-wait"))]);
             if let Some(timeout) = timeout {

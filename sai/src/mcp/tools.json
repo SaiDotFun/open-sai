@@ -275,7 +275,7 @@
   },
   {
     "name": "intent_wait",
-    "description": "Wait up to timeout seconds for a final outcome and return an intent receipt.\n\n    Keeper can report a fill more than 10 seconds after submission. Pass\n    timeout=60, the limit that CLI --wait uses, to cover that delay.\n\n    If the outcome is unknown, call this tool again with the same key and\n    address. Keep using the original key for follow-up.\n\n    Args:\n        key: Intent key from a trade result or an OUTCOME_UNKNOWN error.\n        addr: EVM or Nibiru address. Defaults to the local intent account, then the active account.\n        timeout: Wait in seconds. Defaults to 10 and is capped at 60.\n    ",
+    "description": "Wait up to timeout seconds for a final outcome and return an intent receipt.\n\n    Keeper can report a fill more than 10 seconds after submission. Pass\n    timeout=55, the longest wait allowed, to cover that delay. The limit\n    stays under the 60-second tool timeout some MCP clients use.\n\n    If the outcome is unknown, call this tool again with the same key and\n    address. Keep using the original key for follow-up.\n\n    Args:\n        key: Intent key from a trade result or an OUTCOME_UNKNOWN error.\n        addr: EVM or Nibiru address. Defaults to the local intent account, then the active account.\n        timeout: Wait in seconds. Defaults to 10 and is capped at 55.\n    ",
     "inputSchema": {
       "properties": {
         "key": {"title": "Key", "type": "string"},

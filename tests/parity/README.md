@@ -194,7 +194,7 @@ strict argument errors, and the JSON string in each successful response's
 per-tool `outputSchema`, so the comparison accepts either shape and masks
 output schemas. `test_mcp_output_schemas.py` validates every native tool
 result against its listed schema. The native `intent_wait` description
-states its 60-second limit, and the transcript projects that text onto
+states its 55-second limit, and the transcript projects that text onto
 the Python listing outside release comparisons. It also replaces a fixture session
 between calls to check the trade refusal before argument validation.
 Auth cases check expiry, strict arguments, and active account changes

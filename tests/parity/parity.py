@@ -967,10 +967,10 @@ PYTHON_INTENT_WAIT_LIMIT = "Wait up to 10 seconds for a final outcome"
 
 
 def project_reference_intent_wait_limit(output: Any) -> None:
-    """Show Python's intent_wait listing with the native 60-second limit.
+    """Show Python's intent_wait listing with the native 55-second limit.
 
     Python is frozen with a 10-second cap. The native server honors a
-    caller's timeout up to the 60 seconds that CLI --wait uses.
+    caller's timeout up to 55 seconds, under Codex's 60-second tool timeout.
     """
     [native] = [
         tool["description"]
