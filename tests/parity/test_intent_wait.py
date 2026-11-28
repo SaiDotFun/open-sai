@@ -36,10 +36,12 @@ from test_intent_status import (
 )
 
 # Rust adds a dollar field beside each receipt collateral amount in base
-# units. The pinned Python reports base units only (#231).
-RECEIPT_USD = re.compile(
+# units. The pinned Python reports base units only (#231). Rust also reports
+# a close's realized PnL (#268).
+RUST_RECEIPT_FIELDS = re.compile(
     rb', "(?:sizeCollateralUsd|escrowedCollateralUsd|collateralUsd|openCollateralUsd)"'
     rb': (?:null|"[0-9.]+")'
+    rb'|, "realizedPnl": null'
 )
 REQUEST_BLOCK = 50109595
 
@@ -535,6 +537,140 @@ def test_wait_requires_execution_block_position_for_fill(
             assert not replies
 
 
+def closed(change: str = "position_closed_user", **trade: object) -> dict[str, Any]:
+    row = indexed(change)
+    row["trade"].update(
+        {
+            "isOpen": False,
+            "closeBlock": {"block": FILL_BLOCK},
+            "closePrice": 81001.25,
+            "collateralAmount": 3_950_000,
+            **trade,
+        }
+    )
+    return row
+
+
+def pnl_page(row_id: int = 1007, **fields: object) -> dict[str, Any]:
+    return {
+        "data": {
+            "perp": {
+                "tradeHistory": [
+                    {
+                        "id": 1008,
+                        "tradeChangeType": "position_opened",
+                        "grossPricePnlPct": None,
+                        "grossPricePnlCollateral": None,
+                    },
+                    {
+                        "id": row_id,
+                        "tradeChangeType": "position_closed_user",
+                        "grossPricePnlPct": -0.002531144239360719,
+                        "grossPricePnlCollateral": -5057.985533514525,
+                        **fields,
+                    },
+                ]
+            }
+        }
+    }
+
+
+REALIZED = {
+    "basis": "grossBeforeFees",
+    "collateralBaseUnits": -5057.985533514525,
+    "usd": "-0.005058",
+    "percent": "-0.2531144239360719",
+}
+
+
+@pytest.mark.parametrize(
+    ("kind", "row", "lookup", "price", "realized"),
+    [
+        ("CLOSE_POSITION", closed(), pnl_page(), 81001.25, REALIZED),
+        (
+            "CLOSE_POSITION",
+            closed(
+                perpBorrowing={"marketId": 0, "collateralToken": {"symbol": "stNIBI"}}
+            ),
+            pnl_page(),
+            81001.25,
+            {**REALIZED, "usd": None},
+        ),
+        ("CLOSE_POSITION", closed(), pnl_page(row_id=999), 81001.25, None),
+        (
+            "CLOSE_POSITION",
+            closed(),
+            pnl_page(grossPricePnlCollateral=None),
+            81001.25,
+            None,
+        ),
+        (
+            "CLOSE_POSITION",
+            closed(),
+            response({"errors": [{"message": OPAQUE}]}),
+            81001.25,
+            None,
+        ),
+        ("CLOSE_POSITION", closed(isOpen=True), None, None, None),
+        (
+            "CLOSE_POSITION",
+            closed(closeBlock={"block": FILL_BLOCK + 1}),
+            None,
+            None,
+            None,
+        ),
+        ("CLOSE_POSITION", closed(closePrice=0), None, None, None),
+        ("DECREASE_POSITION_SIZE", closed("trade_size_decrease"), None, None, None),
+    ],
+    ids=[
+        "full-close",
+        "non-usdc-collateral",
+        "pnl-row-missing",
+        "pnl-unreported",
+        "pnl-lookup-error",
+        "position-still-open",
+        "closed-in-later-block",
+        "missing-close-price",
+        "partial-close",
+    ],
+)
+def test_rust_close_receipt_fills_price_and_realized_pnl(
+    cli_pair: tuple[CLI, CLI],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    kind: str,
+    row: dict[str, Any],
+    lookup: dict[str, Any] | Reply | None,
+    price: float | None,
+    realized: dict[str, Any] | None,
+) -> None:
+    """Fill a close receipt only when Keeper ties it to the closing fill (#268)."""
+    with replay() as (endpoint, replies, requests):
+        home = tmp_path / "sai"
+        seed(home, endpoint, monkeypatch, "unknown")
+        replies.extend(map(response, (intent("filled", kind=kind), history(row))))
+        if lookup is not None:
+            replies.append(response(lookup))
+        result = invoke(
+            cli_pair[1], home, "--endpoint", endpoint, "--json", "intent", "wait", KEY
+        )
+        assert (result.returncode, result.stderr) == (0, b"")
+        assert OPAQUE.encode() not in result.stdout
+        document = json.loads(result.stdout)
+        assert document["outcome"] == "filled"
+        fill = document["receipt"]["fill"]
+        assert fill["price"] == price
+        assert fill["realizedPnl"] == realized
+        assert fill["oraclePrice"] == "81000.50"
+        assert not replies
+        assert len(requests) == 2 + (lookup is not None)
+        if lookup is not None:
+            query = json.loads(requests[-1].body)
+            assert "grossPricePnlCollateral" in query["query"]
+            assert query["variables"] == {"trader": ADDR, "limit": 25, "offset": 0}
+            assert "authorization" not in requests[-1].headers
+
+
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
 def test_intent_wait(
     wait_cli_pair: tuple[CLI, CLI],
@@ -628,13 +764,17 @@ def test_intent_wait(
                 if index:
                     assert fill.pop("sizeCollateralUsd") is None
                     assert fill.pop("escrowedCollateralUsd") == "4"
+                    if case.name == "market-close":
+                        assert fill.pop("realizedPnl") is None
                 assert fill == {
                     "price": None,
                     "sizeCollateralBaseUnits": None,
                     "oraclePrice": "81000.50",
                     "escrowedCollateralBaseUnits": 4_000_000,
                 }
-            output = RECEIPT_USD.sub(b"", result.stdout) if index else result.stdout
+            output = (
+                RUST_RECEIPT_FIELDS.sub(b"", result.stdout) if index else result.stdout
+            )
             if case.outcome == "unknown":
                 output = document if index else with_timeout_warning(document)
             observed.append((output, wire, ledger))

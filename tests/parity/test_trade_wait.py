@@ -42,8 +42,8 @@ from test_intent_status import (
 )
 from test_intent_wait import (
     FILL_BLOCK,
-    RECEIPT_USD,
     REQUEST_BLOCK,
+    RUST_RECEIPT_FIELDS,
     history,
     indexed,
     intent,
@@ -669,7 +669,9 @@ def test_trade_wait(
                     stamp = submission["intent"].pop("tsIntentInit")
                     assert submission["lifecycle"].pop("tsLifecycleStep") == stamp
             # Python main reports receipt collateral in base units only (#231).
-            stdout = RECEIPT_USD.sub(b"", result.stdout) if index else result.stdout
+            stdout = (
+                RUST_RECEIPT_FIELDS.sub(b"", result.stdout) if index else result.stdout
+            )
             documents.append(
                 (
                     stdout.replace(key.encode(), b"<intent>"),

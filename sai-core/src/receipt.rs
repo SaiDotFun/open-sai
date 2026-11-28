@@ -15,6 +15,14 @@ const TRADE_FILLS: &[&str] = &[
     "trade_size_decrease",
 ];
 
+/// Values that Keeper ties to the fill only after the receipt is confirmed.
+#[derive(Default)]
+pub(crate) struct FillValues {
+    pub price: Value,
+    pub size: Option<i64>,
+    pub realized_pnl: Value,
+}
+
 pub(crate) struct Evidence<'a> {
     row: &'a Value,
     indexed: &'a Value,
@@ -121,9 +129,9 @@ impl<'a> Evidence<'a> {
         trade_id: i64,
         block: i64,
         account: &str,
-    ) -> (Value, Option<i64>) {
+    ) -> FillValues {
         let Some(trade) = data.get("perp").and_then(|perp| perp.get("trade")) else {
-            return (Value::Null, None);
+            return FillValues::default();
         };
         // Ordinary transactions finish before the end-block market fill. A
         // new position still at its opening update describes that fill.
@@ -138,7 +146,7 @@ impl<'a> Evidence<'a> {
             || trade["openBlock"]["block"].as_i64() != Some(block)
             || trade["lastUpdatedBlock"]["block"].as_i64() != Some(block)
         {
-            return (Value::Null, None);
+            return FillValues::default();
         }
         let price = number(&trade["openPrice"]);
         let price = if decimal_float(&price).is_some_and(|value| value > 0.0) {
@@ -147,7 +155,64 @@ impl<'a> Evidence<'a> {
             Value::Null
         };
         let size = opening_size(trade, &self.row["body"]["leverage"]);
-        (price, size)
+        FillValues {
+            price,
+            size,
+            realized_pnl: Value::Null,
+        }
+    }
+
+    /// Identify a full close that Keeper ties to its end-block market fill.
+    /// History rows carry the position as it is now, and a closed position
+    /// does not change again, so its close price is the fill price.
+    pub fn closing_fill(&self) -> Option<(i64, Value)> {
+        if self.indexed["tradeChangeType"] != "position_closed_user" {
+            return None;
+        }
+        let block = self.indexed["block"]["block"].as_i64()?;
+        let history_id = self.indexed["id"].as_i64()?;
+        let trade = &self.indexed["trade"];
+        if block <= 0
+            || history_id < 0
+            || trade["isOpen"] != false
+            || trade["closeBlock"]["block"].as_i64() != Some(block)
+            || self.indexed["marketOrder"]["orderExecBlock"].as_i64() != Some(block)
+        {
+            return None;
+        }
+        let price = number(&trade["closePrice"]);
+        decimal_float(&price)
+            .is_some_and(|value| value > 0.0)
+            .then_some((history_id, price))
+    }
+
+    /// Read the gross realized PnL Keeper recorded on the closing history row.
+    pub fn closing_pnl(&self, data: &Map<String, Value>, history_id: i64) -> Value {
+        let rows = data
+            .get("perp")
+            .and_then(|perp| perp.get("tradeHistory"))
+            .and_then(Value::as_array);
+        let Some(row) = rows.into_iter().flatten().find(|row| {
+            row["id"].as_i64() == Some(history_id)
+                && row["tradeChangeType"] == "position_closed_user"
+        }) else {
+            return Value::Null;
+        };
+        let (units, fraction) = (
+            number(&row["grossPricePnlCollateral"]),
+            number(&row["grossPricePnlPct"]),
+        );
+        let (Some(amount), Some(fraction)) = (decimal(&units), decimal(&fraction)) else {
+            return Value::Null;
+        };
+        let usd = usdc_collateral(&self.indexed["trade"])
+            .then(|| plain(&(amount / BigDecimal::from(1_000_000)).round(6)));
+        json!({
+            "basis": "grossBeforeFees",
+            "collateralBaseUnits": units,
+            "usd": usd,
+            "percent": plain(&(fraction * BigDecimal::from(100))),
+        })
     }
 
     pub fn build(
@@ -155,7 +220,7 @@ impl<'a> Evidence<'a> {
         outcome: Outcome,
         request_hash: &Value,
         request_block: &Value,
-        fill_values: (Value, Option<i64>),
+        fill_values: FillValues,
         project: impl Fn(Value) -> Value,
     ) -> Value {
         let public = self
@@ -195,16 +260,25 @@ impl<'a> Evidence<'a> {
         });
         let usdc = usdc_collateral(&self.indexed["trade"]);
         let fill = (outcome == Outcome::Filled).then(|| {
-            let size = fill_values.1.map_or(Value::Null, |size| json!(size));
+            let size = fill_values.size.map_or(Value::Null, |size| json!(size));
             let escrow = number(&order["collateralAmount"]);
-            json!({
-                "price": fill_values.0,
+            let mut fill = json!({
+                "price": fill_values.price,
                 "sizeCollateralBaseUnits": size,
                 "sizeCollateralUsd": usdc_usd(&size, usdc),
                 "oraclePrice": number(&order["execPrice"]),
                 "escrowedCollateralBaseUnits": escrow,
                 "escrowedCollateralUsd": usdc_usd(&escrow, usdc),
-            })
+            });
+            // Only closing fills realize PnL. Keeper reports none for a
+            // partial close, so its value stays null.
+            if matches!(
+                self.indexed["tradeChangeType"].as_str(),
+                Some("position_closed_user" | "trade_size_decrease")
+            ) {
+                fill["realizedPnl"] = fill_values.realized_pnl;
+            }
+            fill
         });
         let fees = [
             ("opening", number(&self.indexed["openingFeeUsd"])),
@@ -246,6 +320,21 @@ fn opening_size(trade: &Value, requested_leverage: &Value) -> Option<i64> {
     (leverage * BigDecimal::from(collateral))
         .to_i64()
         .filter(|size| *size > 0)
+}
+
+/// Read a validated receipt number exactly, as GraphQL Float text.
+fn decimal(value: &Value) -> Option<BigDecimal> {
+    match value {
+        Value::String(text) => text.parse().ok(),
+        Value::Number(number) => number.to_string().parse().ok(),
+        _ => None,
+    }
+}
+
+/// Write a decimal without an exponent or trailing fractional zeros.
+fn plain(value: &BigDecimal) -> String {
+    let text = value.normalized().to_plain_string();
+    if text == "-0" { "0".into() } else { text }
 }
 
 fn decimal_float(value: &Value) -> Option<f64> {
