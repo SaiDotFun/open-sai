@@ -13,6 +13,7 @@ use sai_core::{
     keeper::{
         self, Keeper,
         stream::{self, Connection, Failure, Subscription},
+        usdc_markets,
     },
     log::{EventContext, Field, Level},
     settings::{Environment, Flags, Key},
@@ -238,18 +239,6 @@ fn read(
     } else {
         output::read(&data, json)
     }
-}
-
-pub(super) fn usdc_markets(
-    data: &Map<String, Value>,
-) -> Result<impl Iterator<Item = &Value>, SaiError> {
-    let rows = data
-        .get("perp")
-        .and_then(|perp| perp["borrowings"].as_array())
-        .ok_or_else(SaiError::internal)?;
-    Ok(rows
-        .iter()
-        .filter(|row| row["collateralToken"]["symbol"] == "USDC"))
 }
 
 fn market_table(data: &Map<String, Value>) -> Result<(), SaiError> {

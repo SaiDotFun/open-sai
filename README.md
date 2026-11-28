@@ -360,7 +360,9 @@ the Python tests and the four native smoke jobs, and uploads the
 the planned tag before publishing.
 
 Run `just release X.Y.Z` on `main` to check the tree and preview the Git
-commands. Add `--run` to create and push the tag. The tag workflow checks that
+commands. A stable release also needs its upgrade guide at
+`docs/releases/sai-cli-vX.Y.Z.md`, which leads the release notes. Add `--run`
+to create and push the tag. The tag workflow checks that
 the tagged commit is on main's first-parent history. It publishes four native
 archives, the shim wheel and sdist, a ZIP containing the full Python wheel and
 sdist, and one `SHA256SUMS` file in one immutable release. After publication,

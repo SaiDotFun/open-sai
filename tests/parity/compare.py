@@ -28,6 +28,28 @@ LOG_FILE = re.compile(r"logs/(?P<surface>[a-z]+)-(?P<day>\d{4}-\d{2}-\d{2})\.jso
 LOG_TIMESTAMP = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z"
 )
+# Native MCP changes from #267. Map the native market_id schema and docs to
+# the Python spelling, and drop Pydantic's documentation link from Python
+# validation errors, so the comparison still checks everything else.
+NATIVE_MCP_SPELLINGS = (
+    (
+        (
+            '"market_id":{"anyOf":[{"type":"integer"},{"type":"string"}],'
+            '"title":"Market Id"}'
+        ),
+        '"market_id":{"title":"Market Id","type":"integer"}',
+    ),
+    (
+        (
+            r"market_id: Market ID from market_list, or a market symbol such as\n"
+            r"            \"ETH\". A symbol that matches more than one market is refused."
+        ),
+        "market_id: Market id from market_list.",
+    ),
+)
+PYDANTIC_LINK = re.compile(
+    r"\n    For further information visit https://errors\.pydantic\.dev/[\d.]+/v/\w+"
+)
 LOG_SCHEMA = Path(__file__).resolve().parents[2] / "docs" / "log-events.json"
 LEDGER = "trader/intents.sqlite3"
 MIN_SQLITE_SCHEMA = (3, 26, 0)
@@ -476,6 +498,7 @@ def normalize_mcp_result(result: dict[str, Any]) -> None:
         if not isinstance(text, str):
             raise TypeError("MCP text content must be a string")
         if result.get("isError"):
+            block["text"] = PYDANTIC_LINK.sub("", text)
             continue
         structured_text(result)
         value = json.loads(text)
@@ -702,6 +725,9 @@ def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
         if command == "logs tail":
             return [normalize.log_event(record) for record in records]
         if mode == "mcp":
+            for native, python in NATIVE_MCP_SPELLINGS:
+                raw = raw.replace(native, python)
+            records = [json.loads(line) for line in raw.splitlines()]
             for frame, record in zip(raw.splitlines(), records, strict=True):
                 result = record.get("result", {})
                 if "tools" in result:
