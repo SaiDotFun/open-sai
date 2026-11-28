@@ -695,7 +695,7 @@ pub fn run(
     Ok(ExitCode::Ok)
 }
 
-fn emit_preview(mut output: Value, json: bool) -> Result<(), SaiError> {
+fn emit_preview(output: Value, json: bool) -> Result<(), SaiError> {
     let execution = &output["estimates"]["execution"];
     if !json
         && execution["status"] == "would_be_rejected"
@@ -704,51 +704,22 @@ fn emit_preview(mut output: Value, json: bool) -> Result<(), SaiError> {
     {
         return Err(SaiError::new(Code::PreviewMismatch, reason));
     }
-    let quote = &output["quote"];
-    let base_units = &output["collateralBaseUnits"];
-    let (before, after) = if output["intent"]["body"]["requestedLeverage"].is_null() {
-        (None, None)
-    } else if quote.is_null() {
-        (base_units["before"].as_str(), base_units["after"].as_str())
-    } else {
-        (
-            quote["collateralBefore"].as_str(),
-            quote["collateralAfter"].as_str(),
+    let collateral = &output["collateral"];
+    if !json
+        && let (Some(before), Some(after)) = (
+            collateral["beforeUsd"].as_str(),
+            collateral["afterUsd"].as_str(),
         )
-    };
-    if let (Some(before), Some(after)) = (before, after) {
-        let before = collateral_usd(before);
-        let after = collateral_usd(after);
-        if !json {
-            if let Some(warning) = execution["warning"].as_str() {
-                println!("{warning}");
-            }
-            println!("Estimated collateral: ${before} → ${after}");
-            if let Some(warning) = output["warning"].as_str() {
-                println!("{warning}");
-            }
+    {
+        if let Some(warning) = execution["warning"].as_str() {
+            println!("{warning}");
         }
-        if let Some(fields) = output.as_object_mut() {
-            fields.shift_insert(
-                2,
-                "collateral".into(),
-                json!({"beforeUsd": before, "afterUsd": after}),
-            );
+        println!("Estimated collateral: ${before} → ${after}");
+        if let Some(warning) = output["warning"].as_str() {
+            println!("{warning}");
         }
     }
     local::emit(&output, json)
-}
-
-fn collateral_usd(units: &str) -> String {
-    // USDC has six decimals and uses a fixed price of one dollar.
-    let digits = format!("{units:0>7}");
-    let (whole, fraction) = digits.split_at(digits.len() - 6);
-    let fraction = fraction.trim_end_matches('0');
-    if fraction.is_empty() {
-        whole.into()
-    } else {
-        format!("{whole}.{fraction}")
-    }
 }
 
 fn check_ascii_decimals(fields: &[(&str, Option<&str>)]) -> Result<(), SaiError> {

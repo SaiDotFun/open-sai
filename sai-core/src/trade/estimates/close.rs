@@ -13,8 +13,8 @@ use crate::{
 };
 
 use super::{
-    COLLATERAL_ORACLE, FEE_UNAVAILABLE, Price, SCALE, base_fees, decimal, integer, lcd::QuoteLcd,
-    liquidation_fee, not_applicable, now, oracle_publication_time, unavailable,
+    Price, SCALE, base_fees, decimal, integer, lcd::QuoteLcd, liquidation_fee, not_applicable, now,
+    oracle_publication_time, unavailable,
 };
 
 const UNKNOWN: &str = "Cannot verify the position and Perp liquidation inputs at one block.";
@@ -23,7 +23,7 @@ const UNKNOWN_ORACLE_TIME: &str = "The oracle price publication time is unknown.
 
 pub(in crate::trade) struct PartialCloseQuote<'a> {
     pub(in crate::trade) amount: &'a BigUint,
-    pub(in crate::trade) rechecked: Option<(u128, &'a Value)>,
+    pub(in crate::trade) effective: Option<u128>,
 }
 
 fn unavailable_close(partial: bool) -> Value {
@@ -86,7 +86,7 @@ impl Trading<'_> {
         let mut result = unavailable_close(false);
         let quote = async {
             let state = self
-                .position_snapshot(lcd, account, id, route, (indexed, Some(raw)), true)
+                .position_snapshot(lcd, account, id, route, (indexed, Some(raw)), false)
                 .await?;
             if let Some(height) = state.verified_height(lcd, id).await? {
                 let quote_lcd = QuoteLcd::new(lcd.0, state.route.contract_address.clone());
@@ -119,9 +119,6 @@ impl Trading<'_> {
         partial: PartialCloseQuote<'_>,
     ) -> Value {
         let mut result = unavailable_close(true);
-        if !state.raw["long"].is_boolean() {
-            return result;
-        }
         if let Ok(Some(height)) = height {
             let quote_lcd = QuoteLcd::new(lcd.0, state.route.contract_address.clone());
             Self::quote_close(
@@ -150,61 +147,63 @@ impl Trading<'_> {
         result: &mut Value,
     ) -> Option<()> {
         let raw = &state.raw;
-        let long = raw["long"].as_bool()?;
-        let trade = raw.get("user")?;
-        let height = Some(height);
-
-        let prices;
-        let row = if let Some((_, prices)) = partial.as_ref().and_then(|quote| quote.rechecked) {
-            prices
-        } else {
-            let read = lcd
-                .smart(
-                    json!({"get_perp_prices": {
-                        "market_index": raw.get("market_index")?,
-                        "collateral_index": raw.get("collateral_index")?,
-                    }}),
-                    height,
-                )
-                .await;
-            prices = match read {
-                Ok(prices) => prices,
-                Err(_) => return unknown_oracle_time(result),
-            };
-            &prices
-        };
-        let oracle = &row["market"];
-        let Some(Some(published_at)) = oracle_publication_time(oracle) else {
+        let Some(pair) = lcd.market(raw.get("market_index")?, Read::At(height)).await else {
             return unknown_oracle_time(result);
         };
-        let config = lcd
-            .smart(json!({"market_order_config": {}}), height)
+        let Ok(oracle) = position_lcd
+            .market_oracle_price(&state.route.contract_address, &pair, height)
             .await
-            .ok()?;
-        if config["fill_at_next_oracle_price"].as_bool()? {
+        else {
+            return unknown_oracle_time(result);
+        };
+        let Some(Some(published_at)) = oracle_publication_time(&oracle) else {
+            return unknown_oracle_time(result);
+        };
+        let queued = lcd
+            .smart(json!({"market_order_config": {}}), Some(height))
+            .await
+            .ok()
+            .and_then(|config| config["fill_at_next_oracle_price"].as_bool());
+        // Perp reads no price when it queues a close, so a stale oracle
+        // cannot reject the request.
+        if queued? {
             let queued = unavailable("Queued closes settle on a fresh oracle update.");
             for value in result.as_object_mut()?.values_mut() {
                 *value = queued.clone();
             }
             return Some(());
         }
-        let pair = lcd.market(&raw["market_index"], Read::At(height?)).await?;
-        let group = lcd.group(&pair, height).await?;
-        let ttl = group["stale_price_expiration_secs"].as_u64()?;
-        if ttl > 0
-            && i128::from(lcd.block_timestamp(height?).await?) - i128::from(published_at)
-                > i128::from(ttl)
-        {
-            let reason = "Perp rejects the close at the observed stale oracle price.";
-            for value in result.as_object_mut()?.values_mut() {
-                *value = unavailable(reason);
+        // Only an immediate close reads the market price.
+        let Some(market) = oracle
+            .get("base_per_quote")
+            .and_then(Value::as_str)
+            .and_then(|price| Price::new(price, "Sai Perp market oracle", Some(now())))
+        else {
+            return unverified_market_oracle(
+                result,
+                "OraclePriceUnavailable",
+                super::UNVERIFIED_MARKET_ORACLE,
+            );
+        };
+        // Without the staleness limit or block time the estimate is
+        // unavailable, and Perp makes the staleness check at execution.
+        let ttl = lcd.group(&pair, Some(height)).await?["stale_price_expiration_secs"].as_u64()?;
+        if ttl > 0 {
+            let block_time = lcd.block_timestamp(height).await?;
+            if i128::from(block_time) - i128::from(published_at) > i128::from(ttl) {
+                let reason = "Perp rejects the close at the observed stale oracle price.";
+                for value in result.as_object_mut()?.values_mut() {
+                    *value = unavailable(reason);
+                }
+                result["execution"] = json!({
+                    "status": "would_be_rejected", "code": "OraclePriceStale", "reason": reason,
+                });
+                return Some(());
             }
-            result["execution"] = json!({
-                "status": "would_be_rejected", "code": "OraclePriceStale", "reason": reason,
-            });
-            return Some(());
         }
 
+        let long = raw["long"].as_bool()?;
+        let trade = raw.get("user")?;
         let threshold = lcd
             .smart(
                 json!({"get_liquidation_price": {
@@ -212,16 +211,10 @@ impl Trading<'_> {
                     "trader": trade,
                     "include_borrowing_fees": true,
                 }}),
-                height,
+                Some(height),
             )
             .await
             .ok()?;
-        let observed_at = now();
-        let market = Price::new(
-            oracle.get("base_per_quote")?.as_str()?,
-            "Sai Perp market oracle",
-            Some(observed_at.clone()),
-        )?;
         let trigger = decimal(&threshold["liquidation_price"])?;
         let collateral = integer(&raw["collateral_amount"])?;
         if (long && market.units <= trigger) || (!long && market.units >= trigger) {
@@ -241,9 +234,9 @@ impl Trading<'_> {
         }
 
         let stored = decimal(&raw["leverage"])?;
-        let effective = match partial.as_ref().and_then(|quote| quote.rechecked) {
-            Some((effective, _)) => Ok(effective),
-            None => state.effective_leverage(position_lcd, id, height?).await,
+        let effective = match partial.as_ref().and_then(|quote| quote.effective) {
+            Some(effective) => Ok(effective),
+            None => state.effective_leverage(position_lcd, id, height).await,
         };
         let effective = match effective {
             Ok(effective) if partial.is_some() && effective != stored => {
@@ -270,18 +263,13 @@ impl Trading<'_> {
         } else {
             result["execution"] = json!({"status": "voluntary_close"});
         }
-        result["fees"] = unavailable(FEE_UNAVAILABLE);
-        let price = Price::new(
-            row["collateral"].as_str()?,
-            COLLATERAL_ORACLE,
-            Some(observed_at),
-        )?;
-        let schedule = lcd.fees(&pair, height).await?;
+        result["fees"] = unavailable("Perp fee schedule is unavailable.");
+        let schedule = lcd.fees(&pair, Some(height)).await?;
         let reduced = partial.as_ref().map_or(&collateral, |quote| quote.amount);
         let notional = reduced * effective / SCALE;
         let (_, fees) = base_fees(
             &schedule,
-            &price,
+            &Price::usdc(),
             notional,
             false,
             partial.is_some(),
@@ -293,9 +281,13 @@ impl Trading<'_> {
 }
 
 fn unknown_oracle_time(result: &mut Value) -> Option<()> {
+    unverified_market_oracle(result, "OraclePublicationTimeUnknown", UNKNOWN_ORACLE_TIME)
+}
+
+fn unverified_market_oracle(result: &mut Value, code: &str, reason: &str) -> Option<()> {
     for field in result.as_object_mut()?.values_mut() {
-        *field = unavailable(UNKNOWN_ORACLE_TIME);
+        *field = unavailable(reason);
     }
-    result["execution"]["code"] = json!("OraclePublicationTimeUnknown");
+    result["execution"]["code"] = json!(code);
     Some(())
 }

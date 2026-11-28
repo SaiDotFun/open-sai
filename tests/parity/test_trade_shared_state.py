@@ -355,7 +355,11 @@ ACTIONS = {
         outcome="filled",
     ),
     "close": Action(
-        ("close", "7"), "CLOSE_POSITION", "position_closed_user", outcome="filled"
+        ("close", "7"),
+        "CLOSE_POSITION",
+        "position_closed_user",
+        server="shared-confirmable-position",
+        outcome="filled",
     ),
     "cancel": Action(
         ("close", "7", "--cancel-order"),
@@ -372,6 +376,7 @@ ACTIONS = {
         ("partial-close", "7", "--percent", "50"),
         "DECREASE_POSITION_SIZE",
         "trade_size_decrease",
+        server="shared-confirmable-position",
         outcome="filled",
     ),
     "tpsl": Action(
@@ -618,12 +623,16 @@ def test_trade_wait_replays_pending_then_receipt(
         assert receipt["execution"]["tradeChangeType"] == action.change
         assert receipt["execution"]["marketOrderSequence"] == 49
         if action.outcome == "filled":
-            assert receipt["fill"] == {
+            fill = {
                 "price": None,
                 "sizeCollateralBaseUnits": None,
                 "oraclePrice": "100.25",
                 "escrowedCollateralBaseUnits": "4000000",
             }
+            if writer.rust:
+                # Python main still reports base units only (#231).
+                fill |= {"sizeCollateralUsd": None, "escrowedCollateralUsd": "4"}
+            assert receipt["fill"] == fill
         else:
             assert receipt["fill"] is None
         home.row(key, action.kind, action.entity, "terminal")
@@ -717,20 +726,21 @@ def test_submission_times_out_after_keeper_receives_mutation(
     # Exercise the real transport deadline in the pinned mixed-runtime run.
     reader = runtime(reconciler, request, python_reference)
     writer = runtime(submitter, request, python_reference)
-    replay = TradeReplay(hold_admission=True)
-    with loopback("default", trade_replay=replay) as endpoints:
+    action = ACTIONS["close"]
+    replay = action.replay(hold_admission=True)
+    with loopback(action.server, trade_replay=replay) as endpoints:
         home = Home(tmp_path / "home", endpoints)
         seed_home(home.path, endpoints, "session")
         trade_help(home, writer, "close")
         started = time.monotonic()
         try:
-            error = home.json(writer, "trade", "close", "7", code=5)["error"]
+            error = home.json(writer, "trade", *action.args, code=5)["error"]
             assert replay.arrived.is_set() and time.monotonic() - started >= 15
             assert error["code"] == "OUTCOME_UNKNOWN" and error["retryable"] is False
             key = error["intentKey"]
             home.row(key, replay.kind, replay.entity, "unknown")
             home.local(reader, key, replay.kind, "unknown")
-            assert_blocked(home.invoke(writer, "--json", "trade", "close", "7"), key)
+            assert_blocked(home.invoke(writer, "--json", "trade", *action.args), key)
         finally:
             replay.release.set()
         replay.phase = "pending"

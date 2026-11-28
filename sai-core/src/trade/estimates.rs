@@ -23,6 +23,8 @@ const SCALE: u128 = 10u128.pow(18);
 const USDC_PLACES: u32 = 6;
 const QUOTE_TIMEOUT: Duration = Duration::from_secs(3);
 const FEE_UNAVAILABLE: &str = "Perp fee schedule or collateral oracle price is unavailable.";
+pub(super) const UNVERIFIED_MARKET_ORACLE: &str =
+    "Cannot verify the market oracle price at the position's block.";
 const COLLATERAL_ORACLE: &str = "Sai Perp collateral oracle";
 const KEEPER_PRICE: &str = "Sai Keeper market price";
 
@@ -179,7 +181,8 @@ impl Trading<'_> {
             return Some(());
         }
         let row = row?;
-        let token = json_index(row.get("collateralToken")?.get("id")?)?;
+        let token = row.get("collateralToken")?;
+        let token_index = json_index(token.get("id")?)?;
         let group = lcd.group(&pair, None).await?;
         let minimum = decimal(&group["min_leverage"])?;
         let mut maximum = decimal(&group["max_leverage"])?;
@@ -189,14 +192,18 @@ impl Trading<'_> {
         }
         let leverage = decimal(&body["leverage"])?;
         let schedule = lcd.fees(&pair, None).await?;
-        let quote = lcd
-            .smart(
-                json!({"get_collateral_price": {"collateral_index": format!("TokenIndex({token})")}}),
-                None,
-            )
-            .await
-            .ok()?;
-        let price = Price::new(quote.as_str()?, COLLATERAL_ORACLE, Some(now()))?;
+        let price = if token["symbol"] == "USDC" {
+            Price::usdc()
+        } else {
+            let quote = lcd
+                .smart(
+                    json!({"get_collateral_price": {"collateral_index": format!("TokenIndex({token_index})")}}),
+                    None,
+                )
+                .await
+                .ok()?;
+            Price::new(quote.as_str()?, COLLATERAL_ORACLE, Some(now()))?
+        };
         let collateral = BigUint::from(decimal(&body["amountUsd"])? / 10u128.pow(18 - USDC_PLACES));
         let notional = &collateral * leverage / SCALE;
         // Perp floors USD notional before dividing by leverage.
@@ -233,6 +240,13 @@ struct Price {
 }
 
 impl Price {
+    fn usdc() -> Self {
+        Self {
+            units: SCALE,
+            output: json!({"price": "1", "source": "Fixed USDC price", "observedAt": null}),
+        }
+    }
+
     fn new(text: &str, source: &str, observed_at: Option<String>) -> Option<Self> {
         Some(Self {
             units: positive_decimal(text, "Quote price").ok()?,

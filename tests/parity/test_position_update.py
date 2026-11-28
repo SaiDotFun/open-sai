@@ -23,6 +23,7 @@ from scenarios import (
     ADDRESS,
     CONTRACT,
     NODE_INFO,
+    ORACLE_CONTRACT,
     OTHER_ADDRESS,
     PROTOCOL,
     TRADE_REQUEST_HASH,
@@ -52,13 +53,31 @@ PYTHON_QUOTE_WIRE = [
     *QUOTE_ESTIMATE_WIRE,
 ]
 LEVERAGE_MARKET_WIRE = ["get_market", "market_order_config"]
-LEVERAGE_ORACLE_WIRE = ["get_perp_prices", "get_group", "block"]
+LEVERAGE_ORACLE_WIRE = ["get_oracle_address", "get_exchange_rate", "get_group", "block"]
 LEVERAGE_LIMITS_WIRE = [
     "is_after_hours_market",
     "get_group",
     "get_pair_custom_max_leverage",
 ]
 LEVERAGE_WIRE = LEVERAGE_MARKET_WIRE + LEVERAGE_ORACLE_WIRE + LEVERAGE_LIMITS_WIRE
+
+
+def python_main_wire(wire: list[str], mode: str) -> list[str]:
+    """Translate native leverage reads to Python main's combined price query.
+
+    Python main skips the oracle for a queued change (README "Fixed USDC Price").
+    """
+    if mode == "queued":
+        oracle = {"get_oracle_address", "get_exchange_rate"}
+        return [label for label in wire if label not in oracle]
+    size = len(LEVERAGE_ORACLE_WIRE)
+    for start in range(len(wire) - size + 1):
+        if wire[start : start + size] == LEVERAGE_ORACLE_WIRE:
+            oracle = ["get_perp_prices", "get_group", "block"]
+            return wire[:start] + oracle + wire[start + size :]
+    return wire
+
+
 CHAIN = "cataclysm-1"
 HEIGHT = "120"
 ENTRY = "100.000000000000000000"
@@ -192,6 +211,8 @@ def update_loopback(mode: str) -> Generator[Endpoints]:
         ),
         "is_after_hours_market": mode == "after-hours",
         "get_market": {
+            "base": "TokenIndex(7)",
+            "quote": "TokenIndex(0)",
             "group_index": "GroupIndex(0)",
             "fee_index": "FeeIndex(0)",
             "block_last_opened": 101,
@@ -205,24 +226,25 @@ def update_loopback(mode: str) -> Generator[Endpoints]:
         },
         "get_pair_custom_max_leverage": "8" if mode == "pair-cap" else "0",
         "get_fees": {"open_fee_p": "0.001"},
-        "get_collateral_price": "1.01",
-        "get_perp_prices": {
-            "market": {
-                "base_per_quote": {
-                    "queued": "85",
-                    "stale": "85",
-                    "liquidation": "85",
-                    "cap-missing-height": "85",
-                    "cap-wrong-height": "85",
-                    "short-liquidation": "110",
-                }.get(mode, "99"),
-                "base_last_update_time": 995,
-                "quote_last_update_time": 980 if mode == "stale" else 995,
-            }
+        "get_oracle_address": ORACLE_CONTRACT,
+        "get_exchange_rate": {
+            "base_per_quote": {
+                "queued": "85",
+                "stale": "85",
+                "liquidation": "85",
+                "cap-missing-height": "85",
+                "cap-wrong-height": "85",
+                "short-liquidation": "110",
+            }.get(mode, "99"),
+            "base_last_update_time": 995,
+            "quote_last_update_time": 980 if mode == "stale" else 995,
         },
         "market_order_config": {"fill_at_next_oracle_price": mode == "queued"},
         "quote_trade": {"data": None, "attributes": [], "events": [], "messages": []},
     }
+    # Python main still reads the combined Perp price query.
+    lcd_replies["get_collateral_price"] = "1.01"
+    lcd_replies["get_perp_prices"] = {"market": lcd_replies["get_exchange_rate"]}
     lcd_variables = {
         "get_trade_raw": {"trader": ADDRESS, "index": 7},
         "get_exchange_balance": {
@@ -235,6 +257,8 @@ def update_loopback(mode: str) -> Generator[Endpoints]:
         "get_group": {"index": "GroupIndex(0)"},
         "get_pair_custom_max_leverage": {"index": 3},
         "get_fees": {"index": "FeeIndex(0)"},
+        "get_oracle_address": {},
+        "get_exchange_rate": {"base": 7, "quote": 0},
         "get_collateral_price": {"collateral_index": "TokenIndex(0)"},
         "get_perp_prices": {
             "market_index": "MarketIndex(3)",
@@ -359,6 +383,10 @@ def update_loopback(mode: str) -> Generator[Endpoints]:
                 )
                 return
             prefix = f"/cosmwasm/wasm/v1/contract/{CONTRACT}/smart/"
+            oracle_prefix = f"/cosmwasm/wasm/v1/contract/{ORACLE_CONTRACT}/smart/"
+            oracle_read = url.path.startswith(oracle_prefix)
+            if oracle_read:
+                prefix = oracle_prefix
             if not url.path.startswith(prefix):
                 self.reject("Unexpected LCD path")
                 return
@@ -373,7 +401,8 @@ def update_loopback(mode: str) -> Generator[Endpoints]:
                 return
             wire.append(WireRequest(name, variables=values))
             if (
-                not same_variables(values, lcd_variables.get(name, {}))
+                oracle_read != (name == "get_exchange_rate")
+                or not same_variables(values, lcd_variables.get(name, {}))
                 or name not in lcd_replies
             ):
                 self.reject("Unexpected Perp query or variables")
@@ -482,6 +511,7 @@ def dry_run_bytes(cli: CLI, home: Path, endpoints: Endpoints, command: CLI) -> b
         (
             LEVERAGE,
             "queued",
+            # Perp reads no price for a queued change, so neither runtime does.
             LEVERAGE_MARKET_WIRE + LEVERAGE_LIMITS_WIRE + ["get_fees"],
             {**estimates(QUOTED_LIQUIDATION), "execution": unavailable(QUEUED)},
         ),
@@ -579,6 +609,8 @@ def test_position_update_dry_run(
             if command == LEVERAGE:
                 wire = QUOTE_WIRE[:-1]
             expected_wire = wire + suffix
+            if implementation == "python" and command == LEVERAGE:
+                expected_wire = python_main_wire(expected_wire, mode)
             if (
                 command == LEVERAGE
                 and expected["liquidationPrice"]["status"] == "estimate"

@@ -14,4 +14,5 @@ pub mod session;
 pub mod settings;
 pub mod storage;
 pub mod trade;
+pub mod usdc;
 pub mod wait;

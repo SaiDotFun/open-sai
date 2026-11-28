@@ -142,12 +142,8 @@ the one the person confirmed. The digest covers:
   leverage. If `quote.marginChangeIsEstimate` is true, say that after-hours
   guard fees can change the amount.
 - `trade_partial_close` also binds the close percentage, starting collateral,
-  and leverage inputs, including the applicable after-hours cap. A tick in the
-  collateral/USD price updates the USD estimate without changing the digest.
-  Show the quoted notional and say whether `quote.closedNotionalIsEstimate`
-  is true. If the collateral oracle price is unavailable, the partial-close
-  estimate cannot be submitted. Preview again when Sai can verify the price
-  and ask the person to confirm the updated quote.
+  and leverage inputs, including the applicable after-hours cap. Show the
+  quoted notional and say whether `quote.closedNotionalIsEstimate` is true.
 
 The `estimates` object is informational. The price sources, time fields,
 and fee exclusions are in [Reading the Estimates](trading-safety.md#reading-the-estimates).
@@ -197,10 +193,9 @@ For `PRICE_MOVED`, check that the replacement `preview` has a
 `previewDigest` and `referencePrice`. If the digest is absent, address the
 reported rejection and request a fresh preview before asking for confirmation.
 
-For a partial close, check that `quote.collateralPriceUsd` has a value
-before asking for confirmation. An estimated preview can carry a digest
-while that field is `null`. Wait for the collateral price and request a
-fresh preview in that case.
+A partial-close preview values each USDC at $1. If the preview omits the
+digest, check the reported cause and request a fresh preview before asking
+for confirmation.
 
 To cancel a pending order, pass `cancel_order=true` to `preview_close` and
 `trade_close`. Both check that the order is pending. If it fills after the

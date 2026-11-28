@@ -7,7 +7,7 @@ use crate::trade::{
     LeverageCollateral, TradePreview, Trading,
     actions::invalid,
     confirmation::{plain_decimal, positive_decimal},
-    estimates::{market_rejection, oracle_publication_time},
+    estimates::{UNVERIFIED_MARKET_ORACLE, market_rejection, oracle_publication_time},
     position::{Lcd, PositionRoute, Snapshot, SnapshotError, contract_decimal, number_text},
 };
 
@@ -60,9 +60,18 @@ async fn leverage_execution(
     let estimated = |value| Some(Ok((value, None)));
     let raw = &state.raw;
     let read = |query| state.smart(lcd, query, height);
-    let pair = read(json!({"get_market": {"index": raw.get("market_index")?}}))
-        .await
-        .ok()?;
+    let oracle_unavailable = || {
+        let mut estimates = all_unavailable(UNVERIFIED_MARKET_ORACLE);
+        estimates["execution"] = json!({
+            "status": "unavailable",
+            "code": "OraclePriceUnavailable",
+            "reason": UNVERIFIED_MARKET_ORACLE,
+        });
+        estimated(estimates)
+    };
+    let Ok(pair) = read(json!({"get_market": {"index": raw.get("market_index")?}})).await else {
+        return oracle_unavailable();
+    };
     if let Some(reason) = market_rejection(&pair, true) {
         return estimated(rejected("MarketClosed", reason));
     }
@@ -72,29 +81,38 @@ async fn leverage_execution(
         pair.get("group_index")
             .map(|index| json!({"get_group": {"index": index}}))
     };
+    // Perp reads no price when it queues the change, so a queued change
+    // needs no oracle read and a stale oracle cannot reject it.
     let oracle_price = if queued {
         None
     } else {
-        let prices = read(json!({"get_perp_prices": {
-            "market_index": raw["market_index"], "collateral_index": raw["collateral_index"],
-        }}))
-        .await
-        .ok()?;
-        let oracle = &prices["market"];
-        if let Some(published) = oracle_publication_time(oracle)? {
-            let group = read(group_query()?).await.ok()?;
-            let ttl = group["stale_price_expiration_secs"].as_u64()?;
-            if ttl > 0
-                && i128::from(lcd.block_timestamp(height).await.ok()?) - i128::from(published)
-                    > i128::from(ttl)
-            {
-                return estimated(rejected("OraclePriceStale", STALE));
+        let Ok(oracle) = lcd
+            .market_oracle_price(&state.route.contract_address, &pair, height)
+            .await
+        else {
+            return oracle_unavailable();
+        };
+        let Some(published) = oracle_publication_time(&oracle) else {
+            return oracle_unavailable();
+        };
+        if let Some(published) = published {
+            // Without the staleness limit or block time the estimate is
+            // unavailable, and Perp makes the staleness check at execution.
+            let ttl = read(group_query()?).await.ok()?["stale_price_expiration_secs"].as_u64()?;
+            if ttl > 0 {
+                let block_time = lcd.block_timestamp(height).await.ok()?;
+                if i128::from(block_time) - i128::from(published) > i128::from(ttl) {
+                    return estimated(rejected("OraclePriceStale", STALE));
+                }
             }
         }
-        let price = contract_decimal(oracle.get("base_per_quote")?).ok()?;
-        if price == 0 {
-            return None;
-        }
+        let Some(price) = oracle
+            .get("base_per_quote")
+            .and_then(|price| contract_decimal(price).ok())
+            .filter(|price| *price != 0)
+        else {
+            return oracle_unavailable();
+        };
         Some(price)
     };
 

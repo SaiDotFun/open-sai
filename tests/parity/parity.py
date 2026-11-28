@@ -49,6 +49,7 @@ from manifest_gaps import ManifestGaps
 from mcp_cases import CALLS, RELEASE_MCP_TOOL_NAMES, handshake
 from mcp_clients import SECRET, client_state, seed_clients
 from network import enter_loopback, restricted, unroutable_packets
+from python_main_usdc import as_native_usdc
 from reference_uv import resolve_uv
 from release_mismatch import differing_paths, value_fingerprint
 from sai_cli.sai_cli import command_path
@@ -645,11 +646,10 @@ def observe(
                 if isinstance(payload, dict):
                     trade_estimate_clocks(payload.get("preview"))
                     preview = payload.get("preview", payload)
-                    if case.name == "mcp-trade-leverage-confirmation" and isinstance(
-                        preview, dict
-                    ):
-                        # The fixture checks each runtime's display before
+                    if isinstance(preview, dict):
+                        # The fixture checks each runtime's USD display before
                         # comparing the shared base-unit binding and digest.
+                        # Python v0.1.3 shows it for leverage changes only.
                         preview.pop("collateral", None)
     stderr = stderr_category(result.stderr)
     if case.accepted_divergence == "uninstall-read-only":
@@ -962,6 +962,32 @@ def project_reference_auth_status_errors(
     return "Native MCP auth status omits disconnected addresses" if changed else None
 
 
+def project_reference_native_usdc(output: Any, *, collateral: bool) -> None:
+    """Show Python tool replies with the native fixed USDC price and USD rows.
+
+    Python is frozen and keeps the oracle rate (README "Fixed USDC Price").
+    """
+    if not isinstance(output, list):
+        return
+    for frame in output:
+        result = frame.get("result") if isinstance(frame, dict) else None
+        if not isinstance(result, dict):
+            continue
+        text = result.get("_toolText")
+        for block in result.get("content", []):
+            value = block.get("text")
+            projected = as_native_usdc(value, collateral=collateral)
+            # Python serializes tool replies with json.dumps, so a changed
+            # reply keeps its byte form only when the original round-trips.
+            if projected == value or (text is not None and json.dumps(value) != text):
+                continue
+            block["text"] = projected
+            if isinstance(result.get("structuredContent"), dict):
+                result["structuredContent"]["result"] = projected
+            if text is not None:
+                result["_toolText"] = json.dumps(projected)
+
+
 def expect_native_mcp_validation(
     output: list[dict[str, Any]], profile: str
 ) -> str | None:
@@ -1259,6 +1285,8 @@ def run_case(
     if cutover:
         diffs = cutover_differences(left, right)
     else:
+        if rust and case.mode == "mcp":
+            project_reference_native_usdc(left.output, collateral=not case.mcp_trade)
         if rust and case.name == "trade-open-unknown-market-symbol":
             error = left.output.get("error", {})
             if (
