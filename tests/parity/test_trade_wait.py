@@ -11,6 +11,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import termios
 import threading
 import time
 from collections import deque
@@ -1459,6 +1460,54 @@ def test_current_cli_wait_progress_precedes_the_receipt(
                 assert stderr == b""
             assert json.loads(stdout)["outcome"] == "filled"
             assert not replies
+
+
+def test_wait_polls_and_interrupts_with_paused_terminal(
+    native_wait_launcher: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Paused terminal output, as after Ctrl-S, must not hold up polling."""
+    home = tmp_path / "sai"
+    first_poll = threading.Event()
+    release = threading.Event()
+    with replay(get=target_lcd) as (endpoint, replies, requests), ExitStack() as stack:
+        connect(home, endpoint, monkeypatch)
+        preflight = filled_close(replies, requests, rust=True)
+        filled = replies[-2]
+
+        def hold_poll(request: Request) -> Reply:
+            first_poll.set()
+            assert release.wait(10)
+            assert callable(filled)
+            return filled(request)
+
+        replies[-2] = hold_poll
+        args = tuple(arg for arg in trade_wait_args(endpoint, CLOSE) if arg != "--json")
+        master, terminal = pty.openpty()
+        stack.callback(os.close, master)
+        stack.callback(os.close, terminal)
+        termios.tcflow(terminal, termios.TCOOFF)
+        with subprocess.Popen(
+            [native_wait_launcher, *args],
+            env=cli_environment(home),
+            cwd=tmp_path,
+            stdout=subprocess.PIPE,
+            stderr=terminal,
+        ) as process:
+            try:
+                assert first_poll.wait(10), "polling waited on terminal output"
+                process.send_signal(signal.SIGINT)
+                stdout, _ = process.communicate(timeout=3)
+            finally:
+                release.set()
+                if process.poll() is None:
+                    process.kill()
+        assert process.returncode == 5, stdout
+        document = json.loads(stdout)
+        assert document["intentKey"] == submitted_key(
+            requests[preflight], "CLOSE_POSITION"
+        )
+        assert document["interrupted"] is True
+        assert document["outcome"] == "unknown"
 
 
 @pytest.mark.skipif(not Path("/dev/full").exists(), reason="requires /dev/full")
