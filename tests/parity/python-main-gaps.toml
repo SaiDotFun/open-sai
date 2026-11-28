@@ -6,29 +6,29 @@
 [gap."case:trade-open-market-symbol"]
 owner = "#245"
 title = "Differs from Python main. Native fee estimates price USDC at a fixed $1."
-signature = "0000000000000000000000000000000000000000000000000000000000000000"
+signature = "bc4e78ac5c7cffd36d7bedec47f3ecf0d9d365ca1d34712f47f94980f6b6e344"
 
 [gap."case:trade-margin"]
 owner = "#245"
 title = "Differs from Python main. Native margin previews read the market rate from the oracle contract, not the combined price query."
-signature = "0000000000000000000000000000000000000000000000000000000000000000"
+signature = "b71fc2e52c13efc49e35926325e7847361803ea63a3bdef7a8cd47b6bf13a9b7"
 
 [gap."case:trade-margin-capped-add"]
 owner = "#245"
 title = "Differs from Python main. Native margin previews read the market rate from the oracle contract, not the combined price query."
-signature = "0000000000000000000000000000000000000000000000000000000000000000"
+signature = "38ebbeb9f1a498091605484078e2f41744839ffb4d5664cfad19e2eaf02c6627"
 
 [gap."case:trade-margin-add-rounding"]
 owner = "#245"
 title = "Differs from Python main. Native margin previews read the market rate from the oracle contract, not the combined price query."
-signature = "0000000000000000000000000000000000000000000000000000000000000000"
+signature = "38ebbeb9f1a498091605484078e2f41744839ffb4d5664cfad19e2eaf02c6627"
 
 [gap."case:trade-margin-remove-rounding"]
 owner = "#245"
 title = "Differs from Python main. Native margin previews read the market rate from the oracle contract, not the combined price query."
-signature = "0000000000000000000000000000000000000000000000000000000000000000"
+signature = "38ebbeb9f1a498091605484078e2f41744839ffb4d5664cfad19e2eaf02c6627"
 
 [gap."case:trade-margin-after-hours"]
 owner = "#245"
 title = "Differs from Python main. Native margin previews read the market rate from the oracle contract, not the combined price query."
-signature = "0000000000000000000000000000000000000000000000000000000000000000"
+signature = "f9740ddc67e3a9b4d8ffeceaaf1e718b69ac4b7bf709229de07242e78ee4aac5"
