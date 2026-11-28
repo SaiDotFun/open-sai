@@ -83,6 +83,16 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
+@pytest.fixture(autouse=True)
+def shared_umask():
+    """Run each test under umask 022, so directories the fixtures create are
+    not group-writable on hosts whose default umask is 002. Sai refuses a
+    cache that other users can write."""
+    previous = os.umask(0o022)
+    yield
+    os.umask(previous)
+
+
 @pytest.fixture
 def cli_pair() -> tuple[tuple[str, ...], tuple[str, ...]]:
     candidate = os.environ.get("SAI_PARITY_BIN")
