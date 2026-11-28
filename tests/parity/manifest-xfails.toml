@@ -407,7 +407,7 @@ signature = "72813cb0759d60f8662b6c203b97583483a017891fc981c01a12243aec443d4c"
 
 [gap."case:mcp-intent-wait-final"]
 owner = "#175"
-signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
+signature = "6996d3f5c4c1a2d23844507666af070711b3d82b66887cd88e5b3d4c5b1a2091"
 
 [gap."case:mcp-intent-wait-pending"]
 owner = "#175"
@@ -515,12 +515,12 @@ signature = "5ae8c49462c0c2a01cfe44d95295174f5bdfb9bfc2899af7198e98a42bd0de7d"
 [gap."case:skill-install"]
 owner = "#171"
 title = "Matches Python main. Both install the same bundled skill files and report the same source metadata."
-signature = "fb681b9ad14402cd87ce65e4c033e13d1f2cdebd868464ae0594f8307405c294"
+signature = "c2ee0fedf2b35d994660a04cf6ccdc16bf92449162fd4877d956755ea536fa33"
 
 [gap."case:skill-page"]
 owner = "#171"
 title = "Matches Python main. Both emit the same bundled skill text."
-signature = "ac694c3a6e5b6e62071e1748a1562ffbf49a6c028c01344aacbd4183fe3e4bbb"
+signature = "1ec729d71b4b970b4795913cce9385b6627783bd8c5b875f93d7887c109c150c"
 
 [gap."case:skill-show"]
 owner = "#171"
@@ -558,7 +558,7 @@ signature = "866e192520eeeb1c7bc98f00573be7158e9f797c43a29d596c42d42fa157aa95"
 
 [gap."case:trade-margin"]
 owner = "#140"
-signature = "4269bbfb0e53923bd9134fb0b5e9767e03a1effdf2689e72597fd0f705e8f07e"
+signature = "f28f120b3e2cfb2f01494b96da9c8d6ec2db4eb54c8faf66eb0d47dca1615a2b"
 
 [gap."case:trade-margin-accepted"]
 owner = "#174"
@@ -644,7 +644,7 @@ signature = "6f14fe32d261f14c6bb0ff659fcdefe89f62840b9caf2a83fd2e383c8bb4ff7b"
 
 [gap."case:trade-open-market"]
 owner = "#174"
-signature = "28c31ae3c1844dbd7d085ab020635499fd074820255fbb2f23f86f61649bd715"
+signature = "b3a8f3275683876f2b98d5a075702743fe672f832ebcb6f5fcb4082146a29c27"
 
 [gap."case:trade-open-missing-side-json"]
 owner = "#172"
@@ -664,20 +664,20 @@ signature = "61313b81f4af139bb27ef9b7f77355143aa3fd54393c87e47eec75ed0258536c"
 
 [gap."case:trade-partial-close"]
 owner = "#140"
-signature = "ca7d701bbf3e8d21f85473bfcf8578da436d9a454dbd0943e7046366702d83c4"
+signature = "b3d8f991fa2c8b29f6fa37870a70c15e8febf078e67a3a82c8fa95dfa40a70fb"
 
 [gap."case:trade-partial-close-accepted"]
 owner = "#174"
-signature = "5043b94aa261baeedcb8d0e87719a415d669d761f02e0d3149c3ddc157a89521"
+signature = "d38977cc7792bdac5ee5aa123aa4245965cf4b041ff5aaae906598720c36bc08"
 
 [gap."case:trade-partial-close-after-hours"]
 owner = "#174"
 title = "Matches Python main for the after-hours partial-close preview."
-signature = "9128d43d51121a02ba0037e0ebfa31da5219ccbb17811a64a1ed2000725f8cbd"
+signature = "b8bdddf09a59a3c900cf9b3fc744ebcfb458d52e2c88983f90c44eb36a4fcd84"
 
 [gap."case:trade-partial-close-confirm-current-route"]
 owner = "#174"
-signature = "e361732f3294c8bf331fe72a37a27b886edf99cef1b0c3150efc6fcf45a8430d"
+signature = "2266b65d07efc78298b68211c400100eb15bf335dcdb955d32d9e04e699c0f75"
 
 [gap."case:trade-partial-close-index-lag-before-minimum"]
 owner = "#174"
@@ -697,7 +697,7 @@ signature = "56a6650730701052d1895a5c7b06591a0faed6885b30a4a64b3f4e8d146e8c43"
 [gap."case:trade-partial-close-live-leverage-change"]
 owner = "#174"
 title = "Differs from Python main in the error log. Both reject the stale preview after rechecking the position."
-signature = "ad7670fb451638dc7b6aa9db6dbfaacd2df042c149229042a8daded4d1c0d48b"
+signature = "92e7d8f9b0bcb06f739034cf35ee70b21ff0ee687962fbc7de329a07b083c8cd"
 
 [gap."case:trade-partial-close-malformed-percent"]
 owner = "#49"
@@ -707,20 +707,20 @@ signature = "4f264b3264ad84549e26b00b867dde006e21ebbbf3db9a775a0569f29b186228"
 [gap."case:trade-partial-close-market-minimum"]
 owner = "#174"
 title = "Matches Python main for the 99% partial-close preview."
-signature = "121bed116fd50c2ff4e91c8b43382f0ed5344b28e5c0b2658ee1642b0989516a"
+signature = "992ad321145eac0be60b9692335a79716fed5cff8f53e18a91b532b014ee2729"
 
 [gap."case:trade-partial-close-no-oracle"]
 owner = "#174"
 title = "Released Python still reads the USDC rate. The current preview quotes one dollar per USDC."
-signature = "4648add5baef78f31e1b85dbafd6b2691df7a1dec6f316ea6e02b00de22eeb97"
+signature = "10eeddd2c6f9970a7cda29156b96ee31d338a2bd740a73cfd101c76ebb37af9e"
 
 [gap."case:trade-partial-close-refuse-stale-chain"]
 owner = "#174"
-signature = "be7046609cc95470fdc8d83d715121bd221ba145503e247a3af6b6876088ff0e"
+signature = "bea5866d3806e635e313f31d71513f94c0a2ea8a660cba286ba673e041851cd7"
 
 [gap."case:trade-partial-close-refuse-stale-contract"]
 owner = "#174"
-signature = "be7046609cc95470fdc8d83d715121bd221ba145503e247a3af6b6876088ff0e"
+signature = "bea5866d3806e635e313f31d71513f94c0a2ea8a660cba286ba673e041851cd7"
 
 [gap."case:trade-partial-close-refuse-wrong-lcd-on-confirm"]
 owner = "#174"
@@ -729,12 +729,12 @@ signature = "15b880ff6d30e09b3dd13222889d760bc53304aeb57e00436331a1a06acc73a3"
 [gap."case:trade-partial-close-rounding"]
 owner = "#174"
 title = "Matches Python main for the partial-close rounding preview."
-signature = "9e4872eab774530da699cd141de65bac3ae75d12663eed5c21aa1be0f2518aa9"
+signature = "0bed5042c20bd8bc99780db38733f55fce95c12e231c03092ce20badb33d85d8"
 
 [gap."case:trade-partial-close-scientific-reduction"]
 owner = "#174"
 title = "Matches Python main for the partial-close preview with a reduction in scientific notation."
-signature = "172e977a334b74eabefc8c2a70a35650234bd7e2ab1bd3dde73cd60756eb1e34"
+signature = "32dd26400a4c17b1a0047563fa777afccbd2047129d33ba238779e1d46bf2c54"
 
 [gap."case:trade-partial-close-unicode-percent"]
 owner = "#139"
@@ -742,7 +742,7 @@ signature = "5b545493cbedb49797318e5516595b2029764cc350bda78b5c3493f002389a5e"
 
 [gap."case:trade-partial-close-unknown-blocks-retry"]
 owner = "#174"
-signature = "150574bac35091d382a56d0cd347903b0d46de79a128f2cf8044709568be8f06"
+signature = "1f8e56f0faec6780a8460e01f522c6aac03467f89b72297ac69cb9779b369abc"
 
 [gap."case:trade-tpsl"]
 owner = "#174"
@@ -877,7 +877,7 @@ signature = "f796d5fd0e7d5c0c32766ed61c1802a6fec907517ed4e9bc7f5f6758c32e25ad"
 
 [gap."mcp:intent_wait"]
 owner = "#175"
-signature = "c7b6297f0bae7d431708a75bc67401973eac5efb724871436a7c01c1baf2308d"
+signature = "c4e865d743d86b5f78dced586f639d1e3b5bbf633dc8158adfb1bfcba8cf052b"
 
 [gap."mcp:logs_intent"]
 owner = "#175"
@@ -899,9 +899,59 @@ signature = "3b2844b011b77ddc9648577a2755b9ce4f8530631367c8ac630453f50d73dec4"
 # The v0.1.2 inventory has a different open-tool description.
 [gap."mcp:preview_open"]
 owner = "#49"
-signature = "82489300a9b00d596a66c573969c7a44bbe6560d7f3cfaad661a0bcb3d8b3745"
+signature = "d97dd03383e1aa0233dae20dd81011c2dc688e50f6cbd06d3c30d0d0914401d8"
 
 # The v0.1.2 inventory has a different open-tool description.
 [gap."mcp:trade_open"]
 owner = "#49"
-signature = "0adb73da98a9099253ec61090e17065d597f2f2558c3a663c1c7036e2eaebd5f"
+signature = "91651f557604f2e0fb9d10cf626e7bda5a6cfa9564de925922593f3976f768ab"
+
+[gap."case:mcp-trade-close-confirmation"]
+owner = "#245"
+title = "Differs from Python v0.1.3. Native fee estimates price USDC at a fixed $1."
+signature = "4074f08c7f835ec17ff448b8d9b8f85ae01384e0abfdcba96293a0d5615fc1a8"
+
+[gap."case:mcp-trade-margin-confirmation"]
+owner = "#231"
+title = "Differs from Python v0.1.3. Native MCP margin previews show collateral in USD."
+signature = "b19925a8768f241d7d7bf718603ce3e65bab795339548680410bd9cbee6a9ebd"
+
+[gap."case:mcp-trade-open-confirmation"]
+owner = "#245"
+title = "Differs from Python v0.1.3. Native fee estimates price USDC at a fixed $1."
+signature = "4074f08c7f835ec17ff448b8d9b8f85ae01384e0abfdcba96293a0d5615fc1a8"
+
+[gap."case:trade-partial-close-mcp-changed-leverage"]
+owner = "#231"
+title = "Differs from Python v0.1.3. Native partial-close previews read the market oracle and show collateral in USD."
+signature = "f3940a39308b97cebfd0a6e835aa89407d204301d1795f105ae0554bf4e6acb3"
+
+[gap."mcp:preview_close"]
+owner = "#245"
+title = "Native close fee estimates price USDC at a fixed $1."
+signature = "f8fe76c7620f140b21cf0865c32333c729715623d341970b129e70de75c0e511"
+
+[gap."mcp:preview_margin"]
+owner = "#231"
+title = "Native MCP margin previews show collateral in USD."
+signature = "c6dfaa6d7609b0559e6dcd8db7ebd7f73bd9f1161b7122785f4f5bb0e125bab6"
+
+[gap."mcp:preview_partial_close"]
+owner = "#231"
+title = "Native partial-close previews show collateral in USD."
+signature = "aad66ead45661afde6fb01aaefd79d54deff997f5ab53b53999f29df1c351e05"
+
+[gap."mcp:trade_close"]
+owner = "#245"
+title = "Native close fee estimates price USDC at a fixed $1."
+signature = "91b3f266946af7059d2e4d62276249dabfeb2956daac2e8c5a988a97cf6ff036"
+
+[gap."mcp:trade_margin"]
+owner = "#231"
+title = "Native MCP margin previews show collateral in USD."
+signature = "53d908bc1e21cecc5dad324113c4b925d6977ead6121a868359b5f24f85a537e"
+
+[gap."mcp:trade_partial_close"]
+owner = "#231"
+title = "Native partial-close previews show collateral in USD."
+signature = "19f2026ef28b7d21933dd10323dbff101048b932f4db2c08735fdce7b28b7399"
