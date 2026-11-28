@@ -1,6 +1,5 @@
 use std::{
     future::{Future, pending},
-    io::{self, IsTerminal as _},
     sync::OnceLock,
     time::{Duration, Instant},
 };
@@ -798,7 +797,7 @@ impl WaitTrade<'_> {
                 Err(error) if error.code == Code::OutcomeUnknown => None,
                 Err(error) => return Err(error),
             };
-            if !self.json && io::stderr().is_terminal() {
+            if !self.json {
                 local::write_stderr_detached(format!("Waiting for intent {key} to confirm...\n"));
             }
             let remember_fill = |receipt| {

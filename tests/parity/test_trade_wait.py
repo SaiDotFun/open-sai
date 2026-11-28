@@ -1440,7 +1440,7 @@ def test_current_cli_wait_progress_precedes_the_receipt(
                 stream = terminal_output if terminal else process.stderr
                 assert stream is not None
                 assert not select.select([process.stdout], [], [], 0)[0]
-                if not json_output and (terminal or launcher == "python"):
+                if not json_output:
                     assert select.select([stream], [], [], 1)[0]
                     progress = os.read(stream.fileno(), 256).replace(b"\r\n", b"\n")
                     assert (
