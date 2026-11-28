@@ -632,6 +632,9 @@ def test_trade_wait_replays_pending_then_receipt(
             if writer.rust:
                 # Python main still reports base units only (#231).
                 fill |= {"sizeCollateralUsd": None, "escrowedCollateralUsd": "4"}
+                if action.change in {"position_closed_user", "trade_size_decrease"}:
+                    # Only native close receipts report realized PnL (#268).
+                    fill["realizedPnl"] = None
             assert receipt["fill"] == fill
         else:
             assert receipt["fill"] is None
