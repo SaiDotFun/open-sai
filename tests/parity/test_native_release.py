@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import runpy
 import shutil
 import subprocess
@@ -24,6 +25,20 @@ TARGETS = (
     "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
 )
+
+
+# Inline targets `](target)` and reference definitions `[label]: target`.
+LINK_TARGET = re.compile(
+    r"\]\(\s*<?([^)\s>]*)|^\s{0,3}\[[^\]]+\]:\s*<?([^\s>]+)", re.MULTILINE
+)
+
+
+def unreachable_links(markdown: str) -> list[str]:
+    """Link targets that would not resolve on a GitHub release page."""
+    targets = (
+        inline or reference for inline, reference in LINK_TARGET.findall(markdown)
+    )
+    return [target for target in targets if not target.startswith(("https://", "#"))]
 
 
 def native_dist(
@@ -164,7 +179,26 @@ def test_renders_the_checked_in_guide_with_absolute_links() -> None:
     guide = path.read_text()
     body = guide.split("\n", 1)[1].strip()
     assert result.stdout.startswith(body + "\n\n## Choose the Sai Package")
-    assert "](../" not in result.stdout
+    assert unreachable_links(result.stdout) == []
+
+
+def test_release_page_links_must_be_absolute_or_anchors() -> None:
+    notes = """See [install](https://github.com/SaiDotFun/open-sai#install),
+[below](#upgrade), [readme](README.md#trader-cli), [docs](./docs/x.md),
+[up](../README.md), [titled](docs/y.md "Y"), [bare](<docs/z.md>), [http](http://x).
+
+[ref]: README.md
+[ok]: https://example.com
+"""
+    assert unreachable_links(notes) == [
+        "README.md#trader-cli",
+        "./docs/x.md",
+        "../README.md",
+        "docs/y.md",
+        "docs/z.md",
+        "http://x",
+        "README.md",
+    ]
 
 
 def test_stages_python_only_without_cargo_or_shim(tmp_path: Path) -> None:
