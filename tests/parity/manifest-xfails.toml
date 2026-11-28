@@ -550,7 +550,7 @@ signature = "866e192520eeeb1c7bc98f00573be7158e9f797c43a29d596c42d42fa157aa95"
 
 [gap."case:trade-concurrent-close"]
 owner = "#174"
-signature = "ee620d557b9aaa98d05641bce515e6448d93d04c21e87294ba2c2592e40bc8fb"
+signature = "51d0dca95ad14273a44ecd5cdcbb44282605db8df428aef7bfd1e33f64008d2f"
 
 [gap."case:trade-leverage"]
 owner = "#174"
@@ -562,17 +562,17 @@ signature = "f28f120b3e2cfb2f01494b96da9c8d6ec2db4eb54c8faf66eb0d47dca1615a2b"
 
 [gap."case:trade-margin-accepted"]
 owner = "#174"
-signature = "a9efbdd68197dad827008734d01c42ea68fb48edc3b0f8498de32189aa025b2f"
+signature = "b6076d647e7eca2556b3c3e195f252cd216845b58277c11844419fa1f10b49c9"
 
 [gap."case:trade-margin-add-rounding"]
 owner = "#231"
 title = "Differs from Python main. The margin preview comparison reports different request traces or output."
-signature = "2b1f303fd087fd6ac42546a5db972c2442a93fa04a61711baac9ad54dd27fe67"
+signature = "2fb21f06f0bafc1a21d64d9857309c434b2e1a05bc6e377b3c0ad13dbf3893e6"
 
 [gap."case:trade-margin-after-hours"]
 owner = "#231"
 title = "Differs from Python main. The margin preview comparison reports different request traces or output."
-signature = "4e0222d17bdbfb6b56b913765ab64004b69438b3aabf6d2115e58d96fe698c9d"
+signature = "a23a081a23fdcc0e2baf0819046fa48acb70a9f3e551555018bb215edbd35c49"
 
 [gap."case:trade-margin-amount-required"]
 owner = "#49"
@@ -587,7 +587,7 @@ signature = "3e39c6cc4d1f37a135e532a47b5a1e0dde6d6d73fd2e67e53b0933f340a0634b"
 [gap."case:trade-margin-equivalent-owner"]
 owner = "#174"
 title = "Differs from Python main. Rust makes extra validation reads before submitting for an equivalent owner."
-signature = "80e9822f1ef14861aee9efc7d13305e17ff07d0844a930c103f3305884d7a168"
+signature = "0729375fc66bc3d3f344383ea5d530b369eeaa4a81319fff20541dfc3994dc51"
 
 [gap."case:trade-margin-foreign-contract-owner"]
 owner = "#49"
@@ -616,12 +616,12 @@ signature = "c31c076f2a5480bc0a961f1f557b80545ac070b45ca9e508b916596bdb894d46"
 
 [gap."case:trade-margin-rejected"]
 owner = "#174"
-signature = "754f7e213433010b6dd71c125b75c074c5c654b94cfcffb8e399f4946c254a6c"
+signature = "7948527afb0c22cec7e00b6c14d4ada11fcf3c25c4fcf7fbca5874f260b003e8"
 
 [gap."case:trade-margin-remove-rounding"]
 owner = "#231"
 title = "Differs from Python main. The margin preview comparison reports different request traces or output."
-signature = "c9de985fdcbb2f9633a864fdbec0ad50f7ad59508b9aba80eaeb731903088094"
+signature = "2063b64466f356e2c2f5bc386da279bc76bb666e0367e4dbd8f305febe68880c"
 
 [gap."case:trade-margin-signed-out-before-amount"]
 owner = "#174"
@@ -630,7 +630,7 @@ signature = "3290d000c84dce5128ae890bde3c57928de183ecd2c6dfdc33b37bbab775b414"
 
 [gap."case:trade-margin-unknown-blocks-retry"]
 owner = "#174"
-signature = "f696b876c747f2f3f25d5ca582911af9f06442992f6fdddf58ce35ffa988022c"
+signature = "2d5dfe07f5a9b000279950588a1796ad7649faabab6e52c955a5fc75971a548a"
 
 [gap."case:trade-margin-wrong-contract-index"]
 owner = "#49"
