@@ -93,7 +93,7 @@ pub(super) fn show(result: &Value) -> Result<(), SaiError> {
                     number(&row["triggerPriceUsd"], ""),
                     number(&row["sizeUsd"], ""),
                     collateral(row),
-                    number(&row["leverage"], "x"),
+                    leverage(&row["leverage"]),
                     number(&row["takeProfitPriceUsd"], ""),
                     number(&row["stopLossPriceUsd"], ""),
                     source(row),
@@ -425,7 +425,7 @@ impl Display {
                     text(&row["side"]),
                     number(&row["sizeUsd"], ""),
                     collateral(row),
-                    number(&row["leverage"], "x"),
+                    leverage(&row["leverage"]),
                     number(&row["unrealizedPnlUsd"], ""),
                     number(&row["unrealizedPnlPercent"], "%"),
                 ]
@@ -574,6 +574,13 @@ fn trigger(row: &Value, prefix: &str) -> String {
             number(&row[format!("{prefix}DistancePercent")], "%")
         )
     }
+}
+
+/// Show leverage to two decimals. A margin change sets an exact target
+/// leverage such as 1.500000075, which reads as noise at full precision.
+fn leverage(value: &Value) -> String {
+    let rounded = value.as_f64().map(|value| (value * 100.0).round() / 100.0);
+    number(&json!(rounded), "x")
 }
 
 // Match Python's comma grouping and eight significant digits for overview values.
