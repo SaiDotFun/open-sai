@@ -68,3 +68,94 @@ def without_receipt_usd(native: dict[str, Any]) -> dict[str, Any]:
         for field in fields:
             (receipt.get(section) or {}).pop(field, None)
     return result
+
+
+def _insert_after(mapping: dict[str, Any], anchor: str, key: str, value: Any) -> None:
+    items = list(mapping.items())
+    mapping.clear()
+    for name, item in items:
+        mapping[name] = item
+        if name == anchor:
+            mapping[key] = value
+
+
+def _usd_or_none(units: Any, usdc: bool) -> str | None:
+    if not usdc or isinstance(units, bool):
+        return None
+    if isinstance(units, int) and units >= 0:
+        return usd(units)
+    if isinstance(units, str) and units.isascii() and units.isdigit():
+        return usd(int(units))
+    return None
+
+
+def _collateral_rows(preview: dict[str, Any]) -> dict[str, str] | None:
+    intent = preview.get("intent") or {}
+    quote = preview.get("quote") or {}
+    if intent.get("kind") == "DECREASE_POSITION_SIZE":
+        before = quote.get("collateralBefore")
+        reduction = (intent.get("body") or {}).get("collateral", {}).get("amountUsdc")
+        if before is None or reduction is None:
+            return None
+        before, reduction = int(before), int(reduction)
+        return {"beforeUsd": usd(before), "afterUsd": usd(before - reduction)}
+    if (intent.get("body") or {}).get("requestedLeverage") is None:
+        return None
+    source = quote or {
+        "collateralBefore": (preview.get("collateralBaseUnits") or {}).get("before"),
+        "collateralAfter": (preview.get("collateralBaseUnits") or {}).get("after"),
+    }
+    before, after = source.get("collateralBefore"), source.get("collateralAfter")
+    if before is None or after is None:
+        return None
+    return {"beforeUsd": usd(int(before)), "afterUsd": usd(int(after))}
+
+
+def as_native_usdc(value: Any) -> Any:
+    """Project a Python main tool reply onto the native USDC fields.
+
+    The fee price must be the $1 fixture rate, so the amounts already match.
+    """
+    if not isinstance(value, dict):
+        return value
+    result = deepcopy(value)
+    preview = result.get("preview")
+    if isinstance(preview, dict):
+        result["preview"] = as_native_usdc(preview)
+    fees = (result.get("estimates") or {}).get("fees") or {}
+    price = fees.get("collateralPriceUsd")
+    if isinstance(price, dict) and price.get("price") == "1":
+        fees["collateralPriceUsd"] = FIXED_USDC_PRICE
+    if "intent" in result and "collateral" not in result:
+        rows = _collateral_rows(result)
+        if rows is not None:
+            items = list(result.items())
+            result.clear()
+            result.update(items[:2])
+            result["collateral"] = rows
+            result.update(items[2:])
+    receipt = result.get("receipt")
+    if isinstance(receipt, dict):
+        position = receipt.get("positionNow")
+        symbol = None
+        if isinstance(position, dict):
+            borrowing = position.get("perpBorrowing") or {}
+            symbol = (borrowing.get("collateralToken") or {}).get("symbol")
+        usdc = symbol in (None, "USDC")
+        fill = receipt.get("fill")
+        if isinstance(fill, dict):
+            for base, field in (
+                ("sizeCollateralBaseUnits", "sizeCollateralUsd"),
+                ("escrowedCollateralBaseUnits", "escrowedCollateralUsd"),
+            ):
+                if base in fill:
+                    _insert_after(fill, base, field, _usd_or_none(fill[base], usdc))
+        if isinstance(position, dict):
+            for base, field in (
+                ("collateralAmount", "collateralUsd"),
+                ("openCollateralAmount", "openCollateralUsd"),
+            ):
+                if base in position:
+                    dollars = _usd_or_none(position[base], usdc)
+                    _insert_after(position, base, field, dollars)
+    return result

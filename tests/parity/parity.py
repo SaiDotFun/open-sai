@@ -49,6 +49,7 @@ from manifest_gaps import ManifestGaps
 from mcp_cases import CALLS, RELEASE_MCP_TOOL_NAMES, handshake
 from mcp_clients import SECRET, client_state, seed_clients
 from network import enter_loopback, restricted, unroutable_packets
+from python_main_usdc import as_native_usdc
 from reference_uv import resolve_uv
 from release_mismatch import differing_paths, value_fingerprint
 from sai_cli.sai_cli import command_path
@@ -962,6 +963,29 @@ def project_reference_auth_status_errors(
     return "Native MCP auth status omits disconnected addresses" if changed else None
 
 
+def project_reference_native_usdc(output: Any) -> None:
+    """Show Python tool replies with the native fixed USDC price and USD rows.
+
+    Python is frozen and keeps the oracle rate (README "Fixed USDC Price").
+    """
+    if not isinstance(output, list):
+        return
+    for frame in output:
+        result = frame.get("result") if isinstance(frame, dict) else None
+        if not isinstance(result, dict) or "_toolText" not in result:
+            continue
+        for block in result.get("content", []):
+            value = block.get("text")
+            projected = as_native_usdc(value)
+            # Python serializes tool replies with json.dumps, so a changed
+            # reply keeps its byte form only when the original round-trips.
+            if projected == value or json.dumps(value) != result["_toolText"]:
+                continue
+            block["text"] = projected
+            result["structuredContent"]["result"] = projected
+            result["_toolText"] = json.dumps(projected)
+
+
 def expect_native_mcp_validation(
     output: list[dict[str, Any]], profile: str
 ) -> str | None:
@@ -1259,6 +1283,8 @@ def run_case(
     if cutover:
         diffs = cutover_differences(left, right)
     else:
+        if rust and case.mode == "mcp":
+            project_reference_native_usdc(left.output)
         if rust and case.name == "trade-open-unknown-market-symbol":
             error = left.output.get("error", {})
             if (
