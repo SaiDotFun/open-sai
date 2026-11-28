@@ -43,9 +43,13 @@ use crate::reads::output;
 
 pub(crate) use install::launcher_path;
 
-const MCP_WAIT_LIMIT: Duration = Duration::from_secs(10);
+// Python's 10-second wait stays the default. A caller can ask for the
+// 60 seconds that CLI `--wait` uses, which covers Keeper's finality lag.
+const MCP_WAIT_DEFAULT: Duration = Duration::from_secs(10);
+const MCP_WAIT_LIMIT: Duration = Duration::from_secs(60);
 const INSTRUCTIONS: &str = include_str!("mcp/instructions.txt");
 // Wire metadata captured from Python main at 1c671b231b0fc968a44ec8dd520e67ea28e25b7f.
+// The native intent_wait description states its longer limit.
 static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
     serde_json::from_str(include_str!("mcp/tools.json")).expect("valid Python tool inventory")
 });
@@ -341,7 +345,7 @@ impl SaiMcp {
         let seconds = args
             .get("timeout")
             .and_then(validation::float_value)
-            .unwrap_or(MCP_WAIT_LIMIT.as_secs_f64());
+            .unwrap_or(MCP_WAIT_DEFAULT.as_secs_f64());
         let timeout = wait::validate_timeout(seconds)?.min(MCP_WAIT_LIMIT);
         let key = args["key"]
             .as_str()
@@ -737,11 +741,9 @@ fn latest_version(home: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn queued_timeout_omits_an_unresolved_address() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Environment::new(home.path().to_owned(), |_| None);
-        let server = SaiMcp {
+    fn queued_server(home: &Path) -> SaiMcp {
+        let env = Environment::new(home.to_owned(), |_| None);
+        SaiMcp {
             settings: Arc::new(Settings::load(&Flags::default(), &env).unwrap()),
             env,
             writer: None,
@@ -749,10 +751,17 @@ mod tests {
             local_ledger_slots: Arc::new(Semaphore::new(2)),
             trade_slots: Arc::new(Semaphore::new(2)),
             reconcile_slots: Arc::new(Semaphore::new(8)),
+            // No wait slot frees up, so each wait runs out its whole timeout.
             wait_slots: Arc::new(Semaphore::new(0)),
             log_slots: Arc::new(Semaphore::new(2)),
             overview_slots: Arc::new(Semaphore::new(2)),
-        };
+        }
+    }
+
+    #[test]
+    fn queued_timeout_omits_an_unresolved_address() {
+        let home = tempfile::tempdir().unwrap();
+        let server = queued_server(home.path());
         let args = json!({
             "addr": "https://keeper.invalid/?key=fixture-wait-addr",
             "key": "fixture-wait",
@@ -768,5 +777,35 @@ mod tests {
         assert_eq!(result["code"], "OUTCOME_UNKNOWN");
         assert_eq!(result["intentKey"], "fixture-wait");
         assert_eq!(result["addr"], Value::Null);
+    }
+
+    #[test]
+    fn intent_wait_honors_timeouts_up_to_the_cli_wait_limit() {
+        let home = tempfile::tempdir().unwrap();
+        let server = queued_server(home.path());
+        // Tokio's paused clock skips ahead, so the waits finish at once.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        for (timeout, waited) in [
+            (None, 10),
+            (Some(json!(45)), 45),
+            (Some(json!(60)), 60),
+            (Some(json!(600)), 60),
+        ] {
+            let mut args = Map::from_iter([("key".into(), json!("fixture-wait"))]);
+            if let Some(timeout) = timeout {
+                args.insert("timeout".into(), timeout);
+            }
+            let (result, elapsed) = runtime.block_on(async {
+                let started = tokio::time::Instant::now();
+                let result = server.wait_for_intent(&args, "fixture-call").await;
+                (result.unwrap(), started.elapsed())
+            });
+            assert_eq!(result["code"], "OUTCOME_UNKNOWN");
+            assert_eq!(elapsed.as_secs(), waited, "timeout {args:?}");
+        }
     }
 }
