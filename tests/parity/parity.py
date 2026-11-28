@@ -972,18 +972,21 @@ def project_reference_native_usdc(output: Any) -> None:
         return
     for frame in output:
         result = frame.get("result") if isinstance(frame, dict) else None
-        if not isinstance(result, dict) or "_toolText" not in result:
+        if not isinstance(result, dict):
             continue
+        text = result.get("_toolText")
         for block in result.get("content", []):
             value = block.get("text")
             projected = as_native_usdc(value)
             # Python serializes tool replies with json.dumps, so a changed
             # reply keeps its byte form only when the original round-trips.
-            if projected == value or json.dumps(value) != result["_toolText"]:
+            if projected == value or (text is not None and json.dumps(value) != text):
                 continue
             block["text"] = projected
-            result["structuredContent"]["result"] = projected
-            result["_toolText"] = json.dumps(projected)
+            if isinstance(result.get("structuredContent"), dict):
+                result["structuredContent"]["result"] = projected
+            if text is not None:
+                result["_toolText"] = json.dumps(projected)
 
 
 def expect_native_mcp_validation(
