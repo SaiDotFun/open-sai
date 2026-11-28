@@ -259,12 +259,13 @@ fn balance_source(row: &Value) -> String {
     } else {
         format!("{hours}h {minutes}m")
     };
-    let stale = if row["stale"] == true {
-        " · stale"
-    } else {
-        ""
-    };
-    format!("block {height} ({elapsed} old{stale})")
+    // The source block is the balance's last change. An old one means an
+    // idle account, not a failed read, so name the age by that change.
+    match (row["stale"] == true, row["sourceAtBasis"] == "fetchedAt") {
+        (true, false) => format!("block {height} (unchanged for {elapsed})"),
+        (true, true) => format!("block {height} ({elapsed} old · stale)"),
+        (false, _) => format!("block {height} ({elapsed} old)"),
+    }
 }
 
 pub(super) fn show_table(
