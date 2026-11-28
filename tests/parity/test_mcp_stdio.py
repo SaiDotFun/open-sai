@@ -381,6 +381,14 @@ TRADE_INTEGER_ERROR = (
     "Value error, Expected a nonnegative integer or a string of ASCII digits",
     "value_error",
 )
+MARKET_ID_ERROR = (
+    (
+        "Value error, Expected a market ID (a nonnegative integer or a string of"
+        " ASCII digits) or a market symbol"
+    ),
+    "value_error",
+)
+UNKNOWN_SYMBOL = "Unknown market symbol in market_id. Call market_list for market IDs."
 
 
 def validation_text(tool: str, *issues: tuple[str | None, str, str]) -> str:
@@ -398,9 +406,7 @@ def validation_text(tool: str, *issues: tuple[str | None, str, str]) -> str:
     return "\n".join(lines)
 
 
-@pytest.mark.parametrize(
-    "market_id", [-3, " 3", "3e0", "01_1", "+02", "٣", 3.0, True, []]
-)
+@pytest.mark.parametrize("market_id", [-3, " 3", "01_1", "+02", "٣", 3.0, True, []])
 def test_trade_integer_rejections(
     native: Path, tmp_path: Path, market_id: object
 ) -> None:
@@ -425,12 +431,67 @@ def test_trade_integer_rejections(
                 "type": "text",
                 "text": validation_text(
                     "trade_open",
-                    ("market_id", *TRADE_INTEGER_ERROR),
+                    ("market_id", *MARKET_ID_ERROR),
                 ),
             }
         ]
         assert "structuredContent" not in result
         assert not endpoints.wire
+
+
+OPEN_ARGUMENTS = {
+    "side": "long",
+    "order_type": "market",
+    "amount": "20",
+    "leverage": "2",
+    "slippage": "1",
+}
+
+
+def test_open_resolves_a_market_symbol(native: Path, tmp_path: Path) -> None:
+    with (
+        loopback("market-symbol") as endpoints,
+        server(native, tmp_path / "home", endpoints, seed="session") as stdio,
+    ):
+        arguments = {**OPEN_ARGUMENTS, "addr": ADDRESS}
+        by_symbol = stdio.call(2, "preview_open", market_id="bTc", **arguments)
+        assert by_symbol["isError"] is False
+        assert endpoints.wire[0].label == "borrowings"
+        by_id = stdio.call(3, "preview_open", market_id=3, **arguments)
+    preview = json.loads(by_symbol["content"][0]["text"])
+    assert preview["intent"]["body"]["market"] == {"marketIndex": "MarketIndex(3)"}
+    assert (
+        preview["previewDigest"]
+        == json.loads(by_id["content"][0]["text"])["previewDigest"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("scenario", "market_id", "message"),
+    [
+        (
+            "normal",
+            "BTC",
+            "Ambiguous market symbol 'BTC'. Pass a market ID: 0, 3.",
+        ),
+        ("normal", "UNKNOWN", UNKNOWN_SYMBOL),
+        ("normal", "3e0", UNKNOWN_SYMBOL),
+    ],
+)
+def test_open_refuses_an_unmatched_market_symbol(
+    native: Path, tmp_path: Path, scenario: str, market_id: str, message: str
+) -> None:
+    with (
+        loopback(scenario) as endpoints,
+        server(native, tmp_path / "home", endpoints) as stdio,
+    ):
+        result = stdio.call(2, "preview_open", market_id=market_id, **OPEN_ARGUMENTS)
+        assert result["isError"] is False
+        assert json.loads(result["content"][0]["text"]) == {
+            "error": message,
+            "code": "INVALID_REQUEST",
+        }
+        assert [request.label for request in endpoints.wire] == ["borrowings"]
 
 
 @pytest.mark.parametrize("offline", ["true", "YES", 1.0])

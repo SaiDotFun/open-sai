@@ -2,6 +2,7 @@ use std::{future::pending, path::Path};
 
 use sai_core::{
     errors::{Code, SaiError},
+    keeper::Keeper,
     log::{self, EventContext, Surface},
     storage::{Storage, StorageEvent, is_trade_reservation_diagnostic},
     trade::{
@@ -117,9 +118,24 @@ impl<'a> Action<'a> {
                 .map_err(with_recovery_account);
         }
 
+        // Validation keeps market_id as a string only for a market symbol.
+        let market = match args.get("market_id") {
+            Some(Value::String(symbol)) => Some(
+                Keeper::new(endpoint, events)
+                    .market_symbol(symbol, pending())
+                    .await?
+                    .id(
+                        symbol,
+                        "Unknown market symbol in market_id. Call market_list for market IDs.",
+                    )?
+                    .to_string(),
+            ),
+            Some(_) => Some(integer("market_id").to_owned()),
+            None => None,
+        };
         let preview = match self.kind {
             "open" => OpenTrade {
-                market: integer("market_id"),
+                market: market.as_deref().expect("validated market_id"),
                 side: match required("side") {
                     "long" => Side::Long,
                     "short" => Side::Short,

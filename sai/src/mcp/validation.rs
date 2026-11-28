@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 
 use rmcp::model::Tool;
-use sai_core::settings::repr;
+use sai_core::{keeper::is_market_symbol, settings::repr};
 use serde_json::{Map, Value};
 
 const PYDANTIC_ERRORS: &str = "https://errors.pydantic.dev/2.14/v";
@@ -33,6 +33,15 @@ pub(super) fn arguments<'a>(
             .and_then(|text| serde_json::from_str::<Value>(text).ok())
             .filter(|value| matches!(value, Value::Null | Value::Array(_) | Value::Object(_)));
         let value = parsed.as_ref().unwrap_or(value);
+        if name == "market_id" && super::trade::Action::named(&tool.name).is_some() {
+            match market(value) {
+                Ok(replacement) => {
+                    converted.extend(replacement.or(parsed).map(|value| (name.clone(), value)))
+                }
+                Err((message, code)) => issues.push(Issue::new(Some(name), message, code)),
+            }
+            continue;
+        }
         let schema = if let Some(alternatives) = schema.get("anyOf").and_then(Value::as_array) {
             if value.is_null() {
                 converted.extend(parsed.map(|value| (name.clone(), value)));
@@ -59,10 +68,10 @@ pub(super) fn arguments<'a>(
                 Err(("Input should be a valid string", "string_type"))
             }
             Some("integer")
-                if matches!(name.as_str(), "market_id" | "trade_id" | "percent")
+                if matches!(name.as_str(), "trade_id" | "percent")
                     && super::trade::Action::named(&tool.name).is_some() =>
             {
-                trade_integer(value)
+                trade_integer(value, TRADE_INTEGER)
             }
             Some("integer") => integer(value),
             Some("number") => number(value),
@@ -160,7 +169,21 @@ fn is_integer(value: &Value) -> bool {
 
 type Conversion = Result<Option<Value>, (&'static str, &'static str)>;
 
-fn trade_integer(value: &Value) -> Conversion {
+const TRADE_INTEGER: &str =
+    "Value error, Expected a nonnegative integer or a string of ASCII digits";
+
+/// Accept a market ID like trade IDs do, or keep a symbol for the Keeper lookup.
+fn market(value: &Value) -> Conversion {
+    match value {
+        Value::String(text) if is_market_symbol(text) => Ok(None),
+        _ => trade_integer(
+            value,
+            "Value error, Expected a market ID (a nonnegative integer or a string of ASCII digits) or a market symbol",
+        ),
+    }
+}
+
+fn trade_integer(value: &Value, expected: &'static str) -> Conversion {
     match value {
         Value::Number(number) if number.as_str() == "-0" => Ok(Some(Value::from(0))),
         Value::Number(number) if is_integer(value) && !number.as_str().starts_with('-') => Ok(None),
@@ -169,10 +192,7 @@ fn trade_integer(value: &Value) -> Conversion {
         {
             integer(value)
         }
-        _ => Err((
-            "Value error, Expected a nonnegative integer or a string of ASCII digits",
-            "value_error",
-        )),
+        _ => Err((expected, "value_error")),
     }
 }
 
