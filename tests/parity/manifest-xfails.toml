@@ -515,12 +515,12 @@ signature = "5ae8c49462c0c2a01cfe44d95295174f5bdfb9bfc2899af7198e98a42bd0de7d"
 [gap."case:skill-install"]
 owner = "#171"
 title = "Matches Python main. Both install the same bundled skill files and report the same source metadata."
-signature = "c2ee0fedf2b35d994660a04cf6ccdc16bf92449162fd4877d956755ea536fa33"
+signature = "bdff17d62290622bc8be6cecf9465cff64e2b65adb1e48858e610bd92f51df64"
 
 [gap."case:skill-page"]
 owner = "#171"
 title = "Matches Python main. Both emit the same bundled skill text."
-signature = "1ec729d71b4b970b4795913cce9385b6627783bd8c5b875f93d7887c109c150c"
+signature = "4cbfe2980f9e481dc2262777d8b890423992ceaf42cf97a9e45f6b5bccbf7311"
 
 [gap."case:skill-show"]
 owner = "#171"
