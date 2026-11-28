@@ -1,3 +1,34 @@
 # Reviewed Python main vs Rust differences.
 # The issue #231 comparisons now run as passing cases in test_manifest_gaps.py.
+# Python is frozen. The #245 rows record its USDC oracle reads.
 [gap]
+
+[gap."case:trade-open-market-symbol"]
+owner = "#245"
+title = "Differs from Python main. Native fee estimates price USDC at a fixed $1."
+signature = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[gap."case:trade-margin"]
+owner = "#245"
+title = "Differs from Python main. Native margin previews read the market rate from the oracle contract, not the combined price query."
+signature = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[gap."case:trade-margin-capped-add"]
+owner = "#245"
+title = "Differs from Python main. Native margin previews read the market rate from the oracle contract, not the combined price query."
+signature = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[gap."case:trade-margin-add-rounding"]
+owner = "#245"
+title = "Differs from Python main. Native margin previews read the market rate from the oracle contract, not the combined price query."
+signature = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[gap."case:trade-margin-remove-rounding"]
+owner = "#245"
+title = "Differs from Python main. Native margin previews read the market rate from the oracle contract, not the combined price query."
+signature = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[gap."case:trade-margin-after-hours"]
+owner = "#245"
+title = "Differs from Python main. Native margin previews read the market rate from the oracle contract, not the combined price query."
+signature = "0000000000000000000000000000000000000000000000000000000000000000"

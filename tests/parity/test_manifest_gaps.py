@@ -58,13 +58,7 @@ CURRENT_TRADE_UX_CASES = (
     "market-list-text",
     "trade-cancel-alias",
     "trade-open-ambiguous-market-symbol",
-    "trade-open-market-symbol",
     "trade-open-unknown-market-symbol",
-    "trade-margin",
-    "trade-margin-capped-add",
-    "trade-margin-add-rounding",
-    "trade-margin-remove-rounding",
-    "trade-margin-after-hours",
 )
 
 
